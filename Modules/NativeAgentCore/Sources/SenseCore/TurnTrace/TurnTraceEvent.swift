@@ -27,6 +27,7 @@ public struct TurnTraceEvent: Sendable, Equatable {
     public let turnId: String
     public let ts: Date
     public let kind: String
+    package static let dispatchSettledKind = "tool.dispatch.settled"
     private static let terminalKinds: Set<String> = ["turn.terminal", "turn.cancelled", "turn.failed"]
     public static func isTerminalKind(_ kind: String) -> Bool { terminalKinds.contains(kind) }
     public let sessionId: String?
@@ -155,12 +156,14 @@ public struct TurnTraceEvent: Sendable, Equatable {
         let leafBound: JSONValue
         if kind == "llm.call" {
             leafBound = value
-        } else if ["context.snapshot", "tool.dispatch"].contains(kind), case .object(let fields) = value {
+        } else if ["context.snapshot", "tool.dispatch", dispatchSettledKind].contains(kind), case .object(let fields) = value {
             var bounded: [String: JSONValue] = [:]
             for (key, field) in fields {
                 let result = kind == "tool.dispatch" && key == "result"
                     && field.stringValue.map { $0.utf8.count <= toolResultInlineUTF8Bytes } == true
-                bounded[key] = (kind == "context.snapshot" && key == "feelingFrame") || result ? field : field.mapStrings(boundString)
+                let settled = kind == dispatchSettledKind && key == "receipt"
+                    && (try? field.serializedData(pretty: false).count).map { $0 <= toolResultInlineUTF8Bytes } == true
+                bounded[key] = (kind == "context.snapshot" && key == "feelingFrame") || result || settled ? field : field.mapStrings(boundString)
             }
             leafBound = .object(bounded)
         } else {
@@ -217,6 +220,7 @@ public struct TurnTraceEvent: Sendable, Equatable {
                 "milestone", "provider", "model", "resultClass",
                 "durationMs", "elapsedMs", "inputTokens", "outputTokens",
                 "argKeys", "shown", "receipt", "result_recovery", "parentId", "automaticOrigin", "cacheMarkers",
+                "invocationID", "callID", "result_retention_failed",
                 // Preserve context scalar integrity facts when large previews are summarized so rows stay queryable despite sorted-key truncation.
                 "containsCognitiveSubstrate", "cognitiveCapsuleBytes", "cognitiveCue",
                 "toolSchemaCount", "toolSchemaParameterBytes",

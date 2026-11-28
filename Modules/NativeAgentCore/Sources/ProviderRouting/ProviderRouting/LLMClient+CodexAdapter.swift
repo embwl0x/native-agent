@@ -137,30 +137,13 @@ private final class CodexProcessInput: Sendable {
 }
 
 /// One invocation retains its process and pipes through exit and drain, independently of the caller's wait.
-public struct CodexProcessInvocation: Sendable {
-    public var executable: String
-    public var arguments: [String]
-    public var stdin: String
-    public var lifetime: ProviderRequestLifetime
-    public var call: LLMCall?
-    /// Optional full child-process environment. Rooted secondary runtimes use this to bind CODEX_HOME/NATIVE_AGENT_DATA_ROOT instead of silently reading
-    /// the operator's personal Codex home.
-    public var environment: [String: String]?
-    public init(
-        executable: String,
-        arguments: [String],
-        stdin: String,
-        environment: [String: String]? = nil,
-        lifetime: ProviderRequestLifetime = ProviderRequestLifetime(),
-        call: LLMCall? = nil
-    ) {
-        self.executable = executable
-        self.arguments = arguments
-        self.stdin = stdin
-        self.environment = environment
-        self.lifetime = lifetime
-        self.call = call
-    }
+private struct CodexProcessInvocation: Sendable {
+    let executable: String
+    let arguments: [String]
+    let stdin: String
+    let environment: [String: String]
+    let call: LLMCall
+    let images: [(fileExtension: String, data: Data)]
 
     /// Spawn once, drain both pipes, and join shutdown before reporting exit.
     fileprivate func run(
@@ -170,11 +153,41 @@ public struct CodexProcessInvocation: Sendable {
         exited: @escaping @Sendable (Int32, String?) -> Void
     ) throws {
         let proc = ManagedProcess()
-        var environment = environment ?? ManagedProcess.agentEnvironment()
+        var environment = self.environment
         environment["PATH"] = CodexExecutable.augmentedPath(environment["PATH"])
         proc.executableURL = try CodexExecutable.resolveCodexExecutable(
             environment: environment, program: executable)
-        proc.arguments = arguments
+        let imageDirectory: URL?
+        if images.isEmpty {
+            imageDirectory = nil
+        } else {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("nativeagent-codex-images-\(UUID().uuidString)", isDirectory: true)
+            guard !directory.path.contains(",") else {
+                throw LLMError.providerError(message: "Codex CLI cannot attach images from a temporary path containing a comma.")
+            }
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o700])
+            imageDirectory = directory
+        }
+        var launched = false
+        defer {
+            if !launched, let failure = Self.removeImageDirectory(imageDirectory) {
+                TurnTraceBus.fireFromContext(kind: "codex.attachment.cleanupFailed", surface: call.surface,
+                    payload: .object(["cause": .string(failure)]), turn: call.turn)
+            }
+        }
+        var childArguments = arguments
+        if let imageDirectory {
+            for (index, image) in images.enumerated() {
+                let file = imageDirectory.appendingPathComponent("image-\(index + 1).\(image.fileExtension)")
+                try image.data.write(to: file, options: .withoutOverwriting)
+                childArguments += ["--image", file.path]
+            }
+            childArguments += ["--ephemeral", "--", "-"]
+            try Task.checkCancellation()
+        }
+        proc.arguments = childArguments
         proc.environment = environment
         let outPipe = Pipe(), errPipe = Pipe(), inPipe = Pipe()
         proc.standardOutput = outPipe
@@ -218,12 +231,13 @@ public struct CodexProcessInvocation: Sendable {
             stdoutReader.waitForEOF()
             stderrReader.waitForEOF()
             let failures = [p.terminationError, input.captureFailure, stdoutReader.captureFailure,
-                            stderrReader.captureFailure].compactMap { $0 }
+                            stderrReader.captureFailure, Self.removeImageDirectory(imageDirectory)].compactMap { $0 }
             let failure = failures.isEmpty ? nil : failures.joined(separator: "; ")
             exited(p.terminationStatus, failure)
         }
         do {
             try proc.run()
+            launched = true
         } catch {
             input.stop()
             input.wait()
@@ -237,35 +251,30 @@ public struct CodexProcessInvocation: Sendable {
         }
         if input.captureFailure != nil, proc.isRunning { ProcessTreeReaper.quiesceAndKill(proc.groupSnapshot) }
     }
-}
 
-/// Yield stdout in order; a silent answer requires EOF and successful process exit.
-public typealias CodexStreamingProcessRunner = @Sendable (CodexProcessInvocation) -> AsyncThrowingStream<String, Error>
+    private static func removeImageDirectory(_ directory: URL?) -> String? {
+        guard let directory else { return nil }
+        do {
+            try FileManager.default.removeItem(at: directory)
+            return nil
+        } catch {
+            return "Codex image attachment cleanup failed: \(error.localizedDescription)"
+        }
+    }
+}
 
 /// Buffered and incremental callers share one process lifecycle; delivery follows the CLI's stdout flushing.
 public final class CodexProcess: LLMTransport {
-    public static let toolWire = ProviderToolWire.unsupported
-    /// The CLI prompt is text-only, so image loss must be reported.
-    public static let carriesImages = false
+    public static let toolWire = ProviderToolWire.textMarkers
+    public static let carriesImages = true
     /// This transport has no output-cap field.
     public func requestOutputTokens(model: String, call: LLMCall) throws -> Int { 0 }
 
     public let providerId: String = "codex"
-    private let codexBin: String?
-    private let streamingRunner: CodexStreamingProcessRunner
-    private let processEnvironment: [String: String]
+    private let processEnvironment = ProcessInfo.processInfo.environment
     private let dataRootOverride: URL?
-    public var telemetry: LLMCallTraceRecorder { LLMCallTraceRecorder(dataRootOverride: dataRootOverride) }
 
-    public init(
-        codexBin: String? = nil,
-        streamingRunner: @escaping CodexStreamingProcessRunner = CodexProcess.defaultStreamingRunner,
-        processEnvironmentOverride: [String: String]? = nil,
-        dataRootOverride: URL? = nil
-    ) {
-        self.codexBin = codexBin
-        self.streamingRunner = streamingRunner
-        self.processEnvironment = processEnvironmentOverride ?? ProcessInfo.processInfo.environment
+    public init(dataRootOverride: URL? = nil) {
         self.dataRootOverride = dataRootOverride
     }
 
@@ -344,10 +353,11 @@ public final class CodexProcess: LLMTransport {
     }
 
     /// Words settle at stdout EOF; a silent answer also waits for successful process exit.
-    public func stream(
+    private func stream(
         prompt: String,
         system: String?,
-        model: String, call: LLMCall
+        model: String, call: LLMCall,
+        images: [(fileExtension: String, data: Data)]
     ) -> AsyncThrowingStream<String, Error> {
         guard !Task.isCancelled, call.replyWork?.isStopped != true else {
             return AsyncThrowingStream { $0.finish(throwing: CancellationError()) }
@@ -363,15 +373,15 @@ public final class CodexProcess: LLMTransport {
                     if work.isStopped { throw CancellationError() }
                     let args = try arguments(model: model, authPath: authPath, call: call)
                     let invocation = CodexProcessInvocation(
-                        executable: try codexBin ?? CodexExecutable.resolveCodexExecutable(environment: processEnvironment).path,
+                        executable: try CodexExecutable.resolveCodexExecutable(environment: processEnvironment).path,
                         arguments: args,
                         stdin: Self.composedPrompt(system: system, prompt: prompt),
-                        environment: childEnvironment(authPath: authPath), lifetime: call.lifetime, call: call
+                        environment: childEnvironment(authPath: authPath), call: call, images: images
                     )
                     // The call's receipt binds to the token the child is handed; with none, the call proves nothing.
                     if let handed = try await Self.prepareCodexHome(authPath), !handed.isEmpty { call.sentCredential?.sending(token: handed) }
                     if work.isStopped { throw CancellationError() }
-                    let upstream = streamingRunner(invocation)
+                    let upstream = Self.defaultStreamingRunner(invocation)
                     for try await chunk in upstream {
                         output += chunk
                         if !chunk.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -433,18 +443,6 @@ public final class CodexProcess: LLMTransport {
         await settle { await TurnTracePersistLane(dataRootOverride: root).append(row) }
     }
 
-    // MARK: - Text-only messages contract
-
-    private func messagesPrompt(_ messages: [LLMMessage], model: String, call: LLMCall) async throws -> String {
-        let flattened = try llmCompatibilityPrompt(messages: messages) { role in
-            role == .user ? "USER:" : "ASSISTANT:"
-        }
-        if flattened.imageCount > 0 {
-            await Self.emitVisionUnsupportedTrace(provider: providerId, model: model, imageCount: flattened.imageCount, call: call)
-        }
-        return flattened.text
-    }
-
     /// Delivery follows stdout; silence also requires the process's successful exit.
     public func streamMessages(
         messages: [LLMMessage],
@@ -452,12 +450,35 @@ public final class CodexProcess: LLMTransport {
         model: String,
         tools: [LLMToolSchema]?, call: LLMCall
     ) -> AsyncThrowingStream<LLMMessageStreamEvent, Error> {
-        return AsyncThrowingStream { continuation in
+        let source = ReplyStream { continuation in
             let task = Task {
                 do {
-                    let prompt = try await messagesPrompt(messages, model: model, call: call)
+                    guard tools?.isEmpty != false else {
+                        throw LLMError.providerError(message: "Codex CLI receives tools through NativeAgent text markers.")
+                    }
+                    let prompt = try llmCompatibilityPrompt(messages: messages, attachingImages: true) { role in
+                        role == .user ? "USER:" : "ASSISTANT:"
+                    }
+                    var images: [(fileExtension: String, data: Data)] = []
+                    for block in messages.flatMap(\.content) {
+                        guard case .image(let mediaType, let base64, _, _) = block else { continue }
+                        let fileExtension = switch mediaType {
+                        case "image/png": "png"
+                        case "image/jpeg": "jpg"
+                        case "image/gif": "gif"
+                        case "image/webp": "webp"
+                        default: ""
+                        }
+                        guard !fileExtension.isEmpty else {
+                            throw LLMError.providerError(message: "Codex CLI cannot attach image #\(images.count + 1) in its current format.")
+                        }
+                        guard let data = Data(base64Encoded: base64), !data.isEmpty else {
+                            throw LLMError.providerError(message: "Codex CLI image #\(images.count + 1) has invalid attachment data.")
+                        }
+                        images.append((fileExtension, data))
+                    }
                     try Task.checkCancellation()
-                    for try await chunk in stream(prompt: prompt, system: system, model: model, call: call) {
+                    for try await chunk in stream(prompt: prompt.text, system: system, model: model, call: call, images: images) {
                         try Task.checkCancellation()
                         continuation.yield(.textDelta(chunk))
                     }
@@ -472,29 +493,12 @@ public final class CodexProcess: LLMTransport {
                 if case .cancelled = ending { task.cancel() }
             }
         }
-    }
-
-    /// Record dropped images in the path-owned trace so text-only transport loss remains visible.
-    private static func emitVisionUnsupportedTrace(
-        provider: String,
-        model: String,
-        imageCount: Int, call: LLMCall
-    ) async {
-        guard !call.preview else { return }
-        let event = TurnTraceEvent(kind: "vision.attachment_unsupported",
-            title: "vision_attachment_unsupported", status: "ok", payload: .object([
-                "provider": .string(provider),
-                "model": .string(model),
-                "imageCount": .int(Int64(imageCount)),
-            ]), createdAt: ISO8601DateFormatter().string(from: Date()),
-            turnId: call.turn?.id, sessionId: call.session, surface: call.surface, turn: call.turn)
-        await TurnTracePersistLane(dataRootOverride: call.traceDataRoot).append(event)
+        guard system?.contains(AnthropicOAuthTransport.textToolProtocolHeader) == true else { return source }
+        return AnthropicOAuthTransport.endingCallBlock(source, turn: call.turn)
     }
 
     /// Piped non-interactive prompts must work from any app working directory.
     private func arguments(model: String, authPath: URL, call: LLMCall) throws -> [String] {
-        // This transport is a model call. CLI tools would act outside the NativeAgent dispatcher, so its declared no-tools contract applies to the child
-        // too, independent of the person's CLI configuration.
         var args: [String] = [
             "exec", "--color", "never", "--skip-git-repo-check",
             "--ignore-user-config", "--ignore-rules", "--strict-config",
@@ -540,10 +544,10 @@ public final class CodexProcess: LLMTransport {
         return system + "\n\n" + prompt
     }
 
-    public static let defaultStreamingRunner: CodexStreamingProcessRunner = { inv in
+    private static func defaultStreamingRunner(_ inv: CodexProcessInvocation) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
-            let activity = inv.lifetime.activity
-            let admitted = inv.lifetime.admitted
+            let activity = inv.call.lifetime.activity
+            let admitted = inv.call.lifetime.admitted
             let stdout = CodexUTF8Output(), stderr = CodexUTF8Output()
             do {
                 try inv.run(stdout: { data in
@@ -577,8 +581,8 @@ public final class CodexProcess: LLMTransport {
                     } else { cause = nil }
                     var payload: [String: JSONValue] = ["exitCode": .int(Int64(status)), "status": .string(cause == nil ? "completed" : "failed")]
                     if let cause { payload["cause"] = .string(ProviderFailure.diagnosticDescription(cause)) }
-                    TurnTraceBus.fireFromContext(kind: "codex.process.exited", surface: inv.call?.surface,
-                        payload: .object(payload), turn: inv.call?.turn)
+                    TurnTraceBus.fireFromContext(kind: "codex.process.exited", surface: inv.call.surface,
+                        payload: .object(payload), turn: inv.call.turn)
                     if let cause { continuation.finish(throwing: cause) }
                     else { continuation.finish() }
                 })

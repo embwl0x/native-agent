@@ -824,10 +824,6 @@ public enum QuietSettings {
             read: { _ in .string(try SimpleViewMode.checkedCurrent()) },
             write: { _, value, context in UserDefaults.standard.set(try choiceValue(value, "View", SimpleViewMode.choices), forKey: SimpleViewMode.key) }
         ).watchingDefaults(SimpleViewMode.key))
-        rows.append(defaultsBool(
-            id: "settings.developer_surfaces", page: "settings",
-            label: "Show developer surfaces", key: "showDeveloperSurfaces"
-        ))
         rows.append(liveBool(
             id: "settings.global_hotkey", page: "settings",
             label: "Global hotkey", key: "globalHotkeyEnabled", defaultOn: true,
@@ -984,15 +980,14 @@ public enum QuietSettings {
 
     /// Preference invalidation uses the keys declared beside the registry readers, never a second list of settings.
     @MainActor
-    public static func defaultsKeys(forPage page: String, host: any QuietSettingsHost) -> [String] {
+    public static func defaultsKeys(host: any QuietSettingsHost) -> [String] {
         // Defaults-backed rows are declared here or by the platform; lower-only rows read their checked stores.
-        (staticRows + host.platformSettings).filter { $0.page == page }.compactMap(\.defaultsKey)
+        (staticRows + host.platformSettings).filter { $0.page == "settings" }.compactMap(\.defaultsKey)
     }
 
-    /// Snapshot bot values only for a read; mutations keep fresh store readers.
     @MainActor
-    public static func all(host: (any QuietSettingsHost)?, snapshotBots: Bool = false) throws -> [QuietSetting] {
-        try staticRows + botRows(host, snapshot: snapshotBots) + (host?.lowerOnlyRows(forPage: nil) ?? []) + (host?.platformSettings ?? [])
+    public static func all(host: (any QuietSettingsHost)?) throws -> [QuietSetting] {
+        try staticRows + botRows(host) + (host?.lowerOnlyRows(forPage: nil) ?? []) + (host?.platformSettings ?? [])
     }
 
     @MainActor

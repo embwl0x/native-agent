@@ -92,6 +92,15 @@ extension SwiftToolDispatcher {
                     : why),
             ])
         }
+        if prepared.packet.associationPointers.contains(pointer) {
+            let session = turn.verifiedSessionID ?? turn.session
+            let surface = ContextSurface(rawValue: turn.envelope?.surface ?? prepared.need.surface.rawValue)
+            guard session == prepared.need.sessionID, surface == prepared.need.surface,
+                  let audience = AssociationAudience(turn: turn, session: session, surface: surface, origin: prepared.need.origin),
+                  let atom = prepared.generation.atoms(id: atomID).first, audience.permits(atom.draft) else {
+                return .object(["status": .string("failed"), "reason": .string("association_audience_withheld")])
+            }
+        }
         let result = try ContextExpander().expand(
             pointer,
             for: prepared.need,
@@ -101,8 +110,9 @@ extension SwiftToolDispatcher {
             offset: offset,
             offeredSelectedItems: prepared.packet.selectedItems.filter { item in
                 prepared.packet.expandablePointers.contains(item.pointer)
-            }
+            }, offeredPacket: prepared.packet
         )
+        prepared.openedAssociation(result)
         Task {
             await prepared.recordExpansion(
                 atomID: result.receipt.atomID,
@@ -121,7 +131,7 @@ extension SwiftToolDispatcher {
             "truncated": .bool(result.truncated),
             "receipt_id": .string(result.receipt.id),
         ]
-        let sources = prepared.packet.selectedItems.first { $0.pointer == pointer }?.untrustedSources ?? []
+        let sources = prepared.generation.atoms(id: pointer.atomID).flatMap { ContextMemoryLead.untrustedSources(for: $0.draft) }
         let steering = MemoryDataProvenance.steering(sources, dataRoot: turn.dataRoot)
         fields.merge(MemoryDataProvenance.fields(steeredBy: steering)) { _, value in value }
         return .object(fields)

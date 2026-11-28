@@ -85,8 +85,7 @@ enum NativeCognitiveEventFactory {
         case .failed, .blocked, .expired:
             kind = .toolFailed
             importance = 0.8
-        case .running, .ready, .awaitingApproval, .awaitingHuman, .waitingExternal,
-             .verifying, .proposed:
+        case .running, .ready, .awaitingApproval, .waitingExternal:
             kind = .toolStarted
             importance = model.phase == .waitingExternal ? 0.68 : 0.48
         case .cancelled:

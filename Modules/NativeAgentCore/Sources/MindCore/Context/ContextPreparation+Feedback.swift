@@ -145,8 +145,7 @@ extension ContextPreparation {
     }
 
     private static func feedbackTimeBucket(_ date: Date = Date()) throws -> Int64 {
-        let bucket = (date.timeIntervalSince1970 / 300).rounded(.towardZero)
-        guard let value = Int64(exactly: bucket) else {
+        guard let value = MemoryStrength.bucket(for: date) else {
             throw ContextFlowStoreError.malformedStoredValue("feedback date outside bucket range")
         }
         return value

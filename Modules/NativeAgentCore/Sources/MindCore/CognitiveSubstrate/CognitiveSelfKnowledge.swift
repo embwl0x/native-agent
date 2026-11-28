@@ -19,7 +19,8 @@ public struct CognitiveSelfKnowledge: Codable, Sendable, Equatable {
             guard let fields = value.objectValue,
                   let when = CognitiveSelfKnowledge.words(fields["when"], limit: 120),
                   let tendency = CognitiveSelfKnowledge.words(fields["i_tend_to"], limit: 160),
-                  let refs = CognitiveSelfKnowledge.references(fields["shown_by"]) else { return nil }
+                  let refs = CognitiveSelfKnowledge.references(fields["shown_by"]),
+                  fields["shown_by"] == .array(refs.map(JSONValue.string)) else { return nil }
             self.when = when; self.iTendTo = tendency; self.shownBy = refs
         }
     }
@@ -37,6 +38,10 @@ public struct CognitiveSelfKnowledge: Codable, Sendable, Equatable {
     public struct Person: Codable, Sendable, Equatable {
         public var person: String
         public var line: String
+        init(person: String, line: String) {
+            self.person = person
+            self.line = line
+        }
         public init?(_ value: JSONValue) {
             guard let fields = value.objectValue,
                   let person = CognitiveSelfKnowledge.words(fields["person"], limit: 120),
@@ -75,6 +80,8 @@ public struct CognitiveSelfKnowledge: Codable, Sendable, Equatable {
 
     /// A story reference survives insertion/reordering and identifies the exact captured entry, including its source and change, rather than an array index.
     static func reference(_ moment: CognitiveCare.Moment, in care: UUID) -> String? {
+        var moment = moment
+        moment.sharedAt = nil
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         guard let data = try? encoder.encode(moment) else { return nil }
@@ -306,7 +313,18 @@ extension CognitiveSubstrate {
             var entry = entry; entry.shownBy = refs; return entry
         }
         var seen = Set<String>()
-        let people = night.people.filter { night.selfPeople.contains($0.person) && seen.insert($0.person).inserted }
+        var people = night.people.filter { night.selfPeople.contains($0.person) && seen.insert($0.person).inserted }
+        // A person the night was not shown is still known: their line stays while a care that is not faded still holds them. One who
+        // was shown and left out is let go, as the prompt says.
+        let held = Set(cares.values.filter { $0.fadedAt == nil }.flatMap(\.with))
+        // Carried lines never crowd the save: they are kept only while the reading stays well inside the file's size.
+        var room = 160_000 - people.reduce(0) { $0 + $1.person.utf8.count + $1.line.utf8.count + 40 }
+        people += (selfKnowledge?.people ?? []).filter {
+            let cost = $0.person.utf8.count + $0.line.utf8.count + 40
+            guard !night.selfPeople.contains($0.person), held.contains($0.person), cost <= room, seen.insert($0.person).inserted else { return false }
+            room -= cost
+            return true
+        }
         var progress = selfKnowledge?.stanceReadAt ?? [:]
         for care in night.keys.values {
             if let at = care.story.last(where: { $0.stanceChange != nil })?.at {
@@ -371,7 +389,13 @@ extension CognitiveSubstrate {
         let grouped = Dictionary(grouping: live.flatMap { care in care.with.filter {
             carePeopleReadFailure == nil || CognitiveCareProvenance.independentPersonKey($0)
         }.map { ($0, care) } }, by: { $0.0 })
-        for person in grouped.keys.sorted().prefix(CognitiveSelfKnowledge.maximumPeople) {
+        // The person this mind is with comes first, then whoever's care moved most recently, so a tight night never cuts by spelling.
+        func newest(_ person: String) -> Date { (grouped[person] ?? []).map { $0.1.updatedAt }.max() ?? .distantPast }
+        let order = grouped.keys.sorted {
+            ($0 == CognitiveCare.ownerKey) != ($1 == CognitiveCare.ownerKey) ? $0 == CognitiveCare.ownerKey
+                : newest($0) != newest($1) ? newest($0) > newest($1) : $0 < $1
+        }
+        for person in order.prefix(CognitiveSelfKnowledge.maximumPeople) {
             let held = (grouped[person] ?? []).map { $0.1 }.sorted {
                 $0.updatedAt != $1.updatedAt ? $0.updatedAt > $1.updatedAt : $0.id.uuidString < $1.id.uuidString
             }
@@ -398,38 +422,84 @@ extension CognitiveSubstrate {
             """)
         remaining += 16_000
 
-        // Include recent changes even when that care was quiet today. They are actual prior depth/stance entries, never predictions of tonight's pass.
-        let changed = cares.values.filter { $0.story.contains { $0.depthChange != nil || $0.stanceChange != nil || $0.felt == "changed my mind" } }
-            .sorted { $0.updatedAt != $1.updatedAt ? $0.updatedAt > $1.updatedAt : $0.id.uuidString < $1.id.uuidString }
+        func isChange(_ moment: CognitiveCare.Moment) -> Bool {
+            moment.depthChange != nil || moment.stanceChange != nil
+        }
+        func countsTowardCareKeys(_ moment: CognitiveCare.Moment) -> Bool {
+            isChange(moment) || moment.felt == "changed my mind"
+        }
+        func storyRow(_ moment: CognitiveCare.Moment, in care: UUID) -> (reference: String, line: String)? {
+            guard let ref = CognitiveSelfKnowledge.reference(moment, in: care) else { return nil }
+            let depth = moment.depthChange.map { " | depth: \($0.from.rawValue) → \($0.to.rawValue)" } ?? ""
+            return (ref, """
+                \(ref): \(NativeTimestampFormat.calendarDay(moment.at)) | \(moment.by.rawValue)\(moment.who.map { " (\($0))" } ?? "") | moved \
+                \(moment.moved) | \(moment.felt): \(moment.note)\(depth)
+                """)
+        }
+        func newestCareFirst(_ lhs: CognitiveCare, _ rhs: CognitiveCare) -> Bool {
+            lhs.updatedAt != rhs.updatedAt ? lhs.updatedAt > rhs.updatedAt : lhs.id.uuidString < rhs.id.uuidString
+        }
+        let week: TimeInterval = 7 * 86_400
+        let changed = cares.values.filter { $0.story.contains(where: countsTowardCareKeys) }.sorted(by: newestCareFirst)
         var candidates = Array(keys.values)
         for care in changed.prefix(10) where !candidates.contains(where: { $0.id == care.id }) { candidates.append(care) }
-        candidates.sort { $0.updatedAt != $1.updatedAt ? $0.updatedAt > $1.updatedAt : $0.id.uuidString < $1.id.uuidString }
+        candidates.sort(by: newestCareFirst)
+        let careKeyCandidateCount = candidates.count
+        let selectedIDs = Set(candidates.map(\.id))
+        candidates += live.filter { care in
+            guard !selectedIDs.contains(care.id),
+                  let first = care.story.first(where: { $0.moved != 0 }),
+                  let last = care.story.last(where: { $0.moved != 0 }) else { return false }
+            return last.at.timeIntervalSince(first.at) >= week
+        }.sorted(by: newestCareFirst)
         _ = append("--- YOUR CARE STORIES (a bounded retained window; read your if-then signature from what really happened) ---")
-        for care in candidates.prefix(48) {
-            let changes = care.story.filter { $0.depthChange != nil || $0.stanceChange != nil || $0.felt == "changed my mind" }.suffix(5)
-            let recent = care.story.filter { $0.moved != 0 }.suffix(3)
-            var rows: [(reference: String, line: String, change: Bool)] = []
-            for moment in Array(recent) + Array(changes) {
-                guard let ref = CognitiveSelfKnowledge.reference(moment, in: care.id) else { continue }
-                let change = moment.depthChange != nil || moment.stanceChange != nil || moment.felt == "changed my mind"
-                let depth = moment.depthChange.map { " | depth: \($0.from.rawValue) → \($0.to.rawValue)" } ?? ""
-                rows.append((ref, """
-                    \(ref): \(NativeTimestampFormat.calendarDay(moment.at)) | \(moment.by.rawValue)\(moment.who.map { " (\($0))" } ?? "") | moved \
-                    \(moment.moved) | \(moment.felt): \(moment.note)\(depth)
-                    """, change))
+        var remainingForCareKeys = remaining
+        for (index, care) in candidates.prefix(48).enumerated() {
+            let header = "\(care.id.uuidString): \(Self.careLineText(care))\n"
+            var movements = Array(care.story.filter { $0.moved != 0 }.suffix(3))
+            if index < careKeyCandidateCount {
+                let previousChanges = care.story.filter(countsTowardCareKeys).suffix(5)
+                let previousRows = (movements + previousChanges).compactMap { storyRow($0, in: care.id)?.line }
+                let size = (header + previousRows.joined(separator: "\n")).count
+                if !previousRows.isEmpty, size <= remainingForCareKeys {
+                    remainingForCareKeys -= size + 1
+                    include(care)
+                }
             }
-            guard !rows.isEmpty, append("\(care.id.uuidString): \(Self.careLineText(care))\n" + rows.map(\.line).joined(separator: "\n")) else { continue }
-            include(care)
+            let changes = care.story.filter(isChange)
+            var shownChanges = Array(changes.suffix(5))
+            if let latest = changes.last,
+               let earlier = changes.last(where: { $0.stanceChange != nil && latest.at.timeIntervalSince($0.at) >= week }),
+               !shownChanges.contains(earlier) {
+                shownChanges = [earlier] + shownChanges.suffix(4)
+            }
+            if let latest = movements.last {
+                var cutoff = latest.at.addingTimeInterval(-week)
+                for moment in care.story.reversed() where moment.moved != 0 && moment.at <= cutoff {
+                    if !movements.contains(moment) { movements.append(moment) }
+                    if movements.count == 5 { break }
+                    cutoff = moment.at.addingTimeInterval(-week)
+                }
+            }
+            var rows: [(reference: String, line: String, change: Bool)] = []
+            var shown = Set<String>()
+            for moment in (movements + shownChanges).sorted(by: { $0.at < $1.at }) {
+                guard let row = storyRow(moment, in: care.id), shown.insert(row.reference).inserted else { continue }
+                let stance = moment.stanceChange == nil ? "" : " | accepted stance"
+                rows.append((row.reference, row.line + stance, isChange(moment)))
+            }
+            guard !rows.isEmpty, append(header + rows.map(\.line).joined(separator: "\n")) else { continue }
             storyRefs.formUnion(rows.map(\.reference))
             changeRefs.formUnion(rows.filter(\.change).map(\.reference))
         }
         // Instructions remain outside the material budget so a full window cannot remove the schema or imply that omitted evidence was shown.
         lines.append("""
             You may return \"traits\": at most 5 {\"when\": \"<condition, at most 120 characters>\", \"i_tend_to\": \"<your tendency, at most 160 \
-            characters>\", \"shown_by\": [\"<shown care UUID or exact story reference>\"]}. Read them afresh tonight: a trait the shown stories no longer \
-            support drops. Never invent adjectives or evidence. You may also return \"story\": at most 5 {\"line\": \"<one line in your voice, at most 400 \
-            characters, telling how you changed>\", \"shown_by\": [\"<exact change story reference>\"]}. Each shown_by has 1–8 references to depth changes, \
-            changed-my-mind or accepted-stance entries. These optional fields replace your previous night's reading; omit or use [] when unsupported.
+            characters>\" (they are read as one sentence, \"When <when>, I tend to <i_tend_to>\", so neither opens with a capital), \"shown_by\": [\"<exact shown story reference>\"]}. Cite care histories by exact story reference. Read traits afresh \
+            tonight: a trait the shown stories no longer support drops. Never invent adjectives or evidence. You may also return \"story\": at most 5 \
+            {\"line\": \"<one line in your voice, at most 400 characters, telling how you changed>\", \"shown_by\": [\"<exact change story reference>\"]}. \
+            Each story shown_by has 1–8 references to shown depth changes or accepted stances. These optional fields replace your previous night's \
+            reading; omit or use [] when unsupported.
             """)
         return (lines, storyRefs, changeRefs, people)
     }

@@ -3,7 +3,6 @@ import PersistenceCore
 
 // Blueprint: | `KnowledgeGraphMaintenanceActions.swift` | `KnowledgeGraphMaintenanceActions`: exact-reviewed-set orphan removal |
 
-/// Preview grants no permission to delete a later state; both graph controls and `rebuild_knowledge_graph mode: sweep_orphans` reread canonical memory.
 public struct KnowledgeGraphMaintenanceActions: Sendable {
     public enum ApplyResult: Sendable, Equatable {
         case applied(KnowledgeGraphGCReport)

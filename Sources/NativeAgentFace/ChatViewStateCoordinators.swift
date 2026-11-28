@@ -38,7 +38,8 @@ final class ChatToastQueue {
 final class ChatTurnCardClearance {
     var measuredHeight: CGFloat = 0
     /// Keep the idle floor even when no card is visible.
-    var showsCard = false
+    var showsTurnCard = false
+    var showsCard: Bool { showsTurnCard || measuredHeight > 0 }
     /// Use measured composer inset to align the Latest overlay with the frame.
     var measuredComposerHeight: CGFloat = 0
     var clearance: CGFloat {
@@ -120,39 +121,190 @@ struct ChatClearConfirmationState: Equatable {
 /// Observe lifecycle and approvals here so updates cannot invalidate ChatView.body.
 struct ChatTurnCardInset: View {
     @Environment(AppModel.self) var appModel
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// Keep the thumbnail in Simple because it has no Work pane.
     @Environment(\.layoutProfile) private var layoutProfile
     let store: ChatTurnCardClearance
 
-    /// Keep the tray inside the glass merge distance so it fuses with the composer's container.
-    private var card: some View {
-        // Use the composer-owned Stop in this window while sharing detached chat's card.
-        MacChatTurnCardHost(
-            sessionId: appModel.activeChatSessionId,
-            onOpenScreen: layoutProfile == SimpleViewMode.simple ? nil : { WorkPaneState.shared.userShow(.screen) }
-        )
-        .padding(.horizontal, NativeAgentShellLayout.roomGutter)
-        .padding(.bottom, ChatComposerTray.gap)
+    var body: some View {
+        ChatTurnStepsFace(sessionID: appModel.activeChatSessionId, showsStatus: showThinkingRow,
+                          onOpenScreen: layoutProfile == SimpleViewMode.simple ? nil : { WorkPaneState.shared.userShow(.screen) })
+            .id(appModel.activeChatSessionId)
+            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { store.measuredHeight = $0 }
+            .onChange(of: showThinkingRow, initial: true) { _, shows in store.showsTurnCard = shows }
+    }
+}
+
+private struct ChatTurnStepsFace: View {
+    private struct TurnReading: Equatable {
+        let id: String
+        let isLive: Bool
+        let ending: TurnPresentationPhase?
+        let settledSteps: [TurnFace.Step]
     }
 
+    private struct Reading: Equatable {
+        let turnID: String
+        var face: PartFace
+        var levers: [PartFace.Section]
+        var ending: TurnPresentationPhase? = nil
+    }
+
+    private enum FooterFocus: Hashable { case pin, dismiss }
+
+    let sessionID: String
+    let showsStatus: Bool
+    let onOpenScreen: (() -> Void)?
+    @Environment(AppModel.self) private var appModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.chatPageIsVisible) private var chatPageIsVisible
+    @FocusState private var footerFocus: FooterFocus?
+    @State private var shown: Reading?
+    @State private var session = FacePageSession()
+
     var body: some View {
-        // The card's measured height feeds the transcript's bottom inset (`clearance`); the card itself fades in and out.
-        ZStack(alignment: .bottom) {
-            if showThinkingRow {
-                card
+        let turn = appModel.turnPart("turnStepsReading", for: sessionID) { face -> TurnReading? in
+            guard let face, let id = face.turnID else { return nil }
+            let ending = face.phase.flatMap { $0.isTerminal ? $0 : nil }
+            return TurnReading(id: id, isLive: face.activeTurnID == id && face.phase?.isTerminal == false,
+                               ending: ending, settledSteps: ending == nil ? [] : face.steps)
+        }
+        let snapshot = chatPageIsVisible && !sessionID.isEmpty
+            ? appModel.face.slot(.page(PageFaceKey.turnSteps(sessionID))).value(as: PartFaceSnapshot.self) : nil
+        let live = snapshot.flatMap { $0.part == turn?.id && turn?.isLive == true ? $0 : nil }
+        let reading = chatPageIsVisible ? shown : nil
+        let covered = Set(reading?.face.allRows.filter { $0.tone != .live }.map(\.id) ?? [])
+        VStack(spacing: ChatComposerTray.gap) {
+            if let shown = reading {
+                card(shown, live: live, turn: turn, held: session)
+                    .id(shown.turnID)
+                    .transition(NativeAgentMotion.reveal(reduceMotion: reduceMotion, anchor: .bottom))
+                    .padding(.horizontal, NativeAgentShellLayout.roomGutter)
+            }
+            if showsStatus {
+                MacChatTurnCardHost(sessionId: sessionID, onOpenScreen: onOpenScreen,
+                                   coveredTurnID: reading?.turnID, coveredStepIDs: covered)
+                    .padding(.horizontal, NativeAgentShellLayout.roomGutter)
+                    .padding(.bottom, ChatComposerTray.gap)
                     .fixedSize(horizontal: false, vertical: true)
                     .transition(NativeAgentMotion.fade)
             }
         }
-        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
-            store.measuredHeight = height
+        .animation(Animation.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion), value: showsStatus)
+        .animation(reduceMotion ? NativeAgentMotion.crossfade : NativeAgentMotion.spring, value: reading?.turnID)
+        .onChange(of: chatPageIsVisible) { _, visible in if !visible { replace(with: nil) } }
+        .onChange(of: live, initial: true) { _, next in update(next, turn: turn) }
+        .onChange(of: turn) { _, next in update(live, turn: next) }
+        .onChange(of: session.interactsWithText) { _, _ in update(live, turn: turn) }
+        .onChange(of: holdsDissolution) { _, held in
+            FaceFollows.shared.holdChatSteps(session, held: held && reading != nil)
+            update(live, turn: turn)
         }
-        .onChange(of: showThinkingRow, initial: true) { _, shows in
-            store.showsCard = shows
+        .onDisappear { FaceFollows.shared.holdChatSteps(session, held: false) }
+    }
+
+    private var holdsDissolution: Bool { footerFocus != nil || session.holdsDissolution }
+
+    private func card(_ reading: Reading, live: PartFaceSnapshot?, turn: TurnReading?, held: FacePageSession) -> some View {
+        let active = reading.turnID == live?.part
+        let shape = RoundedRectangle(cornerRadius: NativeAgentRadius.card)
+        let operation = held.operation(for: reading.turnID)
+        var face = reading.face
+        if active || operation != nil {
+            face.sections += reading.levers.map { section in
+                var section = section
+                section.rows = section.rows.map { row in
+                    var row = row
+                    if !active { row.actions = nil }
+                    if let outcome = operation?.outcome, outcome.accepted, !outcome.unresolved { row.detail = outcome.words }
+                    return row
+                }
+                return section
+            }
         }
-        .animation(
-            NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion),
-            value: showThinkingRow)
+        let door: any FaceDoor = if active || operation != nil {
+            appModel.pageDoor(page: PageFaceKey.turnSteps(sessionID), open: { _ in })
+        } else { ReadOnlyFaceDoor() }
+        let contents = FaceView(face: face, door: door, session: held, inline: true)
+        let pinLabel = held.isPinned ? (active ? "Follow live" : "Release") : "Keep open"
+        return VStack(alignment: .leading, spacing: NativeAgentSpacing.xs) {
+            contents
+            HStack {
+                Text(active ? "Turn steps" : Self.endLabel(reading.ending, pinned: held.isPinned))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer()
+                Button(pinLabel) {
+                    held.isPinned.toggle()
+                    update(live, turn: turn)
+                }
+                .focused($footerFocus, equals: .pin)
+                if !active {
+                    Button("Dismiss") { replace(with: live) }
+                        .focused($footerFocus, equals: .dismiss)
+                        .disabled(operation.map { $0.outcome == nil || $0.checking } == true)
+                }
+            }
+            .font(.caption)
+            .buttonStyle(.borderless)
+        }
+        .padding(NativeAgentSpacing.md)
+        .background(Color(nsColor: .controlBackgroundColor), in: shape)
+        .overlay { shape.strokeBorder(NativeAgentShell.hairline, lineWidth: 1).allowsHitTesting(false) }
+        .contentShape(shape)
+        .onHover { held.isHovering = $0 }
+        .fixedSize(horizontal: false, vertical: true)
+        .accessibilityIdentifier("chat.turn.steps")
+    }
+
+    private func update(_ live: PartFaceSnapshot?, turn: TurnReading?) {
+        guard var reading = shown else { replace(with: live); return }
+        if reading.turnID == live?.part {
+            if !session.isPinned, !session.interactsWithText, let live, let face = live.drawnFace {
+                reading.face = face
+                reading.levers = live.drawnLevers
+                if shown != reading { shown = reading }
+            }
+            return
+        }
+        guard holdsDissolution else { replace(with: live); return }
+        if let turn, turn.id == reading.turnID, let ending = turn.ending {
+            reading.ending = ending
+            if !session.isPinned {
+                let rows = PartFace.turnSteps(turn.settledSteps).allRows
+                let final = Dictionary(uniqueKeysWithValues: rows.map { ($0.id, $0) })
+                let shownRows = reading.face.allRows
+                let shownIDs = Set(shownRows.map(\.id))
+                reading.face.sections[0].rows = shownRows.map { final[$0.id] ?? $0 } + rows.filter { !shownIDs.contains($0.id) }
+            }
+        }
+        if !session.isPinned {
+            reading.face.sections[0].rows = reading.face.allRows.map { row in
+                guard row.tone == .live else { return row }
+                return .init(id: row.id, title: row.title, value: "Outcome unconfirmed", tone: .attention)
+            }
+        }
+        if shown != reading { shown = reading }
+    }
+
+    private func replace(with live: PartFaceSnapshot?) {
+        guard shown != nil || live != nil else { return }
+        FaceFollows.shared.holdChatSteps(session, held: false)
+        footerFocus = nil
+        session = FacePageSession()
+        shown = live.flatMap { snapshot in
+            snapshot.drawnFace.map { Reading(turnID: snapshot.part, face: $0, levers: snapshot.drawnLevers) }
+        }
+    }
+
+    private static func endLabel(_ phase: TurnPresentationPhase?, pinned: Bool) -> String {
+        let label: String = switch phase {
+        case .completed?: "Finished"
+        case .canceled?: "Stopped"
+        case .failed?: "Turn failed"
+        case .outcomeUnknown?: "Outcome unconfirmed"
+        case .waitingOnPerson?: "Waiting on you"
+        default: "Live updates ended"
+        }
+        return pinned ? label + " · Last live reading" : label
     }
 }

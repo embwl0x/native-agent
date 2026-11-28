@@ -27,7 +27,7 @@ struct ActivityView: View {
     /// A card a link elsewhere asked to open.
     @Binding var cardTarget: String?
 
-    @State private var path = NavigationPath()
+    @State private var pushed: FaceDestination?
 
     init(
         navigationTarget: Binding<ActivitySection?> = .constant(nil),
@@ -43,50 +43,39 @@ struct ActivityView: View {
     // MARK: - Body
 
     var body: some View {
-        NavigationStack(path: $path) {
-            AlivePage(title: today?.title ?? "Today", line: today?.line, style: .root) {
-                MobileFaceRows(page: "today") { path.append($0) }
-            }
-            .navigationDestination(for: FaceDestination.self) { $0.view }
-            .navigationDestination(for: ActivitySection.self) { section in
-                // Destinations share Activity's NavigationStack; nesting another breaks navigation.
-                switch section {
-                case .inbox:
-                    MobileFacePage(page: "inbox")
-                }
-            }
-            .refreshable {
-                _ = await sync.refreshSnapshotGroup(.faces)
-                await sync.refreshActivitySnapshot()
-            }
-            .task {
-                _ = await sync.refreshSnapshotGroup(.faces)
-                await sync.refreshActivitySnapshot()
-            }
-            .onChange(of: navigationTarget) { _, section in
-                openRequestedSection(section)
-            }
-            .onChange(of: cardTarget, initial: true) { _, id in
-                // A card is a matter in the Inbox; the face reads it in place, with no selected row.
-                guard id != nil else { return }
-                openRequestedSection(.inbox)
-                cardTarget = nil
-            }
-            .onAppear {
-                openRequestedSection(navigationTarget)
-                openDesignSampleScreen()
-                #if DEBUG
-                if ProcessInfo.processInfo.arguments.contains("-todaySample") { sync.faces["today"] = Self.sampleToday }
-                #endif
-            }
+        AlivePage(title: today?.title ?? "Today", line: today?.line) {
+            MobileFaceRows(page: "today") { pushed = $0 }
         }
-        .macSyncErrorBanner()
+        .navigationDestination(item: $pushed) { $0.view }
+        .refreshable {
+            _ = await sync.refreshSnapshotGroup(.faces)
+            await sync.refreshActivitySnapshot()
+        }
+        .task {
+            _ = await sync.refreshSnapshotGroup(.faces)
+            await sync.refreshActivitySnapshot()
+        }
+        .onChange(of: navigationTarget) { _, section in
+            openRequestedSection(section)
+        }
+        .onChange(of: cardTarget, initial: true) { _, id in
+            // A card is a matter in the Inbox; the face reads it in place, with no selected row.
+            guard id != nil else { return }
+            openRequestedSection(.inbox)
+            cardTarget = nil
+        }
+        .onAppear {
+            openRequestedSection(navigationTarget)
+            openDesignSampleScreen()
+            #if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("-todaySample") { sync.faces["today"] = Self.sampleToday }
+            #endif
+        }
     }
 
     private func openRequestedSection(_ section: ActivitySection?) {
-        guard let section else { return }
-        path = NavigationPath()
-        path.append(section)
+        guard section == .inbox else { return }
+        pushed = .page("inbox")
         navigationTarget = nil
     }
 

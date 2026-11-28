@@ -22,7 +22,7 @@ public protocol InboxCardActionEffects: Sendable {
 
 public enum InboxCardActions {
     public static func perform(
-        _ id: String, action: String, metadata: [String: JSONValue] = [:], quiet: Bool = false,
+        _ id: String, action: String, quiet: Bool = false,
         dataRootOverride: URL?, turn: Turn, effects: any InboxCardActionEffects
     ) async throws {
         let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()

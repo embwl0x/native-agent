@@ -66,9 +66,7 @@ extension MemoryStorage {
                 return text(content, String.fromDatabaseValue(args[1]))
             }
             let stamp = DatabaseFunction("today_moment_time", argumentCount: 1, pure: true) { args in
-                String.fromDatabaseValue(args[0]).flatMap {
-                    NativeTimestampFormat.parseISO8601FractionalFirst($0.trimmingCharacters(in: .whitespacesAndNewlines))
-                }?.timeIntervalSince1970
+                NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(String.fromDatabaseValue(args[0]))?.timeIntervalSince1970
             }
             let live = DatabaseFunction("today_moment_live", argumentCount: 1, pure: true) { args in
                 MemoryLifecycle.isRecallEligible(String.fromDatabaseValue(args[0]))
@@ -214,7 +212,10 @@ extension MemoryStorage {
                 try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [hint.id])
                     .map(Self.decodeMemory)
             }
-            return current.map { ($0, !Self.projectionEligible($0)) } ?? (hint, true)
+            let now = Date()
+            return current.map {
+                ($0, !Self.projectionEligible($0) || !MemoryRecallScoring.hasStarted(validFrom: $0.validFrom, at: now))
+            } ?? (hint, true)
         } catch {
             nativeLog("[memory] projection read failed for \(hint.id): \(error)")
             return nil

@@ -12,17 +12,11 @@ public enum FaceVoicePhase: String, Codable, Sendable { case idle, listening, re
 public struct MessageActionFace: Codable, Sendable, Equatable {
     public var message: String
     public var canRetry: Bool
-    public var canContinue: Bool
     public var canRemember: Bool
-    public var retryDraft: String?
-    public var failure: WireFailure?
-    public init(message: String, canRetry: Bool, canContinue: Bool, canRemember: Bool, retryDraft: String?, failure: WireFailure?) {
+    public init(message: String, canRetry: Bool, canRemember: Bool) {
         self.message = message
         self.canRetry = canRetry
-        self.canContinue = canContinue
         self.canRemember = canRemember
-        self.retryDraft = retryDraft
-        self.failure = failure
     }
 }
 
@@ -168,43 +162,19 @@ public struct VisibleReplyTarget: Codable, Sendable, Equatable {
 public struct ConversationFace: FaceValue {
     public var session: String
     public var state: FaceReadState
-    public var cacheReady: Bool
     public var actions: [MessageActionFace]
     public var attachments: [FaceResolvedAttachment]
-    public var otherRoomExchanges: [FaceThreadLine]
     public var waitingForPerson: Bool?
     public var visibleReply: VisibleReplyTarget?
-    public var transcriptComplete: Bool
     public var contactName: String?
-    public init(session: String, state: FaceReadState, cacheReady: Bool, actions: [MessageActionFace], attachments: [FaceResolvedAttachment],
-                otherRoomExchanges: [FaceThreadLine], waitingForPerson: Bool? = nil, visibleReply: VisibleReplyTarget? = nil,
-                transcriptComplete: Bool = true) {
+    public init(session: String, state: FaceReadState, actions: [MessageActionFace], attachments: [FaceResolvedAttachment],
+                waitingForPerson: Bool? = nil, visibleReply: VisibleReplyTarget? = nil) {
         self.session = session
         self.state = state
-        self.cacheReady = cacheReady
         self.actions = actions
         self.attachments = attachments
-        self.otherRoomExchanges = otherRoomExchanges
         self.waitingForPerson = waitingForPerson
         self.visibleReply = visibleReply
-        self.transcriptComplete = transcriptComplete
-    }
-}
-
-public struct DocumentFace: FaceValue {
-    public var id: UUID
-    public var subject: DocumentSubject
-    public var title: String?
-    public var text: String?
-    public var revision: String?
-    public var state: FaceReadState
-    public init(id: UUID, subject: DocumentSubject, title: String?, text: String?, revision: String?, state: FaceReadState) {
-        self.id = id
-        self.subject = subject
-        self.title = title
-        self.text = text
-        self.revision = revision
-        self.state = state
     }
 }
 
@@ -390,12 +360,10 @@ public struct HelpersFace: FaceValue {
 public struct HelperRunsFace: FaceValue {
     public var helper: String
     public var runs: [PartFace.Row]
-    public var detailRequests: [String: UUID]
     public var state: FaceReadState
-    public init(helper: String, runs: [PartFace.Row], detailRequests: [String: UUID], state: FaceReadState) {
+    public init(helper: String, runs: [PartFace.Row], state: FaceReadState) {
         self.helper = helper
         self.runs = runs
-        self.detailRequests = detailRequests
         self.state = state
     }
 }
@@ -461,21 +429,12 @@ public struct SenseViewFace: FaceValue {
 
 public struct MemoryDiagnosticsFace: Sendable, Equatable {
     public var rows: [PartFace.Row]
-    public var counts: [String: Int]
-    public var dimensions: Int?
-    public var checkedAt: Date?
     public var stale: Bool?
-    public var cloudKitIssue: WireFailure?
     public var embeddingIssue: WireFailure?
     public var state: FaceReadState
-    public init(rows: [PartFace.Row], counts: [String: Int], dimensions: Int?, checkedAt: Date?, stale: Bool?,
-                cloudKitIssue: WireFailure?, embeddingIssue: WireFailure?, state: FaceReadState) {
+    public init(rows: [PartFace.Row], stale: Bool?, embeddingIssue: WireFailure?, state: FaceReadState) {
         self.rows = rows
-        self.counts = counts
-        self.dimensions = dimensions
-        self.checkedAt = checkedAt
         self.stale = stale
-        self.cloudKitIssue = cloudKitIssue
         self.embeddingIssue = embeddingIssue
         self.state = state
     }
@@ -484,14 +443,10 @@ public struct MemoryDiagnosticsFace: Sendable, Equatable {
 public struct KnowledgeGraphFace: FaceValue {
     public var entities: [FaceGraphEntity]
     public var edges: [FaceGraphEdge]
-    public var totalEntities: Int?
-    public var totalEdges: Int?
     public var state: FaceReadState
-    public init(entities: [FaceGraphEntity], edges: [FaceGraphEdge], totalEntities: Int?, totalEdges: Int?, state: FaceReadState) {
+    public init(entities: [FaceGraphEntity], edges: [FaceGraphEdge], state: FaceReadState) {
         self.entities = entities
         self.edges = edges
-        self.totalEntities = totalEntities
-        self.totalEdges = totalEdges
         self.state = state
     }
 }
@@ -534,17 +489,6 @@ public struct MoodFace: FaceValue {
     }
 }
 
-public struct RunsFace: FaceValue {
-    public var ids: [String]
-    public var rows: [PartFace.Row]
-    public var state: FaceReadState
-    public init(ids: [String], rows: [PartFace.Row], state: FaceReadState) {
-        self.ids = ids
-        self.rows = rows
-        self.state = state
-    }
-}
-
 public struct RunFace: FaceValue {
     public var id: String
     public var record: RunRecord?
@@ -563,19 +507,12 @@ public struct RunFace: FaceValue {
 public struct OnboardingFace: FaceValue {
     public var disposition: String
     public var agentName: String?
-    public var userName: String?
     public var abilityOverview: [PartFace.Row]
-    public var progress: String?
-    public var greeting: String?
     public var state: FaceReadState
-    public init(disposition: String, agentName: String?, userName: String?, abilityOverview: [PartFace.Row], progress: String?,
-                greeting: String?, state: FaceReadState) {
+    public init(disposition: String, agentName: String?, abilityOverview: [PartFace.Row], state: FaceReadState) {
         self.disposition = disposition
         self.agentName = agentName
-        self.userName = userName
         self.abilityOverview = abilityOverview
-        self.progress = progress
-        self.greeting = greeting
         self.state = state
     }
 }
@@ -647,17 +584,15 @@ public struct VoiceFace: FaceValue {
     public var operation: UUID
     public var session: String?
     public var message: String?
-    public var composerRevision: UInt64?
     public var phase: FaceVoicePhase
     public var text: String?
     public var attachment: FaceAttachment?
     public var state: FaceReadState
-    public init(operation: UUID, session: String?, message: String?, composerRevision: UInt64?, phase: FaceVoicePhase, text: String?,
+    public init(operation: UUID, session: String?, message: String?, phase: FaceVoicePhase, text: String?,
                 attachment: FaceAttachment?, state: FaceReadState) {
         self.operation = operation
         self.session = session
         self.message = message
-        self.composerRevision = composerRevision
         self.phase = phase
         self.text = text
         self.attachment = attachment

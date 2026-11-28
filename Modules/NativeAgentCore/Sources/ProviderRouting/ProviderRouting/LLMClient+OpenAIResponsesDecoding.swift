@@ -141,6 +141,9 @@ extension ChatGPTTransport {
                       state.pendingByItemId[id] == nil else {
                     throw LLMError.providerError(message: "\(providerLabel): invalid or duplicate function-call identity in output_item.added")
                 }
+                if let arguments = item["arguments"], !(arguments is String) {
+                    throw LLMError.providerError(message: "\(providerLabel): added function-call arguments are not a string")
+                }
                 let args = (item["arguments"] as? String) ?? ""
                 state.pendingByItemId[id] = ResponsesStreamState.PendingCall(callId: callId, name: name, args: args)
             }

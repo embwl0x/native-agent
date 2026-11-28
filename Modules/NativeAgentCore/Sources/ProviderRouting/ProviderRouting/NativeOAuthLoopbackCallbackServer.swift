@@ -12,7 +12,6 @@ public final class NativeOAuthLoopbackCallbackServer: Sendable {
     private let path: String
     private let port: UInt16
     private let displayName: String
-    private let callbackPageMessage: @Sendable (URL) -> String
     private struct State {
         var continuation: CheckedContinuation<URL, Error>?
         var workerStarted = false
@@ -25,12 +24,10 @@ public final class NativeOAuthLoopbackCallbackServer: Sendable {
     public init(
         preferredPort: UInt16,
         path: String,
-        displayName: String,
-        callbackPageMessage: @escaping @Sendable (URL) -> String = NativeOAuthFlow.callbackPageMessage
+        displayName: String
     ) throws {
         self.path = path
         self.displayName = displayName
-        self.callbackPageMessage = callbackPageMessage
         let opened = Darwin.socket(AF_INET, SOCK_STREAM, 0)
         guard opened >= 0 else {
             throw OAuthLoopbackCallbackError.socket("socket() failed: \(unsafe String(cString: strerror(errno)))")
@@ -254,7 +251,7 @@ public final class NativeOAuthLoopbackCallbackServer: Sendable {
         let html: String
         let status: String
         if let url {
-            let message = callbackPageMessage(url)
+            let message = NativeOAuthFlow.callbackPageMessage(url)
             html = """
                 <!doctype html><html><head><meta charset="utf-8"><title>NativeAgent</title>
                 <style>body{font:15px -apple-system,Helvetica,Arial;background:#111;color:#eee;

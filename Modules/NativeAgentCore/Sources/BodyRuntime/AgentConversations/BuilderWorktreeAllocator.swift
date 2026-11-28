@@ -445,8 +445,8 @@ package actor BuilderWorktreeAllocator {
     }
 
     /// Git runs until process settlement or explicit cancellation; launch failures retain their cause.
-    package nonisolated static func git(_ arguments: [String], cwd: URL) async -> GitResult {
-        var environment = ManagedProcess.agentEnvironment()
+    package nonisolated static func git(_ arguments: [String], cwd: URL, environment additions: [String: String] = [:]) async -> GitResult {
+        var environment = ManagedProcess.agentEnvironment().merging(additions) { _, value in value }
         environment["GIT_TERMINAL_PROMPT"] = "0"
         do {
             let result = try await ProcessExecution().run(

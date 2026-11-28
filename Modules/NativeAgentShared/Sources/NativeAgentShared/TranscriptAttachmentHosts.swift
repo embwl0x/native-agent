@@ -79,6 +79,21 @@ open class TranscriptAttachmentHosts<Box: AnyObject, Root: View> {
         }
     }
 
+    /// While the window is being dragged, the hosts on screen follow the column as it moves; the stored width stays the last settled one, so the
+    /// one full measure when the drag ends still reaches every host.
+    public func follow(columnWidth: CGFloat) {
+        guard columnWidth > 0 else { return }
+        for (blockID, entry) in entries {
+#if canImport(AppKit)
+            let view: TranscriptPlatformView? = entry.host.view
+#else
+            let view = entry.host.viewIfLoaded
+#endif
+            guard let view, view.superview != nil, !view.isHidden else { continue }
+            if measure(entry, width: columnWidth) { heightChanged(blockID) }
+        }
+    }
+
     /// Whether a view is a block's hosted view or inside one: its own controls take the pointer or the touch, not the document.
     public func hosts(_ view: TranscriptPlatformView?) -> Bool {
         guard let view else { return false }
@@ -165,7 +180,8 @@ open class TranscriptAttachmentHosts<Box: AnyObject, Root: View> {
     /// The hosted view's fitting size at the column width: its own width up to the column (so paragraph alignment can seat it)
     /// and its whole height. Returns whether the size changed. Before the reader gives a column width there is nothing to fit.
     @discardableResult
-    private func measure(_ entry: Entry) -> Bool {
+    private func measure(_ entry: Entry, width: CGFloat? = nil) -> Bool {
+        let columnWidth = width ?? self.columnWidth
         guard columnWidth > 0 else { return false }
         let fit = entry.host.sizeThatFits(in: CGSize(width: columnWidth, height: .greatestFiniteMagnitude))
         let size = CGSize(width: min(fit.width.rounded(.up), columnWidth), height: fit.height.rounded(.up))

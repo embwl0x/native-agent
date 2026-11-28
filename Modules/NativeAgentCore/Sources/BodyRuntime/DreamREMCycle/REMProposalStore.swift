@@ -292,44 +292,69 @@ public struct REMProposalStore: Sendable {
         resolver: ConversationHistory.ExperienceResolver? = nil, limit: Int = .max
     ) async throws -> Int {
         let resolver = resolver ?? ConversationHistory.ExperienceResolver(dataRoot: dataRoot)
-        do {
-        let staged = try await SwiftNativePersistenceCore.withFileLock(proposalsURL) {
-            let read = try self.readStrictly()
-            var lines = read.lines
-            guard !lines.isEmpty else { return 0 }
-            let pending = read.feed.enumerated().compactMap { i, row -> (Int, REMProposalRow)? in
-                guard row.status == "pending", row.approvalId == nil,
-                      Self.supportsProposalTarget(row.targetDoc) else { return nil }
-                return (i, row)
-            }
-            var staged = 0
-            for (i, row) in pending.prefix(max(0, limit)) {
-                let identities = try await resolver.resolve(
-                    for: row.supportingExperienceReferences ?? [], includingSourceRows: false).identities
-                guard let approvalId = try await stage(row, row.supportingExperienceCount(identities: identities)) else { continue }
-                var stamped = row
-                stamped.approvalId = approvalId
-                lines[i] = Data(try Self.encodeRow(stamped).utf8)
-                staged += 1
-            }
-            if staged > 0 {
-                try Self.writeLines(lines, to: self.proposalsURL)
-            }
-            return staged
-        }
-        if try loadAllStrictly().allSatisfy({ $0.status != "pending" || $0.approvalId != nil }) {
-            await RepairOwed.settle(dataRoot, operation: "rem.stage",
-                evidence: .init(source: "rem_proposals.jsonl", id: "approval stamps")).value
-        }
-        return staged
-        } catch {
-            try Task.checkCancellation()
-            await RepairOwed.owe(dataRoot, id: "rem-stage-repair:" + UUID().uuidString, kind: .run,
+        let oweFailure: @Sendable (any Error) -> Task<Void, Never> = { [dataRoot] error in
+            RepairOwed.owe(dataRoot, id: "rem-stage-repair:" + UUID().uuidString, kind: .run,
                 operation: "rem.stage", owner: "rem_proposals.jsonl approval stamps",
                 words: "REM approval staging failed: \(error.localizedDescription)",
-                nextCall: ToolFailureError.call("app", ["action": .string("mind.rem"), "args": .object(["repair": .bool(true)])])).value
+                nextCall: ToolFailureError.call("app", ["action": .string("mind.rem"), "args": .object(["repair": .bool(true)])]))
+        }
+        let result: (staged: Result<Int, any Error>, repair: Task<Void, Never>?)
+        do {
+            result = try await SwiftNativePersistenceCore.withFileLock(proposalsURL) { () -> (Result<Int, any Error>, Task<Void, Never>?) in
+                do {
+                    let read = try self.readStrictly()
+                    var lines = read.lines
+                    var feed = read.feed
+                    let pending = feed.enumerated().compactMap { i, row -> (Int, REMProposalRow)? in
+                        guard row.status == "pending", row.approvalId == nil,
+                              Self.supportsProposalTarget(row.targetDoc) else { return nil }
+                        return (i, row)
+                    }
+                    var staged = 0
+                    var stopped: CancellationError?
+                    for (i, row) in pending.prefix(max(0, limit)) {
+                        let approvalId: String?
+                        do {
+                            try Task.checkCancellation()
+                            let identities = try await resolver.resolve(
+                                for: row.supportingExperienceReferences ?? [], includingSourceRows: false).identities
+                            approvalId = try await stage(row, row.supportingExperienceCount(identities: identities))
+                        } catch let cancellation as CancellationError {
+                            stopped = cancellation
+                            break
+                        }
+                        guard let approvalId else { continue }
+                        var stamped = row
+                        stamped.approvalId = approvalId
+                        lines[i] = Data(try Self.encodeRow(stamped).utf8)
+                        feed[i] = stamped
+                        staged += 1
+                    }
+                    if staged > 0 {
+                        try Self.writeLines(lines, to: self.proposalsURL)
+                    }
+                    if let stopped { throw stopped }
+                    let settled = Self.fold(feedRows: feed, baseRows: read.base).allSatisfy {
+                        $0.status != "pending" || $0.approvalId != nil || !Self.supportsProposalTarget($0.targetDoc)
+                    }
+                    let repair = settled ? RepairOwed.settle(self.dataRoot, operation: "rem.stage",
+                        evidence: .init(source: "rem_proposals.jsonl", id: "approval stamps")) : nil
+                    return (.success(staged), repair)
+                } catch let stopped as CancellationError {
+                    return (.failure(stopped), nil)
+                } catch {
+                    return (.failure(error), oweFailure(error))
+                }
+            }
+        } catch let stopped as CancellationError { throw stopped }
+        catch {
+            await oweFailure(error).value
             throw error
         }
+        await result.repair?.value
+        let staged = try result.staged.get()
+        try Task.checkCancellation()
+        return staged
     }
 
     /// Clear a cancelled card's stamp so still-pending work can receive a fresh decision rather than remain stranded.

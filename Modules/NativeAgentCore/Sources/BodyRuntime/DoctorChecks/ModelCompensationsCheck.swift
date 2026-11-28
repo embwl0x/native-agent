@@ -13,11 +13,10 @@ public struct ModelCompensationsCheck: DoctorCheck {
 
     /// Count recorded shim.fired receipts; silence measures receipt count, never mechanism health.
     private static let censusIDs = [
-        "C04", "C09",
-        "L10", "L12", "L13",
+        "C04",
+        "L12", "L13",
         "L22", "L23",
         "T01", "T16", "T17", "T21",
-        "M20",
     ]
 
     public init(root: URL = defaultDataRoot(), cacheTTL: TimeInterval = 60) {

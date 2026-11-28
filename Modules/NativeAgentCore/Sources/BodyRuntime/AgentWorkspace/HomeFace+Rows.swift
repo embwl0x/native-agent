@@ -251,6 +251,7 @@ extension HomeFace {
     }
 
     private static func waitWords(_ entry: MyQueue.Entry, now: Date) -> String {
+        if let wait = entry.step.causalWait { return "Waits for " + wait.trigger.words }
         guard let condition = MyQueue.when(entry) else { return "Condition unavailable" }
         switch condition {
         case .every:
@@ -357,9 +358,10 @@ extension HomeFace {
 
     static func senses(_ world: AgentWorld, keys: inout RowKeys) -> [JSONValue] {
         var rows: [JSONValue] = []
+        let at = text(world.readings["senses"].map { clock($0.at) })
         for (index, words) in world.senses.enumerated() {
             keys.add("sense:" + String(index), open: "page:home/senses")
-            rows.append(fact(["key": .string("sense:" + String(index)), "words": .string(words)]))
+            rows.append(fact(["key": .string("sense:" + String(index)), "words": .string(words), "at": at]))
         }
         for (index, failure) in world.senseFailures.enumerated() {
             keys.add("sense:failed:" + String(index), open: "page:home/senses")
@@ -383,17 +385,23 @@ extension HomeFace {
 
     static func places(_ world: AgentWorld, dataRoot: URL, layout: SurfaceLayoutAvailability, keys: inout RowKeys) -> [JSONValue] {
         layout.contentNames("places", profile: SurfaceLayoutStore.profile).map(AppDoorNames.resolve).map { place -> JSONValue in
-            let badge = AgentReadBadges.shared.latest(place, dataRoot: dataRoot)
             let detail: String?
+            let at: Date?
             if place == "browser" {
                 detail = BrowserConnectionMirror.connected.map { $0 ? "Chrome connected" : "Chrome not connected" } ?? "Chrome connection unobserved"
+                at = nil
             } else if place == "desk", let state = world.desk {
                 detail = "board: \(world.split.active.count) active · \(world.split.parked.count) parked · \(world.split.waiting.count) waiting · "
                     + state.boardCountSummary
-            } else { detail = badge?.words }
+                at = world.readings["desk"]?.at
+            } else {
+                let badge = AgentReadBadges.shared.latest(place, dataRoot: dataRoot)
+                detail = badge?.words
+                at = badge?.at
+            }
             keys.add(place, open: "page:home/" + place)
             return fact(["key": .string(place), "name": .string(place.capitalized), "detail": text(detail),
-                "at": text(badge.map { clock($0.at) })])
+                "at": text(at.map(clock))])
         }
     }
 

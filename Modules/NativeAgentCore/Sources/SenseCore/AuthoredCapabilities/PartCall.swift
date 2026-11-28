@@ -79,10 +79,25 @@ extension PartFace {
     /// Validate the block's identity, content and kind-specific declarations.
     private static func validateFaceBlock(_ blockValue: JSONValue, documentRead: Bool) throws {
         let block = try object(blockValue, keys: ["kind", "key", "text", "format", "language", "copy", "leaf", "ref", "alt",
-                                              "fields", "submit", "revision", "protected", "receiver", "doors", "cards", "choices"])
+                                              "fields", "submit", "revision", "protected", "receiver", "doors", "cards", "choices", "ids"])
         guard case .string(let kind)? = block["kind"], !kind.isEmpty,
               case .string(let key)? = block["key"], !key.isEmpty else {
             throw PartCallError(code: "bad_face", message: "A block has nonempty kind and key strings.")
+        }
+        let slice = block["leaf"] == .string("table_slice")
+        if slice {
+            guard kind == "leaf", block["ref"] == .string(BoardDocument.tableRef),
+                  let alt = block["alt"]?.stringValue, !alt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  Set(block.keys).isSubset(of: ["kind", "key", "leaf", "ref", "alt", "ids"]) else {
+                throw PartCallError(code: "bad_face", message: "A table slice is a read-only leaf with key, ref:table, alt and optional ids.")
+            }
+            for value in try list(block["ids"], at: 64, "table slice ids") {
+                guard let id = value.stringValue, Block.isTableSliceID(id) else {
+                    throw PartCallError(code: "bad_face", message: "A table slice id has 1–40 ASCII letters, digits or hyphens.")
+                }
+            }
+        } else if block["ids"] != nil {
+            throw PartCallError(code: "bad_face", message: "Element ids belong to a table slice.")
         }
         if let cards = block["cards"] {
             guard kind == "leaf", block["leaf"] == .string("board"), case .object(let entries) = cards,

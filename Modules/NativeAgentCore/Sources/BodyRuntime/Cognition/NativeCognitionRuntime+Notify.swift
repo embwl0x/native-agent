@@ -22,7 +22,7 @@ extension NativeCognitionRuntime: InnerStateProviding {
     public func innerStateReading(
         windowHours: Double,
         detail: CognitiveInnerStateReading.Detail,
-        surface: String = "chat"
+        request: CognitiveCapsuleRequest = .init(surface: "inner_state", userMessage: "", turnKind: .live)
     ) async -> CognitiveInnerStateReading {
         // A read may await an existing bootstrap but cannot start one.
         guard let bootstrapTask else {
@@ -52,7 +52,7 @@ extension NativeCognitionRuntime: InnerStateProviding {
             windowHours: windowHours,
             detail: detail,
             organism: organism,
-            surface: MemoryRecordDisclosurePolicy.canonicalSurface(surface),
+            request: request,
             at: at
         )
     }
@@ -66,7 +66,7 @@ extension NativeCognitionRuntime: InnerStateProviding {
         ]
         var out: [CognitiveInnerStateReading.Expectation] = []
         for kind in kinds {
-            guard let prediction = await organismKernel.latestPrediction(ofKind: kind),
+            guard let prediction = await organismKernel.latestPrediction(ofKind: kind, includingPeerWaits: false),
                   prediction.status == .pending,
                   prediction.dueAt >= instant
             else { continue }

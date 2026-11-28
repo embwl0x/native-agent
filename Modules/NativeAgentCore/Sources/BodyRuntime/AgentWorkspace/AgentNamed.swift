@@ -1,4 +1,3 @@
-import AppKit
 import Foundation
 import NativeAgentShared
 import MacNerves
@@ -7,6 +6,7 @@ import PersistenceCore
 import DeskCore
 import SenseCore
 import Darwin
+import AppKit
 // Blueprint: | `AgentNamed.swift` | The agent's named room bindings and first-draw state |
 
 final class AgentNamed: Sendable {

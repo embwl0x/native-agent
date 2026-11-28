@@ -10,6 +10,7 @@ import ImageIO
 import UniformTypeIdentifiers
 import MacNerves
 import SenseCore
+import Synchronization
 // Blueprint: | `FileActions+Files.swift` | files action contracts and execution |
 
 enum FileActions {}
@@ -503,13 +504,30 @@ extension SwiftToolDispatcher {
             }
         }
         if invocation.metadataOnly { return try await raw(invocation.senseOperation(turn: turn)) }
+        let sources = Mutex(Set<String>())
+        let studio = MakeStudio(dataRoot: dataRoot)
         let nativeReadSupported = FileReadSourceMaterial.nativeReadSupported(path: address)
         let result = try await SenseDoor.read(corner: .fileKind(URL(fileURLWithPath: address).pathExtension.lowercased()), address: address, input: wire,
             scope: turn.verifiedSessionID ?? "",
             nativeReadSupported: nativeReadSupported,
             fileAlreadyReadable: nativeReadSupported,
             operation: invocation.senseOperation(turn: turn),
-            raw: raw, material: { result, _ in try Self.senseFileMaterial(result) })
+            raw: { operation in
+                let read = try await raw(operation)
+                let files = read.objectValue?["files"]?.arrayValue?.compactMap { $0.objectValue?["result"] } ?? [read]
+                for file in files {
+                    guard let fields = file.objectValue, fields["ok"] != .bool(false),
+                          let path = fields["path"]?.stringValue,
+                          ["content", "excerpt"].contains(where: { fields[$0]?.stringValue?.isEmpty == false })
+                              || fields["records"]?.arrayValue?.isEmpty == false,
+                          let peer = try studio.version(at: URL(fileURLWithPath: path))?.peerID else { continue }
+                    sources.withLock { _ = $0.insert("peer:" + peer) }
+                }
+                return read
+            }, material: { result, _ in try Self.senseFileMaterial(result) })
+        if ChatToolOutcome.outputLooksSuccessful(result) {
+            for source in sources.withLock({ $0.sorted() }) { turn.peerSteering?.mark(dataRoot: dataRoot, peer: source) }
+        }
         let reply = ToolResult(result)
         if input.raw == true || input.wrong == true || invocation.readingRaw { return result }
         guard case .object(let object) = result else { return result }

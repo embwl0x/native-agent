@@ -37,10 +37,7 @@ extension AppModel {
     @MainActor
     func autodetectSearXNG() async -> SearXNGAutodetectOutcome {
         do {
-            let detected = try await SwiftNativeResearchClient(dataRoot: engine.dataRoot).autodetectSearXNG()
-            let outcome = detected.outcome
-            if case .found = outcome { try await engine.configuration.readSearXNG(dataRoot: engine.dataRoot) }
-            return outcome
+            return try await SwiftNativeResearchClient(dataRoot: engine.dataRoot).autodetectSearXNG().outcome
         } catch {
             return .failed(UserFacingError.cause(error, action: "find a SearXNG server"))
         }
@@ -102,7 +99,7 @@ extension AppModel {
         statusText = "Clearing Telegram diagnostics…"
         defer { isClearingTelegramLogs = false }
         do {
-            let receipt = try await engine.telegram.clearTelegramDiagnostics(manager: backgroundLoopsManager)
+            let receipt = try await engine.telegram.clearTelegramDiagnostics()
             telegramClearLogsOutcome = .completed(receipt)
             statusText = TelegramClearLogsPresentation.summary(for: receipt)
         } catch {
@@ -146,10 +143,10 @@ extension AppModel {
     @MainActor
     func refreshLiveDoctorCoverage() async {
         guard let current = engine.doctor.report else { return }
-        _ = await engine.doctor.reportRead.read({
+        _ = try? await engine.doctor.reportRead.read({
         let liveChecks = await AppDoctorPort(dataRoot: engine.dataRoot, backgroundLoopsManager: backgroundLoopsManager)
             .runtime.liveDoctorCoverageChecks()
-        let statusChecks = await DoctorFacade.statusChecks(
+        let statusChecks = try await DoctorFacade.statusChecks(
             dataRoot: engine.dataRoot,
             approvals: engine.approvals,
             repairDesk: false,

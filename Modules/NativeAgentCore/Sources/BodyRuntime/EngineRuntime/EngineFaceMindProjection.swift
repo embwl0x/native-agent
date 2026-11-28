@@ -125,9 +125,7 @@ public enum EngineFaceMindProjection {
             if let issue = snapshot.spotlightLastError { rows.append(row("spotlight.issue", "Spotlight issue", issue)) }
         }
         rows += input.owed.enumerated().map { row("owed.\($0.offset)", "Lived moments", $0.element) }
-        return MemoryDiagnosticsFace(rows: rows, counts: input.counts,
-            dimensions: input.checkedAt == nil ? nil : snapshot.runtimeEmbedderDimensions, checkedAt: input.checkedAt,
-            stale: input.stale, cloudKitIssue: nil,
+        return MemoryDiagnosticsFace(rows: rows, stale: input.stale,
             embeddingIssue: (input.embeddingIssue ?? snapshot.coreMLLastLoadError).map { failure("embedding_unavailable", $0) }, state: state)
     }
 
@@ -157,7 +155,7 @@ public enum EngineFaceMindProjection {
 
     static func row(_ id: String, _ title: String, _ detail: String?, state: String? = nil, date: Date? = nil) -> PartFace.Row {
         PartFace.Row(id: id, title: NativeAppSecretRedactor.redactText(title), detail: detail.map(NativeAppSecretRedactor.redactText),
-            value: state, at: date.map { ISO8601DateFormatter().string(from: $0) }, actions: [])
+            value: state, at: date.map(NativeTimestampFormat.plainZulu), actions: [])
     }
 
     static func failure(_ code: String, _ cause: String) -> WireFailure {

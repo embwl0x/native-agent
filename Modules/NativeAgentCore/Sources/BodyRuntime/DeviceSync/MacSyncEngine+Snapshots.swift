@@ -1,6 +1,3 @@
-import CommonCrypto
-import CryptoKit
-import AppKit
 import Foundation
 import PersistenceCore
 import NativeAgentShared
@@ -11,6 +8,9 @@ import MacNerves
 import DeskCore
 import SenseCore
 import ProviderRouting
+import CommonCrypto
+import CryptoKit
+import AppKit
 import AVFoundation
 // Blueprint: | `MacSyncEngine+Snapshots.swift` | Revisioned payload/wire digests; host-owned Inspector and bounded chat projections. |
 
@@ -127,7 +127,7 @@ extension MacSyncEngine {
                 attempted.insert("faces")
                 return nil
             }
-            let data = try await MobileSnapshotBuilder.shared.faces(snapshots)
+            let data = try await MobileSnapshotBuilder.shared.faces(snapshots, studio: MakeStudio(dataRoot: sync.dataRoot))
             await writeSnapshot(.built(data), to: "faces.json", in: snapshotDir,
                 lifecycleGeneration: lifecycleGeneration, readRevision: readRevision,
                 changed: &changed, skipped: &skipped, attempted: &attempted)
@@ -635,7 +635,6 @@ extension MacSyncEngine {
         let faceInputs = await writeFaceSnapshots(in: snapshotDir, lifecycleGeneration: lifecycleGeneration, readRevision: readRevision,
             changed: &committedSnapshots, skipped: &skippedSnapshotGroups, attempted: &attemptedSnapshotGroups)
         guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return }
-        lastSnapshotAt = Date()
         let digests = snapshotFileDigests
         let prunedDigests = await MobileSnapshotBuilder.shared.build { Self.digestsPrunedToExistingFiles(digests, in: snapshotDir) }
         if prunedDigests.count != snapshotFileDigests.count {

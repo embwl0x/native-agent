@@ -14,22 +14,30 @@ private struct DiagnosticNarration: Codable, Sendable {
 extension DoctorFacade {
     public static func statusChecks(dataRoot root: URL, approvals: ApprovalsFacade, repairDesk: Bool,
                                     stuckReason: (DeskItem, [DeskItem]) -> String,
-                                    safeDetail: (String) -> String) async -> (checks: [CheckResult], repaired: Bool) {
-        let desk = await deskCheck(approvals: approvals, root: root, repair: repairDesk, stuckReason: stuckReason, safeDetail: safeDetail)
-        let activity = await activityCheck(root: root, safeDetail: safeDetail)
+                                    safeDetail: (String) -> String) async throws -> (checks: [CheckResult], repaired: Bool) {
+        try Task.checkCancellation()
+        let desk = try await deskCheck(approvals: approvals, root: root, repair: repairDesk, stuckReason: stuckReason, safeDetail: safeDetail)
+        let settledDesk = desk.repaired && desk.row.status != "fail"
+        if settledDesk {
+            await settle { await DoctorReadout.recordReadings([desk.row], dataRoot: root, settledWarning: desk.settledWarning) }
+        }
+        try Task.checkCancellation()
+        let activity = try await activityCheck(root: root, safeDetail: safeDetail)
+        try Task.checkCancellation()
         let rows = [desk.row, activity]
-        await DoctorReadout.recordReadings(rows, dataRoot: root, settledWarning: desk.settledWarning)
+        await DoctorReadout.recordReadings(settledDesk ? [activity] : rows, dataRoot: root, settledWarning: desk.settledWarning)
         return (rows, desk.repaired)
     }
 
     private static func deskCheck(approvals: ApprovalsFacade, root: URL, repair: Bool, stuckReason: (DeskItem, [DeskItem]) -> String, safeDetail: (
-        String) -> String) async -> (row: CheckResult, repaired: Bool, settledWarning: String?) {
+        String) -> String) async throws -> (row: CheckResult, repaired: Bool, settledWarning: String?) {
         let store = SwiftNativeDeskStore(dataRoot: root)
         do {
             var state = try await store.liveState()
             let initialContradictions = SwiftNativeDeskStore.terminalParentsWithNonTerminalDescendants(in: state)
             var repaired = false
             if repair && !initialContradictions.isEmpty {
+                try Task.checkCancellation()
                 let ops = try await store.reconcileTerminalParentsWithNonTerminalDescendants()
                 repaired = !ops.isEmpty
                 state = try await store.liveState()
@@ -44,6 +52,8 @@ extension DoctorFacade {
             do {
                 pendingApprovals = try await approvals.list()
                     .filter { OwnerAttentionPolicy.approvalWaits(status: $0.status, agentOwned: $0.isAgentsOwnDecision) }.count
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 return (CheckResult(source: "workflows/approvals/requests.json",
                                     id: "status.desk_attention", title: "Desk work and decisions", status: "fail",
@@ -81,6 +91,8 @@ extension DoctorFacade {
                                 human_action: needsPerson ? narration.humanAction : nil,
                                 repair_available: pendingApprovals > 0 || !waiting.isEmpty || !blocked.isEmpty || !contradictions.isEmpty
                                     ? !contradictions.isEmpty : nil), repaired, severity == "warn" && !needsPerson ? id : nil)
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             let file: URL?
             switch error {
@@ -123,7 +135,7 @@ extension DoctorFacade {
         }
     }
 
-    private static func activityCheck(root: URL, safeDetail: (String) -> String) async -> CheckResult {
+    private static func activityCheck(root: URL, safeDetail: (String) -> String) async throws -> CheckResult {
         let id = "status.activity"
         let title = "Recent activity"
         var source = "activity/events.jsonl"
@@ -174,6 +186,8 @@ extension DoctorFacade {
                                        Each JSONL line must hold an activity event with its original identity, timestamp, status and outcome payload. \
                                        Preserve unknown outcomes and reconciliation evidence.
                                        """) : nil)
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             return CheckResult(source: source,
                                id: id, title: title, status: "fail",

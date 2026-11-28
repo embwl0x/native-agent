@@ -220,7 +220,7 @@ public struct TelegramSessionStore: Sendable {
         return owner == Int64(destination.chatId)
     }
 
-    public func persona(destination: TelegramDestination) async throws -> String? {
+    public func persona() -> String? {
         PersonaSelection.current()
     }
 
@@ -239,7 +239,7 @@ public struct TelegramSessionStore: Sendable {
     }
 
     private func status(destination: TelegramDestination, sessionId: String) async throws -> TelegramSessionStatus {
-        let persona = try await persona(destination: destination) ?? "NativeAgent"
+        let persona = persona() ?? "NativeAgent"
         let messages = try await SwiftNativePersistenceCore.readJSONL(messagesPath(sessionId: sessionId))
         return TelegramSessionStatus(
             chatId: destination.chatId,

@@ -149,11 +149,8 @@ public enum MemoryRecoveryReadout {
 }
 
 public struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
-    public var sqliteRecordCount: Int
-    public var sqliteProposalCount: Int
     /// `nil` before the direct store probe, `false` when it could not read.
     public var storageReadable: Bool?
-    public var coreMLReady: Bool
     public var coreMLModelLabel: String
     public var embedderDimensions: Int
     public var runtimeEmbedderDimensions: Int? = nil
@@ -161,61 +158,48 @@ public struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
     public var coreMLLoaded: Bool
     public var coreMLLastLoadError: String?
     public var coreMLLoadCount: Int
-    public var embeddingMode: String
     public var requestedEmbeddingBackend: String
     public var effectiveEmbeddingBackend: String
     public var spotlightReindexed: Bool
     public var spotlightIndexedCount: Int
     public var spotlightLastError: String? = nil
     public var cloudKitAccountStatus: String
-    public var dataRootPath: String
 
     public static let empty = MemoryV2NativeStackSnapshot(
-        sqliteRecordCount: 0,
-        sqliteProposalCount: 0,
         storageReadable: nil,
-        coreMLReady: false,
         coreMLModelLabel: "bge-large-en-v1.5 (not loaded)",
         embedderDimensions: CoreMLEmbeddingProvider.bundledDimensions,
         coreMLLoaded: false,
         coreMLLastLoadError: nil,
         coreMLLoadCount: 0,
-        embeddingMode: "unknown",
         requestedEmbeddingBackend: "unknown",
         effectiveEmbeddingBackend: "unknown",
         spotlightReindexed: false,
         spotlightIndexedCount: 0,
-        cloudKitAccountStatus: "checking…",
-        dataRootPath: ""
+        cloudKitAccountStatus: "checking…"
     )
 
     @concurrent public static func read(
         dataRoot: URL
     ) async -> MemoryV2NativeStackSnapshot {
         var snap = MemoryV2NativeStackSnapshot.empty
-        snap.dataRootPath = dataRoot.path
         var spotlightEligibleCount = 0
         var storageGeneration: String?
 
-        // Probe the canonical store; zero requires a successful read, while failure remains explicit.
         do {
             let store = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
-            let counts = try await store.statusCounts()
+            _ = try await store.statusCounts()
             snap.storageReadable = true
-            snap.sqliteRecordCount = counts.active
             let spotlightSnapshot = try await store.spotlightSnapshot()
             spotlightEligibleCount = spotlightSnapshot.items.count
             storageGeneration = spotlightSnapshot.fingerprint
-            snap.sqliteProposalCount = counts.pendingProposals
             snap.spotlightLastError = await store.spotlightProjectionFailure
         } catch {
             snap.storageReadable = false
         }
 
-        // Use the runtime's resolver so missing and broken assets cannot appear ready.
         do {
             let installed = try CoreMLEmbeddingProvider.installedExtrasModel(root: dataRoot)
-            snap.coreMLReady = true
             snap.coreMLModelLabel = installed.modelID
             snap.embedderDimensions = installed.dimensions
         } catch {
@@ -241,7 +225,6 @@ public struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
     public mutating func applyEmbeddingRuntime(_ snapshot: EmbeddingRuntimeSnapshot?) {
         guard let runtime = snapshot else { return }
         runtimeEmbedderDimensions = runtime.dimensions
-        embeddingMode = runtime.mode
         requestedEmbeddingBackend = runtime.requestedBackend
         effectiveEmbeddingBackend = runtime.effectiveBackend
         coreMLLoaded = runtime.coreMLLoaded

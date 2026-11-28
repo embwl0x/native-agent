@@ -8,6 +8,8 @@ struct DreamLesson: Sendable, Codable {
     let from: String
     let kind: String
 
+    var diaryLine: String { "- \(lesson) (from: \(from))\n" }
+
     init?(_ value: JSONValue) {
         guard let fields = value.objectValue,
               let lesson = fields["lesson"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -49,7 +51,8 @@ public struct DreamClaim: Sendable, Codable {
     }
 }
 
-struct DreamPayload: Decodable {
+struct DreamPayload: Decodable, Sendable {
+    typealias Drops = (total: Int, mergesMalformed: Int)
     let title: String
     let summary: String
     let mood: String
@@ -61,9 +64,19 @@ struct DreamPayload: Decodable {
     let lessons: [DreamLesson]
     let careMerges: [CognitiveCareMerge]
     let careStanceChanges: [CognitiveCareStanceChange]
-    let traits: [CognitiveSelfKnowledge.Trait]
-    let story: [CognitiveSelfKnowledge.Story]
-    let people: [CognitiveSelfKnowledge.Person]
+    private(set) var traits: [CognitiveSelfKnowledge.Trait]
+    private(set) var story: [CognitiveSelfKnowledge.Story]
+    private(set) var people: [CognitiveSelfKnowledge.Person]
+    let retainedFields: [String: JSONValue]
+    var drops: Drops
+
+    mutating func bindSelfReading(to night: CognitiveCareNight) {
+        let proposed = traits.count + story.count + people.count
+        traits.removeAll { !$0.shownBy.allSatisfy(night.selfStoryRefs.contains) }
+        story.removeAll { !$0.shownBy.allSatisfy(night.selfChangeRefs.contains) }
+        people.removeAll { !night.selfPeople.contains($0.person) }
+        drops.total += proposed - (traits.count + story.count + people.count)
+    }
 
     private enum CodingKeys: String, CodingKey {
         case title
@@ -85,7 +98,7 @@ struct DreamPayload: Decodable {
         title = try container.decode(String.self, forKey: .title)
         summary = try container.decode(String.self, forKey: .summary)
         mood = try container.decode(String.self, forKey: .mood)
-        affect = try container.decode(Double?.self, forKey: .affect)
+        affect = try container.decodeIfPresent(Double.self, forKey: .affect)
         if let affect, !affect.isFinite || !(-1...1).contains(affect) {
             throw DecodingError.dataCorruptedError(forKey: .affect, in: container,
                 debugDescription: "affect must be null or a number from -1 to 1")
@@ -93,23 +106,46 @@ struct DreamPayload: Decodable {
         emergingThemes = try container.decode([String].self, forKey: .emergingThemes)
         surprisingMoments = try container.decode([String].self, forKey: .surprisingMoments)
         claims = try container.decode([DreamClaim].self, forKey: .claims)
-        cares = try container.decodeIfPresent([String].self, forKey: .cares) ?? []
+        let raw = try decoder.container(keyedBy: JSONKey.self)
+        var untouched = Set(raw.allKeys)
+        var fields: [String: JSONValue] = [:]
+        var counts: Drops = (0, 0)
         func checked<T>(_ key: CodingKeys, maximum: Int,
                         transform: (JSONValue) -> T?) throws -> [T] {
-            let values = try container.decodeIfPresent([JSONValue].self, forKey: key) ?? []
-            guard values.count <= maximum else {
-                throw DecodingError.dataCorruptedError(forKey: key, in: container,
-                    debugDescription: "\(key.stringValue) exceeds its \(maximum)-entry bound")
+            untouched.remove(JSONKey(key.rawValue))
+            guard container.contains(key) else { return [] }
+            if try container.decodeNil(forKey: key) {
+                fields[key.rawValue] = .null
+                return []
             }
-            return try values.enumerated().map { index, value in
-                guard let decoded = transform(value) else {
-                    throw DecodingError.dataCorruptedError(forKey: key, in: container,
-                        debugDescription: "\(key.stringValue)[\(index)] is malformed; learning was not applied")
+            guard var values = try? container.nestedUnkeyedContainer(forKey: key) else {
+                counts.total += 1
+                if key == .careMerges { counts.mergesMalformed += 1 }
+                return []
+            }
+            var kept: [T] = []
+            var retained: [JSONValue] = []
+            while !values.isAtEnd {
+                let item = try values.superDecoder()
+                guard let value = (try? JSONValue(from: item)).map(DreamPart.redactOutput),
+                      NativeAgentSecretRedactor.secretPath(value) == nil, let decoded = transform(value) else {
+                    counts.total += 1
+                    if key == .careMerges { counts.mergesMalformed += 1 }
+                    continue
                 }
-                return decoded
+                guard kept.count < maximum else { counts.total += 1; continue }
+                kept.append(decoded)
+                retained.append(value)
             }
+            fields[key.rawValue] = .array(retained)
+            return kept
         }
-        lessons = try checked(.lessons, maximum: 5, transform: DreamLesson.init)
+        cares = try checked(.cares, maximum: .max) { $0.stringValue }
+        lessons = try checked(.lessons, maximum: 5) { value in
+            guard let lesson = DreamLesson(value),
+                  (try? DreamEntryProvenance.checkProse(lesson.diaryLine)) != nil else { return nil }
+            return lesson
+        }
         careMerges = try checked(.careMerges, maximum: 6) { value -> CognitiveCareMerge? in
             guard let fields = value.objectValue,
                   let rawIDs = fields["into_it"]?.arrayValue, !rawIDs.isEmpty, rawIDs.count <= 6,
@@ -144,6 +180,10 @@ struct DreamPayload: Decodable {
         story = try checked(.story, maximum: 5, transform: CognitiveSelfKnowledge.Story.init)
         people = try checked(.people, maximum: CognitiveSelfKnowledge.maximumPeople,
             transform: CognitiveSelfKnowledge.Person.init)
+        for key in untouched { fields[key.stringValue] = try raw.decode(JSONValue.self, forKey: key) }
+        fields["affect"] = fields["affect"] ?? .null
+        retainedFields = fields
+        drops = counts
 
         guard !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw DecodingError.dataCorruptedError(

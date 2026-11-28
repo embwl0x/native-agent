@@ -13,10 +13,9 @@ public enum CognitiveSomaticSignals {
         switch kind {
         case .toolStarted, .toolSucceeded, .toolFailed, .toolCancelled,
              .providerStarted, .providerSucceeded, .providerFailed, .providerCancelled, .providerRecovered,
-             .iPhoneReachable, .iPhoneStale,
+             .iPhoneReachable,
              .phoneDeliveryStarted, .phoneDeliveryReceived, .phoneDeliveryFailed,
-             .memoryCommitted,
-             .appWake, .appSleep, .resourcePressureChanged:
+             .appWake, .appSleep:
             return false
         default:
             return true
@@ -180,7 +179,7 @@ public enum CognitiveSomaticSignals {
             "importance": .double(event.importance),
             "summaryCharacters": .int(Int64(event.summary.count)),
         ]
-        if let label = event.subject.label, !label.isEmpty {
+        if !event.subject.isChatTurn, let label = event.subject.label, !label.isEmpty {
             metadata["subjectLabel"] = .string(label)
         }
         for key in forwardedMetadataKeys {

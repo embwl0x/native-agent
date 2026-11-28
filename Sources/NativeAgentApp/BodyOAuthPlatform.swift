@@ -12,12 +12,12 @@ enum BodyOAuthPlatform: NativeOAuthPlatformPort {
         error is CancellationError || (error as? ASWebAuthenticationSessionError)?.code == .canceledLogin
     }
 
-    static func runAuthSession(authURL: URL, expectedState: String, providerId: String) async throws -> URL {
+    static func runAuthSession(authURL: URL, providerId: String) async throws -> URL {
         guard let call else {
             throw PartCallError(code: "face_unavailable", message: "Open NativeAgent's window to sign in.")
         }
         let reply = try await call(.runOAuthSession(.init(operation: UUID(), provider: providerId,
-            authorizationURL: authURL.absoluteString, expectedState: expectedState, callbackScheme: NativeOAuthFlow.callbackURLScheme)))
+            authorizationURL: authURL.absoluteString, callbackScheme: NativeOAuthFlow.callbackURLScheme)))
         switch reply {
         case .oauthCallback(let raw):
             guard let url = URL(string: raw) else {

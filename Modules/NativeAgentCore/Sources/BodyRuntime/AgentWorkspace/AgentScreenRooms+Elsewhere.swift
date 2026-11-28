@@ -34,9 +34,9 @@ extension AgentScreen {
         userDoors[surface.lowercased()] ?? (surface.hasSuffix("-bridge") ? "bridge" : nil)
     }
 
-    static func doorLines(dataRoot: URL, now: Date, since: Date? = nil, sessions: SessionConversation? = nil) throws -> [DoorLine] {
+    static func doorLines(dataRoot: URL, now: Date, since: Date? = nil) throws -> [DoorLine] {
         let dir = dataRoot.appendingPathComponent("chat/messages", isDirectory: true).path
-        let sessions = try sessions ?? SessionConversation(dataRoot: dataRoot)
+        let sessions = try SessionConversation(dataRoot: dataRoot)
         let entries: [String]
         do { entries = try FileManager.default.contentsOfDirectory(atPath: dir) }
         catch let error as CocoaError where error.code == .fileReadNoSuchFile { entries = [] }
@@ -462,17 +462,38 @@ extension AgentScreen {
             guard !peer, clean(row) else { return "" }
             return clip(ChatSecretRedactor.redactText(row.face?.words ?? row.happening?.words ?? ""), 2_000)
         }
+        func agentHandle(_ address: String) -> String {
+            address.hasPrefix("agent:") ? String(address.dropFirst(6)) : address
+        }
         func name(_ address: String, disclose: Bool = true) -> String {
-            let handle = address.hasPrefix("agent:") ? String(address.dropFirst(6)) : address
+            let handle = agentHandle(address)
             guard handle.hasPrefix("peer:") else { return address }
             guard disclose else { return "an agent" }
             return reading.peerNames[handle].map { clip(ChatSecretRedactor.redactText($0), 100) } ?? "an agent"
+        }
+        func isAgent(_ address: String) -> Bool {
+            address.hasPrefix("agent:") || address.hasPrefix("peer:")
+        }
+        func party(_ address: String?, disclose: Bool, unknown: String) -> String {
+            guard let address else { return unknown }
+            switch address {
+            case "person": return "the person"
+            case "self", "her": return "myself"
+            default:
+                guard isAgent(address) else { return unknown }
+                if disclose, let label = reading.peerNames[agentHandle(address)] {
+                    return "an agent (" + clip(ChatSecretRedactor.redactText(label), 100) + ")"
+                }
+                return "an agent"
+            }
         }
         func owed(_ rows: [Experience]) -> String {
             let open = rows.filter(clean).flatMap { row in row.owes.sorted { $0.key < $1.key }.filter { !$0.value.phase.isSettled }
                 .map { $0.key + " to " + name($0.value.to) } }
             return open.isEmpty ? "" : "; still owe " + open.joined(separator: ", ")
         }
+        let deliverySurfaces = ["deliver:mac": "Mac notification", "deliver:phone": "iPhone",
+                                "deliver:telegram": "Telegram", "deliver:slack": "Slack"]
         var lines: [(at: Date, text: String)] = []
         for row in reading.rows {
             guard let at = NativeTimestampFormat.parseISO8601FractionalFirst(row.at), at > reading.since, at <= now,
@@ -482,24 +503,81 @@ extension AgentScreen {
             let conversation = session(source) ?? session(row)
             guard conversation != scope, conversation != nil || ![.heard, .answer].contains(row.kind) else { continue }
             if conversation == Attention.stream && row.kind != .thought && row.kind != .happening { continue }
-            let door = row.happening?.door
-                ?? (row.kind == .message ? row.addressedTo.first { $0.hasPrefix("agent:") } : nil)
-                ?? source.evidence.first(where: { $0.source == "door" }).map { AgentScreen.door($0.id) ?? $0.id }
-                ?? conversation.map { "conversation:" + $0 } ?? row.addressedTo.first ?? "self"
-            var line = name(door, disclose: !peer && clean(source) && clean(row)) + ", " + row.kind.rawValue + ", " + age(now.timeIntervalSince(at)) + " ago"
+            let recordedDoor = source.evidence.first { $0.source == "door" }.map { AgentScreen.door($0.id) ?? $0.id }
+            let elapsed = age(now.timeIntervalSince(at)) + " ago"
+            var line: String
             if row.kind == .thought {
                 guard ["hit", "empty"].contains(row.outcome?.status ?? ""), let run = row.thought?.run, let answer = indexed[Experience.answer(run: run)],
                       let prose = answer.face?.words, !prose.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
-                line += ", I thought"
+                let door = row.happening?.door ?? recordedDoor ?? conversation.map { "conversation:" + $0 } ?? row.addressedTo.first ?? "self"
+                line = name(door, disclose: !peer && clean(row)) + ", thought, " + elapsed + ", I thought"
                 if clean(row), !words(answer).isEmpty { line += ": " + words(answer) }
                 if !peer && clean(row) { line += owed([row, answer]) }
             } else {
+                let destination = row.addressedTo.first { $0 == "person" || $0 == "self" || $0 == "her" || isAgent($0) }
+                let contactConversation = source.face?.from == "self" && conversation.map { session in
+                    source.steeredBy?.contains { handle in
+                        handle.hasPrefix("peer:") && session.hasPrefix(ContactThread.prefix(owner: String(handle.dropFirst(5))))
+                    } == true
+                } == true
+                let unverifiedSpeaker = contactConversation && !source.evidence.contains { $0.source == "speaker" && $0.id == "self" }
+                let sender = unverifiedSpeaker ? nil : (source.face?.from ?? source.happening?.who)
+                let speech = [.heard, .answer, .message].contains(row.kind)
+                let agentConversation = speech && (contactConversation || sender.map(isAgent) == true
+                    || (row.kind == .message && destination.map(isAgent) == true))
+                let contactHappening = row.happening?.door.hasPrefix("contact:") == true
+                let contactStatus = contactHappening && row.happening?.kind == .body
+                let disclose = !peer && clean(row)
+                let acceptedDeliveries = row.owes.filter { $0.key.hasPrefix("deliver:") && $0.value.phase == .accepted }
+                let deliveryLabels = disclose && row.kind == .message
+                    ? acceptedDeliveries.keys.compactMap { deliverySurfaces[$0] }.sorted() : []
+                let location: String
+                if agentConversation || (contactHappening && row.happening?.kind == .returned) {
+                    location = "in an agent conversation"
+                } else if contactStatus { location = "on this Mac" }
+                else if contactHappening { location = "on a contact door" }
+                else if let door = row.happening?.door ?? recordedDoor {
+                    location = "on " + name(door, disclose: !peer && clean(source) && clean(row))
+                } else if !deliveryLabels.isEmpty {
+                    location = "on " + deliveryLabels.joined(separator: " and ")
+                } else if conversation != nil { location = "in another conversation" }
+                else { location = "on an unrecorded door" }
                 if let ask {
-                    line += ", " + (!peer && clean(ask) ? name(ask.face?.from ?? "person") : "speaker") + " asked"
+                    let speaker = party(sender, disclose: !peer && clean(ask), unknown: "an unknown sender")
+                    let request = speaker == "myself" ? "I asked myself" : "\(speaker) asked"
+                    line = "\(request), \(location), \(elapsed)"
                     if !words(ask).isEmpty { line += ": " + words(ask) }
                     line += "; I answered"
-                } else if !peer && clean(row) {
-                    line += ", " + name(row.face?.from ?? row.happening?.who ?? (row.kind == .heard ? "person" : "I"))
+                } else {
+                    let action: String
+                    switch row.kind {
+                    case .heard:
+                        action = "I heard from " + party(sender, disclose: disclose, unknown: "an unknown sender")
+                    case .answer:
+                        action = "I answered " + party(destination, disclose: disclose, unknown: "an unknown sender")
+                    case .message where row.owes["repair"] != nil:
+                        action = "I recorded a repair obligation"
+                    case .message:
+                        let recipient = party(destination, disclose: disclose, unknown: "an unknown recipient")
+                        let accepted = row.owes["accept"]?.phase == .accepted || row.owes["deliver"]?.phase == .accepted
+                            || !acceptedDeliveries.isEmpty
+                        if sender == "person" {
+                            action = (accepted ? "The person sent a message to " : "The person had a message for ") + recipient
+                        } else if sender == "self" || sender == "her"
+                                    || (destination == "person" && row.face?.row != nil && sender.map { !isAgent($0) } == true) {
+                            action = (accepted ? "I sent a message to " : "I had a message for ") + recipient
+                        } else {
+                            let speaker = party(sender, disclose: disclose, unknown: "an unknown sender")
+                            action = "A message from \(speaker)" + (accepted ? " was sent to " : " to ") + recipient
+                        }
+                    case .happening:
+                        if contactStatus { action = "I noted a contact status update" }
+                        else if sender == "world" { action = "I noted an update" }
+                        else { action = "I noted an update from " + party(sender, disclose: disclose, unknown: "an unknown sender") }
+                    default:
+                        action = row.kind.rawValue
+                    }
+                    line = "\(action), \(location), \(elapsed)"
                 }
                 if !words(row).isEmpty { line += ": " + words(row) }
                 if !peer && clean(row) { line += owed([row] + (ask.map { [$0] } ?? [])) }

@@ -184,67 +184,64 @@ struct OnboardingTourOverlay: View {
                 .ignoresSafeArea()
                 .onTapGesture { } // Keep background taps from reaching the dimmed room.
 
-            GlassEffectContainer(spacing: 0) {
-                HStack(spacing: NativeAgentSpacing.xl) {
-                    tabRail
-                        .plate()
-
-                    VStack(spacing: NativeAgentSpacing.xl) {
-                        Text(presentation.progressText)
-                            .font(ShellType.label)
-                            .foregroundStyle(NativeAgentShell.secondary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-
-                        // Keep the plate and controls fixed so only the current stop changes.
-                        VStack(spacing: NativeAgentSpacing.sm) {
-                            Text(step.title)
-                                .font(ShellType.display)
-                                .foregroundStyle(NativeAgentShell.text)
-                                .multilineTextAlignment(.center)
-
-                            Text(step.body)
-                                .font(ShellType.body)
-                                .foregroundStyle(NativeAgentShell.secondary)
-                                .multilineTextAlignment(.center)
-                                .fixedSize(horizontal: false, vertical: true)
-                                .frame(maxWidth: 420)
-                        }
-                        .motionArrival()
-                        .id(step.id)
-
-                        HStack(spacing: NativeAgentSpacing.md) {
-                            Button("Skip") {
-                                completeTour()
-                            }
-                            .buttonStyle(.plain)
-                            .foregroundStyle(NativeAgentShell.secondary)
-                            .font(ShellType.label)
-                            .keyboardShortcut(.cancelAction)
-                            .accessibilityIdentifier("onboarding-tour.skip")
-
-                            Spacer()
-
-                            Button("Back") {
-                                retreat()
-                            }
-                            .buttonStyle(.bordered)
-                            .disabled(!presentation.backEnabled)
-                            .accessibilityIdentifier("onboarding-tour.back")
-
-                            Button(presentation.advanceLabel) {
-                                advance()
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .controlSize(.large)
-                            .keyboardShortcut(.defaultAction)
-                            .accessibilityIdentifier("onboarding-tour.advance")
-                        }
-                        .frame(maxWidth: 420)
-                    }
-                    .padding(NativeAgentSpacing.xl)
+            HStack(spacing: NativeAgentSpacing.xl) {
+                tabRail
                     .plate()
-                    .frame(maxWidth: 520)
+
+                VStack(spacing: NativeAgentSpacing.xl) {
+                    Text(presentation.progressText)
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                    VStack(spacing: NativeAgentSpacing.sm) {
+                        Text(step.title)
+                            .font(ShellType.display)
+                            .foregroundStyle(NativeAgentShell.text)
+                            .multilineTextAlignment(.center)
+
+                        Text(step.body)
+                            .font(ShellType.body)
+                            .foregroundStyle(NativeAgentShell.secondary)
+                            .multilineTextAlignment(.center)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: 420)
+                    }
+                    .motionArrival()
+                    .id(step.id)
+
+                    HStack(spacing: NativeAgentSpacing.md) {
+                        Button("Skip") {
+                            completeTour()
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .font(ShellType.label)
+                        .keyboardShortcut(.cancelAction)
+                        .accessibilityIdentifier("onboarding-tour.skip")
+
+                        Spacer()
+
+                        Button("Back") {
+                            retreat()
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(!presentation.backEnabled)
+                        .accessibilityIdentifier("onboarding-tour.back")
+
+                        Button(presentation.advanceLabel) {
+                            advance()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.large)
+                        .keyboardShortcut(.defaultAction)
+                        .accessibilityIdentifier("onboarding-tour.advance")
+                    }
+                    .frame(maxWidth: 420)
                 }
+                .padding(NativeAgentSpacing.xl)
+                .houseInset(in: RoundedRectangle(cornerRadius: NativeAgentShellLayout.railPlateRadius, style: .continuous))
+                .frame(maxWidth: 520)
             }
             .padding(NativeAgentSpacing.xl)
             // The overlay stays over a dimmed room in either appearance.

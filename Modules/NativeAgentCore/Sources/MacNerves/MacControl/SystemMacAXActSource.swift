@@ -103,7 +103,7 @@ public final class SystemMacAXActSource: MacAXActSource {
         state.withLock { $0.table[handle] }?.element
     }
     public func isTrusted() -> Bool {
-        MacAXExecutionLane.sync { AXIsProcessTrusted() }
+        MacAXExecutionLane.sync { SystemPermissionPreflight.status(.accessibility) == .granted }
     }
     public func resolve(path: [Int], inAppPid pid: Int32, context: MacOperationContext) -> MacAXPidResolution {
         MacAXExecutionLane.sync {
@@ -373,6 +373,13 @@ public final class SystemMacAXActSource: MacAXActSource {
                 context: context))) }
             do { try SystemMacAXElementSource.ensureRenderer(element, refresh: true, context: context) }
             catch { return .failure(.renderer(error.localizedDescription)) }
+            if let restore = context.textRestore {
+                guard attribute == kAXValueAttribute,
+                      let current = MacAXAttributeRead.copyString(element, attribute, context: context),
+                      current.utf8.elementsEqual(restore.written.utf8) else {
+                    return .failure(.evidence("The field no longer holds the deed's exact write."))
+                }
+            }
             guard context.driver?.allowsAction(context: context) == true else { return .failure(.driver(MacAttentionSessionStore.driverRefusal(
                 context: context))) }
             PersonOnlyWindows.noteAgentMotor()

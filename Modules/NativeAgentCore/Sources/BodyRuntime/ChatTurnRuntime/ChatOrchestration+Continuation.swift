@@ -15,6 +15,7 @@ actor TurnCheckpointWriter {
     private let dataRoot: URL
     private var pendingCalls = 0
     private var owesSettle = true
+    private(set) var admitsWithdrawal = true
 
     init(record: TurnCheckpoint, dataRoot: URL) {
         self.record = record
@@ -43,13 +44,27 @@ actor TurnCheckpointWriter {
         persist()
     }
 
-    private func persist() {
-        if Self.persist(record, dataRoot: dataRoot) != nil { owesSettle = true; return }
+    var withdrawsUnstarted: Bool { record.withdrawsUnstarted == true }
+
+    func withdrawUnstarted() throws -> Bool {
+        guard admitsWithdrawal else { return false }
+        record.withdrawsUnstarted = true
+        if let failure = persist() {
+            throw WireFailure(code: "withdrawal_checkpoint", message: "Withdrawal could not be confirmed.", cause: failure, effects: .unknown)
+        }
+        return true
+    }
+
+    func endWithdrawalAdmission() { admitsWithdrawal = false }
+
+    @discardableResult private func persist() -> String? {
+        if let failure = Self.persist(record, dataRoot: dataRoot) { owesSettle = true; return failure }
         if owesSettle {
             RepairOwed.settle(dataRoot, operation: Self.operation(record),
                               evidence: .init(source: "chat/session_state", id: record.turnId))
             owesSettle = false
         }
+        return nil
     }
 
     private static func operation(_ record: TurnCheckpoint) -> String { "turn.checkpoint:" + record.sessionId }
@@ -331,6 +346,11 @@ extension SwiftNativeChatOrchestrationClient {
             }
             request.attachments = try CodexCompletionTranscriptEvidence.savedAttachments(metadata["attachments"])
         }
+        if case .some(.some(var origin)) = request.origin, let elevated = origin.elevatedPeerSources {
+            origin.peerSources = Array(Set((origin.peerSources ?? []) + elevated)).sorted()
+            origin.elevatedPeerSources = nil
+            request.origin = .some(origin)
+        }
         let turn = restoredTurn
         var record = checkpoint
         let sources = rows.flatMap { row -> [String] in
@@ -338,10 +358,9 @@ extension SwiftNativeChatOrchestrationClient {
                   case .array(let saved)? = metadata["untrusted_sources"] else { return [] }
             return saved.compactMap { if case .string(let source) = $0 { return source }; return nil }
         }
-        // Restore recorded steering; rereading saved evidence never adds steering peers.
-        let taint = PeerDataTaint(dataRoot: turn.dataRoot, restoring: (record.peerSources ?? []) + sources
-            + (turn.peerSteering?.checkpointSources ?? []),
-            elevated: (record.answeredPeers ?? []) + (turn.peerSteering?.elevatedSources ?? []))
+        let admitted = PeerDataTaint.carried(turn: turn, surface: request.surface)
+        let taint = PeerDataTaint(dataRoot: turn.dataRoot, restoring: (record.peerSources ?? []) + (record.answeredPeers ?? [])
+            + sources + admitted.sources, elevated: admitted.elevated)
         try await work.journal?.resume()
         return try await holding(turn.with(\.peerSteering, taint)) { turn in
         record.peerSources = taint.checkpointSources
@@ -443,7 +462,7 @@ extension SwiftNativeTurnEngine {
                 switch event {
                 case .delta, .toolUse, .toolResult, .notice, .replyTextSettled:
                     ExperienceStore.record(root, heardID) { try await $0.append([.progress("working")], to: heardID) }
-                case .final, .error, .writing: break
+                case .final, .error, .writing, .unstartedStep: break
                 }
             }
             await progress?(event, receipt: receipt, invocationID: invocationID)
@@ -466,6 +485,10 @@ extension SwiftNativeTurnEngine {
             if sessionId == nil { workerRecord = record }
             checkpoint = TurnCheckpointWriter(record: record, dataRoot: root)
         } else { checkpoint = nil }
+        let withdrawalWriter = surface == "chat" && sessionId != nil ? checkpoint : nil
+        if let sessionId, let withdrawalWriter {
+            await ChatTurnSteering.shared.bindWithdrawalWriter(withdrawalWriter, in: sessionId, turn: turn)
+        }
         func settleWorker() {
             guard let workerRecord, let root = remPinsDataRoot else { return }
             do { try workerRecord.remove(dataRoot: root) }
@@ -492,6 +515,7 @@ extension SwiftNativeTurnEngine {
                         workingCommentaryCharacters: returned.workingCommentaryCharacters, terminalReason: .cancelled,
                         loopCounters: returned.loopCounters, cognitiveContextDelivered: returned.cognitiveContextDelivered)
                 } else { result = returned }
+                await withdrawalWriter?.endWithdrawalAdmission()
                 let reason = result.terminalReason ?? .incomplete
                 let state: DeskContinuation.State
                 switch reason {
@@ -516,6 +540,7 @@ extension SwiftNativeTurnEngine {
                 return result
             } catch {
                 let canceled = Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath)
+                await withdrawalWriter?.endWithdrawalAdmission()
                 if ownsJournal, let journal {
                     let peerSources = turn.peerSteering?.checkpointSources
                     try await settle { () -> Result<Void, Error> in

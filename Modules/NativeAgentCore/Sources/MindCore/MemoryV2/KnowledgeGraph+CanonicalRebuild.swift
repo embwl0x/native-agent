@@ -5,20 +5,39 @@ import PersistenceCore
 // Blueprint: | `KnowledgeGraph+CanonicalRebuild.swift` | `SwiftNativeKnowledgeGraphIndexer`, `rebuildMemoryDerivedGraphFromCanonicalStore`, `reconcileMemoryIndexFingerprints` |
 
 extension SwiftNativeKnowledgeGraphIndexer {
+    struct RebuildEntityIDs {
+        struct Key: Hashable {
+            let name: [UInt8]
+            let type: [UInt8]
+
+            init(name: String, type: String) {
+                self.name = Self.sqliteLowercase(name)
+                self.type = Self.sqliteLowercase(type)
+            }
+
+            private static func sqliteLowercase(_ value: String) -> [UInt8] {
+                value.utf8.map { (65...90).contains($0) ? $0 + 32 : $0 }
+            }
+        }
+
+        var byKey: [Key: String] = [:]
+        var reserved: Set<String> = []
+    }
+
     /// Rebuild MemoryV2-owned rows and snapshot canonical memories under one SQLite write lock so concurrent writes cannot fall between snapshot and indexing.
     /// Preserve independently owned entities; when production is off, retire owned rows without rederiving them using one checked mode.
     public func rebuildMemoryDerivedGraphFromCanonicalStore(
         producing: Bool = true
-    ) async throws -> KnowledgeGraphMemoryRebuildReport {
+    ) async throws {
         try await rebuildMemoryDerivedGraphFromCanonicalStore(
             producing: producing, identity: resolvedExtractionIdentity())
     }
 
     func rebuildMemoryDerivedGraphFromCanonicalStore(
         producing: Bool, identity: ExtractionIdentity
-    ) async throws -> KnowledgeGraphMemoryRebuildReport {
+    ) async throws {
         let dbPool = try await pool()
-        return try await dbPool.write { db in
+        try await dbPool.write { db in
             // A cold write awaiting admission (MemoryV2's `admission_pending`) is not a fact until its vector lands; its landing re-indexes it.
             let rows = try Row.fetchAll(db, sql: """
                 SELECT id, content, source, status, created_at, updated_at,
@@ -49,6 +68,25 @@ extension SwiftNativeKnowledgeGraphIndexer {
                 WHERE json_extract(metadata_json, '$.\(Self.createdByKey)')
                       IN (\(ownedIndexerPlaceholders))
                 """
+            var rebuildEntityIDs = RebuildEntityIDs()
+            if !facts.isEmpty {
+                let ownedEntities = try Row.fetchAll(db, sql: """
+                    SELECT id, name, type FROM kg_entities
+                    WHERE id IN (\(provenanceSubquery))
+                      AND NOT (type = 'fact' AND substr(id, 1, 8) = 'memfact_')
+                    ORDER BY json_extract(metadata_json, '$.role') IS 'primary_user' DESC,
+                             mention_count DESC, last_seen DESC, id
+                    """, arguments: StatementArguments(Self.ownedIndexerVersions))
+                for row in ownedEntities {
+                    let id = try row.decode(String.self, forColumn: "id")
+                    let key = RebuildEntityIDs.Key(
+                        name: try row.decode(String.self, forColumn: "name"),
+                        type: try row.decode(String.self, forColumn: "type")
+                    )
+                    rebuildEntityIDs.byKey[key] = rebuildEntityIDs.byKey[key] ?? id
+                    rebuildEntityIDs.reserved.insert(id)
+                }
+            }
             try db.execute(
                 sql: """
                     DELETE FROM kg_relationships
@@ -63,7 +101,6 @@ extension SwiftNativeKnowledgeGraphIndexer {
                         + Self.ownedIndexerVersions
                 )
             )
-            let ownedRelationshipsRemoved = db.changesCount
             try db.execute(
                 sql: """
                     DELETE FROM kg_entities
@@ -72,12 +109,10 @@ extension SwiftNativeKnowledgeGraphIndexer {
                     """,
                 arguments: StatementArguments(Self.ownedIndexerVersions)
             )
-            let ownedEntitiesRemoved = db.changesCount
             try db.execute(sql: "DELETE FROM kg_memory_index")
-            let indexRowsRemoved = db.changesCount
 
             let now = NativeTimestampFormat.fractionalZulu(Date())
-            let consolidation = if facts.isEmpty {
+            if facts.isEmpty {
                 try Self.removeUnreferencedPrimaryUserRole(db)
             } else {
                 try Self.consolidatePrimaryUserEntities(
@@ -85,13 +120,11 @@ extension SwiftNativeKnowledgeGraphIndexer {
                     primaryUserName: identity.primaryUserName
                 )
             }
-            var danglingRelationshipsRemoved = 0
             try db.execute(sql: """
                 DELETE FROM kg_relationships
                 WHERE from_id NOT IN (SELECT id FROM kg_entities)
                    OR to_id NOT IN (SELECT id FROM kg_entities)
                 """)
-            danglingRelationshipsRemoved += db.changesCount
             // Reset the surviving primary-user hub's count before deriving it from current facts.
             try db.execute(sql: """
                 UPDATE kg_entities SET mention_count = 0
@@ -113,50 +146,47 @@ extension SwiftNativeKnowledgeGraphIndexer {
                     now: now,
                     extracted: extracted[index],
                     primaryUserName: identity.primaryUserName,
-                    contactIDs: identity.contactIDs
+                    contactIDs: identity.contactIDs,
+                    rebuildEntityIDs: rebuildEntityIDs
                 )
             }
-            return KnowledgeGraphMemoryRebuildReport(
-                factsIndexed: facts.count,
-                entitiesRemoved: ownedEntitiesRemoved + consolidation.entitiesRemoved,
-                relationshipsRemoved: ownedRelationshipsRemoved + danglingRelationshipsRemoved + consolidation.relationshipsRemoved,
-                indexRowsRemoved: indexRowsRemoved
-            )
         }
+        dbPool.invalidateReadOnlyConnections()
     }
 
     /// Check the complete canonical fingerprint set, including existing rows. Drift rebuilds under the canonical write lock so stale derived claims are removed
     /// as well as missing ones restored.
-    @discardableResult
-    public func reconcileMemoryIndexFingerprints() async throws -> Int {
+    public func reconcileMemoryIndexFingerprints() async throws {
         let identity = try resolvedExtractionIdentity()
         let dbPool = try await pool()
-        let drift = try await dbPool.read { db in
-            let rows = try Row.fetchAll(db, sql: """
-                SELECT m.id, m.content, m.source, m.status, m.created_at,
-                       m.updated_at, m.metadata_json, m.valid_from, m.valid_to, i.content_hash
-                FROM memories m LEFT JOIN kg_memory_index i ON i.memory_id = m.id
-                WHERE m.status = 'active'
-                  AND TRIM(COALESCE(m.content, '')) <> ''
-                  AND lower(COALESCE(NULLIF(TRIM(m.lifecycle), ''), 'confirmed'))
-                        NOT IN \(MemoryLifecycle.recallExcludedSQL)
-                  AND json_extract(m.metadata_json, '$.admission_pending') IS NOT 1
-                ORDER BY m.id
-                """)
-            let facts = try rows.compactMap { row -> (fact: KnowledgeGraphMemoryFact, hash: String?)? in
-                guard let fact = try KnowledgeGraphMemoryFact(row: row) else { return nil }
-                return (fact, try row.decode(String?.self, forColumn: "content_hash"))
-            }
-            let indexCount = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM kg_memory_index") ?? 0
-            if indexCount != facts.count { return true }
-            return facts.contains { fact, hash in
-                hash != Self.factFingerprint(
-                    fact, content: fact.content.trimmingCharacters(in: .whitespacesAndNewlines), identity: identity
-                )
-            }
+        let drift = try await dbPool.read { db in try Self.contextIndexDrift(in: db, identity: identity) }
+        guard drift else { return }
+        try await rebuildMemoryDerivedGraphFromCanonicalStore(producing: true, identity: identity)
+    }
+
+    static func contextIndexDrift(in db: Database, identity: ExtractionIdentity) throws -> Bool {
+        let rows = try Row.fetchAll(db, sql: """
+            SELECT m.id, m.content, m.source, m.status, m.created_at,
+                   m.updated_at, m.metadata_json, m.valid_from, m.valid_to, i.content_hash
+            FROM memories m LEFT JOIN kg_memory_index i ON i.memory_id = m.id
+            WHERE m.status = 'active'
+              AND TRIM(COALESCE(m.content, '')) <> ''
+              AND lower(COALESCE(NULLIF(TRIM(m.lifecycle), ''), 'confirmed'))
+                    NOT IN \(MemoryLifecycle.recallExcludedSQL)
+              AND json_extract(m.metadata_json, '$.admission_pending') IS NOT 1
+            ORDER BY m.id
+            """)
+        let facts = try rows.compactMap { row -> (fact: KnowledgeGraphMemoryFact, hash: String?)? in
+            guard let fact = try KnowledgeGraphMemoryFact(row: row) else { return nil }
+            return (fact, try row.decode(String?.self, forColumn: "content_hash"))
         }
-        guard drift else { return 0 }
-        return try await rebuildMemoryDerivedGraphFromCanonicalStore(producing: true, identity: identity).factsIndexed
+        let indexCount = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM kg_memory_index") ?? 0
+        if indexCount != facts.count { return true }
+        return facts.contains { fact, hash in
+            hash != Self.factFingerprint(
+                fact, content: fact.content.trimmingCharacters(in: .whitespacesAndNewlines), identity: identity
+            )
+        }
     }
 
     private static let ownedIndexerVersions = [indexVersion]

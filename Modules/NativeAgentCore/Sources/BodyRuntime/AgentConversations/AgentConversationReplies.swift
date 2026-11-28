@@ -1,12 +1,12 @@
 import NativeAgentShared
 import Foundation
-import os
-import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import MacNerves
 import MindCore
 import SenseCore
+import os
+import CryptoKit
 // Blueprint: | `AgentConversationReplies.swift` | Locked retained-answer delivery, inline waits and reply settlement on the existing conversation store |
 
 extension AgentConversationStore {
@@ -203,6 +203,7 @@ extension AgentConversationStore {
                 sourceSurface: "agent-bridge", operationStartedAt: message.at, expectsReply: false)
             let life = try DataRootLife.current(in: root)
             var exchange = AgentConversationExchange.started(operationID: sendID, at: message.at, message: text)
+            exchange.scopeSessionID = session
             exchange.lifeID = life
             exchange.phase = "ready"; exchange.status = "held"
             row.exchanges = try AgentConversationExchange.bounded([exchange], file: fileURL)

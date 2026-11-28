@@ -1,6 +1,5 @@
 import Foundation
 import Observation
-@_exported import NativeAgentShared
 import PersistenceCore
 import NativeAgentCore
 import ProviderRouting
@@ -9,7 +8,6 @@ import MindCore
 import MacNerves
 import DeskCore
 import SenseCore
-@unsafe @preconcurrency import EventKit
 import Synchronization
 import os
 import OSLog
@@ -20,6 +18,7 @@ import ImageIO
 import UniformTypeIdentifiers
 import AppKit
 import CoreGraphics
+@_exported import NativeAgentShared
 // Blueprint: | `ConversationAttention.swift` | `MacChatUnreadSessions`; Phone activity remains unread until its chat opens |
 
 /// Phone activity in a background chat stays unread until that chat opens.

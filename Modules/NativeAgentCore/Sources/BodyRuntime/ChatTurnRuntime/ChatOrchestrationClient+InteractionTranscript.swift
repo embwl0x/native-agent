@@ -396,7 +396,9 @@ extension SwiftNativeChatOrchestrationClient {
             // One provider ask across conversations and producers. This lock carries no credential or copied account state.
             return try await SwiftNativePersistenceCore.withFileLock(root.appendingPathComponent("chat/provider-asks")) {
                 let retained = try await appendLockedTranscriptRow(row, raisedBy: receipt, to: path, lifeID: lifeID)
-                if let card = retained.card { await supersedeProviderAsks(card, except: path, root: root, lifeID: lifeID) }
+                if let card = retained.card {
+                    await settle { await Self.supersedeProviderAsks(card, except: path, root: root, lifeID: lifeID) }
+                }
                 return retained
             }
         }
@@ -528,6 +530,12 @@ extension SwiftNativeChatOrchestrationClient {
                        card.kind == incoming.kind,
                        card.allTargets.sorted() == incoming.allTargets.sorted(),
                        card.mode == incoming.mode, card.secret == incoming.secret,
+                       // Queued project steps and wakes share one session: each asker keeps its own card, so one answer releases only its own steps.
+                       ({ () -> Bool in
+                           let asker: (JSONValue) -> String? = { $0.objectValue?["metadata"]?.objectValue?["envelope"]?.objectValue?["workIdentity"]?.stringValue }
+                           let a = asker(prior), b = asker(row)
+                           return a == b || ![a, b].contains { $0?.hasPrefix("carry.") == true || $0?.hasPrefix("wake:") == true }
+                       })(),
                        (card.kind != .choose || (row.objectValue?["metadata"]?.objectValue?["choiceSubject"] != nil
                         && prior.objectValue?["metadata"]?.objectValue?["choiceSubject"] == row.objectValue?["metadata"]?.objectValue?["choiceSubject"])),
                        card.options.sorted(by: { $0.id < $1.id }) == incoming.options.sorted(by: { $0.id < $1.id }) {
@@ -547,6 +555,7 @@ extension SwiftNativeChatOrchestrationClient {
                 throw ChatOrchestrationError.underlying("The interaction card could not be encoded; no card was filed.")
             }
             metadata[InlineInteractionWire.metadataKey] = encoded
+            metadata["raisingDispatchReceiptId"] = .string(receipt)
             fields["metadata"] = .object(metadata)
             try await ContactThread.append(.object(fields), to: path)
             return (born, true)

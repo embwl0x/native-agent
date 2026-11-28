@@ -7,6 +7,61 @@ import PersistenceCore
 // Blueprint: | `MemoryStorage+Recall.swift` | `MemoryStorage`, `invalidateRecallCache`, `rankedRecall`, `recall` |
 
 extension MemoryStorage {
+    func currentRecallID(id: String, surface: String) async throws -> String? {
+        do {
+            return try await dbPool.read { db -> String? in
+                let tombstoneHash = DatabaseFunction("memory_tombstone_hash", argumentCount: 1, pure: true) { args in
+                    String.fromDatabaseValue(args[0]).map(Self.contentHash)
+                }
+                db.add(function: tombstoneHash)
+                defer { db.remove(function: tombstoneHash) }
+                guard let row = try Row.fetchOne(db, sql: """
+                    SELECT \(Self.memoryProjectionColumns) FROM memories WHERE id = ?
+                      AND NOT EXISTS (SELECT 1 FROM tombstones WHERE content_hash = memory_tombstone_hash(memories.content))
+                    """, arguments: [id]) else { return nil }
+                let record = MemoryRecord(stored: try Self.decodeMemoryProjection(row))
+                let now = Date()
+                guard record.id == id, MemoryRecallScoring.hasStarted(validFrom: record.validFrom, at: now),
+                      let disclosure = MemoryRecordDisclosurePolicy.classify(record, at: now),
+                      disclosure.permits(surface: surface, personaID: nil),
+                      MemoryCandidateQuality.isDurableCandidate(text: record.text),
+                      !Self.metadataFlag(record.extras, Self.pendingAdmissionKey) else { return nil }
+                return record.id
+            }
+        } catch where !(error is CancellationError) {
+            throw MemoryStorageError.databaseUnavailable("The replacement memory could not be checked.")
+        }
+    }
+
+    func checkedRecallRows(_ candidates: [ScoredMemoryRecord], surface: String?, persona: String?,
+                           recordingUsage: Bool, includingNoncurrent: Bool = false) async throws -> [ScoredMemoryRecord] {
+        guard !candidates.isEmpty else { return [] }
+        let read: @Sendable (Database) throws -> [ScoredMemoryRecord] = { db in
+            let keys = String(decoding: try JSONEncoder().encode(candidates.map { $0.record.id }), as: UTF8.self)
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT \(Self.memoryProjectionColumns) FROM memories WHERE id IN (SELECT value FROM json_each(?))
+                """, arguments: [keys]).map(Self.decodeMemoryProjection)
+            let byID = Dictionary(uniqueKeysWithValues: rows.map { ($0.id, MemoryRecord(stored: $0)) })
+            let now = Date()
+            let checked = candidates.compactMap { candidate -> ScoredMemoryRecord? in
+                guard let record = byID[candidate.record.id], record.text == candidate.record.text,
+                      record.memoryKind == candidate.record.memoryKind,
+                      !Self.metadataFlag(record.extras, Self.pendingAdmissionKey),
+                      includingNoncurrent || MemoryRecallScoring.hasStarted(validFrom: record.validFrom, at: now),
+                      let disclosure = MemoryRecordDisclosurePolicy.classify(record, at: now, includingNoncurrent: includingNoncurrent),
+                      disclosure.permits(surface: surface, personaID: persona)
+                else { return nil }
+                return ScoredMemoryRecord(record: record, score: candidate.score)
+            }
+            if recordingUsage {
+                try Self.recordRecallHits(ids: checked.map { $0.record.id }, at: NativeTimestampFormat.fractionalZulu(now), in: db)
+            }
+            return checked
+        }
+        if recordingUsage { return try await dbPool.write(read) }
+        return try await dbPool.read(read)
+    }
+
     struct RecallCache: Sendable {
         let candidates: [StoredMemory]
         let lexical: MemoryRecallScoring.LexicalIndex
@@ -110,9 +165,13 @@ extension MemoryStorage {
             }
             return vector
         }
-        let candidates = cache.candidates.enumerated().filter { persona == nil || $0.element.personaId == persona }
         let now = Date()
-        let lexicalRows = persona.map { _ in Set(candidates.map(\.offset)) }
+        let candidates = cache.candidates.enumerated().filter { _, memory in
+            (persona == nil || memory.personaId == persona)
+                && MemoryRecallScoring.hasStarted(validFrom: memory.validFrom, at: now)
+                && MemoryRecordDisclosurePolicy.isTemporallyEligible(validTo: memory.validTo, at: now)
+        }
+        let lexicalRows = candidates.count == cache.candidates.count ? nil : Set(candidates.map(\.offset))
         let groups = Dictionary(grouping: vectors.indices, by: { vectors[$0].width })
         var rankings = readings.map { _ in [(memory: StoredMemory, similarity: Double)]() }
         for (width, indices) in groups {

@@ -1,4 +1,50 @@
-// Blueprint: | `SidebarItem.swift` | Shell destinations, tab homes, door page names, labels and symbols shared by the app and the face |
+import Foundation
+// Blueprint: | `SidebarItem.swift` | Shell places and their names, destinations, tab homes, door page names, labels and symbols |
+
+public enum ShellSurface: String, CaseIterable, Identifiable, Sendable {
+    case chat, desk, agent, control, diagnostics
+
+    public var id: String { rawValue }
+
+    public init(_ item: SidebarItem) {
+        switch item {
+        case .chat: self = .chat
+        case .desk, .activity, .inboxPolicy, .bots: self = .desk
+        case .memories, .knowledge, .personality, .dreams, .capabilities, .ownPage: self = .agent
+        case .trust, .providers, .connectors, .settings: self = .control
+        case .diagnostics, .cognition, .inspector: self = .diagnostics
+        }
+    }
+
+    public var firstPage: SidebarItem {
+        switch self {
+        case .chat: .chat
+        case .desk: .desk
+        case .agent: .memories
+        case .control: .trust
+        case .diagnostics: .diagnostics
+        }
+    }
+
+    public func title(agentName: String, simple: Bool = false) -> String {
+        switch self {
+        case .chat: simple ? "Together" : "Chat"
+        case .desk: simple ? "Table" : "Desk"
+        case .agent: NativeAgentIdentity.displayName(agentName, fallback: "Agent")
+        case .control: "Control"
+        case .diagnostics: "Diagnostics"
+        }
+    }
+
+    public static func named(_ word: String, agentName: String = "") -> Self? {
+        let word = word.trimmingCharacters(in: .whitespacesAndNewlines)
+        func matches(_ name: String) -> Bool { name.caseInsensitiveCompare(word) == .orderedSame }
+        if let fixed = allCases.first(where: { matches($0.rawValue) || matches($0.title(agentName: "", simple: true)) }) {
+            return fixed
+        }
+        return matches(Self.agent.title(agentName: agentName)) ? .agent : nil
+    }
+}
 
 public enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
     case chat = "Chat"

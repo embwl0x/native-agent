@@ -14,9 +14,6 @@ extension RuntimeReadouts {
         @ObservationIgnored var diagnosticsDidChange: (@MainActor () -> Void)?
         public private(set) var rows: [RunRecord] = []
         public private(set) var readSucceeded: Bool?
-        public private(set) var readIssue: String?
-        public private(set) var observationIssue: String?
-        public func setObservationIssue(_ issue: String?) { observationIssue = issue }
         @ObservationIgnored private let latest = LatestRead()
         public nonisolated init() {}
         @discardableResult
@@ -26,8 +23,8 @@ extension RuntimeReadouts {
                 catch { return .failure(error) }
             }, publish: { next in
                 switch next {
-                case .success(let value): rows = value; readSucceeded = true; readIssue = nil
-                case .failure(let error): readSucceeded = false; readIssue = error.localizedDescription
+                case .success(let value): rows = value; readSucceeded = true
+                case .failure: readSucceeded = false
                 }
                 diagnosticsDidChange?()
             })

@@ -5,13 +5,6 @@ import MacNerves
 // Blueprint: | `AgentWorkspaceChanges.swift` | `AgentWorkspaceChanges`: resident source-stamped conversation comparison |
 
 enum AgentWorkspaceChanges {
-    static func workspaceChangeObservation(workspace: WorkspaceOperation, _ row: AgentConversationRecord,
-                                          location: AgentWorkspaceLocation,
-                                          previous: Stamp?) -> Observation? {
-        evaluate(location: location,
-            result: workspace.ports.conversations.presentation(row), previous: previous)
-    }
-
     struct Stamp: Sendable, Equatable {
         let identity: String
         let fingerprint: String

@@ -51,7 +51,7 @@ public enum MemoryApprovalTransactions {
     /// Stage kind-less rows only once through this root's canonical inbox, including automatic Full Mac applications.
     public static func stageKindBackfillIfNeeded(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        makeLLMClient: @Sendable (PrivateWorkContextAssembly) -> any LLMClient
+        makeLLMClient: @Sendable () -> any LLMClient
     ) async {
         let yolo = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
             .fullMacYoloAuthority(
@@ -73,7 +73,7 @@ public enum MemoryApprovalTransactions {
         }
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
         // Prefer on-device classification; remote classification uses the resolved Memory route. Both accept only an exact supplied category.
-        let llm = makeLLMClient(.taskOnly)
+        let llm = makeLLMClient()
         let classifier: @Sendable (String, [String]) async throws -> String = { content, taxonomy in
             if OnDeviceClassification.isAvailable {
                 return try await MemoryKindBackfill.foundationModelsClassifier(
@@ -95,22 +95,22 @@ public enum MemoryApprovalTransactions {
                     let yolo = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
                         .fullMacYoloAuthority(origin: SecurityOriginContext(
                             surface: "desk", source: "memory_kind_backfill_stager", isRemote: false), turn: nil)
+                    try Task.checkCancellation()
                     if yolo.state == .explicitlyBlocked {
                         throw NSError(domain: "MemoryKindBackfill", code: 403, userInfo: [
                             NSLocalizedDescriptionKey: yolo.reason
                         ])
                     }
-                    if yolo.admitted {
-                        let staged = try await inbox.create(body, turn: nil)
+                    let staged = try await inbox.create(body, turn: nil)
+                    guard yolo.admitted, !Task.isCancelled else { return staged.id }
+                    do {
                         let admitted = try await inbox.resolve(staged.id, decision: .approved,
                             provenance: .local(decidedBy: "full_mac_yolo"))
-                        await applyResolvedKindBackfill(from: admitted, dataRoot: dataRoot)
-                        return admitted.id
-                    }
-                    return try await inbox.create(body, turn: nil).id
+                        if !Task.isCancelled { await applyResolvedKindBackfill(from: admitted, dataRoot: dataRoot) }
+                    } catch is CancellationError { return staged.id }
+                    return staged.id
                 }
             },
-            approvalIsPending: { id in try await inbox.get(id).status == "pending" },
             listPendingBackfills: {
                 let yolo = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
                     .fullMacYoloAuthority(origin: SecurityOriginContext(

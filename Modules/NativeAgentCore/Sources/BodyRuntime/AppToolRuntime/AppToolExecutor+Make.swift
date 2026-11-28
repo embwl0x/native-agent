@@ -53,7 +53,7 @@ extension AppToolExecutor {
     }
 
     /// Studio reads and writes share the versioned MakeStudio refs shown in the Work pane.
-    func runMake(verb: String, input: [String: JSONValue], turn: Turn, execution: AppActionExecution) async -> JSONValue {
+    func runMake(verb: String, input: [String: JSONValue], turn: Turn) async -> JSONValue {
         let root = securityCenter.dataRoot
         let studio = MakeStudio(dataRoot: root)
         let ref = input["ref"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
@@ -80,14 +80,22 @@ extension AppToolExecutor {
             guard content.utf8.count <= MakePreviewFace.wordsLimit else {
                 return Self.failure("invalid_input", "content is over 2 MB; write it to a file and pass path instead.")
             }
+            let folder = FileManager.default.temporaryDirectory.appendingPathComponent("make-" + UUID().uuidString, isDirectory: true)
+            let staged = folder.appendingPathComponent(name)
             do {
-                let folder = FileManager.default.temporaryDirectory.appendingPathComponent("make-" + UUID().uuidString, isDirectory: true)
-                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-                let staged = folder.appendingPathComponent(name)
-                try Data(content.utf8).write(to: staged, options: .atomic)
+                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
                 written = staged
+                try Data(content.utf8).write(to: staged, options: .atomic)
             } catch {
-                return Self.failure("make_add_failed", "The words could not be staged for Make: " + error.localizedDescription + " Nothing was added.")
+                var effects = ToolFailureError.Effects.none
+                if written != nil {
+                    written = nil
+                    do { try FileManager.default.removeItem(at: folder) }
+                    catch let cleanup as CocoaError where cleanup.code == .fileNoSuchFile || cleanup.code == .fileReadNoSuchFile {}
+                    catch { effects = .partial }
+                }
+                return Self.failure("make_add_failed", "The words could not be staged for Make: " + error.localizedDescription + " Nothing was added.",
+                    extra: ["effects": .string(effects.rawValue)])
             }
         }
         if let written {
@@ -152,7 +160,8 @@ extension AppToolExecutor {
         let ceiling = await SwiftNativeSecurityCenter(dataRoot: root).drivenAgentLaunchPermission(origin: origin, turn: turn)
         // A line of the agent's carries this turn's limits: the peers steering it and its file access, so nothing reaches the agent's hands wider through a
         // line.
-        let limits = (peers: turn.peerSteering?.checkpointSources ?? [], elevated: turn.peerSteering?.elevatedSources ?? [], fileAccess: turn.fileAccessCeiling)
+        let steering = PeerDataTaint.carried(turn: turn, surface: surface)
+        let limits = (peers: steering.sources, elevated: steering.elevated, fileAccess: turn.fileAccessCeiling)
         return await AgentJobs.commission(input.filter { !$0.key.hasPrefix("__") }, session: turn.verifiedSessionID ?? input["__session_id"]?.scalarText,
             surface: surface, ceiling: ceiling, limits: limits, origin: origin, service: agentJobs, register: Self.jobRegistrar(dataRoot: root))
     }
@@ -161,7 +170,8 @@ extension AppToolExecutor {
     /// their provenance; neither the organ's JSON nor a part can. The brief is what was asked, as a generation's prompt is.
     public static func jobRegistrar(dataRoot: URL) -> AgentJobRegistrar {
         { file, provenance in
-            let added = try MakeStudio(dataRoot: dataRoot).add(file, prompt: String(provenance.brief.prefix(4000)), madeBy: provenance.madeBy)
+            let added = try MakeStudio(dataRoot: dataRoot).add(file, prompt: String(provenance.brief.prefix(4000)),
+                madeBy: provenance.madeBy, jobID: provenance.job, peerID: provenance.peerID)
             return (added.ref, added.version.n)
         }
     }

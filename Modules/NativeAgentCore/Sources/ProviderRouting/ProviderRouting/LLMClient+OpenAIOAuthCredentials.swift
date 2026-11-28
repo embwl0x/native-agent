@@ -17,14 +17,12 @@ extension ChatGPTTransport {
     public static func preferredAuthPath(
         dataRoot: URL? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        userCodexHome: URL = defaultUserCodexHome(),
         allowSharedFallbacks: Bool = true,
-        defaultRoot: URL = PersistenceCore.defaultDataRoot(),
         authPathOverride: URL? = nil,
         source: AuthPathSource = .runtime
     ) -> URL {
         if let authPathOverride { return authPathOverride }
-        let shared = userCodexHome.appendingPathComponent("auth.json")
+        let shared = defaultUserCodexHome().appendingPathComponent("auth.json")
         let commandCLI = environment["CODEX_HOME"].flatMap { home in
             home.isEmpty ? nil : URL(fileURLWithPath: (home as NSString).expandingTildeInPath).appendingPathComponent("auth.json")
         }
@@ -45,10 +43,10 @@ extension ChatGPTTransport {
             return owned
         }
         if !allowSharedFallbacks {
-            return ownedPath(dataRoot ?? defaultRoot)
+            return ownedPath(dataRoot ?? PersistenceCore.defaultDataRoot())
         }
         let root = dataRoot ?? (!(environment["NATIVE_AGENT_DATA_ROOT"] ?? "").isEmpty
-            ? PersistenceCore.defaultDataRoot(environment: environment) : defaultRoot)
+            ? PersistenceCore.defaultDataRoot(environment: environment) : PersistenceCore.defaultDataRoot())
         return boundRootPath(root)
     }
 

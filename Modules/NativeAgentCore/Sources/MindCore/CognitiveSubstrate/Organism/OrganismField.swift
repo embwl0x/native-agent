@@ -277,14 +277,14 @@ public enum OrganismPlasticity {
     private static func learningSign(for kind: SomaticSignalKind) -> LearningSign {
         switch kind {
         case .toolSucceeded, .providerSucceeded, .providerRecovered, .phoneDeliveryReceived,
-             .deskItemClosed, .memoryCommitted,
+             .deskItemClosed,
              .dreamCompleted, .remIntegrated, .iPhoneReachable,
              .approvalResolved, .assistantSpoke:
             return .strengthen(1.2)
-        case .correctionReceived, .memoryCorrected:
+        case .correctionReceived:
             return .weaken(0.65)
-        case .toolFailed, .providerFailed, .phoneDeliveryFailed, .deskItemBlocked, .iPhoneStale,
-             .approvalRequested, .resourcePressureChanged, .organDeviated:
+        case .toolFailed, .providerFailed, .phoneDeliveryFailed, .deskItemBlocked,
+             .approvalRequested, .organDeviated:
             return .uncertain(0.35)
         case .userSpoke, .toolStarted, .toolCancelled, .providerStarted, .providerCancelled,
              .phoneDeliveryStarted, .deskItemCreated, .deskItemCancelled, .appWake, .appSleep:
@@ -312,9 +312,9 @@ public enum OrganismPlasticity {
 
     private static func defaultArousal(for kind: SomaticSignalKind) -> Double {
         switch kind {
-        case .toolFailed, .providerFailed, .resourcePressureChanged, .correctionReceived:
+        case .toolFailed, .providerFailed, .correctionReceived:
             return 0.8
-        case .deskItemBlocked, .approvalRequested, .iPhoneStale, .memoryCorrected:
+        case .deskItemBlocked, .approvalRequested:
             return 0.6
         case .toolStarted, .appWake:
             return 0.45
@@ -341,7 +341,7 @@ public enum OrganismPlasticity {
             ),
         ]
 
-        for id in bodyNodeIDs(for: signal.kind, bodySchema: bodySchema, metadata: signal.metadata) {
+        for id in bodyNodeIDs(for: signal.kind, bodySchema: bodySchema) {
             nodes.append(OrganismNode(
                 id: id,
                 kind: .body,
@@ -356,27 +356,21 @@ public enum OrganismPlasticity {
 
     private static func bodyNodeIDs(
         for kind: SomaticSignalKind,
-        bodySchema: BodySchema,
-        metadata: [String: JSONValue]
+        bodySchema: BodySchema
     ) -> [String] {
         switch kind {
         case .providerStarted, .providerSucceeded, .providerFailed, .providerCancelled, .providerRecovered:
             return ["body:provider:\(bodySchema.providersHealthy ? "healthy" : "brittle")"]
         case .toolStarted, .toolSucceeded, .toolFailed, .toolCancelled:
             return ["body:tools:\(bodySchema.toolHandsAvailable ? "available" : "unavailable")"]
-        case .memoryCommitted, .memoryCorrected:
-            return ["body:memory:\(bodySchema.memoryHealthy ? "healthy" : "brittle")"]
         case .dreamCompleted, .remIntegrated:
             return ["body:dream:\(bodySchema.dreamHealthy ? "healthy" : "brittle")"]
-        case .iPhoneReachable, .iPhoneStale, .phoneDeliveryStarted,
-             .phoneDeliveryReceived, .phoneDeliveryFailed:
+        case .iPhoneReachable, .phoneDeliveryStarted, .phoneDeliveryReceived, .phoneDeliveryFailed:
             return ["body:phone:\(bodySchema.iPhoneReachable ? "reachable" : "stale")"]
         case .approvalRequested, .approvalResolved:
             return ["body:approval:\(bodySchema.approvalChannelsOpen ? "open" : "closed")"]
         case .appWake, .appSleep:
             return ["body:mac:\(bodySchema.macAwake ? "awake" : "sleeping")"]
-        case .resourcePressureChanged:
-            return ["body:resource:\(OrganismResourcePressure.from(metadata: metadata)?.rawValue ?? bodySchema.resourcePressure.rawValue)"]
         case .userSpoke, .assistantSpoke, .correctionReceived, .deskItemCreated, .deskItemBlocked, .deskItemClosed, .deskItemCancelled,
              .organDeviated:
             return []

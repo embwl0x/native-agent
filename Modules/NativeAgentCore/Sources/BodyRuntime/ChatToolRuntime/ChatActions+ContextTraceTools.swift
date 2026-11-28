@@ -114,10 +114,12 @@ extension SwiftToolDispatcher {
     }
 
     private func readTraceSnapshot(_ call: TraceSummaryCall, sessionID: String?) async throws -> TurnTraceRecentReader.Snapshot {
-        try await TurnTraceRecentReader(dataRootOverride: dataRoot).read(now: call.anchorDate ?? call.now,
+        let settledTurn = call.kindFilter == TurnTraceEvent.dispatchSettledKind && call.turnID?.isEmpty == false ? call.turnID : nil
+        return try await TurnTraceRecentReader(dataRootOverride: dataRoot).read(now: call.anchorDate ?? call.now,
             history: call.receiptID != nil || call.completedTurns != nil || call.turnID?.isEmpty == false,
             since: call.since ?? (call.receiptID != nil ? Date.distantPast : nil),
             holding: call.receiptID != nil ? ["tool.dispatch"] : [],
+            trace: settledTurn,
             kinds: call.receiptID != nil ? ["tool.dispatch"] : nil,
             kindContains: call.receiptID == nil && call.completedTurns == nil && call.normalizedSessionFilter == nil
                 && call.turnID?.isEmpty != false

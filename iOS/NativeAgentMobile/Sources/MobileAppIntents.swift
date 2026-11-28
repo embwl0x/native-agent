@@ -1,5 +1,6 @@
 import AppIntents
 import Foundation
+import NativeAgentShared
 // Blueprint: | `MobileAppIntents.swift` | Named-agent Siri/Shortcuts actions, including authenticated foreground talk entry and ordinary Ask replies |
 
 struct MobileAgentEntity: AppEntity {
@@ -117,14 +118,20 @@ struct MobileApproveIntent: AppIntent {
     @Parameter(title: "Approval") var approval: MobileApprovalEntity
     static var parameterSummary: some ParameterSummary { Summary("Approve \(\.$approval) for \(\.$agent)") }
 
+    @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog {
         try await MobileIntentRuntime.validate(agent)
-        guard let current = try await MobileApprovalQuery().entities(for: [approval.id]).first else {
+        guard try await MobileApprovalQuery().entities(for: [approval.id]).first != nil else {
             throw MobileIntentRuntime.failure("This request is no longer pending.")
         }
-        try await requestConfirmation(dialog: "Approve \(current.title)? \(current.detail)")
-        try await MobileIntentRuntime.decide(id: current.id, approve: true)
-        return .result(dialog: "Approved \(current.title).")
+        let (row, submission) = try await iCloudSyncEngine.shared.inboxDecision(id: approval.id, approve: true)
+        guard submission.expectedPageRevision != nil else {
+            throw MobileIntentRuntime.failure("Read the page again before acting.")
+        }
+        let detail = row.detail.map { " " + $0 } ?? ""
+        try await requestConfirmation(dialog: "Approve \(row.title)?\(detail)")
+        try await MobileIntentRuntime.decide(submission)
+        return .result(dialog: "Approved \(row.title).")
     }
 }
 

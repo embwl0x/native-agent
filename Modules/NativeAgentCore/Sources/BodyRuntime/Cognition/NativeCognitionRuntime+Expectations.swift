@@ -8,8 +8,7 @@ import DeskCore
 // Blueprint: | `NativeCognitionRuntime+Expectations.swift` | `NativeCognitionRuntime`. |
 
 // Compose source evidence here while the organism owns its bounded register, prediction ledger and reads.
-// Use canonical Desk plans, staged approvals, unanswered completions and peer jobs; unavailable stores cannot invent placeholders.
-// Only bounded source names or identifiers cross, never bodies; source stores remain read-only.
+// Peer waits have no time boundary. Answers bring relief, failures and external stops bring disappointment, and handoffs and chosen stops close quietly.
 // Coalesce invalidations and real horizon boundaries on the existing residual deadline without polling.
 // Deliver horizonRefresh through the kernel's somatic input so anticipation updates its canonical ledger alone.
 
@@ -20,7 +19,6 @@ extension NativeCognitionRuntime {
 
     /// Approval age supplies an attention horizon because the inbox has no expiry; it imposes no deadline on the person.
     static let horizonApprovalWindow: TimeInterval = 24 * 60 * 60
-    static let horizonPeerReplyWindow: TimeInterval = 30 * 60
     /// Small per-source valence guesses guide anticipation, never claim measurement; the whole-register ceiling is 0.15 per dimension.
     static func horizonValenceGuess(for kind: OrganismHorizonSourceKind) -> Double {
         switch kind {
@@ -81,31 +79,35 @@ extension NativeCognitionRuntime {
         let at = now()
         let settled = OrganismHorizonRegister.settled(in: before)
         let open = OrganismHorizonRegister.open(in: before)
-        let composed = await composeHorizonSources(at: at)
+        let composed = await composeHorizonSources(at: at, held: before)
+        let expected = composed.tokens.count + composed.peerWaitCount
         // With no open, settled or expected rows, send no signal so a quiet machine stays idle.
-        let facing = !settled.isEmpty || !open.isEmpty || !composed.tokens.isEmpty
+        let facing = !settled.isEmpty || !open.isEmpty || expected > 0
         let incomplete = OrganismHorizonSourceKind.allCases.map(\.rawValue).filter { !composed.completeKinds.contains($0) }
         let result = MindClockResult(incomplete.isEmpty ? (facing ? "refreshed" : "nothing") : (facing ? "partial" : "unavailable"),
-            "\(open.count) open, \(settled.count) settled, \(composed.tokens.count) expected; unreadable or truncated source kinds remain holding.", fields: [
+            "\(open.count) open, \(settled.count) settled, \(expected) expected"
+                + (incomplete.isEmpty ? "." : "; \(incomplete.joined(separator: ", ")) unreadable or truncated, so what they hold stays open."), fields: [
             "open": .int(Int64(open.count)), "settled": .int(Int64(settled.count)),
-            "expected": .int(Int64(composed.tokens.count)),
+            "expected": .int(Int64(expected)),
             "completeKinds": .array(composed.completeKinds.map(JSONValue.string)),
             "incompleteKinds": .array(incomplete.map(JSONValue.string))
-        ], yield: open.count + settled.count + composed.tokens.count)
+        ], yield: open.count + settled.count + expected)
         guard facing else { return result }
 
         for row in settled {
             await announceHorizonResolution(row, at: at)
         }
 
+        var metadata: [String: JSONValue] = [
+            OrganismHorizonRegister.metadataKey: .array(composed.tokens.map(JSONValue.string)),
+        ]
+        metadata[OrganismHorizonRegister.peerJobsKey] = composed.peerJobs
         await ingestOrganismSignal(
             kind: .horizonRefresh,
             sourceOrgan: OrganismHorizonRegister.sourceOrgan,
             // Keep activation at its floor because horizon refresh must remain chemically inert.
             intensity: 0,
-            metadata: [
-                OrganismHorizonRegister.metadataKey: .array(composed.tokens.map(JSONValue.string)),
-            ],
+            metadata: metadata,
             persistSynchronously: false
         )
         // Refresh prunes announced rows and expires horizons without verdicts; retain one coalesced follow-up to feel waiting.
@@ -152,13 +154,16 @@ extension NativeCognitionRuntime {
         case .pending:
             return
         }
+        let moment = horizon.peerJobID == nil
+            ? String(format: "%.0f", row.lastUpdatedAt.timeIntervalSince1970.rounded(.towardZero) + 0)
+            : phase
         let event = CognitiveEvent(
             // Derive IDs from the moment and resolution so repeated reads cannot create repeated felt events.
-            id: "horizon:\(row.id):\(String(format: "%.0f", row.lastUpdatedAt.timeIntervalSince1970.rounded(.towardZero) + 0))",
+            id: "horizon:\(row.id):\(moment)",
             kind: .organismResolutionFelt,
             subject: CognitiveSubjectReference(
                 type: "organism_horizon",
-                id: horizon.sourceKind == .statedPlan ? row.id : "\(horizon.sourceKind.rawValue):\(horizon.label)",
+                id: horizon.sourceKind == .statedPlan || horizon.peerJobID != nil ? row.id : "\(horizon.sourceKind.rawValue):\(horizon.label)",
                 label: OrganismHorizonRegister.resolutionPathLabel
             ),
             sourceClass: .observed,
@@ -173,7 +178,9 @@ extension NativeCognitionRuntime {
                 "horizonSubject": .string(label),
             ]
         )
-        if await substrate.ingestResident(event).accepted {
+        if horizon.peerJobID != nil {
+            await substrate.ingest(event)
+        } else if await substrate.ingestResident(event).accepted {
             scheduleDirtyMicrocycle(
                 reason: "horizon_resolution:\(phase)"
             )
@@ -194,8 +201,8 @@ extension NativeCognitionRuntime {
     }
 
     private func composeHorizonSources(
-        at now: Date
-    ) async -> (tokens: [String], completeKinds: [String]) {
+        at now: Date, held: OrganismPredictionLedger
+    ) async -> (tokens: [String], completeKinds: [String], peerJobs: JSONValue?, peerWaitCount: Int) {
         async let statedPlans = statedPlanSources(at: now)
         async let stagedApprovals = stagedApprovalSources(at: now)
         async let openQuestions = openQuestionSources(at: now)
@@ -203,8 +210,8 @@ extension NativeCognitionRuntime {
             await statedPlans,
             await stagedApprovals,
             await openQuestions,
-            peerReplySources(at: now),
         ]
+        let peer = peerReplySources(held: held)
         var rows = readings.flatMap { reading in
             reading.rows.map { (token: $0.token, dueAt: $0.dueAt, kind: reading.kind) }
         }
@@ -213,10 +220,14 @@ extension NativeCognitionRuntime {
             return lhs.token < rhs.token
         }
         let truncatedKinds = Set(rows.dropFirst(OrganismHorizonRegister.maximumOpen).map(\.kind.rawValue))
+        var completeKinds = readings.filter { $0.complete && !truncatedKinds.contains($0.kind.rawValue) }.map(\.kind.rawValue)
+        if peer.jobs != nil { completeKinds.append(OrganismHorizonSourceKind.peerReply.rawValue) }
         return (
             // Cap nearest-first before metadata bounds so truncation cannot choose sources by composition order instead of due time.
             rows.prefix(OrganismHorizonRegister.maximumOpen).map(\.token),
-            readings.filter { $0.complete && !truncatedKinds.contains($0.kind.rawValue) }.map(\.kind.rawValue).sorted()
+            completeKinds.sorted(),
+            peer.jobs,
+            peer.waitCount
         )
     }
 
@@ -345,32 +356,37 @@ extension NativeCognitionRuntime {
         return HorizonSourceReading(kind: .openQuestion, rows: [token], complete: true)
     }
 
-    /// Group delegated jobs by bridge source so multiple jobs to one peer form one expectation.
-    /// Topic slugs and completion text are content and cannot cross here.
-    private func peerReplySources(at now: Date) -> HorizonSourceReading {
-        // Scope jobs to this install's bridge root so another install's work cannot create expectations here.
-        let projector = DelegationStatusProjector(
-            configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot),
-            dataRoot: dataRoot
-        )
-        let read = projector.recentJobsWithAvailability()
-        var seen: Set<String> = []
-        var out: [(token: String, dueAt: Date)] = []
-        for job in read.jobs {
-            guard job.completedAt == nil else { continue }
-            let peer = job.source.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            guard !peer.isEmpty, !seen.contains(peer) else { continue }
-            guard let created = job.createdAt.flatMap(DeskClock.parseISO) else { continue }
-            guard let token = token(
-                .peerReply,
-                label: peer,
-                natural: created.addingTimeInterval(Self.horizonPeerReplyWindow),
-                at: now
-            ) else { continue }
-            seen.insert(peer)
-            out.append(token)
+    private func peerReplySources(
+        held: OrganismPredictionLedger
+    ) -> (jobs: JSONValue?, waitCount: Int) {
+        guard let jobs = try? AgentJobStore(dataRoot: dataRoot).jobs() else { return (nil, 0) }
+        let heldIDs = Set(held.predictions.values.filter { $0.status == .pending }.compactMap { $0.horizon?.peerJobID })
+        let missing = heldIDs.subtracting(jobs.map(\.id)).sorted()
+        var tokens: [String] = []
+        var waitCount = 0
+        for job in jobs where !job.isOwn {
+            let end: OrganismHorizonRegister.PeerTransition
+            switch job.state {
+            case .working:
+                tokens.append(OrganismHorizonRegister.encodePeerWait(
+                    contactID: job.contact, jobID: job.id, label: job.name, startedAt: job.startedAt,
+                    valence: Self.horizonValenceGuess(for: .peerReply)
+                ))
+                waitCount += 1
+                continue
+            case .needsYou: end = .close
+            case .done, .delivered: end = .satisfied
+            case .failed: end = .violated
+            case .stopped:
+                end = job.stoppedByHer != true
+                    && (job.stoppedByHer == false || job.restored == true) ? .violated : .close
+            }
+            guard heldIDs.contains(job.id) else { continue }
+            tokens.append(OrganismHorizonRegister.encodePeerEnd(
+                contactID: job.contact, jobID: job.id, transition: end, endedAt: job.endedAt
+            ))
         }
-        // Separate empty inventory from unreadable evidence; neither supplies an outcome.
-        return HorizonSourceReading(kind: .peerReply, rows: out, complete: read.allStoresReadable)
+        return (.object(["updates": .array(tokens.map(JSONValue.string)),
+                         "missing": .array(missing.map(JSONValue.string))]), waitCount)
     }
 }

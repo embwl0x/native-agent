@@ -10,7 +10,7 @@ public enum PartReachGrant: Hashable, Sendable {
         case networkPublic = "network_public", computerFiles = "computer_files", arbitraryFileWrite = "arbitrary_file_write"
         case network, shell, model, calendar, reminders, contacts, hands, screenWatch = "screen.watch"
     }
-    case flag(StaticFlag), secret(String), appRead(String), appWrite(String)
+    case flag(StaticFlag), secret(String), appRead(String), appWrite(String), appURL(String, String)
 
     public init?(_ name: String) {
         if let flag = StaticFlag(rawValue: name) { self = .flag(flag); return }
@@ -18,12 +18,23 @@ public enum PartReachGrant: Hashable, Sendable {
         guard parts.count == 2 else { return nil }
         let value = String(parts[1])
         if parts[0] == "secret", Keyring.validName(value) { self = .secret(value); return }
-        guard !value.isEmpty, value.allSatisfy({ $0.isLetter || $0.isNumber || "._-".contains($0) }) else { return nil }
+        if parts[0] == "app_url" {
+            let target = value.split(separator: ":", omittingEmptySubsequences: false)
+            guard target.count == 2, let bundleID = OpenURLClassification.normalizedBundleID(String(target[0])),
+                  let scheme = OpenURLClassification.normalizedScheme(String(target[1])),
+                  OpenURLClassification.classify(bundleID: bundleID, scheme: scheme) != .forbidden else { return nil }
+            self = .appURL(bundleID, scheme)
+            return
+        }
+        guard Self.isAppID(value) else { return nil }
         switch parts[0] {
         case "app_read": self = .appRead(value)
         case "app_write": self = .appWrite(value)
         default: return nil
         }
+    }
+    static func isAppID(_ value: String) -> Bool {
+        !value.isEmpty && value.allSatisfy { $0.isLetter || $0.isNumber || "._-".contains($0) }
     }
     public static func parse(_ names: [String]) throws -> Set<Self> {
         var grants = Set<Self>()
@@ -70,6 +81,7 @@ extension AbilityStore {
         public let signal: String
         public let part: String?
         public let payload: [String: JSONValue]
+        public let origin: WakeOrigin
     }
     public static let partKeys: Set<String> = ["reach", "wake", "face", "resident", "learned", "choices", "answers"]
     public static let partActionPattern = "^[a-z][a-z0-9_]*[.][a-z][a-z0-9_.]*$"

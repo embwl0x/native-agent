@@ -4,10 +4,10 @@ import NativeAgentShared
 import PersistenceCore
 import NativeAgentCore
 import Darwin
-import AppKit
 import MacNerves
 import DeskCore
 import SenseCore
+import AppKit
 // Blueprint: | `DelegationCaches.swift` | Read acceleration over unchanged file stamps |
 
 /// Reuse parses by regular-file stamp, but rerun time-dependent projections on every read.

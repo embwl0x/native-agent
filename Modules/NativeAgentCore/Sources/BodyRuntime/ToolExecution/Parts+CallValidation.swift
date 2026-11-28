@@ -8,13 +8,13 @@ import DeskCore
 extension Parts {
     /// The runner turns a host call into an app action unless the broker owns that primitive. Save uses that same inventory, before any staged write.
     func checkedCallShapes(_ calls: OwnedProgram.Calls, id: String, actions: [String], selfSchema: JSONValue,
-        invocation: Invocation) async throws -> JSONValue {
+        invocation: Invocation, saveRepair: (([String: JSONValue], String) -> SaveRefusal)? = nil) async throws -> JSONValue {
         guard let host = invocation.host else {
             throw PartError.invalid("Checking calls requires the originating app door. Nothing was saved.")
         }
         if let refusal = calls.refusals.first { throw PartError.invalid(refusal + " Nothing was saved.") }
         let declared = Set(try actions.map { try host.canonicalAction($0) })
-        let primitives = ToolPrimitiveBroker.operations.union(OwnedProgramRunner.hostFilePrimitives).union(["apps.call", "part.call"])
+        let primitives = ToolHost.primitives.union(OwnedProgramRunner.hostFilePrimitives)
         var shapes: [String: JSONValue] = [:]
         func shape(_ action: String) throws -> JSONValue? {
             if let known = shapes[action] { return known }
@@ -34,6 +34,13 @@ extension Parts {
         for call in calls.literal {
             if call.primitive, primitives.contains(call.spelling) { continue }
             if let given = call.given, let problem = try host.callProblem(call.id, given: given, schema: call.id == "authored." + id ? selfSchema : nil) {
+                if saveRepair != nil {
+                    let detail = "Check args for \(call.id) at line \(call.line) against its current action form."
+                    throw SaveRefusal(failure: SenseFailure(code: "stale_dependency", message: detail + " Nothing was saved.",
+                        remedy: .object(["kind": .string("correct_arguments"), "instruction": .string(detail),
+                            "action": .string(call.id), "line": .int(Int64(call.line)), "argument_path": .string("args"),
+                            "next_call": .null, "try_instead": .null])))
+                }
                 var failure = Self.revisionFailure("stale_dependency",
                     "Call \(call.id) at line \(call.line): \(problem). Correct this call with ability.save, then keep the reviewed version.", id: id)
                 var remedy = failure.remedy?.objectValue ?? [:]
@@ -44,25 +51,35 @@ extension Parts {
             guard checked.insert(call.id).inserted else { continue }
             guard try shape(call.id) != nil else {
                 let failure = try await unknownCall(call.id, line: call.line, host: host)
+                if saveRepair != nil { throw SaveRefusal(failure: failure) }
                 throw failure
             }
             guard try declared.contains(host.canonicalAction(call.id)) else {
                 let declaration = Set(actions + [call.id]).sorted()
-                throw ToolFailureError("""
+                let args: [String: JSONValue] = ["id": .string(id), "actions": .array(declaration.map(JSONValue.string))]
+                let instruction = """
                     Literal call \(call.id) at line \(call.line) is missing from this ability's actions. Declare \(call.id) in actions (or its applicable \
-                    reach) before saving. Nothing was saved.
-                    """,
+                    reach) before saving.
+                    """
+                let refusal = ToolFailureError(instruction + " Nothing was saved.",
                     argumentPath: "actions", accepted: "declared app action ids", effects: .none,
-                    nextCall: ToolFailureError.call("app", ["action": .string("ability.save"),
-                        "args": .object(["id": .string(id), "actions": .array(declaration.map(JSONValue.string))])]),
+                    nextCall: saveRepair == nil ? ToolFailureError.call("app", ["action": .string("ability.save"),
+                        "args": .object(args)]) : nil,
                     code: "undeclared_dependency", status: .refused,
                     instruction: "Add the named dependency to this ability's actions, then save the revision.", recovery: .correctArguments)
+                if let saveRepair {
+                    var repair = saveRepair(args, instruction)
+                    repair.dependency = refusal
+                    throw repair
+                }
+                throw refusal
             }
         }
         // Declarations themselves cannot name imaginary actions, even on a branch whose call name is computed and therefore invisible to this inspection.
         for action in actions where !checked.contains(action) && action != "authored." + id {
             guard try shape(action) != nil else {
                 let failure = try await unknownCall(action, host: host)
+                if saveRepair != nil { throw SaveRefusal(failure: failure) }
                 throw failure
             }
         }

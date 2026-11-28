@@ -295,15 +295,14 @@ public actor ChromeControlRuntime {
         // Secondary installs must preserve the primary install's native-host registration.
         manageNativeHostRegistration: Bool = !UserDefaults.standard.bool(forKey: "NativeAgentSecondaryInstall"),
         signatureFailureNote: @escaping @Sendable (String, String) async throws -> Void = { _, message in nativeLog("[NativeAgent] %@", message) },
-        authority: @escaping Authority = { origin, turn in
-            try await SwiftNativeTrustCenter(dataRoot: PersistenceCore.defaultDataRoot())
-                .authorizeChromeControlEffect(origin: origin, turn: turn)
-        }
+        authority: Authority? = nil
     ) {
         self.socketPath = socketPath
         self.conversationTabsURL = dataRoot.appendingPathComponent("chrome/conversation-tabs.json")
         self.manageNativeHostRegistration = manageNativeHostRegistration
-        self.authority = authority
+        self.authority = authority ?? { @Sendable origin, turn in
+            try await SwiftNativeTrustCenter(dataRoot: dataRoot).authorizeChromeControlEffect(origin: origin, turn: turn)
+        }
         self.signatureFailureNote = signatureFailureNote
         if FileManager.default.fileExists(atPath: conversationTabsURL.path) {
             do {

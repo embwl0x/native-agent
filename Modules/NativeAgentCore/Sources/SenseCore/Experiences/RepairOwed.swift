@@ -69,6 +69,9 @@ public enum RepairOwed {
             let value = try body()
             settle(dataRoot, operation: operation, evidence: .init(source: "attempt", id: UUID().uuidString.lowercased()))
             return value
+        } catch let stopped as CancellationError {
+            // Stop is not a failure of the work: nothing is owed for it.
+            throw stopped
         } catch {
             owe(dataRoot, id: UUID().uuidString.lowercased(), kind: .act, operation: operation, owner: owner,
                 words: words(error), lever: lever, nextCall: nextCall, tap: tap)
@@ -84,6 +87,9 @@ public enum RepairOwed {
             let value = try await body()
             settle(dataRoot, operation: operation, evidence: .init(source: "attempt", id: UUID().uuidString.lowercased()))
             return value
+        } catch let stopped as CancellationError {
+            // Stop is not a failure of the work: nothing is owed for it.
+            throw stopped
         } catch {
             owe(dataRoot, id: UUID().uuidString.lowercased(), kind: .act, operation: operation, owner: owner,
                 words: words(error), lever: lever, nextCall: nextCall, tap: tap)

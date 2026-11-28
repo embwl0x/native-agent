@@ -215,6 +215,10 @@ extension SlackSocketModeLoop {
                 prepared = ready
             }
             return try await deliverPreparedInbound(prepared, inbound: inbound)
+        } catch is CancellationError {
+            return false
+        } catch let error as URLError where error.code == .cancelled && Task.isCancelled {
+            return false
         } catch {
             await recordError(context: "inbound_delivery_journal", error: error, inbound: received)
             return false
@@ -296,6 +300,7 @@ extension SlackSocketModeLoop {
                                       handling: InboundHandling) async throws -> InboundPreparation {
         var record = record
         let hydration = await hydratingAttachments(record.resolvedRetryInbound ?? inbound)
+        guard !Task.isCancelled else { return .finished(false) }
         let hydrated = hydration.inbound
         guard hydration.notice != nil || !hydrated.text.isEmpty || !hydrated.attachments.isEmpty else {
             await recordError(
@@ -305,7 +310,6 @@ extension SlackSocketModeLoop {
             )
             return .finished(false)
         }
-        guard !Task.isCancelled else { return .finished(false) }
         // A replayed event keeps its run and conversation, so a row the agent's turn already saved stays the one row.
         let sessionId: String
         if let held = record.assistantSessionId { sessionId = held }
@@ -348,7 +352,7 @@ extension SlackSocketModeLoop {
         if let readBy = reply.readBy {
             // The agent's turn in progress read it; that turn's reply answers it, so this event posts nothing.
             _ = try await deliveryJournal.markSteered(eventId: inbound.eventId, turnID: readBy)
-            await recordReceipt(kind: "steered", inbound: inbound, reply: "")
+            await recordReceipt(inbound: inbound)
             return .finished(true)
         }
         let prepared = Self.preparedReply(text: reply.text, attachments: reply.attachments)
@@ -471,7 +475,7 @@ extension SlackSocketModeLoop {
         }
         _ = try await deliveryJournal.markDelivered(eventId: inbound.eventId)
         try await settleCheckpoint(record, verdict: "completed")
-        await recordReceipt(kind: "reply", inbound: inbound, reply: prepared.text)
+        await recordReceipt(inbound: inbound)
         await writeState([
             "lastDeliveryOutcome": .string("delivered"),
             "lastDeliveryOutcomeEventId": .string(inbound.eventId),
@@ -489,7 +493,7 @@ extension SlackSocketModeLoop {
         guard let turnID = try SwiftNativeChatOrchestrationClient.silentTurn(
             dataRoot: dataRoot, sessionId: sessionId, runId: runId) else { return false }
         _ = try await deliveryJournal.markSilent(eventId: inbound.eventId, turnID: turnID)
-        await recordReceipt(kind: "silence", inbound: inbound, reply: "")
+        await recordReceipt(inbound: inbound)
         return true
     }
 
@@ -598,7 +602,7 @@ extension SlackSocketModeLoop {
             return await settleUnconfirmedReply(record, detail: "Cannot reconcile reply without its prepared artifact and bot identity")
         }
         let nextPart = record.confirmedTextCount
-        guard let text = prepared.textParts.dropFirst(nextPart).first else {
+        guard !prepared.textParts.dropFirst(nextPart).isEmpty else {
             // Text is confirmed already; an uncertain upload has no message metadata that could prove its acceptance.
             return await settleUnconfirmedReply(record, detail: "Text reply accepted; image completion is unconfirmed")
         }
@@ -617,7 +621,7 @@ extension SlackSocketModeLoop {
             method = "conversations.history"
         }
         do {
-            let response = try await slackAPI(method: method, httpMethod: "GET", params: params)
+            let response = try await slackAPI(method: method, params: params)
             guard Self.hasUniqueAcceptedReply(
                 response: response,
                 inbound: inbound,
@@ -627,10 +631,11 @@ extension SlackSocketModeLoop {
                 return await settleUnconfirmedReply(record, detail: "Slack history does not uniquely prove acceptance")
             }
             _ = try await deliveryJournal.confirmReplyPart(eventId: inbound.eventId, isText: true)
-            await recordReceipt(kind: "reply_part_reconciled", inbound: inbound, reply: text)
+            await recordReceipt(inbound: inbound)
             // Continue the saved artifact at the next unconfirmed part, under the same handler claim.
             return await handleClaimedInbound(inbound)
         } catch {
+            guard !Task.isCancelled else { return false }
             return await settleUnconfirmedReply(record, detail: "Slack reply reconciliation unavailable: \(Self.redact(String(describing: error)))")
         }
     }

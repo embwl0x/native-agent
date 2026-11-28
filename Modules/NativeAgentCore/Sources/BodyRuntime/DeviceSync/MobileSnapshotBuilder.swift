@@ -1,5 +1,3 @@
-import CommonCrypto
-import AppKit
 import Foundation
 import PersistenceCore
 import NativeAgentShared
@@ -9,7 +7,9 @@ import MacNerves
 import DeskCore
 import SenseCore
 import ProviderRouting
-// Blueprint: | `MobileSnapshotBuilder.swift` | Snapshot integrity vocabulary and bounded mobile projection construction |
+import CommonCrypto
+import AppKit
+// Blueprint: | `MobileSnapshotBuilder.swift` | Snapshot integrity, bounded mobile projections and the signed Desk table drawing |
 
 /// Cached digests cannot prove file integrity after external replacement; reconcile exact phone-readable files on observation and repair.
 struct SnapshotFileDigest: Codable, Equatable, Sendable {
@@ -43,9 +43,9 @@ enum MacSyncSnapshotIntegrity {
     /// Repair only current manifest files; stale digest keys cannot justify rebuilding files outside the phone contract.
     static func reconcile(
         digests: [String: SnapshotFileDigest],
-        in directory: URL,
-        managedFilenames: Set<String> = Set(NAMobileSnapshotGroup.allCases.flatMap(\.filenames))
+        in directory: URL
     ) -> Report {
+        let managedFilenames = Set(NAMobileSnapshotGroup.allCases.flatMap(\.filenames))
         let fileManager = FileManager.default
         var retained: [String: SnapshotFileDigest] = [:]
         var missing: [String] = []
@@ -205,10 +205,11 @@ actor MobileSnapshotBuilder {
     }
 
     /// Whole pages share the phone's file budget; a page that cannot fit carries its own unavailable cause.
-    func faces(_ snapshots: [String: PartFaceSnapshot]) throws -> Data {
+    func faces(_ snapshots: [String: PartFaceSnapshot], studio: MakeStudio) throws -> Data {
         let encoder = TurnSummaryComputer.makeEncoder()
         var pages = try snapshots.map { id, snapshot in
-            (id: id, key: try encoder.encode(id), snapshot: snapshot, data: try encoder.encode(snapshot))
+            let page = id == "desk" ? Self.withTableText(snapshot, text: nil) : snapshot
+            return (id: id, key: try encoder.encode(id), snapshot: page, data: try encoder.encode(page))
         }.sorted { $0.id < $1.id }
         func file() -> Data {
             var data = Data("{".utf8)
@@ -234,15 +235,77 @@ actor MobileSnapshotBuilder {
                         + "Open it on your Mac or reduce its page content."), owed: snapshot.owed)
             let replacement = try encoder.encode(unavailable)
             pages = pages.map { entry in
-                entry.id == page.id ? (entry.id, entry.key, entry.snapshot, replacement) : entry
+                entry.id == page.id ? (entry.id, entry.key, unavailable, replacement) : entry
             }
             data = file()
         }
         guard data.count <= maximumFileBytes else {
             throw DeviceSyncError.payloadTooLarge(actualBytes: data.count, maximumBytes: maximumFileBytes)
         }
+        if let index = pages.firstIndex(where: { $0.id == "desk" }),
+           pages[index].snapshot.status == .ready, let face = pages[index].snapshot.face,
+           let block = face.sections.compactMap(\.block).first(where: Self.isTable),
+           let revision = block.revision, let drawing = try Self.tableDrawing(revision, studio: studio) {
+            pages[index].data = try encoder.encode(Self.withTableText(pages[index].snapshot, text: drawing))
+            let drawn = file()
+            if drawn.count <= maximumFileBytes {
+                do {
+                    _ = try NAMobileSnapshotStatusCodec.encode(group: .faces, files: ["faces.json": try Self.wireBytes(drawn)])
+                    return drawn
+                } catch DeviceSyncError.payloadTooLarge { }
+            }
+        }
         _ = try NAMobileSnapshotStatusCodec.encode(group: .faces, files: ["faces.json": try Self.wireBytes(data)])
         return data
+    }
+
+    private static func isTable(_ block: PartFace.Block) -> Bool {
+        block.kind == "leaf" && block.leaf == BoardDocument.type
+            && block.ref == BoardDocument.tableRef && block.key == "piece:" + BoardDocument.tableRef
+    }
+
+    private static func withTableText(_ snapshot: PartFaceSnapshot, text: String?) -> PartFaceSnapshot {
+        guard snapshot.status == .ready, var face = snapshot.face else { return snapshot }
+        let leaves = face.sections.indices.filter { face.sections[$0].block.map(Self.isTable) == true }
+        guard let first = leaves.first else { return snapshot }
+        for index in leaves {
+            face.sections[index].block?.text = index == first ? text : nil
+        }
+        return PartFaceSnapshot(part: snapshot.part, version: snapshot.version, sourceEpoch: snapshot.sourceEpoch,
+            status: snapshot.status, face: face, error: snapshot.error, owed: snapshot.owed, levers: snapshot.levers,
+            keyLevers: snapshot.keyLevers, pageRevision: snapshot.pageRevision)
+    }
+
+    private static func tableDrawing(_ revision: String, studio: MakeStudio) throws -> String? {
+        guard let number = Int(revision), number >= 0 else { return nil }
+        let ref = BoardDocument.tableRef
+        let board: BoardDocument
+        if number == 0 { board = BoardDocument() }
+        else {
+            guard let meta = try? studio.readMeta(ref), let version = meta.versions.first(where: { $0.n == number }),
+                  let retained = try? studio.board(ref, version) else { return nil }
+            board = retained
+        }
+        let words: Set<String> = ["id", "type", "text", "color", "kind", "size", "from", "to", "fromSide", "toSide", "label", "stroke"]
+        let numbers: Set<String> = ["x", "y", "w", "h", "width"]
+        let elements = board.elements.map { element in
+            var fields: [String: PartFace.Value] = [:]
+            for (key, value) in element.fields {
+                if words.contains(key), case .string(let text) = value {
+                    fields[key] = .string(NativeAppSecretRedactor.redactText(text))
+                } else if numbers.contains(key), value.doubleValue != nil {
+                    fields[key] = value
+                } else if key == "crossed", case .bool = value {
+                    fields[key] = value
+                }
+            }
+            if element.type == "stroke" { fields["points"] = .array(element.numbers.map(PartFace.Value.double)) }
+            return PartFace.Value.object(fields)
+        }
+        let drawing = PartFace.Value.object(["board": .int(1), "elements": .array(elements)])
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return String(decoding: try encoder.encode(drawing), as: UTF8.self)
     }
 
     func status(group: NAMobileSnapshotGroup, directory: URL, committed: [String: Data]) async throws -> String? {

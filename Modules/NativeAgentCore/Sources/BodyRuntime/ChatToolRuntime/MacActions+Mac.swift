@@ -236,17 +236,6 @@ extension MacActions {
                     """
             ),
         ])
-        schemas.append(ActionDescriptor(MacMediaArgs.self,
-            name: "mac_media",
-            availability: .system, run: MacMediaArgs.local,
-            toolClass: .write, reach: .person,
-            description: """
-                Control the Mac's live Now Playing app with a system media key: toggle, next or previous across Music, Spotify, browsers and \
-                podcasts. The player process must be known and obeys its integration's Write switch where one exists. The receipt names the \
-                observed player and key sent without confirming playback. Requires Full Mac system access; never launches a player to resolve \
-                it. For idempotent play, resume or pause use the player's own action.
-                """
-        ))
         schemas.append(ActionDescriptor(MacVolumeArgs.self,
             name: "mac_volume",
             availability: .system, run: MacVolumeArgs.local,
@@ -397,7 +386,9 @@ extension MacActions {
                     append refuses. type with at clicks there then types into the editor that takes focus. Targetless type uses current \
                     editable focus in replace mode, even with frame_id and no handle. An unreadable editor receives keys with an unverified \
                     receipt and a pixel look offered; unknown or noneditable focus refuses. A bare scroll targets the window’s main content. \
-                    A named scroll can use a target whose enabled state is false or unknown. \
+                    A named scroll can use a target whose enabled state is false or unknown. An exact type/replace with handle and frame_id can declare \
+                    after:{expect:"text",value:"<lowercase UTF-8 SHA-256>"} and cleanup:{verb:"restore_text",when:"mismatch"}. \
+                    Cleanup runs only on an observed mismatch while the same field still holds the write. Stop skips cleanup. \
                     Key chords post keys directly. repeat re-resolves each attempt and stops on ambiguity, drift, disappearance or time limit. \
                     holding wraps physical input in held keys/modifiers. Parameter help retains each gesture’s controls. With app behind, \
                     accessibility acts in the background; menus/keys/real input stop with needs_front unless the task explicitly requests \
@@ -597,16 +588,12 @@ private struct MacGitStatusArgs: MacWireArgs {
 }
 
 private struct MacGitDiffArgs: MacWireArgs {
-    static let cwdField = DoorFieldDescriptor.string("cwd", """
-        Repository directory. Defaults to a verified NativeAgent source checkout when present, otherwise the canonical \
-        NativeAgent workspace.
-        """)
     static let stagedField = DoorFieldDescriptor.bool("staged", "Use --staged.")
     static let sinceField = DoorFieldDescriptor.string("since", """
         Optional committed history boundary: today means local midnight; otherwise a Git date. Cannot combine with staged.
         """)
     static let pathField = DoorFieldDescriptor.string("path", "Optional path filter.")
-    static let doorFields: [DoorFieldDescriptor] = [cwdField, stagedField, sinceField, pathField]
+    static let doorFields: [DoorFieldDescriptor] = [MacGitStatusArgs.cwdField, stagedField, sinceField, pathField]
 
     let cwd: String?
     let staged: Bool?
@@ -614,7 +601,7 @@ private struct MacGitDiffArgs: MacWireArgs {
     let path: String?
 
     init(door: inout DoorObjectDecoder) throws(DoorDecodeError) {
-        cwd = try door.string(Self.cwdField)
+        cwd = try door.string(MacGitStatusArgs.cwdField)
         staged = try door.bool(Self.stagedField)
         since = try door.string(Self.sinceField)
         path = try door.string(Self.pathField)
@@ -622,7 +609,7 @@ private struct MacGitDiffArgs: MacWireArgs {
 
     var wire: [String: JSONValue] {
         var fields: [String: JSONValue] = [:]
-        fields[Self.cwdField.name] = cwd.map(JSONValue.string)
+        fields[MacGitStatusArgs.cwdField.name] = cwd.map(JSONValue.string)
         fields[Self.stagedField.name] = staged.map(JSONValue.bool)
         fields[Self.sinceField.name] = since.map(JSONValue.string)
         fields[Self.pathField.name] = path.map(JSONValue.string)
@@ -631,14 +618,9 @@ private struct MacGitDiffArgs: MacWireArgs {
 }
 
 private struct MacGitLogArgs: MacWireArgs {
-    static let cwdField = DoorFieldDescriptor.string("cwd", """
-        Repository directory. Defaults to a verified NativeAgent source checkout when present, otherwise the canonical \
-        NativeAgent workspace.
-        """)
     static let limitField = DoorFieldDescriptor.int("limit", "Commit count, default 10, capped at 100.")
     static let sinceField = DoorFieldDescriptor.string("since", "Optional history boundary: today means local midnight; otherwise a Git date.")
-    static let pathField = DoorFieldDescriptor.string("path", "Optional path filter.")
-    static let doorFields: [DoorFieldDescriptor] = [cwdField, limitField, sinceField, pathField]
+    static let doorFields: [DoorFieldDescriptor] = [MacGitStatusArgs.cwdField, limitField, sinceField, MacGitDiffArgs.pathField]
 
     let cwd: String?
     let limit: DoorNumberLiteral?
@@ -646,41 +628,37 @@ private struct MacGitLogArgs: MacWireArgs {
     let path: String?
 
     init(door: inout DoorObjectDecoder) throws(DoorDecodeError) {
-        cwd = try door.string(Self.cwdField)
+        cwd = try door.string(MacGitStatusArgs.cwdField)
         limit = try door.numberLiteral(Self.limitField)
         since = try door.string(Self.sinceField)
-        path = try door.string(Self.pathField)
+        path = try door.string(MacGitDiffArgs.pathField)
     }
 
     var wire: [String: JSONValue] {
         var fields: [String: JSONValue] = [:]
-        fields[Self.cwdField.name] = cwd.map(JSONValue.string)
+        fields[MacGitStatusArgs.cwdField.name] = cwd.map(JSONValue.string)
         fields[Self.limitField.name] = limit?.wire
         fields[Self.sinceField.name] = since.map(JSONValue.string)
-        fields[Self.pathField.name] = path.map(JSONValue.string)
+        fields[MacGitDiffArgs.pathField.name] = path.map(JSONValue.string)
         return fields
     }
 }
 
 private struct MacRepoDirtySummaryArgs: MacWireArgs {
-    static let cwdField = DoorFieldDescriptor.string("cwd", """
-        Repository directory. Defaults to a verified NativeAgent source checkout when present, otherwise the canonical \
-        NativeAgent workspace.
-        """)
     static let logLimitField = DoorFieldDescriptor.int("log_limit", "Recent commit count, default 5, capped at 20.")
-    static let doorFields: [DoorFieldDescriptor] = [cwdField, logLimitField]
+    static let doorFields: [DoorFieldDescriptor] = [MacGitStatusArgs.cwdField, logLimitField]
 
     let cwd: String?
     let logLimit: DoorNumberLiteral?
 
     init(door: inout DoorObjectDecoder) throws(DoorDecodeError) {
-        cwd = try door.string(Self.cwdField)
+        cwd = try door.string(MacGitStatusArgs.cwdField)
         logLimit = try door.numberLiteral(Self.logLimitField)
     }
 
     var wire: [String: JSONValue] {
         var fields: [String: JSONValue] = [:]
-        fields[Self.cwdField.name] = cwd.map(JSONValue.string)
+        fields[MacGitStatusArgs.cwdField.name] = cwd.map(JSONValue.string)
         fields[Self.logLimitField.name] = logLimit?.wire
         return fields
     }
@@ -737,28 +715,6 @@ private struct MacRestartAppArgs: DoorArgs {
 
     init(door: inout DoorObjectDecoder) throws(DoorDecodeError) {
         reason = try door.requiredString(Self.reasonField)
-    }
-}
-
-private struct MacMediaArgs: MacWireArgs {
-    static let actionField = DoorFieldDescriptor("action", ToolSchema.obj([("type", .string("string")),
-        ("enum", .array(["play", "resume", "pause", "toggle", "next", "skip", "previous"].map(JSONValue.string))),
-        ("description", .string("""
-            toggle sends the play-pause key; next / skip send next; previous sends previous. play / resume / pause refuse rather \
-            than toggle an unknown playback state.
-            """))]), required: true)
-    static let doorFields: [DoorFieldDescriptor] = [actionField]
-
-    let action: String
-
-    init(door: inout DoorObjectDecoder) throws(DoorDecodeError) {
-        action = try door.requiredString(Self.actionField)
-    }
-
-    var wire: [String: JSONValue] {
-        var fields: [String: JSONValue] = [:]
-        fields[Self.actionField.name] = JSONValue.string(action)
-        return fields
     }
 }
 
@@ -1216,7 +1172,30 @@ private struct MacActArgs: MacWireArgs {
     static let intervalField = DoorFieldDescriptor.number("interval", "Optional pause between repeated attempts.", minimum: 0, maximum: 2)
     static let holdingField = DoorFieldDescriptor("holding", holdingSchema, required: false)
     static let buttonField = DoorFieldDescriptor("button", buttonSchema, required: false)
-    static let doorFields: [DoorFieldDescriptor] = [verbField, targetField, handleField, frameIdField, textField, modeField, directionField, scrollAmountField, toField, atField, fromField, imageField, toAppField, againField, stepsField, appField, frontField, secondsField, repeatCountField, intervalField, holdingField, buttonField]
+    static let afterField = DoorFieldDescriptor("after", .object([
+        "type": .string("object"), "additionalProperties": .bool(false),
+        "description": .string("Only for an exact non-secret type/replace with handle and frame_id. The text predicate is supported. surface, state, selected, focus, dismissed, window_title and ax_path_exists are unavailable."),
+        "required": .array([.string("expect"), .string("value")]),
+        "properties": ToolSchema.obj([
+            ("expect", ToolSchema.enumStringSchema(["text"])),
+            ("value", .object(["type": .string("string"), "pattern": .string("^[0-9a-f]{64}$"),
+                "description": .string("Lowercase SHA-256 of the expected complete UTF-8 AXValue.")])),
+            ("target", ToolSchema.strSchema("Optional. Use the deed's same handle.")),
+            ("within_ms", ToolSchema.intSchema("Optional settling budget.", minimum: 0, maximum: MacActClosedLoop.maxWaitMs)),
+        ]),
+    ]), required: false)
+    static let cleanupField = DoorFieldDescriptor("cleanup", .object([
+        "type": .string("object"), "additionalProperties": .bool(false),
+        "description": .string("With after, restore the captured prior AXValue once on an observed mismatch if the same field still holds the write and Stop has not arrived. press, key, dismiss and unobserved are unavailable."),
+        "required": .array([.string("verb"), .string("when")]),
+        "properties": ToolSchema.obj([
+            ("verb", ToolSchema.enumStringSchema(["restore_text"])),
+            ("when", ToolSchema.enumStringSchema(["mismatch"])),
+            ("target", ToolSchema.strSchema("Optional. Use the deed's same handle.")),
+            ("reversible_only", .object(["type": .string("boolean"), "const": .bool(true)])),
+        ]),
+    ]), required: false)
+    static let doorFields: [DoorFieldDescriptor] = [verbField, targetField, handleField, frameIdField, textField, modeField, directionField, scrollAmountField, toField, atField, fromField, imageField, toAppField, againField, stepsField, appField, frontField, secondsField, repeatCountField, intervalField, holdingField, buttonField, afterField, cleanupField]
 
     let verb: String?
     let target: JSONValue?
@@ -1240,6 +1219,8 @@ private struct MacActArgs: MacWireArgs {
     let interval: DoorNumberLiteral?
     let holding: String?
     let button: String?
+    let after: JSONValue?
+    let cleanup: JSONValue?
 
     init(door: inout DoorObjectDecoder) throws(DoorDecodeError) {
         verb = try door.string(Self.verbField)
@@ -1264,6 +1245,8 @@ private struct MacActArgs: MacWireArgs {
         interval = try door.numberLiteral(Self.intervalField)
         holding = try door.string(Self.holdingField)
         button = try door.string(Self.buttonField)
+        after = try door.value(Self.afterField)
+        cleanup = try door.value(Self.cleanupField)
     }
 
     var wire: [String: JSONValue] {
@@ -1290,6 +1273,8 @@ private struct MacActArgs: MacWireArgs {
         fields[Self.intervalField.name] = interval?.wire
         fields[Self.holdingField.name] = holding.map(JSONValue.string)
         fields[Self.buttonField.name] = button.map(JSONValue.string)
+        fields[Self.afterField.name] = after
+        fields[Self.cleanupField.name] = cleanup
         return fields
     }
 }

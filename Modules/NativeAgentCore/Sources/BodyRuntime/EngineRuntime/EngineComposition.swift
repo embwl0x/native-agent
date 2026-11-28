@@ -2,13 +2,13 @@ import SenseCore
 import MacNerves
 import Foundation
 import MindCore
-import OSLog
 import DeskCore
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
 import Darwin
 import NativeAgentShared
+import OSLog
 // Blueprint: | `EngineComposition.swift` | Root-bound body ports forward typed matters to the attention router |
 
 extension NativeAgentEngine {
@@ -34,28 +34,17 @@ extension NativeAgentEngine {
     /// Share resident routing, credentials and call limits so a stalled background call cannot hold memory promotion forever.
     public static func makeSharedLLMClient(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        cognitionRuntime: NativeCognitionRuntime? = nil,
-        assembly: PrivateWorkContextAssembly
+        cognitionRuntime: NativeCognitionRuntime? = nil
     ) -> any LLMClient {
-        // A supplied runtime is that mind's own call. The live root's mind is read through its owner when the call runs, so a client made before
-        // setup or kept across a reset reaches whichever mind runs; an alternate root's runtime is made once here.
-        let mind: @Sendable () -> NativeCognitionRuntime?
         let observer: (any LLMCallLifecycleObserving)?
         if let cognitionRuntime {
-            mind = { cognitionRuntime }; observer = cognitionRuntime
+            observer = cognitionRuntime
         } else if dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL {
-            let owner = NativeAgentEngine.live.mind
-            mind = { owner?.runtime }; observer = owner
+            observer = NativeAgentEngine.live.mind
         } else {
-            let alternate = self.cognitionRuntime(for: dataRoot)
-            mind = { alternate }; observer = alternate
+            observer = self.cognitionRuntime(for: dataRoot)
         }
-        let inner = makeResidentProviderLLMClient(dataRoot: dataRoot, lifecycleObserver: observer)
-        return PersonaBackedBackgroundLLMClient(
-            inner: inner,
-            dataRoot: dataRoot,
-            cognitionRuntime: mind, assembly: assembly
-        )
+        return makeResidentProviderLLMClient(dataRoot: dataRoot, lifecycleObserver: observer)
     }
     /// The night owns dreams and REM; registered loops serve their own evidence.
     public static func assembleAllLoops(
@@ -113,16 +102,19 @@ extension EngineBackgroundWorkPort: DelegationBackgroundWorkPort {
     /// Run every reply owner independently before reporting failures so one cannot suppress its siblings.
     func reconcileReplyDeliveries(dataRoot: URL) async throws {
         var failures: [String] = []
-        func run(_ owner: String, _ body: () async throws -> Void) async {
-            do { try await body() } catch { failures.append("\(owner): \(error.localizedDescription)") }
+        func run(_ owner: String, _ body: () async throws -> Void) async throws {
+            try Task.checkCancellation()
+            do { try await body() }
+            catch is CancellationError { throw CancellationError() }
+            catch { failures.append("\(owner): \(error.localizedDescription)") }
         }
-        await run("agent replies") { try await NativeAgentEngine.live.agents.continuation.reconcileReplies() }
-        await run("Telegram mirror") { try await NativeAgentEngine.makeTurnContinuationRuntime(dataRoot: dataRoot).reconcileReplyMirror() }
+        try await run("agent replies") { try await NativeAgentEngine.live.agents.continuation.reconcileReplies() }
+        try await run("Telegram mirror") { try await NativeAgentEngine.makeTurnContinuationRuntime(dataRoot: dataRoot).reconcileReplyMirror() }
         if let telegram = await SenseCore.BackgroundLoopLifetimes.shared.loopRunner(loopId: "telegram_poll") as? TelegramPollLoop {
-            await run("Telegram replies") { try await telegram.reconcileSavedReplies() }
+            try await run("Telegram replies") { try await telegram.reconcileSavedReplies() }
         }
         if let slack = await SenseCore.BackgroundLoopLifetimes.shared.loopRunner(loopId: "slack_socket_mode") as? SlackSocketModeLoop {
-            await run("Slack replies") { try await slack.reconcileSavedReplies() }
+            try await run("Slack replies") { try await slack.reconcileSavedReplies() }
         }
         guard failures.isEmpty else {
             throw NSError(domain: "NativeAgent.ReplyReconciliation", code: 1,
@@ -232,11 +224,14 @@ extension EngineBackgroundWorkPort: MaintenanceBackgroundWorkPort {
         do {
             let report = try await NativeAgentEngine.live.ports.backgroundWork.runAutoDoctor(checks: checks, dataRoot: dataRoot)
             if owned {
-                await doctor.finishRun(report)
+                try await MainActor.run {
+                    try Task.checkCancellation()
+                    doctor.finishRun(report)
+                }
             }
             return report.checks
         } catch {
-            if owned { await doctor.finishRun(nil, failure: error.localizedDescription) }
+            if owned { await doctor.finishRun(nil, failure: error is CancellationError ? nil : error.localizedDescription) }
             throw error
         }
     }

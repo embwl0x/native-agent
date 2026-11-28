@@ -45,7 +45,7 @@ public actor ChatStreamAccumulator {
                 let delta: String
                 switch update {
                 case .delta(let text): delta = text
-                case .toolUse, .toolResult, .notice:
+                case .toolUse, .toolResult, .unstartedStep, .notice:
                     if let activity = MacChatTurnActivityBoundary.activity(
                         from: update, identity: activityIdentity, shown: shown, at: Date()
                     ) { await onTurnActivity(activity) }

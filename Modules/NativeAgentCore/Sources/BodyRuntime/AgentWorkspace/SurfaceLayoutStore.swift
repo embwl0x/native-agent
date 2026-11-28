@@ -5,8 +5,8 @@ import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import Observation
-import os
 import PersistenceCore
+import os
 // Blueprint: | `SurfaceLayoutStore.swift` | `SurfaceLayoutAvailability`, `SurfaceLayoutLive`, `read`, `write`, `setSurfaceExpanded`, `LatestRead` |
 // Publish snapshot reads through LatestRead; writer-locked version checks also govern previous-content restoration.
 // Checked version exhaustion refuses before either write, and layout availability never owns page discovery.
@@ -278,7 +278,7 @@ public enum SurfaceLayoutStore {
     }
 
     /// Read and write validators share one vocabulary; require unique blocks and fold-only `expanded`.
-    private static func validated(_ document: JSONValue, addingMissing: Bool = true) throws -> SurfaceLayout {
+    private static func validated(_ document: JSONValue) throws -> SurfaceLayout {
         var layout = try document.decodedExactly(as: SurfaceLayout.self)
         // Versions start at one. Int.max is readable but exhausted: commit reports that boundary before touching either saved file.
         guard layout.layoutVersion > 0 else {
@@ -319,15 +319,15 @@ public enum SurfaceLayoutStore {
             }
         }
         guard profiles.contains(layout.phone) else { throw shape("phone \"\(layout.phone)\" is not a profile") }
-        if addingMissing { layout.addMissing() }
+        layout.addMissing()
         return layout
     }
 
     /// A saved file reads in the current vocabulary (`dropRemoved`); writes through the agent's door are checked against it strictly.
-    private static func validated(file: URL, addingMissing: Bool = true) throws -> SurfaceLayout {
+    private static func validated(file: URL) throws -> SurfaceLayout {
         var saved = try JSONValue.parse(Data(contentsOf: file)).decodedExactly(as: SurfaceLayout.self)
         saved.dropRemoved()
-        return try validated(JSONValue.fromEncodable(saved), addingMissing: addingMissing)
+        return try validated(JSONValue.fromEncodable(saved))
     }
 
     /// Exclude author and time from the content digest so identical layouts compare equally.

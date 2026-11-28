@@ -239,14 +239,13 @@ private struct ShotgunComposer: View {
         let draft = appModel.composerDraft(for: sessionId)
         let submitted = draft.text
         let editedAt = draft.editedAt
-        let revision = draft.manualEditRevision
         let text = submitted.trimmingCharacters(in: .whitespacesAndNewlines)
         let attachments = appModel.chatPendingAttachments[sessionId] ?? []
         guard !text.isEmpty || !attachments.isEmpty, !sending else { return }
         sending = true
         Task { @MainActor in
             defer { sending = false }
-            switch await appModel.startChatTurnForSession(text, attachments: attachments, sessionId: sessionId, composerRevision: revision) {
+            switch await appModel.startChatTurnForSession(text, attachments: attachments, sessionId: sessionId) {
             case .accepted:
                 let unchanged = draft.text == submitted && draft.editedAt == editedAt
                 appModel.clearChatDraftAfterSend(submitted, sessionId: sessionId, editedAt: editedAt)

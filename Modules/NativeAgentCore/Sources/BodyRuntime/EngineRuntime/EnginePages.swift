@@ -2,6 +2,7 @@ import SenseCore
 import Foundation
 import MacNerves
 import MindCore
+import NativeAgentCore
 import NativeAgentShared
 import ProviderRouting
 import DeskCore
@@ -11,10 +12,16 @@ import PersistenceCore
 extension NativeAgentEngine {
     /// Every page, registered and read once at launch and again at every change of what it reads, for every door; a door's view only draws
     /// it. A page the agent draws names its part and its owner's packet read; a lever page is the stem's own read. Each read lives in its own
-    /// file; this is only the list. A row does what its call says: every tap runs it through the person's door (`ToolsFacade.personTap`).
+    /// file.
     @MainActor func registerPages() async {
         let run: PartFaces.Run = { [tools, weak self, weak pages, weak phoneMemoryPages] call, tap in
             guard let self else { throw CancellationError() }
+            if let act = ChatTurnSteering.OwnerAct(rawValue: call.action), tap.door == "mac", tap.decided,
+               let session = call.args["session"]?.stringValue, let turn = call.args["turn"]?.stringValue,
+               let run = call.args["run"]?.stringValue,
+               tap.page == PageFaceKey.turnSteps(session) {
+                return try await self.liveStepAct(act, identity: .init(sessionId: session, turnId: turn), run: run)
+            }
             if let outcome = try await self.cognitionPageOutcome(call, page: tap.page) {
                 await pages?.refresh(page: tap.page)
                 return outcome
@@ -59,7 +66,7 @@ extension NativeAgentEngine {
               read: { try await self.deskPacket() })
         // A Desk item read is the Desk opened on that item, for whoever reads it; the window keeps its own selection.
         await pages.register(page: "desk", contains: { [self] item in try await deskItemHandle(item) != nil },
-                             item: { [self] item, _ in try await deskItemFace(item) })
+                             readingItem: { [self] item, _ in try await deskItemFace(item) })
         // A piece on the Desk is a Make ref: what the Make shelf publishes (a new version, a ref read or lost) draws the Desk again.
         Task { [make, pages] in
             await EngineFaceProjection.watch(read: { (make.allMetadata, make.loaded, make.fault) }) { _ in _ = await pages.refresh(page: "desk") }
@@ -167,6 +174,24 @@ extension NativeAgentEngine {
         })
         await registerCognitionPages()
         Task { await pages.ownPages() }
+    }
+
+    @MainActor private func liveStepAct(_ act: ChatTurnSteering.OwnerAct, identity: MacChatTurnIdentity, run: String) async throws -> FaceActOutcome {
+        let session = identity.sessionId
+        let turn = identity.turnId
+        let runtime = turns.runtime
+        let stale = PartCallError(code: "stale_row", message: "This page changed after it was shown. Read the page again before acting.")
+        guard runtime.activeTurnIDsBySession[session] == turn,
+              let lifecycle = runtime.lifecycle(for: session), lifecycle.identity == identity,
+              !lifecycle.presentation.isTerminal, lifecycle.cancellationRequestedAt == nil else { throw stale }
+        switch act {
+        case .withdrawUnstarted:
+            guard try await ChatTurnSteering.shared.withdrawUnstarted(in: identity, run: run, dataRoot: dataRoot) else { throw stale }
+            return .init(words: "Remaining steps will be withdrawn before they start. Running steps can finish.", effects: .known, accepted: true)
+        case .stop:
+            _ = try await faceActs.chat.handle(.stop(session: session, expectedTurn: turn), expectedStopRun: run)
+            return .init(words: "Stop requested.", effects: .known, accepted: true)
+        }
     }
 
     /// A page the agent's part draws from its owner's packet, whose owner changes `paths` (or posts `notifications`): read now and at every

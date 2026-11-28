@@ -91,7 +91,7 @@ enum QuietSelfAdminRender {
             if page.id == "home" {
                 AgentScreenView(room: .constant("home"))
             } else if QuietPages.drawOnly.contains(page) {
-                SimpleShellView(shown: page.id == QuietPages.simpleSettings ? .item(.settings) : .item(.chat),
+                SimpleShellView(pane: .constant(.agent), shown: page.id == QuietPages.simpleSettings ? .item(.settings) : .item(.chat),
                                 choose: { _, _ in }, select: { _ in })
             } else {
                 ShellPageContent(item: page.item, ownPage: page.item == .ownPage ? page.id : nil)
@@ -302,6 +302,15 @@ struct QuietPage: Sendable, Equatable {
         default: .ownPage
         }
     }
+
+    var navigationItem: SidebarItem {
+        switch id {
+        case "knowledge": .knowledge
+        case "dreams": .dreams
+        case "cognition": .cognition
+        default: item
+        }
+    }
 }
 
 enum QuietPages {
@@ -322,6 +331,13 @@ enum QuietPages {
     /// which the selection names by its id.
     @MainActor static func shown(_ item: SidebarItem) -> QuietPage? {
         SidebarItem.doorPage(item).flatMap(page(named:))
+    }
+
+    @MainActor static func navigationPage(named raw: String, appModel: AppModel) -> QuietPage? {
+        if let place = ShellSurface.named(raw) { return shown(place.firstPage) }
+        let doorPage = page(named: raw)
+        if doorPage?.id.caseInsensitiveCompare(raw.trimmingCharacters(in: .whitespacesAndNewlines)) == .orderedSame { return doorPage }
+        return ShellSurface.named(raw, appModel: appModel).flatMap { shown($0.firstPage) } ?? doorPage
     }
 
     /// Only the requested page titles are observed; the catalog supplies claim and inventory availability.

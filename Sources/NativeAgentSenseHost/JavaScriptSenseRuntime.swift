@@ -800,7 +800,7 @@ import PersistenceCore
         }
         guard let record else { throw failure("bad_output", "Sense call has no bound record.") }
         switch type {
-        case "app_read", "act", "state_get", "state_set":
+        case "app_read", "act", "state_get", "state_set", "state_delete", "state_list", "state_cas":
             let data = try payload()
             guard type != "act" || entryType == "act" else {
                 throw failure("bad_output", "Sense actions are allowed only while answering an act request.")

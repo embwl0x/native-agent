@@ -9,14 +9,14 @@ import DeskCore
 public struct PersonaEngineCheck: RepairingDoctorCheck {
     public let id: String = "persona_engine"
     public let title: String = "Persona Engine 2.0"
-    private let engineProvider: @Sendable () -> SwiftNativePersonaEngine
+    private let root: URL?
 
-    public init(root: URL? = nil, engineProvider: (@Sendable () -> SwiftNativePersonaEngine)? = nil) {
-        self.engineProvider = engineProvider ?? { root.map { SwiftNativePersonaEngine.isolated(dataRoot: $0) } ?? SwiftNativePersonaEngine() }
+    public init(root: URL? = nil) {
+        self.root = root
     }
 
     public func run(repair: Bool) async -> CheckResult {
-        let engine = engineProvider()
+        let engine = root.map { SwiftNativePersonaEngine.isolated(dataRoot: $0) } ?? SwiftNativePersonaEngine()
         let rootPath = await engine.personaRoot.path
         let dataRoot = await engine.dataRootURL
         // Before setup finishes there is no agent and so no persona: its absence is not a fault, and setup writes it.

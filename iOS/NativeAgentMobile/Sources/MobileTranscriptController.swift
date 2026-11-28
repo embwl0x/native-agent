@@ -44,7 +44,6 @@ final class MobileTranscriptController: TranscriptReaderCore, UITextViewDelegate
     private var reduceMotion = false
     private var viewportSize = CGSize.zero
     private var scrollingToEnd = false
-    private var selfMoving = false
     private var openingStarted = CACurrentMediaTime()
     private var firstPaintOwed = true
     private let log = ModuleLog(category: "MobileTranscriptDocument")
@@ -215,7 +214,7 @@ final class MobileTranscriptController: TranscriptReaderCore, UITextViewDelegate
     /// The column stays inside the page inset, centred in the room the host gives it.
     private func setWidth(_ width: CGFloat) {
         guard width > 0 else { return }
-        let column = max(1, min(TranscriptMetrics.column, width - 2 * TranscriptMetrics.pageInset))
+        let column = max(1, min(NativeAgentSpacing.chatRoomWidth, width - 2 * NativeAgentSpacing.pageInset))
         let side = floor((width - column) / 2)
         let inset = UIEdgeInsets(top: TranscriptMetrics.documentInset, left: side, bottom: TranscriptMetrics.documentInset, right: side)
         guard column != containerWidth || textView.textContainerInset != inset else { return }
@@ -257,13 +256,6 @@ final class MobileTranscriptController: TranscriptReaderCore, UITextViewDelegate
             return false
         }
         return frame
-    }
-
-    override func moving(_ change: () -> Void) {
-        let enclosing = selfMoving
-        selfMoving = true
-        defer { selfMoving = enclosing }
-        change()
     }
 
     private func scroll(toOffsetY y: CGFloat) {

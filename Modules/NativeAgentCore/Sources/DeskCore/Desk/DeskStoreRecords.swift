@@ -11,10 +11,6 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
     case childRefusedTerminalParent(parentHandle: String)
     case nonTerminalStatusRefusedTerminalAncestor(handle: String, ancestorHandle: String)
     case directArchiveRequiresGuardedPath(handle: String)
-    case archiveRefusedNonTerminalChild(handle: String, childHandle: String)
-    case archiveRefusedStanding(handle: String)
-    case archiveRefusedNonTerminalSelf(handle: String, status: DeskStatus)
-    case archiveRefusedUnresolvedContinuation(handle: String)
     case queueCreationRequiresQueuePath
     case pursuitCapReached(openCount: Int)
     case pursuitFieldMissing(reason: String)
@@ -56,15 +52,7 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
         case let .nonTerminalStatusRefusedTerminalAncestor(handle, ancestorHandle):
             return "desk: cannot reopen \(handle) while ancestor \(ancestorHandle) is terminal; reopen the ancestor first"
         case .directArchiveRequiresGuardedPath(let handle):
-            return "desk: cannot append archive op directly for \(handle); use archiveItem so archive guards and records are preserved"
-        case let .archiveRefusedNonTerminalChild(handle, childHandle):
-            return "desk: cannot archive \(handle) — child \(childHandle) is not terminal (done/canceled)"
-        case .archiveRefusedStanding(let h):
-            return "desk: cannot archive standing item \(h) (MVP)"
-        case let .archiveRefusedNonTerminalSelf(handle, status):
-            return "desk: cannot archive \(handle) — item is not terminal (status \(status.rawValue)); close it first"
-        case .archiveRefusedUnresolvedContinuation(let handle):
-            return "desk: cannot archive \(handle) — its continuation has unfinished steps; verify them through their domains first"
+            return "desk: cannot append archive op directly for \(handle)"
         case .queueCreationRequiresQueuePath:
             return "desk: use queue.add to add a step to my queue so its readiness and origin are preserved"
         case .pursuitCapReached(let openCount):

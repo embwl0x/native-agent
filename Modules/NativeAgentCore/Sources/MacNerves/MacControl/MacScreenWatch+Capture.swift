@@ -1,4 +1,3 @@
-import CoreGraphics
 import CoreMedia
 import CoreVideo
 import Darwin
@@ -101,7 +100,8 @@ extension MacScreenWatch {
     }
 
     func captureFailure(_ operation: String, _ message: String) -> SenseFailure {
-        let failure = CGPreflightScreenCaptureAccess() ? MacScreenCaptureFailure.operationFailed(operation, message) : .screenRecordingNotTrusted
+        let failure = SystemPermissionPreflight.heldByThisProcess(.screenRecording)
+            ? MacScreenCaptureFailure.operationFailed(operation, message) : .screenRecordingNotTrusted
         return SenseFailure(code: failure.rawValue, message: "\(operation): \(message)", remedy: failure.remedy(app: app))
     }
 
@@ -141,6 +141,8 @@ extension MacScreenWatch {
             return (state.frameMasks, state.verdict)
         }
         guard let (masks, painted) = paint, let buffer else { return }
+        // A covered or unreadable session publishes no frame, so none outlives the lock.
+        guard (try? MacScreenLock.isCovered()) == false else { return }
         guard let pixels = maskedPixels(from: buffer, secrets: masks) else { return }
         publish(pixels: pixels, window: frame, at: at, painted: painted)
     }

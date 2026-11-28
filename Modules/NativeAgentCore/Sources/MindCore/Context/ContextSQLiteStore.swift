@@ -48,6 +48,10 @@ public actor ContextSQLiteStore {
 
     @discardableResult
     public func publish(_ draft: ContextGenerationDraft) async throws -> ContextGenerationRecord {
+        try await publish(draft, associationTopologyChanged: false)
+    }
+
+    func publish(_ draft: ContextGenerationDraft, associationTopologyChanged: Bool) async throws -> ContextGenerationRecord {
         try Self.validate(draft)
 
         return try await dbPool.write { db in
@@ -56,7 +60,7 @@ public actor ContextSQLiteStore {
                 sql: "SELECT id FROM context_generations WHERE status = 'completed' ORDER BY id DESC LIMIT 1"
             )
             // The first generation can hold only persona mirrors, with no projected atoms yet.
-            if parentID != nil, draft.changedSources.isEmpty, draft.removedSourceIDs.isEmpty {
+            if parentID != nil, !associationTopologyChanged, draft.changedSources.isEmpty, draft.removedSourceIDs.isEmpty {
                 throw ContextFlowStoreError.emptyGeneration
             }
             let (generationID, overflow) = (parentID ?? 0).addingReportingOverflow(1)

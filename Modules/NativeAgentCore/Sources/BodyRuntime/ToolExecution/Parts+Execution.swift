@@ -5,6 +5,7 @@ import NativeAgentShared
 import PersistenceCore
 import DeskCore
 import CryptoKit
+import MindCore
 // Blueprint: | `Parts+Execution.swift` | pinned calls and pure faces; exact run admission |
 
 extension Parts {
@@ -29,9 +30,10 @@ extension Parts {
     }
 
     /// Pin immutable input/version before execution; domain commits happen afterward so no transaction lock spans JavaScript.
-    public func call<Value: Codable & Sendable>(id: String, input: JSONValue, preview: Bool = false,
+    public func call<Value: Codable & Sendable>(id: String, input: JSONValue, requiredFingerprint: String? = nil, preview: Bool = false,
         within reach: CallReach? = nil, invocation: Invocation, as type: Value.Type = Value.self) async -> PartCallResult<Value> {
-        await callValue(id: id, input: input, projection: false, preview: preview, reach: reach, invocation: invocation, as: type)
+        await callValue(id: id, input: input, projection: false, pinned: requiredFingerprint, preview: preview, reach: reach,
+            invocation: invocation, as: type)
     }
 
     /// Faces run from frozen input outside rendering and have no host effects or notebook access.
@@ -77,6 +79,10 @@ extension Parts {
                     guard let version = Self.string(row, "codeFingerprint") else {
                         throw Self.revisionFailure("state_changed", "Ability \(selectedID) has no selected code fingerprint; its body did not run.",
                             id: selectedID)
+                    }
+                    guard pinned == nil || pinned == version else {
+                        throw Self.revisionFailure("state_changed", "Ability \(selectedID) changed before receiving its pinned input.", id: selectedID,
+                            version: pinned)
                     }
                     selected = (selectedID, version)
                 } catch {
@@ -167,8 +173,12 @@ extension Parts {
                 var terminal = ToolHost.failure(error, effects: "none", execution: "not_run")
                 var fields = Self.fields(terminal)
                 fields["checker"] = .string("part_admission")
+                if id == MindMemoryJudgment.DigestPart.id, let failure = error as? SenseFailure,
+                   MindMemoryJudgment.DigestPart.helperUnavailable(failure.code) {
+                    fields["reason"] = .string("digest_helper_unavailable")
+                }
                 terminal = .object(fields)
-                if !preview {
+                if !preview, id != MindMemoryJudgment.DigestPart.id, id != DreamPart.id {
                     do {
                         if let version = try pinned ?? row(id).flatMap({ Self.string($0, "codeFingerprint") }) {
                             terminal = await abilities.settleRun(id: id, version: version, receipt: terminal, input: nil,
@@ -337,9 +347,26 @@ extension Parts {
         preview: Bool, replay: OwnedProgramRunner.Replay?, projection: Bool, host: any OwnedProgramToolHost,
         invocation: Invocation) async throws -> JSONValue {
         let id = candidate.id, digest = candidate.digest
+        let judgment = id == MindMemoryJudgment.DigestPart.id && !projection
+            ? invocation.execution.turn?[MindMemoryJudgment.DigestPart.Key.self] : nil
+        let dream = id == DreamPart.id && !projection ? invocation.execution.turn?[DreamPart.Key.self] : nil
+        let fieldRepair = id == FieldRepairPart.id && !projection ? invocation.execution.turn?[FieldRepairPart.Key.self] : nil
         let startedAt = Date()
         let dependencySnapshot = if projection { selectedSnapshot } else {
             try await checkSelected(candidate, pinned: digest, invocation: invocation)
+        }
+        if id == MindMemoryJudgment.DigestPart.id, !projection, judgment == nil {
+            throw SenseFailure(code: "digest_needs_moment", message: "The turn digest runs on a recorded moment through after-turn interpretation.")
+        }
+        if id == DreamPart.id, !projection {
+            guard let dream, suppliedInput == dream.input, !preview, replay == nil, !candidate.program.isResident else {
+                throw SenseFailure(code: "dream_needs_night", message: "The dream cycle runs once on the dream or REM owner's captured evidence.")
+            }
+        }
+        if id == FieldRepairPart.id, !projection {
+            guard let fieldRepair, suppliedInput == fieldRepair.input, !preview, replay == nil, !candidate.program.isResident else {
+                throw SenseFailure(code: "field_repair_needs_reading", message: "Field repair needs the organism owner's captured reading.")
+            }
         }
         let input: JSONValue
         if !projection, id == "native-morning-brief", Self.fields(suppliedInput)["operation"] == .string("brief") {
@@ -348,7 +375,6 @@ extension Parts {
             input = try await MorningBriefSources(root: root, now: Date(), worklogPath: worklog).packet()
         } else { input = suppliedInput }
         let binding = OwnedProgramRunner.Binding(revision: revision)
-        // A resident ability holds what it starts and opens across its runs, a resumed one included (a resume never replays a primitive call).
         var selected: OwnedProgram
         if projection {
             guard Self.fields(Self.fields(candidate.manifest)["face"] ?? .null)["projection"] == .bool(true) else {
@@ -378,10 +404,8 @@ extension Parts {
                     readPaths: readPaths, held: AbilityStore(dataRoot: dataRoot)) },
                 end: { _ = await $0.close() })
             : ToolPrimitiveBroker(permissions: grants, abilityID: id, dataRoot: dataRoot, readPaths: readPaths)
-        // A verb the part answers as a read runs read-confined; the declaration is enforced here, not trusted.
-        let answered = Self.fields(Self.fields(Self.fields(candidate.manifest)["answers"] ?? .null)[Self.string(Self.fields(input), "verb") ?? ""] ?? .null)
         let profile = ToolHost(base: host, candidate: candidate, broker: broker, dataRoot: root, openScreenWatch: invocation.openScreenWatch,
-            projection: projection, preview: preview, readOnly: answered["class"] == .string("read"),
+            projection: projection, preview: preview, readOnly: ToolHost.readOnly(candidate, input: input),
             admission: {
                 try await binding.check(self.abilities.revision() + host.dependencyRevision(candidate.program.dependencies)) {
                     _ = try await self.checkSelected(candidate, pinned: digest, invocation: invocation)
@@ -390,14 +414,16 @@ extension Parts {
         await broker.begin()
         var execution = invocation.execution
         execution.dependencySnapshot = projection ? nil : (id: id, version: digest, shapes: dependencySnapshot)
-        var result = Self.fields(await OwnedProgramRunner(dataRoot: root).run(program, input: input, preview: preview, replay: replay,
-            host: profile, execution: execution))
+        let reply = await withTaskCancellationHandler {
+            await OwnedProgramRunner(dataRoot: root).run(program, input: input, preview: preview, replay: replay, host: profile, execution: execution)
+        } onCancel: { broker.cancelStreams(profile.streamRun) }
+        var result = Self.fields(reply)
         // A watch leaves one receipt for all its frames, however it ended.
-        let watched = await settle { await broker.finish() }
+        let watched = await settle { await broker.finish(run: profile.streamRun) }
         if !watched.isEmpty { result["watch"] = watched.count == 1 ? watched[0] : .array(watched) }
         result["ability"] = .string(id); result["version"] = .string(candidate.digest)
         // Completing JavaScript does not make its explicit decline a successful run. Effects and calls remain the runner's evidence.
-        if result["status"] == .string("ok"), let returned = result["returned"]?.objectValue,
+        if judgment == nil, dream == nil, result["status"] == .string("ok"), let returned = result["returned"]?.objectValue,
            returned["status"] == .string("refused") {
             result["status"] = .string("refused")
             for key in ["reason", "reasons", "gate_reason", "not_run_status", "detail", "message", "checker", "remedy"] {
@@ -421,11 +447,102 @@ extension Parts {
             }
         }
         if !projection, !preview {
+            if let dream {
+                return await settleDream(dream, result: result, version: digest, turn: invocation.execution.turn, at: startedAt)
+            }
+            if let judgment {
+                return await settleDigest(judgment, result: result, id: id, version: digest, turn: invocation.execution.turn, at: startedAt)
+            }
+            if let fieldRepair {
+                let answer = result.removeValue(forKey: "returned") ?? .null
+                _ = OwnedProgramRunner.journal(result.removeValue(forKey: "journal_ref"))
+                let plan = result["status"] == .string("ok") ? (try? fieldRepair.reading.verify(answer)) : nil
+                if result["status"] == .string("ok"), plan == nil {
+                    result["status"] = .string("error")
+                    result["reason"] = .string("bad_field_repair")
+                    result["detail"] = .string("The field repair returned an invalid plan for its captured evidence.")
+                    result["error"] = .object(["reason": .string("validation_failed")])
+                }
+                let receipt = await abilities.settleRun(id: id, version: digest, receipt: .object(result),
+                    input: nil, turn: invocation.execution.turn, at: startedAt)
+                if let plan, receipt.objectValue?["accounting_error"] == nil { await fieldRepair.keep(plan) }
+                return receipt
+            }
             if result["status"] != .string("ok"), result["checker"] == nil { result["checker"] = .string("part") }
             return await abilities.settleRun(id: id, version: digest, receipt: .object(result), input: replay == nil ? input : nil,
                 dependencySnapshot: dependencySnapshot, turn: invocation.execution.turn, at: startedAt)
         }
         return .object(result)
+    }
+
+    private func settleDream(_ dream: DreamPart, result: [String: JSONValue], version: String, turn: Turn?, at: Date) async -> JSONValue {
+        await settle {
+            var result = result
+            let returned = result.removeValue(forKey: "returned") ?? .null
+            _ = OwnedProgramRunner.journal(result.removeValue(forKey: "journal_ref"))
+            var verified: DreamPart.Reading?
+            let cancelled = result["stopped"]?.objectValue?["reason"] == .string("cancelled")
+            if !cancelled, await dream.rejectedModelResult {
+                result["status"] = .string("error")
+                result["reason"] = .string("bad_dream_policy")
+                result["error"] = .object(["reason": .string("validation_failed")])
+            } else if result["status"] == .string("ok") {
+                do { verified = try await dream.verify(returned) }
+                catch {
+                    result["status"] = .string("error")
+                    result["reason"] = .string("bad_dream_policy")
+                    result["detail"] = .string(DreamPart.redact(error.localizedDescription))
+                    result["error"] = .object(["reason": .string("validation_failed")])
+                }
+            }
+            if result["status"] != .string("ok"), result["checker"] == nil { result["checker"] = .string("part") }
+            let receipt = if dream.preview { JSONValue.object(result) }
+                else { await abilities.settleRun(id: DreamPart.id, version: version, receipt: .object(result), input: nil, turn: turn, at: at) }
+            if let verified, receipt.objectValue?["accounting_error"] == nil { await dream.keep(verified) }
+            return receipt
+        }
+    }
+
+    private func settleDigest(_ digest: MindMemoryJudgment.DigestPart, result: [String: JSONValue], id: String, version: String,
+                              turn: Turn?, at: Date) async -> JSONValue {
+        await settle {
+            var result = result
+            let terminal = Self.fields(result["error"] ?? .null)
+            if terminal["origin"] == .string("runtime"), let reason = Self.string(terminal, "reason"),
+               MindMemoryJudgment.DigestPart.helperUnavailable(reason) {
+                result["reason"] = .string("digest_helper_unavailable")
+                return .object(result)
+            }
+            let returned = result.removeValue(forKey: "returned") ?? .null
+            var verified: AfterTurnInterpretation?
+            if let failure = await digest.modelFailure {
+                let code: String = switch failure.interpretationFailure {
+                case .envelope, .caring, .affect, .memories, .cares: "validation_failed"
+                case .cancellation: "cancelled"
+                default: "digest_model_unavailable"
+                }
+                result["status"] = .string("failed")
+                result["reason"] = .string(code)
+                result["detail"] = .string(failure.localizedDescription)
+                result["error"] = .object(["reason": .string(code)])
+                if code == "digest_model_unavailable" { return .object(result) }
+            } else if result["status"] == .string("ok") {
+                do { verified = try await digest.verify(returned) }
+                catch {
+                    result["status"] = .string("error")
+                    result["reason"] = .string("bad_digest_policy")
+                    result["detail"] = .string(error.localizedDescription)
+                    result["error"] = .object(["reason": .string("validation_failed")])
+                }
+            }
+            if result["status"] != .string("ok"), result["checker"] == nil { result["checker"] = .string("part") }
+            let receipt = await abilities.settleRun(id: id, version: version, receipt: .object(result), input: nil,
+                turn: turn, at: at)
+            if result["status"] == .string("ok"), receipt.objectValue?["accounting_error"] == nil, let verified {
+                await digest.keep(verified)
+            }
+            return receipt
+        }
     }
 
     @discardableResult
@@ -506,7 +623,7 @@ extension Parts {
                 message: "This run has no gated app door, so its app-action dependencies could not be checked. Use the app door of a conversation or wake run.")
         }
         let calls = try await OwnedProgramRunner(dataRoot: root).analyze(candidate.program).calls
-        let primitives = ToolPrimitiveBroker.operations.union(["apps.call", "part.call"])
+        let primitives = ToolHost.primitives
         for call in calls.literal where !(call.primitive && primitives.contains(call.spelling)) {
             // No current evidence is unavailability, not evidence of removal or an incompatible schema. The actual call still owns its remedy.
             guard let given = call.given, let problem = try host.callProblem(call.id, given: given,

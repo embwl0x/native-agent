@@ -5,11 +5,13 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import DeskCore
+import MindCore
 // Blueprint: | `AgentJobStem.swift` | `AgentJobs`: commission, read, stop, required checks, deliverables and settlement |
 
 /// What the stem attests when it registers an organ's artifact as the agent's.
 public struct AgentJobProvenance: Sendable {
     public let contact: String
+    public let peerID: String?
     public let job: String
     public let brief: String
     /// "made by ‹contact› for ‹job›"
@@ -56,7 +58,7 @@ public enum AgentJobs {
             return refused(named.isEmpty ? "unknown_contact" : "ambiguous_contact", who + " Your contacts: " + all + ". Nothing was sent.", path: "agent")
         }
         let place: AgentJob.Place?
-        switch self.place(input["where"], dataRoot: dataRoot) {
+        switch await Self.place(input["where"], dataRoot: dataRoot) {
         case .success(let found): place = found
         case .failure(let refusal): return refused("invalid_where", refusal.message, path: "where")
         }
@@ -85,8 +87,9 @@ public enum AgentJobs {
         }
         let now = Date()
         // The commissioning turn's peer steering stays on the job, so its return is still a peer's work and never a turn of her own.
+        let steering = Array(Set(limits.peers + limits.elevated)).sorted()
         let job = AgentJob(id: id, lifeID: life, contact: peer.id, name: peer.name, brief: brief,
-            peers: limits.peers.isEmpty ? nil : limits.peers, elevated: limits.elevated.isEmpty ? nil : limits.elevated,
+            peers: steering.isEmpty ? nil : steering,
             fileAccess: limits.fileAccess, place: place, worktree: worktree,
             envelope: envelope, done: done, desk: desk?.isEmpty == false ? desk : nil, state: .working, deliverables: [],
             commission: .init(session: session, surface: surface, origin: origin), startedAt: now, updatedAt: now)
@@ -103,8 +106,10 @@ public enum AgentJobs {
         }
         let runner = service.runner(for: peer)
         let events: AsyncThrowingStream<JobEvent, Error>
-        do { events = try await runner.start(start(job, peer: peer, dataRoot: dataRoot)) }
-        catch let refusal as JobRefusal {
+        do {
+            let request = try await start(job, peer: peer, dataRoot: dataRoot, elevated: limits.elevated)
+            events = try await runner.start(request)
+        } catch let refusal as JobRefusal {
             do { try store.withdraw(job.id) }
             catch { owe(job.id, "withdraw a refused commission", error, store: store, dataRoot: dataRoot) }
             var words = refusal.message
@@ -171,9 +176,9 @@ public enum AgentJobs {
         catch { return failed("This data root's life could not be read: \(error.localizedDescription). Nothing was started.", effects: "none") }
         let desk = input["desk"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
         let now = Date()
+        let peers = Array(Set(limits.peers + limits.elevated)).sorted()
         let job = AgentJob(id: "job-" + UUID().uuidString.lowercased(), lifeID: life, contact: AgentJob.own, name: "your line", brief: brief,
-            instructions: instructions, peers: limits.peers.isEmpty ? nil : limits.peers,
-            elevated: limits.elevated.isEmpty ? nil : limits.elevated, fileAccess: limits.fileAccess,
+            instructions: instructions, peers: peers.isEmpty ? nil : peers, fileAccess: limits.fileAccess,
             place: nil, worktree: nil, envelope: .init(writes: false, network: false, folder: nil), done: done,
             desk: desk?.isEmpty == false ? desk : nil, state: .working, deliverables: [], commission: .init(session: session, surface: surface),
             startedAt: now, updatedAt: now)
@@ -181,7 +186,7 @@ public enum AgentJobs {
         do { try store.insert(job) }
         catch { return failed("The line could not be kept: \(error.localizedDescription). Nothing was started.", effects: "none") }
         let events: AsyncThrowingStream<JobEvent, Error>
-        do { events = try await runner.start(job) }
+        do { events = try await runner.start(job, elevated: limits.elevated) }
         catch {
             do { try store.withdraw(job.id) }
             catch { owe(job.id, "withdraw an unstarted line", error, store: store, dataRoot: dataRoot) }
@@ -238,7 +243,8 @@ public enum AgentJobs {
                 if let peer = peers.first(where: { $0.id == job.contact }) {
                     let runner = service.runner(for: peer)
                     do {
-                        let events = try await runner.resume(start(job, peer: peer, dataRoot: dataRoot), session: session)
+                        let request = try await start(job, peer: peer, dataRoot: dataRoot)
+                        let events = try await runner.resume(request, session: session)
                         keep(job.id, store: store, dataRoot: dataRoot) { $0.detail = "Resumed by its session after the app restarted." }
                         await AgentJobFlights.shared.fly(job.id, dataRoot: dataRoot, runner: runner) {
                             await consume(job.id, events, dataRoot: dataRoot, register: register)
@@ -257,9 +263,10 @@ public enum AgentJobs {
         }
     }
 
-    static func start(_ job: AgentJob, peer: AgentPeerContact, dataRoot: URL) throws -> JobStart {
+    static func start(_ job: AgentJob, peer: AgentPeerContact, dataRoot: URL, elevated: [String] = []) async throws -> JobStart {
         if let folder = job.envelope.folder {
-            _ = try place(.string(folder), dataRoot: dataRoot).get()
+            let checked = await place(.string(folder), dataRoot: dataRoot)
+            _ = try checked.get()
         }
         let access = job.fileAccess ?? .init()
         guard access.invalidMode == nil, !access.noPathfulReads else {
@@ -267,13 +274,13 @@ public enum AgentJobs {
         }
         let kept = try AgentJobStore(dataRoot: dataRoot).update(job.id) { if access.readOnly { $0.envelope.writes = false } }
         return JobStart(job: kept.id, contact: peer, brief: kept.brief, folder: kept.envelope.folder.map { URL(fileURLWithPath: $0, isDirectory: true) },
-                        envelope: kept.envelope, handle: { session in
+                        envelope: kept.envelope, elevated: elevated, handle: { session in
                             try AgentJobStore(dataRoot: dataRoot).update(kept.id) { $0.session = session }
                         })
     }
 
     /// A folder or repo disjoint from the agent's data and credentials, judged by filesystem identity.
-    static func place(_ value: JSONValue?, dataRoot: URL) -> Result<AgentJob.Place?, JobRefusal> {
+    static func place(_ value: JSONValue?, dataRoot: URL) async -> Result<AgentJob.Place?, JobRefusal> {
         guard let value, value != .null else { return .success(nil) }
         guard let raw = value.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
             return .failure(JobRefusal("where must be a folder's path. Nothing was sent."))
@@ -296,6 +303,16 @@ public enum AgentJobs {
         } catch {
             return .failure(JobRefusal(
                 "\(folder.path)'s data and credential boundary could not be checked: \(error.localizedDescription). Nothing was sent."))
+        }
+        guard !folder.pathComponents.contains(".git") else {
+            return .failure(JobRefusal("\(folder.path) is inside Git repository metadata. Nothing was sent."))
+        }
+        do {
+            if try await repositoryMetadata(folder) {
+                return .failure(JobRefusal("\(folder.path) is inside Git repository metadata. Nothing was sent."))
+            }
+        } catch {
+            return .failure(JobRefusal("\(folder.path)'s Git metadata boundary could not be checked: \(error.localizedDescription). Nothing was sent."))
         }
         let repo = FileManager.default.fileExists(atPath: folder.appendingPathComponent(".git").path)
         return .success(.init(kind: repo ? .repo : .folder, path: folder.path))
@@ -350,7 +367,7 @@ public enum AgentJobs {
     // MARK: Read and stop
 
     /// `agent.read` and `agent.cancel` name a job by its id in `job`, as agent.apply and agent.discard do.
-    package static func answer(tool: String, id: String, agent: String?, dataRoot: URL) async throws -> JSONValue {
+    package static func answer(tool: String, id: String, agent: String?, turn: Turn, dataRoot: URL) async throws -> JSONValue {
         let store = AgentJobStore(dataRoot: dataRoot)
         let jobs = try store.jobs()
         guard let job = jobs.first(where: { $0.id == id }) else {
@@ -366,7 +383,7 @@ public enum AgentJobs {
             }
         }
         guard tool == "agent_cancel" else {
-            var fields = view(job, jobs: .success(jobs), dataRoot: dataRoot)
+            var fields = view(job, jobs: .success(jobs), dataRoot: dataRoot, reading: turn)
             fields["status"] = .string("read")
             return .object(fields)
         }
@@ -401,9 +418,11 @@ public enum AgentJobs {
     }
 
     /// The person's and the agent's reading of a job. The organ's words are labelled as its report: data, never instructions.
-    static func view(_ job: AgentJob, jobs: Result<[AgentJob], Error>, dataRoot: URL) -> [String: JSONValue] {
-        // The agent's own line's words are the agent's.
+    static func view(_ job: AgentJob, jobs: Result<[AgentJob], Error>, dataRoot: URL, reading turn: Turn? = nil) -> [String: JSONValue] {
         let untrusted = !job.isOwn && !PeerTrust.ownerTrusts(job.agent, dataRoot: dataRoot)
+        if untrusted, job.report != nil || job.note != nil || job.check?.fromJobFolder == true {
+            turn?.peerSteering?.mark(dataRoot: dataRoot, peer: job.agent)
+        }
         func words(_ text: String, _ extra: [String: JSONValue] = [:]) -> JSONValue {
             let said: [String: JSONValue] = ["by": .string(job.agent), "text": .string(text), "untrusted_remote_data": .bool(untrusted)]
             return .object(said.merging(extra) { _, new in new })
@@ -439,7 +458,7 @@ public enum AgentJobs {
                 var row: [String: JSONValue] = ["path": .string(item.path)]
                 if let ref = item.ref {
                     row["make_ref"] = .string(ref)
-                    row["made_by"] = .string(AgentJobProvenance(contact: job.name, job: job.id, brief: job.brief).madeBy)
+                    row["made_by"] = .string(job.provenance.madeBy)
                 }
                 if let version = item.version { row["version"] = .int(Int64(version)) }
                 if let refusal = item.refusal { row["not_registered"] = .string(refusal) }
@@ -447,7 +466,15 @@ public enum AgentJobs {
             })
         }
         if let report = job.report {
-            fields["report"] = words(report.text, ["truncated": .bool(report.truncated), "model": report.model.map(JSONValue.string) ?? .null])
+            var evidence: [String: JSONValue] = ["truncated": .bool(report.truncated), "model": report.model.map(JSONValue.string) ?? .null]
+            let sources = job.reportSources
+            if job.isOwn, !sources.isEmpty {
+                for source in sources { turn?.peerSteering?.mark(dataRoot: dataRoot, peer: source) }
+                let steering = MemoryDataProvenance.steering(sources, dataRoot: dataRoot)
+                evidence["untrusted_remote_data"] = .bool(!steering.isEmpty)
+                evidence["steered_by"] = .array(steering.map(JSONValue.string))
+            }
+            fields["report"] = words(report.text, evidence)
         }
         if let check = job.check {
             var row: [String: JSONValue] = ["verdict": .string(check.verdict.rawValue), "output": .string(check.output),
@@ -532,7 +559,7 @@ public enum AgentJobs {
         do { job = try store.job(id) } catch { return owe(id, "read before a deliverable", error, store: store, dataRoot: dataRoot) }
         guard !job.state.isTerminal else { return }
         let folder = job.envelope.folder
-        let provenance = AgentJobProvenance(contact: job.name, job: job.id, brief: job.brief)
+        let provenance = job.provenance
         let rows = deliverable.artifacts.map { artifact -> AgentJob.Deliverable in
             let file = artifact.standardizedFileURL.resolvingSymlinksInPath()
             guard let folder, file.path.hasPrefix(folder + "/") else {
@@ -550,7 +577,8 @@ public enum AgentJobs {
         keep(id, store: store, dataRoot: dataRoot) {
             $0.deliverables += rows
             if let text = deliverable.report {
-                $0.report = .init(text: String(text.prefix(reportLimit)), truncated: text.count > reportLimit, model: deliverable.model)
+                $0.report = .init(text: String(text.prefix(reportLimit)), truncated: text.count > reportLimit,
+                                  model: deliverable.model, sources: job.isOwn ? deliverable.sources : nil)
             }
             if let check { $0.check = check }
         }
@@ -596,7 +624,10 @@ public enum AgentJobs {
                     case nil: $0.state = .delivered; $0.detail = "Delivered, unchecked: no check was set."
                     }
                 case .failed(let why): $0.state = .failed; $0.detail = "Its door reported a failure: " + why
-                case .stopped(let why): $0.state = .stopped; $0.detail = "Stopped: " + why
+                case .stopped(let why):
+                    $0.state = .stopped
+                    if !$0.isOwn { $0.stoppedByHer = false }
+                    $0.detail = "Stopped: " + why
                 }
             }
         } catch { return owe(id, "record its end", error, store: store, dataRoot: dataRoot) }
@@ -618,9 +649,10 @@ public enum AgentJobs {
         let line = job.isOwn ? "Your line ended the work you gave it (\(job.id), \"\(String(job.brief.prefix(80)))\"): " + ended
             : "\(job.name) ended the job you gave it (\(job.id), \"\(String(job.brief.prefix(80)))\"): " + ended
         var more: [String] = []
-        // The agent's line's answer is the agent's own words, so it rides the news itself.
-        if job.isOwn, let report = job.report?.text, !report.isEmpty {
-            more.append("It said: \"" + String(report.prefix(600)) + (report.count > 600 ? "…" : "") + "\"")
+        var sources = job.peers ?? []
+        if job.isOwn, let report = job.report, !report.text.isEmpty {
+            more.append("It said: \"" + String(report.text.prefix(600)) + (report.text.count > 600 ? "…" : "") + "\"")
+            sources = job.reportSources
         }
         if !made.isEmpty { more.append("Yours now, \(made.count) made by \(job.name): " + made.joined(separator: ", ") + ".") }
         let refused = job.deliverables.filter { $0.refusal != nil }.count
@@ -633,7 +665,7 @@ public enum AgentJobs {
         more.append("Read it: app {action:\"agent.read\", args:{agent:\"\(job.agent)\", job:\"\(job.id)\"}}.")
         // The once key is the job and its outcome, which the return re-checks against the job's record before it runs.
         Attention.post(Happening(.returned, subject: "job:" + job.id, door: "job:" + job.id, words: line,
-            once: "job:" + job.id + ":" + job.state.rawValue, route: job.commission.session, peers: job.peers, elevated: job.elevated,
+            once: "job:" + job.id + ":" + job.state.rawValue, route: job.commission.session, peers: sources.isEmpty ? nil : sources, elevated: job.elevated,
             shows: more.joined(separator: "\n")), dataRoot: dataRoot)
     }
 

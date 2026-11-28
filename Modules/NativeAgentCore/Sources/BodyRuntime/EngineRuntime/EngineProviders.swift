@@ -17,18 +17,12 @@ public final class ProvidersFacade {
     public private(set) var settingsError: String?
     lazy var settingsReads = LatestRead()
     weak var facePages: PartFaces?
-    var providerProbeStarts: [String: Date] = [:] { didSet { publishProviderState() } }
-    var catalogRefreshStarted: Date? { didSet { publishProviderState() } }
+    var providerProbeStarts: [String: Date] = [:]
+    var catalogRefreshStarted: Date?
     var catalogRefreshTask: Task<SettingsRefreshOutcome, Never>?
     private var missingModelRoutesTask: Task<Void, Never>?
     /// Accounts whose provider is being asked for its list now, as the catalog's one refresh in flight.
     var askingModelRoutes: Set<String> = []
-    public var codexAuth: CodexAuthStatus? { didSet { publishProviderState() } }
-    private let codexAuthRead = LatestRead()
-
-    public func refreshCodexAuth() async throws -> CodexAuthStatus {
-        try await codexAuthRead.read({ try await codexAuthStatus() }, publish: { codexAuth = $0 })
-    }
     private var sessionReads: [String: LatestRead] = [:]
     private var faceDeliveries: [UUID: FaceDeliveryReceipt] = [:]
     /// Mounts own observation independently so another window cannot cancel this session’s reads.
@@ -106,7 +100,9 @@ public final class ProvidersFacade {
         case failed(message: String, cause: String? = nil)
     }
 
-    public internal(set) var isSavingChatBrain = false { didSet { publishProviderState() } }
+    public internal(set) var isSavingChatBrain = false {
+        didSet { faceChanges.yield(.status(saving: isSavingChatBrain)) }
+    }
     public var chatBrainCanonicalSelection: ProviderTurnChoice? {
         settings.flatMap { $0.preferences["chat"] }.map {
             ProviderTurnChoice(provider: settings?.activeProviders["chat"] ?? "",
@@ -158,11 +154,6 @@ public final class ProvidersFacade {
         settingsError = detail
         faceChanges.yield(.failure(detail))
         refreshFace()
-    }
-
-    private func publishProviderState() {
-        faceChanges.yield(.status(probes: providerProbeStarts, catalogStarted: catalogRefreshStarted,
-                                  codexAuth: codexAuth, saving: isSavingChatBrain))
     }
 
     deinit {
@@ -381,18 +372,6 @@ public extension NativeAgentEngine {
     }
 
     @MainActor
-    func configureSurfaceSelection(
-        surface: String, providerID: String, model: String, reasoningEffort: String, serviceTier: String?
-    ) async throws -> ProviderRoutingSnapshot {
-        guard let group = ProviderSurfaceGroups.group(for: surface) else { throw ProviderRoutingError.invalidRequest }
-        let result = try await saveProviderGroupSelection(
-            group: group, providerID: providerID, model: model, reasoningEffort: reasoningEffort,
-            serviceTier: serviceTier, clearOverride: false
-        )
-        return result.snapshot
-    }
-
-    @MainActor
     func configureProvider(_ id: String, apiKey: String?, authMode: String, defaultModel: String?) async throws {
         try await providers.configureProvider(id: id, apiKey: apiKey, authMode: authMode, defaultModel: defaultModel)
         Task { _ = await Self.liveDeviceSync.bridge.publishProviderCatalogStatus() }
@@ -404,8 +383,7 @@ public extension NativeAgentEngine {
 
 extension ProvidersFacade {
     @concurrent public nonisolated func modelCatalog(
-        refresh: Bool,
-        codexCacheURL: URL? = nil
+        refresh: Bool
     ) async throws -> ModelCatalogResponse {
         let dataRoot = self.dataRoot
         async let accountRefresh: Error? = {
@@ -464,8 +442,7 @@ extension ProvidersFacade {
                     priority: 1_000 + index
                 )
             }
-        let resolvedCodexCacheURL = codexCacheURL
-            ?? CodexAccountModelCatalog.chatGPTOAuthCacheCandidate(dataRoot: dataRoot)
+        let resolvedCodexCacheURL = CodexAccountModelCatalog.chatGPTOAuthCacheCandidate(dataRoot: dataRoot)
         let codexSelectableModels = CodexAccountModelCatalog.modelCatalogItems(
             cacheURL: resolvedCodexCacheURL,
             useDefaultCacheWhenNil: false
@@ -490,37 +467,6 @@ extension ProvidersFacade {
             updatedAt: (refresh && refreshFailures.isEmpty ? Date() : openRouterRead.fetchedAt).map { $0.formatted(.iso8601) },
             catalogFreshness: catalogFreshness.rawValue,
             catalogNote: catalogNote
-        )
-    }
-
-    /// Use readiness’s selected credential and adapter verdict; source flags must not come from a second scan.
-    @concurrent public nonisolated func codexAuthStatus(
-        environment: [String: String] = ProcessInfo.processInfo.environment,
-        allowEnvironmentOverride: Bool = true
-    ) async throws -> CodexAuthStatus {
-        let dataRoot = self.dataRoot
-        let path = ChatGPTTransport.preferredAuthPath(
-            dataRoot: dataRoot, environment: allowEnvironmentOverride ? environment : [:]
-        )
-        let status: (usable: Bool, detail: String, health: OAuthCredentialHealth)
-        do {
-            status = try ChatGPTTransport.credentialStatus(at: path)
-        } catch {
-            // Publish optional-refresh failure in its readout so discarded throws cannot leave stale signed-in state.
-            return CodexAuthStatus(
-                active: "unavailable", appOwnedLoggedIn: false, sharedLoggedIn: false,
-                codexHome: path.deletingLastPathComponent().path,
-                detail: ProviderFailure.diagnosticDescription(error)
-            )
-        }
-        let loggedIn = status.usable
-        let appOwned = ChatGPTTransport.codexChildHome(mirroring: path) != nil
-        return CodexAuthStatus(
-            active: loggedIn ? "oauth" : "none",
-            appOwnedLoggedIn: loggedIn && appOwned,
-            sharedLoggedIn: loggedIn && !appOwned,
-            codexHome: path.deletingLastPathComponent().path,
-            detail: status.detail
         )
     }
 }
@@ -560,7 +506,7 @@ extension ProvidersFacade {
             }
             config["default_model"] = .string(model)
         }
-        _ = try await routing.configureProvider(id: id, config: .object(config), expectedRevision: expectedRevision)
+        try await routing.configureProvider(id: id, config: .object(config), expectedRevision: expectedRevision)
         if config["api_key"] != nil { fetchModelListInBackground(after: id) }
     }
 

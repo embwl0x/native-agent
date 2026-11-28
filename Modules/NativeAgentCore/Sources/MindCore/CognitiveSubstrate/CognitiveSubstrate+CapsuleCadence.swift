@@ -8,6 +8,7 @@ extension CognitiveSubstrate {
     /// Stage the next reference in the copied state; only completed-reply settlement can publish it.
     func feelingShift(
         for words: [(axis: String, word: String)],
+        where canSpeak: (String) -> Bool,
         presentationState: inout CognitiveCapsulePresentationState
     ) -> String? {
         var changed: [String] = []
@@ -18,7 +19,9 @@ extension CognitiveSubstrate {
                 return (String(axis), String(word))
             }
             let prior = Dictionary(old, uniquingKeysWith: { first, _ in first })
-            changed = words.filter { value in prior[value.axis].map { $0 != value.word } == true }.map(\.word)
+            changed = words.compactMap { value in
+                prior[value.axis].map { $0 != value.word } == true && canSpeak(value.word) ? value.word : nil
+            }
         }
         presentationState.fingerprintFamily = words.isEmpty ? nil : words.map { $0.axis + ":" + $0.word }.joined(separator: "|")
         return changed.isEmpty ? nil : "My feeling has shifted: \(changed.joined(separator: ", "))."
@@ -26,18 +29,19 @@ extension CognitiveSubstrate {
 
     // MARK: - W4/P7 — the session bridge ("since we last talked")
 
-    /// The user's verified turns define gaps across doors. Only events inside a gap may speak, once after `sessionBridgeGapHours`.
+    /// The user's verified turns define gaps across doors. Only events inside a gap may speak, once after `sessionBridgeGapHours` of the person's waking time.
     func feltSessionBridgeLine(
         from read: CognitiveFrozenRead,
         presentationState: inout CognitiveCapsulePresentationState,
         fromUser: Bool,
         previousUserTurn: Date?,
+        usualQuiet: TimeInterval,
         gapItems: [String]?
     ) -> String? {
         guard read.configuration.enabled, fromUser else { return nil }
         let now = read.fixedAt
         let dyn = read.personalityDynamics
-        let opened = Self.sinceGapOpened(presentationState, previousUserTurn: previousUserTurn, dynamics: dyn, at: now)
+        let opened = Self.sinceGapOpened(presentationState, previousUserTurn: previousUserTurn, usualQuiet: usualQuiet, dynamics: dyn, at: now)
         // A user turn with nothing to bridge closes any owed gap.
         presentationState.owedSinceGap = nil
         guard let opened, let all = gapItems, !all.isEmpty else { return nil }

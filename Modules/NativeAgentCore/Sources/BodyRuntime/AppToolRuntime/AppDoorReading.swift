@@ -245,7 +245,7 @@ extension AppToolExecutor {
                                                           execution: execution, following: true), at: place)
             }
         }
-        if !item.isEmpty, offset == 0, let host = quietHost(), let words = await host.pageItemText(page: page.id, item: item, rows: false) {
+        if !item.isEmpty, offset == 0, let host = quietHost(), let words = await host.pageItemText(page: page.id, item: item, rows: false, turn: turn) {
             return .object(["status": .string("ok"), "page": .string(page.id), "item": .string(item), "content": .string(words)])
         }
         if turn.doorPreview != nil, Self.doorItemReads[page.id]?[item.lowercased()] == nil,
@@ -353,7 +353,7 @@ extension AppToolExecutor {
                     let notFound = ChatToolOutcome.refusedBeforeRunning(.object(["status": .string("not_found")]))
                     guard !following, let shown = await host.pageItem(page: page.id, named: item), let open = shown.open,
                           case .page(let to, item: let toItem)? = FaceLink(open) else {
-                        guard let words = await host.pageItemText(page: page.id, item: item, rows: true) else { return notFound }
+                        guard let words = await host.pageItemText(page: page.id, item: item, rows: true, turn: turn) else { return notFound }
                         return .object(["status": .string("ok"), "page": .string(page.id), "item": .string(item), "content": .string(words)])
                     }
                     let place = AppDoorNames.place(page: to + (toItem.map { "/" + $0 } ?? ""), item: "")

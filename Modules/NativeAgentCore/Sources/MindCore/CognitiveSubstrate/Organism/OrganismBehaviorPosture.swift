@@ -307,14 +307,12 @@ public extension BodySchema {
     var notificationRequiresReceipt: Bool {
         guard let belief = notificationDeliveryBelief else { return notificationPathHealthy != true }
         switch belief.category {
-        case .unconfigured:
-            // An absent transport has no delivery to acknowledge and never goes stale.
+        case .unconfigured, .configured, .deviceReceived, .displayed, .userSeen:
+            // Nothing is owed a receipt: no transport, nothing sent yet, or the last delivery was acknowledged.
             return false
-        case .deviceReceived, .displayed, .userSeen:
-            // Receipts age past their 36-hour horizon; they cannot prove the next delivery.
-            return !BodyBeliefOptimism.licenses(belief.metrics)
-        case .configured, .transportAccepted, .failed, .unknown:
-            return true
+        case .transportAccepted, .failed, .unknown:
+            // The last delivery was attempted with no receipt or failed, inside its evidence horizon; or the targets cannot be read.
+            return belief.sourceUnavailable != nil || belief.metrics.freshness > 0
         }
     }
 

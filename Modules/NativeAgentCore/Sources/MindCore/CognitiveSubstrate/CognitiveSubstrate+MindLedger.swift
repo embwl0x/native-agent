@@ -161,7 +161,7 @@ extension CognitiveSubstrate {
                 payload: mindLedgerArtifactPayload(at: now, undoEntry: nil)),
         ]
         do {
-            try await persistArtifactTransition(artifacts: artifacts, deletedArtifactIDs: [], at: now)
+            try await persistArtifactTransition(artifacts: artifacts, at: now)
         } catch {
             if disposition == restored { disposition = current }
             if dispositionTransitions == writtenTransitions { dispositionTransitions = previousTransitions }

@@ -23,6 +23,7 @@ package func completionPolicy(_ job: String, section: String = "prompt", argumen
 /// Serializes compatibility prose and image disclosure; callers retain role semantics and traces.
 package func llmCompatibilityPrompt(
     messages: [LLMMessage],
+    attachingImages: Bool = false,
     rolePrefix: (LLMMessage.Role) -> String
 ) throws -> (text: String, imageCount: Int) {
     var parts: [String] = []
@@ -39,12 +40,12 @@ package func llmCompatibilityPrompt(
             case .toolResult(_, let content, _):
                 parts.append("\(prefix) [tool_result] \(content)")
             case .image:
-                // Never stringify image bytes.
                 imageCount += 1
+                if attachingImages { parts.append("\(prefix) [Attached image #\(imageCount)]") }
             }
         }
     }
-    if imageCount > 0 {
+    if imageCount > 0, !attachingImages {
         parts.insert(try completionPolicy("unsupported-images", arguments: [String(imageCount)]), at: 0)
     }
     return (parts.joined(separator: "\n"), imageCount)

@@ -60,10 +60,10 @@ extension FaceLink {
                         }
                     }
                     try frames.finish()
-                    await lifetime.end(FaceWireError.disconnected, reachedEOF: true)
+                    await lifetime.end(reachedEOF: true)
                     continuation.finish()
                 } catch {
-                    await lifetime.end(error)
+                    await lifetime.end()
                     continuation.finish(throwing: error)
                 }
                 io.close()
@@ -74,7 +74,7 @@ extension FaceLink {
         deinit {
             reader.cancel()
             io.close()
-            Task { [lifetime] in await lifetime.end(FaceWireError.disconnected) }
+            Task { [lifetime] in await lifetime.end() }
             for write in pending { write.continuation.resume(throwing: FaceWireError.disconnected) }
         }
 
@@ -112,22 +112,6 @@ extension FaceLink {
             reader.cancel()
         }
 
-        /// One forwarding task owns this sink until cancellation, pipe failure or source closure.
-        public func forward(_ source: FaceFeedSource) async throws {
-            let sink = try await lifetime.attach(source)
-            do {
-                for try await batch in sink.batches {
-                    try Task.checkCancellation()
-                    try await send(.feed(batch))
-                }
-                try Task.checkCancellation()
-                await lifetime.detach(sink.epoch, cause: FaceWireError.disconnected)
-            } catch {
-                await lifetime.detach(sink.epoch, cause: error)
-                throw error
-            }
-        }
-
         private func cancelWrite(_ id: UUID) async {
             if let index = pending.firstIndex(where: { $0.id == id }) {
                 pending.remove(at: index).continuation.resume(throwing: CancellationError())
@@ -159,7 +143,7 @@ extension FaceLink {
             let waiting = pending
             pending.removeAll()
             for write in waiting { write.continuation.resume(throwing: cause) }
-            await lifetime.end(cause)
+            await lifetime.end()
         }
 
         private struct Write: Sendable {
@@ -173,33 +157,13 @@ extension FaceLink {
 }
 
 private actor FaceLinkLifetime {
-    private var sources: [UUID: FaceFeedSource] = [:]
-    private var termination: (cause: any Error, reachedEOF: Bool)?
+    private var terminationReachedEOF: Bool?
 
-    var reachedEOF: Bool { termination?.reachedEOF == true }
+    var reachedEOF: Bool { terminationReachedEOF == true }
 
-    func attach(_ source: FaceFeedSource) async throws -> FaceFeedSink {
-        if let termination { throw termination.cause }
-        let sink = await source.attachSink()
-        if let termination {
-            await source.detachSink(sink.epoch, cause: termination.cause)
-            throw termination.cause
-        }
-        sources[sink.epoch] = source
-        return sink
-    }
-
-    func detach(_ epoch: UUID, cause: any Error) async {
-        guard let source = sources.removeValue(forKey: epoch) else { return }
-        await source.detachSink(epoch, cause: cause)
-    }
-
-    func end(_ cause: any Error, reachedEOF: Bool = false) async {
-        guard termination == nil else { return }
-        termination = (cause, reachedEOF)
-        let attached = sources
-        sources.removeAll()
-        for (epoch, source) in attached { await source.detachSink(epoch, cause: cause) }
+    func end(reachedEOF: Bool = false) {
+        guard terminationReachedEOF == nil else { return }
+        terminationReachedEOF = reachedEOF
     }
 }
 

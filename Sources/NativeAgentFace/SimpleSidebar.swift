@@ -75,18 +75,17 @@ struct SimpleSidebar: View {
         if !inChat { select(.item(.chat)) }
     }
 
-    /// The places as Advanced's rail draws them: one row each, the bar on the place shown.
     private func placeRows(_ places: [ShellSurfacePages]) -> some View {
         VStack(spacing: 4) {
             ForEach(places) { place in
-                ShellPlaceRow(place: place, isSelected: place.surface == selectedPlace, barNamespace: selectionBar) {
+                ShellPlaceRow(place: place, isSelected: place.surface == selectedPlace, barNamespace: selectionBar, simple: true) {
                     pane = .agent
                     choose(place.surface, place.pages)
                 }
             }
         }
         // Animate the rows in one transaction so departing and arriving bars stay in sync.
-        .animation(NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion), value: selectedPlace)
+        .animation(Animation.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion), value: selectedPlace)
         .listRowInsets(EdgeInsets())
         .listRowBackground(Color.clear)
         .selectionDisabled()
@@ -175,7 +174,7 @@ private struct SimpleFoldLine: View {
                     .font(ShellType.captionSemibold)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .rotationEffect(.degrees(isOpen ? 90 : 0))
-                    .animation(NativeAgentMotion.respecting(NativeAgentMotion.quickCurve, reduceMotion: reduceMotion), value: isOpen)
+                    .animation(Animation.respecting(NativeAgentMotion.quickCurve, reduceMotion: reduceMotion), value: isOpen)
                     .accessibilityHidden(true)
                 Text(title).font(ShellType.labelSemibold).foregroundStyle(NativeAgentShell.secondary)
                 if let count {

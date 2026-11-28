@@ -32,13 +32,13 @@ public enum ToolNameAliases {
         "desk_read": "desk.read", "desk_add_item": "desk.add", "desk_set_status": "desk.set_status", "desk_wait": "desk.wait",
         "desk_update_item": "desk.update", "desk_note": "desk.note", "desk_add_ref": "desk.add_ref",
         "desk_set_cadence": "desk.set_cadence", "desk_set_notify": "desk.set_notify", "desk_close": "desk.close",
-        "desk_archive": "desk.archive", "desk_blocked_on": "desk.blocked_on", "desk_breakdown": "desk.breakdown",
-        "desk_defer": "desk.defer", "desk_nag_control": "desk.nag", "desk_open_pursuit": "desk.open_pursuit",
-        "desk_work_log": "desk.work_log", "task_ledger_post": "ledger.post", "task_ledger_list": "ledger.list",
+        "desk_blocked_on": "desk.blocked_on",
+        "desk_defer": "desk.defer", "desk_nag_control": "desk.nag",
+        "desk_work_log": "desk.work_log",
         "scheduler_list_jobs": "schedule.list", "scheduler_create_job": "schedule.create", "scheduler_cancel_job": "schedule.cancel",
         "recall_memory": "memory.recall", "commit_memory": "memory.commit",
         "forget_memory": "memory.forget", "memory_proposals_pending": "memory.proposals",
-        "memory_proposal_review": "memory.review", "search_kg": "graph.search", "rebuild_knowledge_graph": "graph.rebuild",
+        "memory_proposal_review": "memory.review", "search_kg": "graph.search",
         "scratchpad_read": "chat.scratch_read",
         "bot_list": "bot.list", "bot_create": "bot.create", "bot_update": "bot.update", "bot_pause": "bot.pause",
         "bot_delete": "bot.delete", "bot_run_once": "bot.run_once", "bot_ask": "bot.ask",
@@ -67,7 +67,7 @@ public enum ToolNameAliases {
         "read_file": "files.read", "list_dir": "files.list", "file_info": "files.info", "file_excerpt": "files.excerpt", "grep": "files.grep",
         "write_file": "files.write", "move_file": "files.move", "copy_file": "files.copy", "trash_file": "files.trash", "apply_patch": "files.patch",
             "mac_spotlight_search": "files.spotlight",
-        "shell": "shell.run", "bash": "shell.bash", "git": "git.run", "git_status": "git.status",
+        "shell": "shell.run", "bash": "shell.bash", "git_status": "git.status",
         "git_diff": "git.diff", "git_log": "git.log", "repo_dirty_summary": "git.summary",
         "swift_build": "swift.build", "swift_test": "swift.test",
         "remote_node_list": "node.list", "remote_node_execute": "node.run",
@@ -85,7 +85,6 @@ public enum ToolNameAliases {
         "menu": "mac.menu", "menu_press": "mac.menu_press", "clipboard_read": "mac.clipboard_read",
         "clipboard_write": "mac.clipboard_write", "system_info": "mac.system_info", "mac_volume": "mac.volume", "activity_query": "mac.activity",
         "mac_screenshot_save": "mac.screenshot_save", "mac_location": "mac.location",
-        "mac_media": "mac.media",
         "context_lookup": "capabilities.lookup", "request_interaction": "card.request",
         "artifact_find": "artifact.find", "work_context": "work.context",
     ]
@@ -250,7 +249,7 @@ public enum ToolNameAliases {
         let action = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !action.isEmpty else { return (name, input) }
         // Historical generated labels survive unmounting or dropping their executable.
-        let ran = authoredTool(raw) ?? ranTool(name, input: fields)
+        let ran = action == "ledger.list" ? "task_ledger_list" : (authoredTool(raw) ?? ranTool(name, input: fields))
         return (ran == name ? action : ran, fields["args"] ?? .object([:]))
     }
 

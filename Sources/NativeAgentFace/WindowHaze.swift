@@ -38,14 +38,10 @@ extension HazeColor {
 // MARK: - Controls wear the haze
 
 extension View {
-    /// Tint one control's on state with haze; page-level tint accents everything.
-    func hazeTinted(_ kind: HazeControlKind = .toggle) -> some View { modifier(HazeControlTint(kind: kind)) }
+    func hazeTinted() -> some View { modifier(HazeControlTint()) }
 }
 
-enum HazeControlKind { case toggle, segments, button }
-
 private struct HazeControlTint: ViewModifier {
-    var kind: HazeControlKind
     @FacePreference(HazeColor.key) private var colorRaw = HazeColor.defaultValue.rawValue
     @Environment(\.colorScheme) private var colorScheme
 
@@ -54,11 +50,11 @@ private struct HazeControlTint: ViewModifier {
     }
 
     @ViewBuilder private func preferenceContent(_ content: Content) -> some View {
-        let color = HazeColor(stored: colorRaw).control(dark: colorScheme == .dark, labelled: kind != .toggle)
+        let color = HazeColor(stored: colorRaw).control(dark: colorScheme == .dark, labelled: true)
         content
             .tint(Color(nsColor: color))
             // tint does not reach AppKit's selected segment; set the native control colour directly.
-            .background { if kind == .segments { SegmentBezelTint(color: color) } }
+            .background { SegmentBezelTint(color: color) }
     }
 }
 

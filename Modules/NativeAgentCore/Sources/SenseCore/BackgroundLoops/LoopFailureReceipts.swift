@@ -37,10 +37,6 @@ internal struct FailureReceiptIncident: Sendable {
 
 /// Each occurrence keeps its own time. Incident identity joins only the same uninterrupted trailing failure streak.
 public enum LoopFailureReceipts {
-    public struct DidWrite: NotificationCenter.AsyncMessage {
-        public typealias Subject = NSObject
-        public init() {}
-    }
     public struct Occurrence: Sendable {
         public let id: String
         public let loopId: String
@@ -146,7 +142,7 @@ extension SwiftNativeLoopScheduler {
         let boundedError = trimmed.isEmpty
             ? "unspecified failure (empty error description)"
             : String(trimmed.prefix(2_000))
-        let at = clock()
+        let at = Date()
         let now = NativeTimestampFormat.plainZulu(at)
         let incident = FailureReceiptIncident(
             loopId: loopId,
@@ -168,7 +164,6 @@ extension SwiftNativeLoopScheduler {
                 .init(source: "loops", at: at, subject: "loop:" + loopId, kind: "loop.failure", row: try incident.toJSON(id: id).serializedData(pretty: false))
             ])
             lastFailureReceipt = LastFailureReceipt(id: id, loopId: loopId, error: boundedError)
-            NotificationCenter.default.post(LoopFailureReceipts.DidWrite())
         } catch {
             // An uncertain write invalidates the memo; never coalesce against bytes whose landing is unknown.
             lastFailureReceipt = nil
@@ -192,7 +187,7 @@ extension SwiftNativeLoopScheduler {
         loopId: String, error: String
     ) async {
         var st = states[loopId] ?? LoopState(loopId: loopId)
-        let now = clock()
+        let now = Date()
         st.lastError = error
         st.lastTickAt = now
         st.tickCount += 1
@@ -209,7 +204,7 @@ extension SwiftNativeLoopScheduler {
         loopId: String, result: String, completedWork: Bool = true, startedAt: Date? = nil
     ) async {
         var st = states[loopId] ?? LoopState(loopId: loopId)
-        let now = clock()
+        let now = Date()
         st.lastResult = result
         st.lastError = nil
         if completedWork {

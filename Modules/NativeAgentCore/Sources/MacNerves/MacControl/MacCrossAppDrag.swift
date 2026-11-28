@@ -493,24 +493,33 @@ extension MacFourVerbs {
                 body: ["app": .string(destinationAppName)]
             , turn: turn, context: context)
         } catch {
-            return MacFourVerbsReply(
-                ok: false,
-                text: MacCrossAppDrag.raiseFailedWords(destinationAppName, because: "\(error)"),
-                detail: raiseDetail.merging([
-                    "raised": .bool(false),
-                    "error": .string(MacCrossAppDrag.raiseFailedReason),
-                ]) { current, _ in current }
-            )
+            let unknown = Self.unknownActionReply(error, operation: "bringing \(destinationAppName) forward", app: destinationAppName)
+            var detail = unknown.detail.merging(raiseDetail) { current, _ in current }
+            detail["error"] = .string(MacCrossAppDrag.raiseFailedReason)
+            if detail["effects"] == .string("none") { detail["raised"] = .bool(false) }
+            return MacFourVerbsReply(ok: false, text: unknown.text + " The drag did not start.", detail: detail)
         }
         guard focused.ok else {
-            return MacFourVerbsReply(
-                ok: false,
-                text: MacCrossAppDrag.raiseFailedWords(destinationAppName, because: focused.error),
-                detail: raiseDetail.merging([
-                    "raised": .bool(false),
-                    "error": .string(MacCrossAppDrag.raiseFailedReason),
-                ]) { current, _ in current }
-            )
+            var detail = Self.operationDetail(focused, app: destinationAppName).merging(raiseDetail) { _, new in new }
+            detail["error"] = .string(MacCrossAppDrag.raiseFailedReason)
+            if detail["status"] == .string("yielded_to_user"), Self.object(focused.output)["activated"] == .bool(true) {
+                detail["raised"] = .bool(true)
+                detail["raised_app"] = .string(destinationAppName)
+                return MacFourVerbsReply(ok: false,
+                    text: "\(destinationAppName) came forward. Control returned to you before the drag started.", detail: detail)
+            }
+            let effects = detail["effects"]
+            let unverifiedCancellation = focused.operationState == .cancelAcknowledged
+                && focused.verification != .notRequired && effects == nil
+            if effects == .string("unknown") || detail["status"] == .string("outcome_unknown")
+                || detail["status"] == .string("timed_out") || focused.operationState == .outcomeUnknown
+                || focused.operationState == .timedOut || unverifiedCancellation {
+                detail["outcome_unknown"] = .bool(true)
+                return MacFourVerbsReply(ok: false,
+                    text: "I couldn't verify whether \(destinationAppName) came forward. The drag did not start.", detail: detail)
+            }
+            detail["raised"] = .bool(false)
+            return MacFourVerbsReply(ok: false, text: MacCrossAppDrag.raiseFailedWords(destinationAppName, because: focused.error), detail: detail)
         }
         return nil
     }

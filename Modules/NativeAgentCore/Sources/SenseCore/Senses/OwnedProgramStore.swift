@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 // Blueprint: | `OwnedProgramStore.swift` | Sealed program seeds, exact proof, tape rehearsal and publication; kept shipped parts follow the bundle |
 
@@ -293,12 +294,21 @@ public struct OwnedProgramStore: Sendable {
 
     /// Use the same intercepting host and runner for capture and replay; a sealed candidate's capture cannot be refreshed.
     @concurrent public func validate(_ candidate: Candidate, key: SymmetricKey, capture: Bool = false, input: JSONValue? = nil,
-                         runner: any OwnedProgramRunning, host: @Sendable () -> any OwnedProgramHostProfile, execution: OwnedProgramExecution,
-                         checkInput: @Sendable (JSONValue) throws -> Void) async throws -> JSONValue {
+                         faceSampleInput: JSONValue?, runner: any OwnedProgramRunning, host: @Sendable (JSONValue) -> any OwnedProgramHostProfile,
+                         faceHost: any OwnedProgramHostProfile, ownerPages: [PartFaceSnapshot], execution: OwnedProgramExecution,
+                         prepareFace: @Sendable (JSONValue) async throws -> NativeAgentSecretRedactor.FaceInput,
+                         actionExists: @Sendable (String) throws -> Bool,
+                         documentReadAllowed: @Sendable (PartFace.Call) throws -> Bool,
+                         checkInput: @Sendable (JSONValue, String) throws -> Void) async throws -> (proof: JSONValue, faceChecked: Bool) {
         let turn = execution.turn
         try CapabilityLifecycle.requireWrite(turn: turn)
         try Task.checkCancellation()
+        let projectsFace = candidate.manifest.objectValue?["face"]?.objectValue?["projection"] == .bool(true)
+        if faceSampleInput != nil, !projectsFace {
+            throw SenseFailure(code: "bad_input", message: "faceSampleInput requires a version that declares face.projection.")
+        }
         var captured: JSONValue?
+        var savedRehearsal: JSONValue?
         guard let retained = try retained(id: candidate.id, matching: { $0 == candidate }) else {
             throw SenseFailure(code: "integrity", message: "The ability version is no longer retained.")
         }
@@ -314,9 +324,11 @@ public struct OwnedProgramStore: Sendable {
             }
             // Only a sealed rehearsal is reusable; keep and seed seals do not prove fixtures ran. Verify exact candidate, fixtures, host and shapes.
             if (captured != nil || !capture && input == nil),
+               (captured ?? candidate.fixtures).arrayValue?.isEmpty == false,
                saved.objectValue?["domain"] == .string("owned-program-validation"),
                saved.objectValue?["receipts"]?.arrayValue?.isEmpty == false {
-                return saved
+                if !projectsFace { return (saved, false) }
+                savedRehearsal = saved
             }
         }
         // Replay recorded practice from its tape without fresh capture.
@@ -324,18 +336,49 @@ public struct OwnedProgramStore: Sendable {
         if !replaying, candidate.fixtures.arrayValue?.contains(where: { $0.objectValue?["tape"] != nil }) == true {
             throw SenseFailure(code: "bad_input", message: "Fixtures are all recorded tape or all hand-written; this candidate mixes them. Save it again.")
         }
-        let recording = !replaying && captured == nil && (capture || candidate.fixtures.arrayValue?.isEmpty == true)
+        let program = candidate.owned
+        let faceOnly = projectsFace && program.entry == .face
+        let faceProgram = projectsFace ? OwnedProgram(kind: program.kind, id: program.id, version: program.version,
+            source: program.source, entry: .face, dependencies: program.dependencies, permissions: program.permissions,
+            seconds: program.seconds, analysis: program.analysis) : nil
+        let recording = !replaying && captured == nil && (candidate.fixtures.arrayValue?.isEmpty == true || capture && !faceOnly)
         let fixtures = recording ? [.object(["input": input ?? .object([:])])] : (captured ?? candidate.fixtures).arrayValue ?? []
-        guard !fixtures.isEmpty else { throw SenseFailure(code: "bad_input", message: "Supply fixtures or capture input for validation.") }
+        if faceOnly, recording, faceSampleInput != nil, input == nil, !capture {
+            throw SenseFailure(code: "bad_input", message: "The face sample checks drawing. Supply fixtures, input or capture:true to rehearse this version.")
+        }
+        guard !fixtures.isEmpty else {
+            throw SenseFailure(code: "bad_input", message: "Supply fixtures or capture input for validation.")
+        }
+        let rehearsal = {
+            var rehearsal = execution
+            rehearsal.options.handsBack = true; rehearsal.wake = nil
+            return rehearsal
+        }()
+
+        func rehearseFace(_ face: OwnedProgram, input: JSONValue, label: String) async throws -> [String: JSONValue] {
+            try Task.checkCancellation()
+            try checkInput(input, label)
+            let prepared: NativeAgentSecretRedactor.FaceInput
+            do { prepared = try await prepareFace(input) }
+            catch is CancellationError { throw CancellationError() }
+            catch { throw SenseFailure(code: "bad_face", message: "\(label): \(error.localizedDescription)") }
+            let receipt = await runner.run(face, input: prepared.value, preview: false, replay: nil, host: faceHost, execution: rehearsal)
+            var fields = receipt.objectValue ?? [:]
+            _ = OwnedProgramRunner.journal(fields.removeValue(forKey: "journal_ref"))
+            try Self.checkFace(fields, input: input, label: label, ownerPages: ownerPages,
+                actionExists: actionExists, documentReadAllowed: documentReadAllowed)
+            return fields
+        }
+
         var receipts: [JSONValue] = []
-        for (index, value) in fixtures.enumerated() {
+        for (index, value) in fixtures.enumerated() where savedRehearsal == nil {
             try Task.checkCancellation()
             let fields = value.objectValue ?? [:]
             guard let input = fields["input"], recording || replaying || fields["expected"] != nil else {
                 throw SenseFailure(code: "bad_input", message: "Fixture \(index + 1) requires input and expected returned JSON.")
             }
-            try checkInput(input)
-            let interceptor = OwnedProgramFixtures(base: host(), calls: recording ? nil : fields["calls"]?.arrayValue ?? [],
+            if !faceOnly { try checkInput(input, "Fixture \(index + 1) input") }
+            let interceptor = OwnedProgramFixtures(base: host(input), calls: recording ? nil : fields["calls"]?.arrayValue ?? [],
                                                    decisions: recording || captured != nil)
             let answers = fields["answers"]?.arrayValue ?? []
             guard answers.count <= OwnedProgramRunner.stepLimit else {
@@ -344,9 +387,12 @@ public struct OwnedProgramStore: Sendable {
             var replay: OwnedProgramRunner.Replay?
             var final: [String: JSONValue] = [:]
             for pass in 0...answers.count {
-                var rehearsal = execution
-                rehearsal.options.handsBack = true; rehearsal.wake = nil
-                let receipt = await runner.run(candidate.owned, input: input, preview: false, replay: replay,
+                if faceOnly, let faceProgram {
+                    final = try await rehearseFace(faceProgram, input: input, label: "Fixture \(index + 1) face(input)")
+                    receipts.append(.object(final.merging(["input": input]) { _, input in input }))
+                    break
+                }
+                let receipt = await runner.run(program, input: input, preview: false, replay: replay,
                     host: interceptor, execution: rehearsal)
                 final = receipt.objectValue ?? [:]
                 // A stopped rehearsal's journal stays private; the next pass replays it, and the sealed proof keeps only the receipt.
@@ -385,7 +431,72 @@ public struct OwnedProgramStore: Sendable {
                 captured = fixture
             }
         }
-        return try bind(candidate, receipts: receipts, key: key, captured: captured, turn: turn)
+        if let faceProgram {
+            if let faceSampleInput {
+                _ = try await rehearseFace(faceProgram, input: faceSampleInput, label: "faceSampleInput")
+            } else if !faceOnly || savedRehearsal != nil {
+                for (index, fixture) in fixtures.enumerated() {
+                    guard let input = fixture.objectValue?["input"] else {
+                        throw SenseFailure(code: "bad_input", message: "Fixture \(index + 1) requires input.")
+                    }
+                    _ = try await rehearseFace(faceProgram, input: input, label: "Fixture \(index + 1) face(input)")
+                }
+            }
+        }
+        let proof = try savedRehearsal ?? bind(candidate, receipts: receipts, key: key, captured: captured, turn: turn)
+        return (proof, faceProgram != nil)
+    }
+
+    private static func checkFace(_ receipt: [String: JSONValue], input: JSONValue, label: String, ownerPages: [PartFaceSnapshot],
+                                  actionExists: (String) throws -> Bool, documentReadAllowed: (PartFace.Call) throws -> Bool) throws {
+        try Task.checkCancellation()
+        guard receipt["status"] == .string("ok") else {
+            let failure = (receipt["stopped"] ?? receipt["error"])?.objectValue ?? [:]
+            let reason = failure["reason"]?.stringValue
+            let detail = failure["detail"]?.stringValue ?? failure["message"]?.stringValue ?? reason ?? "The projection did not return."
+            throw SenseFailure(code: reason == "cancelled" ? "cancelled" : "bad_face", message: "\(label) failed: \(detail)")
+        }
+        if let call = receipt["calls"]?.arrayValue?.first {
+            let name = call.objectValue?["call"]?.stringValue ?? "a host call"
+            throw SenseFailure(code: "bad_face", message: "\(label) attempted \(name). A face reads only its sample packet.")
+        }
+        do {
+            let keys = try PartFace.Keys(packet: input)
+            let documentRead = input.objectValue?["read"] != nil && keys.rows.values.contains { $0.read != nil }
+            let face = try PartFace.decode(receipt["returned"] ?? .null, documentRead: documentRead)
+            for block in face.sections.compactMap(\.block) where !["document", "form", "leaf"].contains(block.kind) {
+                throw PartCallError(code: "bad_face", message: "Block \(block.key) has unsupported kind \(block.kind). Use document, form or leaf.")
+            }
+            let bound = try face.bound(to: keys, levers: [])
+            for page in ownerPages {
+                _ = try face.bound(to: keys, levers: page.levers ?? [], keyLevers: page.keyLevers ?? [])
+            }
+            var calls: [PartFace.Call] = []
+            for row in bound.allRows {
+                calls += (row.actions ?? []).compactMap(\.call)
+                calls += [row.control?.call, row.read].compactMap { $0 }
+            }
+            for section in bound.sections {
+                if let read = section.more?.read { calls.append(read) }
+                if let block = section.block {
+                    if block.kind == "document", block.text == nil || (block.text?.utf8.count ?? 0) > PartFace.Block.inlineByteLimit {
+                        guard let read = block.read, try documentReadAllowed(read) else {
+                            throw PartCallError(code: "bad_face", message: "Document \(block.key) needs inline text or a read-only action."
+                                + (block.read.map { " Its read names \($0.action)." } ?? " Its key has no read."))
+                        }
+                    }
+                    if let read = block.read { calls.append(read) }
+                    if block.protected != true { calls += (block.submit ?? []).compactMap(\.call) }
+                }
+            }
+            for action in Set(calls.map(\.action)).sorted() {
+                guard try actionExists(action) else {
+                    throw PartCallError(code: "bad_face", message: "The face refers to \(action), which is unavailable in the app door.")
+                }
+            }
+        } catch {
+            throw SenseFailure(code: "bad_face", message: "\(label): \(JSONValue.describe(error))")
+        }
     }
 
     public func discard(_ candidate: Candidate, turn: Turn?) throws {
@@ -597,6 +708,7 @@ public actor OwnedProgramFixtures: OwnedProgramHostProfile {
     public var finished: Bool { !faulted && (calls == nil || next == calls?.count) }
     public var captured: Bool { decisions }
     public nonisolated var actionIDs: [String] { get throws { try base.actionIDs } }
+    public nonisolated var allowsNotebook: Bool { base.allowsNotebook }
     public nonisolated var floorReasons: Set<String> { base.floorReasons }
     public nonisolated var scriptKey: String { base.scriptKey }
     public nonisolated func action(_ id: String) throws -> OwnedProgramAction? { try base.action(id) }
@@ -609,6 +721,9 @@ public actor OwnedProgramFixtures: OwnedProgramHostProfile {
         try base.callArgumentsForEvidence(id, given: given)
     }
     public nonisolated func secretLine(_ text: String) -> Bool { base.secretLine(text) }
+    public nonisolated func checkNotebook(_ value: Data?, keyedWrite: Bool) async throws {
+        try await base.checkNotebook(value, keyedWrite: keyedWrite)
+    }
     public nonisolated func evidence(_ receipt: JSONValue) -> OwnedProgramReceiptEvidence { base.evidence(receipt) }
     public nonisolated func receiptField(_ key: String, in receipt: JSONValue) -> JSONValue? { base.receiptField(key, in: receipt) }
     public nonisolated func answer(_ receipt: JSONValue) -> JSONValue { base.answer(receipt) }
@@ -638,7 +753,7 @@ public actor OwnedProgramFixtures: OwnedProgramHostProfile {
     }
 
     public func primitive(_ operation: String, arguments: JSONValue, preview: Bool, execution: OwnedProgramExecution) async throws -> JSONValue {
-        if let refused = await base.checkPrimitive(operation, arguments: arguments, execution: execution) { return refused }
+        if let refused = await base.checkPrimitive(operation, arguments: arguments, fixture: self, execution: execution) { return refused }
         let result: JSONValue
         if calls != nil {
             let call = try consumeCall(operation, arguments: arguments)
@@ -651,6 +766,25 @@ public actor OwnedProgramFixtures: OwnedProgramHostProfile {
         }
         return .object(["status": .string("ok"), "effects": .string("none"), "result": result,
                         "captured": .bool(result.objectValue?["captured"] == .bool(true))])
+    }
+
+    public func ownsStream(_ id: String, opening: String, reading: String, closing: String) -> Bool {
+        guard let calls else { return false }
+        for value in calls.prefix(next).reversed() {
+            guard let call = value.objectValue, let operation = call["operation"]?.stringValue else { continue }
+            let receipt = call["receipt"]
+            guard receipt == nil || receipt?.objectValue?["status"] == .string("ok"),
+                  let result = (receipt?.objectValue?["result"] ?? call["result"])?.objectValue else { continue }
+            switch operation {
+            case opening where result["id"] == .string(id):
+                return true
+            case closing, reading:
+                guard call["args"]?.objectValue?["id"] == .string(id) else { continue }
+                if result["closed"] == .bool(true) || result["done"] == .bool(true) { return false }
+            default: break
+            }
+        }
+        return false
     }
 
     public func decide(_ question: String, data: JSONValue, execution: OwnedProgramExecution) throws -> JSONValue? {

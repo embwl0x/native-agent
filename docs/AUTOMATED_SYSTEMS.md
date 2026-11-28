@@ -28,7 +28,7 @@ Paths below are relative to that root unless identified as source paths.
 | `SenseCore/BackgroundLoops/LoopContracts.swift`, `LoopStatusEvidence.swift` | Runner contracts, outcomes, backoff, tick execution until completion or cancellation and status evidence; watchdog wire keys remain unchanged. |
 | `BackgroundWork` | Maintenance, work and connector runner bodies. |
 | `BodyRuntime/EngineRuntime/EngineLaunch.swift`, `EngineComposition.swift` | Launch ordering and concrete loop composition; `EngineChatSurfaces.swift`, `EngineDreams.swift` and `EngineScheduledWork.swift` compose chat surfaces, Dream/REM and scheduled work through installed host effects. |
-| `DeskCore/TriggerScheduler/OneClock.swift`, `EngineScheduledWork.swift` | The one clock: each declared time (`clock/times.json`), delivered once to its owner. |
+| `DeskCore/TriggerScheduler/OneClock.swift`, `EngineScheduledWork.swift` | The one clock delivers saved declarations (`clock/times.json`) and times held in memory. |
 | `BodyRuntime/DeviceSync/MacSyncEngine*.swift` | Mobile command transport and snapshots. |
 
 Core source paths are under `Modules/NativeAgentCore/Sources/`.
@@ -129,8 +129,8 @@ Inspect these together:
   launch reconcilers) records each pass as a beat with `OrganPulse.record`
   (outcome `worked`, `nothing`, `held`, `busy`, `failed` or `stopped`, a note, an
   optional yield and cadence). The record compares those facts with the organ's
-  latest stored beat in the write transaction; an unchanged reading writes nothing,
-  including across relaunch. Every beat still feeds the live ring for liveness and
+  latest stored beat in the write transaction; an unchanged reading writes nothing
+  within the hour and is restated after it, so a relaunch reads when the organ last worked. Every beat still feeds the live ring for liveness and
   repeated holds. Each organ retains its last 32 beats in memory, so a busy organ
   never evicts another's. Relaunch restores changed facts from the record. `OrganRecord` reads a ring: its
   latest beat and its deviation (missed, failed, stuck, off record), derived on every read
@@ -298,7 +298,8 @@ The configured `doctor_auto_run` lane runs once at launch, off their turn's path
 (`EngineLaunch` ticks it once), then on its configured interval (at least an
 hour); before setup finishes it reads `not needed` like every pass that needs
 the agent; it runs every safe repair and files one inbox ask for the sign-ins and
-permissions it cannot do itself. Its `doctor/latest.json` contains:
+permissions it cannot do itself. Each completed automatic run replaces
+`doctor/latest.json` under its file lock with these fields.
 
 - `measuredAt`: when measurement began;
 - `runAt`: when the snapshot was published;
@@ -306,8 +307,8 @@ permissions it cannot do itself. Its `doctor/latest.json` contains:
 - `checks`: the findings; an unreadable config is a fault with its file,
   never "off".
 
-Every snapshot projects all unsettled `owes.repair`, regardless of evidence source;
-an in-place refresh replaces the prior debt projection from the experience owner.
+Every snapshot projects the experience owner's unsettled `owes.repair`, regardless
+of evidence source.
 Unknown current measurements retain each debt as unmeasured and never settle it.
 
 Repair acceptance follows the [repair law](EXPERIENCE.md#repair-is-owed-users-law-10-18).
@@ -325,6 +326,11 @@ Shortcuts admits and settles its run through the same live Doctor facade as
 the UI and automatic runs. Every full run includes the same Desk and Recent
 activity checks in `EngineDoctorRuntime.runDoctor`, including automatic runs
 and the Doctor shortcut; surface refreshes use those same status readers.
+A full run checks cancellation before starting live coverage, recording status
+readings, filing an ask and publishing the report. Each completed repair's
+passing recheck settles its obligation even if the run stops. A cancelled
+automatic run leaves the previous report inspectable with its completion stamp
+cleared and a plain incomplete-run status.
 The Diagnostics header reads that latest-run
 availability before retained checks and says every check passed only when all
 rows were measured and passed; empty, unmeasured or unclear checks stay incomplete.
@@ -332,11 +338,8 @@ Only a completed full run clears a failed-run issue. Current route details come
 from one checked provider snapshot at the Doctor facade's own root. A failed
 read is a structured `current_route_issue` and makes the envelope unavailable;
 an absent provider is not a route-read failure.
-Health-cache reuse requires the current `launchID` and a `runAt` age from zero
-to less than 60 seconds; a fresh core reading never merges rows from an earlier
-launch.
-Projected rows retain the measured check's verdict, detail and executable repair
-across cache reads and in-place updates; refreshed checks replace them by check identity.
+Projected repair rows retain the measured check's verdict, detail and executable
+repair from the run that publishes the snapshot.
 `getHealth` preserves the phone's existing keys and adds independent `reachable`,
 `doctorStatus` and `doctorIssue` metadata. The answering runtime reports reachable
 even while Doctor is missing, running, failed or incomplete. `ok` means a current,
@@ -377,7 +380,7 @@ Local file and snapshot reads still can fail. Repair remains a separate action.
 | Check | Source owner | What it measures | Does collection probe? |
 |---|---|---|---|
 | `live.providers` | `BodyRuntime/EngineRuntime/EngineDoctorMeasurements.swift`; `BodyRuntime/EngineRuntime/DoctorProviderPathReading.swift` | Saved authentication, active route and native connection-test reading. | No new connection test; reads the provider status feed. Explicit connection tests probe the saved credential. |
-| `live.memory` | `BodyRuntime/EngineRuntime/EngineDoctorMeasurements.swift` | Mounted canonical store attachment, query response, graph reconciliation failure and SQLite integrity. | Yes: queries the running store each time; `quick_check` is cached between integrity readings. |
+| `live.memory` | `BodyRuntime/EngineRuntime/EngineDoctorMeasurements.swift` | Mounted canonical store attachment, query response, graph reconciliation failure and SQLite integrity. | Yes. It queries the running store each time and caches completed `quick_check` readings. Each probe uses a fresh read-only snapshot and renews ordinary pool readers. The store automatically rebuilds damaged external-content search indexes and checks again. A failed rebuild or incomplete recheck retains confirmed damage alongside the error. Without an integrity verdict the probe reads unmeasured. Its restore guidance requires a fresh integrity verdict of damage and a completed rebuild and recheck when attempted. A graph-read failure alone carries no restore guidance. |
 | `live.bridges` | `BodyRuntime/EngineRuntime/EngineDoctorMeasurements.swift` | Expected local listeners, bound ports and startup failures. | No; reads listener snapshots. |
 | `live.mac_operation_recovery` | `BodyRuntime/EngineRuntime/EngineDoctorRuntime.swift`; `MacNerves/MacControl/MacControlOperationStore.swift` | Mac owner's launch-recovery admission state, original failure and repair; unavailable refuses Mac effects while looking and other surfaces remain available. | No; reads owner state, never runs recovery. |
 | `live.browser_operation_recovery` | `BodyRuntime/EngineRuntime/EngineDoctorRuntime.swift`; `MacNerves/Browser/Browser+OperationStore.swift` | Browser owner's launch-recovery state and individual damaged run causes. Uncertain damaged runs refuse new effects; valid sibling rows remain readable and damaged row bytes stay intact. | No; reads owner state and canonical runs, never runs recovery. |
@@ -418,8 +421,13 @@ it does not grant a repair or infer delivery from setup.
 `BodyRuntime/EngineRuntime/EngineLaunch.swift` registers the lanes. The table gives the
 lanes and their production defaults as of this writing; the installed set is
 `logs/background_loop_state.json` and Doctor's aggregate `live.background_loops`
-row, with individual readings at `live.background_loop.<loopId>`. Enabled state,
-event deadlines, backoff and saved configuration determine actual work.
+row, with individual readings at `live.background_loop.<loopId>`. The initial
+coverage measurement reads manager status and failure history once. When the
+history read succeeds, the aggregate row and Diagnostics verdicts use the time
+after that read. Individual rows use the time before the read and check whether
+a repair is still owed. A targeted individual recheck takes a fresh detail
+reading. Enabled state, event deadlines, backoff and saved configuration
+determine actual work.
 
 Senses registration never gates this manifest or its resident observations.
 Loops start together, including Telegram/Slack ingress, reply reconciliation
@@ -487,7 +495,10 @@ therefore does not add its duration to the next period after a restart.
 A Desk continuation whose helper run is still queued or running remains a
 live domain wait. Unknown terminal effects stop the continuation for domain
 verification.
-Queued helper runs retain their initiating turn's steering sources through claim and execution.
+Queued helper runs retain their initiating turn's steering sources and file-access
+ceiling through claim and execution. Direct `bot.ask` carries the same limits.
+Each helper run has independent steering state. Peers elevated for the
+initiating Ask still steer the helper as source identities.
 Requested helper replies follow queue and shelf changes, without a thirty-second
 pending-result poll. A helper's cadence is its `helper:<id>` time on the one clock
 (`BodyRuntime/StandingBots/BotRunnerScheduler.swift`). The scheduler drains queued requests.
@@ -607,13 +618,17 @@ Attention admits the night through `MindStream.night`; its source and policy are
 handlers or launch-time withdrawals. Each night offers REM to its existing gate.
 Dream and REM failures owe repair on `attention > night`, naming `mind.dream` or `mind.rem`.
 A completed dream keeps its result if diary presentation fails and reports that separate failure.
+If putting away older Inbox cards fails after the new dream matter is filed,
+the receipt keeps the new matter, counts cards already put away and reports
+the cause in `archiveFailure`.
 Its Inbox body shows the dream message once: a summary that begins the words is not repeated.
 REM consumes the REM owner's typed outcome: a skip keeps its reason in the receipt;
 a completed pass with proposals files one card (`ClockWork.surfaceREMResult`).
-A scheduled dream report with errors and no written entry files a critical
+A scheduled dream report with failures and no written entry files a critical
 `dream_cycle` card and routes adverse attention before archiving older dream
-cards. It reaches the phone even through quiet hours; a no-work or disabled
-pass still produces no interruption.
+cards. It reaches the phone even through quiet hours. A stopped dream keeps
+any diary entry and its delivery receipt. A stopped pass with no new entry,
+a no-work pass and a disabled pass produce no interruption.
 
 The same `mind_run` action family supports immediate owner passes:
 `app {action:"mind.dream"}`, `mind.rem`, `mind.think_now` and `mind.reflect`
@@ -651,14 +666,16 @@ care/mood effects, and each effect records done or explicitly skipped. Failure n
 never gate retry. Every admitted real pass retries still-owed work across active and
 archived nights, including when no new material exists. Completion is delivered from
 that record after Stop or recovered publication; body-off completion is skipped.
-Settled journals remain complete and permit force replacement; checkpoints leave
-diary bytes stable. Dated mood and body completion claims persist with their effects.
+Settled journals remain complete. New dreams append sections to that day's diary.
+Checkpoints leave diary bytes stable. Dated mood and body completion claims persist with their effects.
 REM checks complete claim blocks section by section, names damaged sections and
 processes readable siblings. Damaged entries remain active past archival age,
 and the next REM reads all active dates so late repairs are not lost.
 REM excludes identity metadata from its model input. A failed evidence reading
 releases the weekly claim if no proposals were saved; durable proposals keep
-their IDs for staging. Archival shares the dream reservation so it cannot move
+their IDs for staging. REM checks approval stamps in the folded snapshot under
+the staging lock. Pending rows for unsupported targets cannot block settlement.
+Archival shares the dream reservation so it cannot move
 a file during publication.
 Under the run reservation, the next pass finishes journaled publications, then reads
 the cutoff from `.dream_state.json` before gathering new material. Recovery after a crash
@@ -690,7 +707,9 @@ stepped cron value (`5/15`) runs from that value through the field's maximum.
 A `connector_action` read's `actionId` is any action of the app door (the agent's
 parts as `authored.<id>`, the Mac's readers such as `mail.recent` or `mac.look`), and
 it runs through that one door like any of the agent's calls (`NativeAgentEngine.withPartDoor`,
-origin `scheduler:watch:<action>`), as a read. An action whose class, as the
+origin `scheduler:watch:<action>`), as a read. Each dispatched read leaves an
+ordinary `tool.dispatch` receipt, visible in `trace.recent` with `view:"receipts"`
+and `name` set to the watched action. An action whose class, as the
 door judges it as it runs (`PermissionLaw.doorClass`), is not a read is refused
 when it is scheduled, with the sentence that a watch reads and that acting on a
 schedule is a part's `schedule:<cron>` wake; each run asks again inside the door,
@@ -704,8 +723,9 @@ read that completes settles it. Each read is then compared with the watch's own
 last read, on CPU with no model call. Its rows
 are object or scalar observations (including arrays of either) of what the read returned: under the door's
 receipt (`result`), a part's own answer (`returned`), never its runner's
-ledger (`calls`, `changed`) or receipt status. The door's read/effect flags and
-execution stamp are removed before checking the content's shape. Single objects retain nested detail,
+ledger (`calls`, `changed`) or receipt status. The door's read/effect flags,
+execution stamp and dispatch receipt metadata are removed before checking the
+content's shape. Single objects retain nested detail,
 including screen controls. An object's top-level arrays project their entries as
 rows, while its non-array fields stay together as one observation, even when
 those arrays are empty. Null or status-only results fail explicitly and keep
@@ -798,8 +818,9 @@ to be made, not automatically an automation failure. Read its origin, bound
 action, decision and execution outcome.
 
 Full Mac keeps macOS privacy-reset approval. An untrusted agent's card offers
-**Just this** for one call or **For this task** for the run. Approve alone means
-Just this; a read steers nothing. Agents enabled in
+**Just this** for one call or **For this task** for the same live, unjoined Ask.
+Approve alone means Just this. Reading an untrusted job report adds its author
+to that Ask's steering sources. Agents enabled in
 Trust → Connected agents carry the owner's authority on authenticated turns;
 ordinary Trust and domain checks still apply. Unattended work (part wakes,
 reflection, resumed turns) is admitted by
@@ -833,15 +854,15 @@ Start with the smallest evidence relevant to the reported problem:
 2. Read the relevant app page or Doctor's non-repair report.
 3. For a loop, compare its result, successful-work clock, listener health and
    failure receipts with its configuration and deadline.
-4. For a clock time, read `clock/times.json` (each time's id `<owner>:<key>`, rhythm
+4. For a declared time, read `clock/times.json` (each time's id `<owner>:<key>`, rhythm
    and next occurrence) and the owner's owed repair. The next occurrence moves
    forward and is saved with its consumed occurrence before delivery, so an occurrence is delivered at most once;
    one that came while the app was quit is delivered once when its owner registers.
    Duplicate saved IDs fail the checked read. Recurrence calculation is checked: a failed recurring item remains pending and owes
    named repair while healthy siblings proceed; it is not ended or immediately rearmed as a clock retry. Clock read/save failures owe
    named repair through the experience owner.
-   One deadline is armed at the earliest handled time; a clock or zone change
-   re-arms from what is saved (`DeskCore/TriggerScheduler/OneClock.swift`). A zone change while the clock is alive preserves each pending calendar
+   System clock changes recheck declared and held times on their separate sleepers in the [one clock](AGENT_IS_THE_APP.md#phases-3-and-5-as-built-11-05-attention).
+   A zone change while the clock is alive preserves each pending calendar
    occurrence's civil date and minute, resolves it in the new zone and saves before delivery. Intervals and explicit one-time instants stay absolute.
    A live Time carries its projection zone across declaration/listing suspensions; projection metadata alone never rewrites the saved time.
    An ended one-shot stays in the same clock as delivery evidence, outside pending listings and deadlines. Restore retains that evidence even for ids

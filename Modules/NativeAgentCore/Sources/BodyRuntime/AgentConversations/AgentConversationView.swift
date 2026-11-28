@@ -138,6 +138,15 @@ public enum AgentConversationView {
         return .object(fields)
     }
 
+    static func heldAnswer(_ send: String, agent: String, dataRoot: URL) -> [String: JSONValue]? {
+        let record = HeldSends(dataRoot: dataRoot).read(send)
+        guard record.sent?.contact == agent, let answer = record.answered, let text = answer.text else { return nil }
+        var fields: [String: JSONValue] = ["reply": .string(text), "status": .string("answered"), "held_answer": .string(send)]
+        fields["reply_from"] = answer.from.map(JSONValue.string)
+        if record.delivered != nil { fields["held_answer_delivered"] = .bool(true) }
+        return fields
+    }
+
     /// `sendPrefix` overrides where the retained send's own outcome goes (a read and a stop both keep it under "last_send_").
     package static func view(_ row: AgentConversationRecord, details: Bool, read: Bool = false, dataRoot: URL,
                      historyBefore: String? = nil, historyExchange: String? = nil, includeHistory: Bool = true,
@@ -146,13 +155,12 @@ public enum AgentConversationView {
         var row = row
         // It names the send (`held_answer`): the turn that takes this result in records the answer delivered (`HeldSends.delivered`), and one
         // already delivered says so.
-        let record = HeldSends(dataRoot: dataRoot).read(row.operationID)
-        if AgentConversationSession.heldSend(row), let answer = record.answered, let text = answer.text, case .object(var fields)? = row.receipt {
-            fields["reply"] = .string(text); fields["status"] = .string("answered"); fields["reply_from"] = answer.from.map(JSONValue.string)
-            fields["held_answer"] = .string(row.operationID)
-            if record.delivered != nil { fields["held_answer_delivered"] = .bool(true) }
+        if AgentConversationSession.heldSend(row), let answer = heldAnswer(row.operationID, agent: row.agent, dataRoot: dataRoot),
+           case .object(var fields)? = row.receipt {
+            fields["reply_from"] = answer["reply_from"]
+            fields.merge(answer) { _, answer in answer }
             row.receipt = .object(fields)
-            if let i = row.exchanges?.lastIndex(where: { $0.id == row.operationID }) { row.exchanges?[i].reply = text }
+            if let i = row.exchanges?.lastIndex(where: { $0.id == row.operationID }) { row.exchanges?[i].reply = answer["reply"]?.stringValue }
         }
         let receipt = row.sendReceipt ?? .object(["status": .string("unknown")])
         guard case .object = receipt else { return receipt }
@@ -164,15 +172,11 @@ public enum AgentConversationView {
                 "remedy": Repair.remedy(owner: "agents/peers.json", nextCall: nil, tap: "Repair the contact address book before resolving this conversation.")])
         }
         let peer = peers.first { "peer:" + $0.id == row.agent }
-        let owner = row.agent.hasPrefix("peer:") ? String(row.agent.dropFirst(5)) : row.agent
-        let identity = AgentContactIdentity(contacts: peers)
         let history = !details && includeHistory
-        let lines: Result<[ContactThread.Line], Error>? = history ? Result { try ContactThread.mergedLines(dataRoot: dataRoot, owner: owner,
-            identity: identity) } : nil
         var result = details ? receipt : conversationPresentation(row, transport: peer?.transport, prefix: sendPrefix ?? (read ? "last_send_" : ""))
         if history {
             result = AgentConversationHistoryView.adding(to: result, agent: row.agent, name: row.name,
-                before: historyBefore, exchange: historyExchange, limit: historyLimit, dataRoot: dataRoot, peers: peers, lines: lines)
+                before: historyBefore, exchange: historyExchange, limit: historyLimit, dataRoot: dataRoot, peers: peers)
         }
         result = withLive(result, row: row, dataRoot: dataRoot)
         guard case .object(var shown) = result else { return result }

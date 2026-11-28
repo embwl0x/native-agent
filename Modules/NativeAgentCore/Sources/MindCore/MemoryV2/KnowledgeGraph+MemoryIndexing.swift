@@ -45,7 +45,9 @@ public struct KnowledgeGraphMemoryFact: Sendable, Equatable {
         let validFrom = try row.decode(String?.self, forColumn: "valid_from")
         let validTo = try row.decode(String?.self, forColumn: "valid_to")
         try MemoryStorage.validateTemporalEvidence(id: id, validFrom: validFrom, validTo: validTo, observedAt: nil)
-        guard MemoryRecordDisclosurePolicy.isTemporallyEligible(validTo: validTo, at: Date()) else { return nil }
+        let now = Date()
+        guard MemoryRecallScoring.hasStarted(validFrom: validFrom, at: now),
+              MemoryRecordDisclosurePolicy.isTemporallyEligible(validTo: validTo, at: now) else { return nil }
         let metadata = try row.decode(String?.self, forColumn: "metadata_json")
         self.init(
             id: id,
@@ -72,25 +74,6 @@ public struct KnowledgeGraphExtractedEntity: Sendable, Equatable {
         self.type = type
         self.summary = summary
         self.aliases = aliases
-    }
-}
-
-public struct KnowledgeGraphMemoryRebuildReport: Sendable, Equatable {
-    public let factsIndexed: Int
-    public let entitiesRemoved: Int
-    public let relationshipsRemoved: Int
-    public let indexRowsRemoved: Int
-
-    public init(
-        factsIndexed: Int,
-        entitiesRemoved: Int,
-        relationshipsRemoved: Int,
-        indexRowsRemoved: Int
-    ) {
-        self.factsIndexed = factsIndexed
-        self.entitiesRemoved = entitiesRemoved
-        self.relationshipsRemoved = relationshipsRemoved
-        self.indexRowsRemoved = indexRowsRemoved
     }
 }
 
@@ -127,9 +110,9 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         while reconciledProjectionGeneration != projectionGeneration {
             let generation = projectionGeneration
             if projectionProducing == true {
-                _ = try await reconcileMemoryIndexFingerprints()
+                try await reconcileMemoryIndexFingerprints()
             } else {
-                _ = try await rebuildMemoryDerivedGraphFromCanonicalStore(producing: false)
+                try await rebuildMemoryDerivedGraphFromCanonicalStore(producing: false)
             }
             // A superseded startup rebuild can finish after retirement. Its completion must repair the current mode rather than certify it.
             reconciledProjectionGeneration = projectionGeneration == generation ? generation : nil
@@ -159,7 +142,13 @@ public actor SwiftNativeKnowledgeGraphIndexer {
     }
 
     func resolvedExtractionIdentity() throws -> ExtractionIdentity {
-        let profileNames = try Self.profileNames(profileURL: primaryUserProfileURL)
+        try Self.resolvedExtractionIdentity(sqlitePath: sqlitePath, profileURL: primaryUserProfileURL,
+                                            explicitPrimaryUserName: explicitPrimaryUserName)
+    }
+
+    static func resolvedExtractionIdentity(sqlitePath: URL, profileURL: URL,
+                                           explicitPrimaryUserName: String?) throws -> ExtractionIdentity {
+        let profileNames = try Self.profileNames(profileURL: profileURL)
         let resolved = Self.primaryUserName(explicit: explicitPrimaryUserName, saved: profileNames.user)
         // Recognize the agent's own name as a person.
         let agent = profileNames.agent
@@ -253,7 +242,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
             }
         } catch IndexingControl.requiresCanonicalRebuild {
             // Eligibility can change while acquiring the rebuild transaction. Its canonical read decides removal; never carry an exclusion.
-            _ = try await rebuildMemoryDerivedGraphFromCanonicalStore(producing: true, identity: identity)
+            try await rebuildMemoryDerivedGraphFromCanonicalStore(producing: true, identity: identity)
         }
     }
 
@@ -266,12 +255,16 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         now: String,
         extracted: [KnowledgeGraphExtractedEntity],
         primaryUserName: String,
-        contactIDs: [String: String]
+        contactIDs: [String: String],
+        rebuildEntityIDs: RebuildEntityIDs? = nil
     ) throws {
+        // An entity was seen when its memory was made, not when the index was last rebuilt.
+        let indexedAt = now, now = fact.createdAt.isEmpty ? now : fact.createdAt
         let userID = try upsertPrimaryUserEntity(
             db,
             primaryUserName: primaryUserName,
-            now: now
+            now: now,
+            rebuildEntityIDs: rebuildEntityIDs
         )
         let factID = try upsertMemoryFactEntity(
             db,
@@ -301,7 +294,9 @@ public actor SwiftNativeKnowledgeGraphIndexer {
                     aliases: entity.aliases,
                     contactID: entity.type == "agent" ? contactIDs[entity.name.lowercased()] : nil,
                     now: now,
-                    fact: fact
+                    fact: fact,
+                    primaryUserID: userID,
+                    rebuildEntityIDs: rebuildEntityIDs
                 )
                 if entityID != userID && entityID != factID {
                     entityIDs.append(entityID)
@@ -336,7 +331,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
               content_hash = excluded.content_hash,
               indexed_at = excluded.indexed_at,
               index_version = excluded.index_version
-            """, arguments: [memoryID, contentHash, now, indexVersion])
+            """, arguments: [memoryID, contentHash, indexedAt, indexVersion])
     }
 
     /// One source-backed fact node per memory row makes searchable meaning traceable to its exact canonical record.
@@ -373,10 +368,11 @@ public actor SwiftNativeKnowledgeGraphIndexer {
                   type = 'fact',
                   summary = ?,
                   mention_count = ?,
-                  last_seen = ?,
+                  last_seen = MAX(COALESCE(last_seen, ''), ?),
+                  first_seen = MIN(COALESCE(NULLIF(first_seen, ''), ?), ?),
                   metadata_json = ?
                 WHERE id = ?
-                """, arguments: [title, summary, nextCount, now, metadataJSON(metadata), id])
+                """, arguments: [title, summary, nextCount, now, now, now, metadataJSON(metadata), id])
             return id
         }
 
@@ -467,14 +463,20 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         aliases: [String] = [],
         contactID: String? = nil,
         now: String,
-        fact: KnowledgeGraphMemoryFact
+        fact: KnowledgeGraphMemoryFact,
+        primaryUserID: String,
+        rebuildEntityIDs: RebuildEntityIDs?
     ) throws -> String {
+        let savedID = rebuildEntityIDs?.byKey[.init(name: name, type: type)]
         if let row = try Row.fetchOne(db, sql: """
             SELECT id, metadata_json, mention_count, aliases_json FROM kg_entities
-            WHERE lower(name) = lower(?) AND lower(type) = lower(?)
-            ORDER BY mention_count DESC, last_seen DESC
+            WHERE id = :savedID
+               OR ((:savedID IS NULL OR id = :primaryUserID)
+                   AND lower(name) = lower(:name) AND lower(type) = lower(:type))
+            ORDER BY (:savedID IS NOT NULL AND id = :primaryUserID) DESC,
+                     mention_count DESC, last_seen DESC
             LIMIT 1
-            """, arguments: [name, type]) {
+            """, arguments: ["savedID": savedID, "primaryUserID": primaryUserID, "name": name, "type": type]) {
             let id: String = try row.decode(forColumn: "id")
             var metadata = try metadataObject(row.decode(forColumn: "metadata_json"))
             // indexActiveFact already updated this profile-backed hub. A name extracted from the fact must not overwrite it with fact content,
@@ -510,16 +512,17 @@ public actor SwiftNativeKnowledgeGraphIndexer {
             try db.execute(sql: """
                 UPDATE kg_entities SET
                   mention_count = ?,
-                  last_seen = ?,
+                  last_seen = MAX(COALESCE(last_seen, ''), ?),
+                  first_seen = MIN(COALESCE(NULLIF(first_seen, ''), ?), ?),
                   summary = ?,
                   metadata_json = ?,
                   aliases_json = COALESCE(?, aliases_json)
                 WHERE id = ?
-                """, arguments: [nextCount, now, summary, metadataJSON(metadata), known.map(aliasesJSON), id])
+                """, arguments: [nextCount, now, now, now, summary, metadataJSON(metadata), known.map(aliasesJSON), id])
             return id
         }
 
-        let id = try uniqueEntityID(db)
+        let id = try entityIDForInsert(db, name: name, type: type, rebuildEntityIDs: rebuildEntityIDs)
         var metadata: [String: JSONValue] = [
             "last_memory_id": .string(fact.id),
             "last_memory_source": fact.source.map(JSONValue.string) ?? .null,
@@ -586,8 +589,8 @@ public actor SwiftNativeKnowledgeGraphIndexer {
             }
             let oldWeight: Double = row["weight"] ?? 0.5
             var metadata = try metadataObject(row["metadata_json"])
-            if metadata["first_seen"] == nil { metadata["first_seen"] = .string(now) }
-            metadata["last_seen"] = .string(now)
+            metadata["first_seen"] = .string(min(metadata["first_seen"]?.stringValue ?? now, now))
+            metadata["last_seen"] = .string(max(metadata["last_seen"]?.stringValue ?? now, now))
             metadata["last_memory_id"] = .string(fact.id)
             metadata["indexer"] = .string(indexVersion)
             try db.execute(sql: """
@@ -624,9 +627,13 @@ public actor SwiftNativeKnowledgeGraphIndexer {
             ])
     }
 
-    static func uniqueEntityID(_ db: Database) throws -> String {
+    static func entityIDForInsert(
+        _ db: Database, name: String, type: String, rebuildEntityIDs: RebuildEntityIDs?
+    ) throws -> String {
+        if let id = rebuildEntityIDs?.byKey[.init(name: name, type: type)] { return id }
         while true {
             let id = String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(8)).lowercased()
+            if rebuildEntityIDs?.reserved.contains(id) == true { continue }
             let exists = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM kg_entities WHERE id = ?", arguments: [id]) ?? 0
             if exists == 0 { return id }
         }
@@ -654,7 +661,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         let kind = fact.metadata?.objectValue?["kind"]?.trimmedString ?? "fact"
         // The person's edge is derived from the memory's tellers (and the person's names, in identity), so a telling added later re-derives
         // it on the next pass.
-        let fields = [indexVersion, "canonical-profile-hub-declared-kind-language-stated-alias-contact-link-v5", identity.fingerprint,
+        let fields = [indexVersion, "canonical-profile-hub-declared-kind-language-stated-alias-contact-link-seen-from-memory-v5", identity.fingerprint,
                       kind, fact.validFrom ?? "", fact.validTo ?? "", content, "tellers:" + tellers(fact).joined(separator: "\n")]
         return contentHash(fields.map { "\($0.utf8.count):\($0)" }.joined())
     }

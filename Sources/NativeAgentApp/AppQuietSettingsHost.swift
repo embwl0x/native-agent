@@ -162,7 +162,7 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
                     let provider = try await checkedProvider()
                     return provider.models.filter { ModelSlot.mayHold($0.id, row: $0, savedInSlot: provider.default_model) }.map(\.id)
                 },
-                note: "The account sheet's default model. Empty means no default has been saved. Does not change credentials or surface overrides.",
+                note: "Model inherited by surfaces using this account without a model choice. Empty means no account default has been saved.",
                 read: { _ in
                     let provider = try await checkedProvider()
                     guard let saved = provider.default_model else { return .string("") }
@@ -179,7 +179,7 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
                         throw QuietSettingError.badValue("Choose one of this account's offered models.")
                     }
                     // Patch only the model through ProviderRouting; this control has no credential or auth-mode input.
-                    _ = try await model.engine.providers.routing.configureProvider(id: id, config: .object(["default_model": .string(wanted)]))
+                    try await model.engine.providers.routing.configureProvider(id: id, config: .object(["default_model": .string(wanted)]))
                     _ = await model.engine.providers.refreshSettings(refreshCatalog: false) { error, _ in error.localizedDescription }
                 }
             ))
@@ -359,18 +359,6 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
     func dreamEnabled() async throws -> Bool { try await appModel.engine.cognitionView.dreamEnabled() }
     func setDreamCycleEnabled(_ enabled: Bool) async -> Bool { await appModel.setDreamCycleEnabled(enabled) }
     func setRemCycleEnabled(_ enabled: Bool) async -> Bool { await appModel.setRemCycleEnabled(enabled) }
-    func savePersonalityChecked(_ profile: PersonalityProfile) async throws {
-        try await appModel.savePersonalityChecked(profile)
-    }
-    func patchMemoryPolicy(knowledgeGraphEnabled: Bool?, adaptivePromotion: Bool?) async -> Bool {
-        await appModel.patchMemoryPolicy(
-            knowledgeGraphEnabled: knowledgeGraphEnabled,
-            adaptivePromotion: adaptivePromotion)
-    }
-    func saveMemoryPolicy(crossSessionRecall: Bool) async {
-        await appModel.saveMemoryPolicy(
-            crossSessionRecall: crossSessionRecall)
-    }
 
     func setInnerLifeEnabled(_ enabled: Bool) async -> (enabled: Bool, problem: String?) {
         await appModel.setInnerLifeEnabled(enabled)
@@ -407,7 +395,6 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
     func saveSearchServiceURL(_ url: String) async throws {
         _ = try await SwiftNativeResearchClient(dataRoot: appModel.engine.dataRoot)
             .saveSearXNGBaseURL(url)
-        try await appModel.engine.configuration.readSearXNG(dataRoot: appModel.engine.dataRoot)
     }
     func findSearchService(context: QuietSettingWrite) async throws -> String {
         switch await appModel.autodetectSearXNG() {

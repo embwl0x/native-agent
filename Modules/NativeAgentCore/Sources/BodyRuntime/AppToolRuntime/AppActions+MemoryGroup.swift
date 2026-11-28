@@ -20,7 +20,6 @@ extension AppActions {
         .fold("memory_proposal_review", "memories"),
         .fold("forget_memory", "memories", irreversible: true),
         .fold("search_kg", "memories", read: true),
-        .fold("rebuild_knowledge_graph", "memories"),
         .fold("scratchpad_read", "chat", read: true),
         ]
     }

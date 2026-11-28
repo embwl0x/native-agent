@@ -61,8 +61,4 @@ enum AppMotion {
     @MainActor static var entranceSystem: Animation? {
         UIAccessibility.isReduceMotionEnabled ? nil : entrance
     }
-
-    static func respecting(_ animation: Animation?, reduceMotion: Bool) -> Animation? {
-        reduceMotion ? nil : animation
-    }
 }

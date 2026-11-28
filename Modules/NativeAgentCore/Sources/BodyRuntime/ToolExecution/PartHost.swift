@@ -1,9 +1,11 @@
 import SenseCore
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 import DeskCore
 import MacNerves
+import AppKit
 // Blueprint: | `PartHost.swift` | `Parts.rehearse`, `ToolHost`: gated host; previews suppress effects; a read verb's run only reads |
 
 extension OwnedProgramExecution {
@@ -18,7 +20,8 @@ extension OwnedProgramExecution {
 
 extension Parts {
     /// Intercept every host call during rehearsal so sealing cannot claim unobserved effects.
-    func rehearse(_ candidate: OwnedProgramStore.Candidate, capture: Bool, input: JSONValue?, invocation: Invocation) async throws -> JSONValue {
+    func rehearse(_ candidate: OwnedProgramStore.Candidate, capture: Bool, input: JSONValue?, faceSampleInput: JSONValue?,
+                  facePages: [PartFaces], invocation: Invocation) async throws -> (proof: JSONValue, faceChecked: Bool) {
         guard let base = invocation.host else {
             throw PartError.invalid("Rehearsal needs the gated app door of a conversation or wake run.")
         }
@@ -26,20 +29,44 @@ extension Parts {
         let key = try await SwiftNativeManifestSigner(dataRoot: root).loadOrCreateSigningKey()
         let broker = ToolPrimitiveBroker(permissions: try PartReachGrant.parse(candidate.program.permissions), abilityID: candidate.id, dataRoot: root,
             readPaths: JSONValue.stringArray(Self.fields(Self.fields(candidate.manifest)["reach"] ?? .null)["readPaths"] ?? .array([])))
-        let host = ToolHost(base: base, candidate: candidate, broker: broker, dataRoot: root, openScreenWatch: invocation.openScreenWatch, admission: {})
+        let dataRoot = root
+        let openScreenWatch = invocation.openScreenWatch
+        let faceHost = ToolHost(base: base, candidate: candidate, broker: broker, dataRoot: root, openScreenWatch: nil,
+            projection: true, admission: {})
         let face = Self.fields(Self.fields(candidate.manifest)["face"] ?? .null)["projection"] == .bool(true)
         let schema = face ? Self.faceNeeds(candidate.program.schema) : candidate.program.schema
+        var ownerPages: [PartFaceSnapshot] = []
+        if face {
+            for pages in facePages {
+                let snapshots = await pages.snapshots
+                ownerPages += snapshots.sorted { $0.key < $1.key }.map(\.value).filter {
+                    $0.part == candidate.id && ($0.levers != nil || $0.keyLevers != nil)
+                }
+            }
+        }
+        let selfAction = candidate.program.entry.callable ? "authored." + candidate.id : nil
+        let turn = invocation.execution.turn
         do {
-            let proof = try await store.validate(candidate, key: key, capture: capture, input: input, runner: OwnedProgramRunner(dataRoot: root).rehearsal(
-                ), host: { host }, execution: invocation.execution) {
-                if let problem = $0.schemaProblem(schema: schema) {
-                    throw SenseFailure(code: "bad_input", message: "Its input: \(problem.words).", remedy: .object([
+            let result = try await store.validate(candidate, key: key, capture: capture, input: input, faceSampleInput: faceSampleInput,
+                runner: OwnedProgramRunner(dataRoot: root).rehearsal(),
+                host: { input in
+                    ToolHost(base: base, candidate: candidate, broker: broker, dataRoot: dataRoot, openScreenWatch: openScreenWatch,
+                        readOnly: ToolHost.readOnly(candidate, input: input), admission: {})
+                }, faceHost: faceHost, ownerPages: ownerPages,
+                execution: invocation.execution,
+                prepareFace: { try await self.prepareFace(id: candidate.id, input: $0) },
+                actionExists: { action in
+                    if action == selfAction { return true }
+                    return try base.action(action) != nil
+                }, documentReadAllowed: { try AppActionBinding.action(input: $0.input, turn: turn)?.read == true }) { input, label in
+                if let problem = input.schemaProblem(schema: schema) {
+                    throw SenseFailure(code: "bad_input", message: "\(label): \(problem.words).", remedy: .object([
                         "kind": .string("correct_arguments"), "instruction": .string(
                             "Correct the input to match \(problem.expected) in ability.validate for \(candidate.id)."), "next_call": .null]))
                 }
             }
             await broker.close()
-            return proof
+            return result
         } catch {
             await broker.close()
             throw error
@@ -63,9 +90,15 @@ extension Parts {
 }
 
 struct ToolHost: OwnedProgramHostProfile {
+    static let primitives = ToolPrimitiveBroker.operations.union(["apps.call", "part.call", PartOpenURLRequest.operation])
+    static func readOnly(_ candidate: OwnedProgramStore.Candidate, input: JSONValue) -> Bool {
+        guard let verb = input.objectValue?["verb"]?.stringValue else { return false }
+        return candidate.manifest.objectValue?["answers"]?.objectValue?[verb]?.objectValue?["class"] == .string("read")
+    }
     let base: any OwnedProgramToolHost
     let candidate: OwnedProgramStore.Candidate
     let broker: ToolPrimitiveBroker
+    let streamRun = ToolPrimitiveBroker.StreamRun()
     let dataRoot: URL
     let openScreenWatch: (@Sendable (MacScreenWatch.Request, Bool) async throws -> MacScreenWatch)?
     var projection = false
@@ -94,6 +127,18 @@ struct ToolHost: OwnedProgramHostProfile {
             effects: "none", execution: "not_run")
     }
     var actionIDs: [String] { candidate.program.dependencies }
+    private var modelOnly: Bool { candidate.id == DreamPart.id || candidate.id == MindMemoryJudgment.DigestPart.id }
+    var allowsNotebook: Bool {
+        !modelOnly && candidate.id != FieldRepairPart.id
+    }
+
+    func checkNotebook(_ value: Data?, keyedWrite: Bool) async throws {
+        guard !keyedWrite || !readOnly else {
+            throw SenseFailure(code: "read_verb", message: "This read verb cannot change keyed notebook entries.")
+        }
+        try await admission()
+        if let value { try await broker.checkNotebook(value) }
+    }
     private func declaredDependency(_ id: String) throws -> String? {
         let resolved = try base.canonicalAction(id)
         return try candidate.program.dependencies.first { try base.canonicalAction($0) == resolved }
@@ -163,6 +208,12 @@ struct ToolHost: OwnedProgramHostProfile {
 
     func perform(_ call: [String: JSONValue], execution: OwnedProgramExecution) async -> JSONValue {
         if projection { return Self.failure("projection_only", "A face reads only its frozen sources.", effects: "none") }
+        if candidate.id == FieldRepairPart.id {
+            return Self.failure("undeclared_dependency", "Field repair reads its captured evidence.", effects: "none")
+        }
+        if modelOnly {
+            return Self.failure("undeclared_dependency", "This part reads its captured evidence and calls only its model.", effects: "none")
+        }
         var call = call
         // JavaScript and model tools share this boundary. Neither can bypass authored secret/typed-text restrictions by supplying raw app JSON.
         if opensHomeItem(call) {
@@ -201,6 +252,19 @@ struct ToolHost: OwnedProgramHostProfile {
                 call["preview"] = .bool(true)
                 execution.turn?.doorPreview = .program(candidate.id)
             }
+            if call["action"] != nil {
+                let broker = self.broker
+                let inherited = execution.anatomyScrub
+                execution.anatomyScrub = {
+                    let parent = await inherited?()
+                    let scrub = await broker.anatomyRedactor()
+                    let revision = scrub.values.count
+                    return .init(text: { text in scrub(parent?.text(text) ?? text) }, isCurrent: {
+                        if let parent, !(await parent.isCurrent()) { return false }
+                        return await broker.anatomyRedactorIsCurrent(revision)
+                    })
+                }
+            }
             return await base.perform(call, execution: execution)
         } catch {
             return Self.failure(error, effects: "none", execution: "not_run")
@@ -210,18 +274,24 @@ struct ToolHost: OwnedProgramHostProfile {
     func primitiveAction(_ operation: String) -> OwnedProgramAction? {
         if operation == "part.call" { return .init(id: operation, page: "tools", read: false, program: true, readOnly: { _ in false }) }
         let files = OwnedProgramRunner.hostFilePrimitives.contains(operation)
-        guard operation == "apps.call" || files || ToolPrimitiveBroker.operations.contains(operation) else { return nil }
+        guard files || Self.primitives.contains(operation) else { return nil }
         let read = ToolPrimitiveBroker.readOperations.contains(operation)
         let space = String(operation.prefix { $0 != "." })
-        let page = operation == "apps.call" ? "apps" : files ? "files" : ["screen", "frame", "hand"].contains(space) ? "screen"
-            : space == "program" ? "shell" : "network"
+        let page = ["apps.call", PartOpenURLRequest.operation, MacAXQuery.operation].contains(operation) ? "apps" : files ? "files"
+            : ["screen", "frame", "hand"].contains(space) ? "screen" : space == "program" ? "shell" : "network"
         return OwnedProgramAction(id: operation, page: page, read: read,
                                   journaled: !ToolPrimitiveBroker.frameOperations.union(ToolPrimitiveBroker.programOperations).contains(operation),
                                   readOnly: { ToolPrimitiveBroker.readOnly(operation, .object($0)) })
     }
 
-    func checkPrimitive(_ operation: String, arguments: JSONValue, execution: OwnedProgramExecution) async -> JSONValue? {
+    func checkPrimitive(_ operation: String, arguments: JSONValue, fixture: OwnedProgramFixtures?, execution: OwnedProgramExecution) async -> JSONValue? {
         if projection { return Self.failure("projection_only", "A face reads only its frozen sources.", effects: "none") }
+        if candidate.id == FieldRepairPart.id {
+            return Self.failure("not_declared", "Field repair reads its captured evidence.", effects: "none")
+        }
+        if modelOnly, operation != "model.call" {
+            return Self.failure("not_declared", "This part calls only its model.", effects: "none")
+        }
         if let refused = readRefusal(operation, arguments) { return refused }
         do {
             if OwnedProgramRunner.hostFilePrimitives.contains(operation) {
@@ -229,6 +299,8 @@ struct ToolHost: OwnedProgramHostProfile {
                     permissions: broker.permissions, dataRoot: dataRoot)
             } else if operation == "part.call" {
                 _ = try partRequest(arguments)
+            } else if operation == PartOpenURLRequest.operation {
+                _ = try await checkedOpenURL(arguments, context: execution.macOperation(dataRoot: dataRoot))
             } else if operation == "apps.call" {
                 try Task.checkCancellation()
                 guard case .object(let args) = arguments, case .string(let bundleID)? = args["bundle_id"],
@@ -241,10 +313,67 @@ struct ToolHost: OwnedProgramHostProfile {
                 try AppleScriptExecution.checkAppScript(args)
                 if !AuthoredToolEffects.appReadOnly(args), let refusal = MacAppActGate.refusal(bundleID: bundleID, throughAppleEvents: true,
                     context: execution.macOperation(dataRoot: dataRoot)) { throw refusal }
-            } else { try await broker.check(operation, arguments: arguments) }
+            } else {
+                var fixtureOwnsStream = false
+                if let fixture, OwnedProgramRunner.layeredHostPrimitives.contains(operation), !ToolPrimitiveBroker.streamOpenOperations.contains(operation),
+                   let id = Parts.fields(arguments)["id"]?.stringValue {
+                    let websocket = operation.hasPrefix("network.websocket.")
+                    fixtureOwnsStream = await fixture.ownsStream(id, opening: websocket ? "network.websocket.open" : "fetch.sse.open",
+                        reading: websocket ? "network.websocket.receive" : "fetch.sse.next",
+                        closing: websocket ? "network.websocket.close" : "fetch.sse.close")
+                }
+                try await broker.check(operation, arguments: arguments, run: streamRun, fixtureOwnsStream: fixtureOwnsStream)
+            }
             return nil
         } catch {
             return Self.failure(error, effects: "none", execution: "not_run")
+        }
+    }
+
+    private func checkedOpenURL(_ arguments: JSONValue, context: MacOperationContext) async throws -> (PartOpenURLRequest, URL) {
+        try Task.checkCancellation()
+        let request = try PartOpenURLRequest(arguments)
+        let missing = request.missingAppReach(broker.permissions)
+        guard missing.isEmpty else {
+            throw Parts.revisionFailure("undeclared_target", "Declare reach.capabilities \(missing.joined(separator: ", ")) to open this app URL.",
+                id: candidate.id)
+        }
+        let matches = try await MacAppIndex.shared.apps(context: context).filter {
+            $0.bundleID.flatMap(OpenURLClassification.normalizedBundleID) == request.bundleID
+        }
+        let installed = MacAppIndex.installed(matches)
+        guard !matches.contains(where: \.installationUncertain), installed.count == 1, let target = installed.first,
+              let info = try? Data(contentsOf: target.url.appendingPathComponent("Contents/Info.plist")),
+              let plist = try? PropertyListSerialization.propertyList(from: info, options: [], format: nil) as? [String: Any],
+              let bundleID = plist["CFBundleIdentifier"] as? String,
+              OpenURLClassification.normalizedBundleID(bundleID) == request.bundleID else {
+            throw SenseFailure(code: "bundle_not_installed", message: "No unique installed Mac app could be verified for \(request.bundleID).")
+        }
+        guard let types = plist["CFBundleURLTypes"] as? [[String: Any]], types.contains(where: { type in
+            (type["CFBundleURLSchemes"] as? [String])?.contains(where: { OpenURLClassification.normalizedScheme($0) == request.scheme }) == true
+        }) else {
+            throw SenseFailure(code: "scheme_not_owned_by_bundle", message: "The installed \(bundleID) does not declare the \(request.scheme) scheme.")
+        }
+        guard !request.needsShellReach(broker.permissions) else {
+            throw Parts.revisionFailure("undeclared", "Declare reach.capabilities shell to open this shell-level app URL.", id: candidate.id)
+        }
+        if let refusal = MacAppActGate.refusal(bundleID: bundleID, context: context) { throw refusal }
+        return (request, target.url)
+    }
+
+    @MainActor private static func openURL(_ request: PartOpenURLRequest, at target: URL) async throws -> JSONValue {
+        try Task.checkCancellation()
+        let config = NSWorkspace.OpenConfiguration()
+        config.activates = request.activate
+        config.addsToRecentItems = false
+        config.allowsRunningApplicationSubstitution = false
+        do {
+            let app = try await NSWorkspace.shared.open([request.url], withApplicationAt: target, configuration: config)
+            return receipt(.object(["status": .string("ok"), "bundle_id": .string(request.bundleID), "scheme": .string(request.scheme),
+                "open_url_class": .string(request.classification.rawValue), "activated": .bool(request.activate && app.isActive),
+                "pid": .int(Int64(app.processIdentifier))]), effects: "occurred")
+        } catch {
+            return failure(error, effects: "unknown", execution: "attempted")
         }
     }
 
@@ -264,6 +393,9 @@ struct ToolHost: OwnedProgramHostProfile {
 
     func primitive(_ operation: String, arguments: JSONValue, preview: Bool, execution: OwnedProgramExecution) async throws -> JSONValue {
         if let refused = readRefusal(operation, arguments) { return refused }
+        if modelOnly, operation == "part.call" {
+            return Self.failure("not_declared", "This part calls only its model.", effects: "none")
+        }
         if operation == "part.call" {
             // Pin before any admission/card wait. The existing gated authored action runs it, retaining its terminal envelope for value calls.
             do {
@@ -284,8 +416,9 @@ struct ToolHost: OwnedProgramHostProfile {
                 return Self.receipt(try .fromEncodable(failure), effects: "none")
             }
         }
-        if let refused = await checkPrimitive(operation, arguments: arguments, execution: execution) { return refused }
-        if preview, ["model.call", "screen.watch", "screen.next", "network.receive", "program.receive"].contains(operation) {
+        if let refused = await checkPrimitive(operation, arguments: arguments, fixture: nil, execution: execution) { return refused }
+        if preview, ["model.call", "screen.watch", "screen.next", "network.receive", "program.receive", "network.websocket.receive",
+                     "fetch.sse.next", PartOpenURLRequest.operation].contains(operation) {
             return .object(["status": .string("preview"), "effects": .string("none"), "execution": .string("preview"), "result": .null])
         }
         if operation == "model.call" { return try await performPrimitive(operation, arguments: arguments, execution: execution) }
@@ -297,7 +430,7 @@ struct ToolHost: OwnedProgramHostProfile {
                 if operation.hasPrefix("program.") {
                     do { try await self.admission() } catch { await self.broker.end(arguments); throw error }
                 }
-                return Self.receipt(try await self.broker.perform(operation, arguments: arguments, host: self.base, execution: execution,
+                return Self.receipt(try await self.broker.perform(operation, arguments: arguments, run: self.streamRun, host: self.base, execution: execution,
                     openScreenWatch: self.openScreenWatch), effects: read ? "none" : "occurred")
             }
             do {
@@ -320,6 +453,7 @@ struct ToolHost: OwnedProgramHostProfile {
         // Each new effect requires current ability admission and Trust; refused program input ends its program.
         let effect = AuthoredToolEffects.primitiveEffect(operation, arguments: arguments)
         let args = Parts.fields(arguments)
+        if ToolPrimitiveBroker.streamOpenOperations.contains(operation) { await broker.observeStreams() }
         let result = await base.admitTool(effect.tool, input: args, execution: execution, effect: {
             try await self.performPrimitive(operation, arguments: arguments, execution: execution)
         })
@@ -337,6 +471,10 @@ struct ToolHost: OwnedProgramHostProfile {
         do {
             try await admission()
             guard await !broker.closed else { throw CancellationError() }
+            if operation == PartOpenURLRequest.operation {
+                let (request, target) = try await checkedOpenURL(arguments, context: execution.macOperation(dataRoot: dataRoot))
+                return try await Self.openURL(request, at: target)
+            }
             dispatched = true
             let result = if operation == "apps.call" {
                 try await AppleScriptExecution().callApp(arguments, targets: appTargets, context: execution.macOperation(dataRoot: dataRoot))
@@ -350,14 +488,15 @@ struct ToolHost: OwnedProgramHostProfile {
             } else if operation == "files.names" {
                 try PartFileReads.names(try PartFileReads.admitted(Parts.fields(arguments)["path"], readPaths: readPaths,
                     permissions: broker.permissions, dataRoot: dataRoot), Parts.fields(arguments))
-            } else { try await broker.perform(operation, arguments: arguments, host: base, profile: self, execution: execution,
+            } else { try await broker.perform(operation, arguments: arguments, run: streamRun, host: base, profile: self, execution: execution,
                 openScreenWatch: openScreenWatch) }
             // The thought's envelope already carries its nested tool effects.
             if operation == "model.call" { return result }
             if operation == "apps.call", result.objectValue?["status"] == .string("denied") { return result }
             let read = ToolPrimitiveBroker.readOnly(operation, arguments)
             // A 429 or 5xx answer fails the fetch and keeps the response it names, so its body and Retry-After stay readable.
-            if operation == "fetch", case .int(let status)? = Parts.fields(result)["status"], status == 429 || (500...599).contains(status) {
+            if ["fetch", "fetch.sse.open"].contains(operation), case .int(let status)? = Parts.fields(result)["status"],
+               status == 429 || (500...599).contains(status) {
                 let host = Parts.fields(arguments)["url"]?.stringValue.flatMap { URL(string: $0)?.host } ?? "the service"
                 var failed = Parts.fields(Self.failure(SenseFailure(code: "http_\(status)", message: """
                     fetch returned HTTP \(status) from \(host). Inspect the service's response in result and its state; for 429 reduce request \

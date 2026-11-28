@@ -1,6 +1,6 @@
 import Synchronization
-import Foundation
 import PersistenceCore
+import Foundation
 import SenseCore
 import MindCore
 import MacNerves

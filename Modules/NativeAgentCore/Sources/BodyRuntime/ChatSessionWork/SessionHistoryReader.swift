@@ -72,7 +72,6 @@ public struct SessionHistoryReadStats: Sendable, Equatable {
     /// Identify exact selected bytes without retaining private speech in diagnostics.
     public let damageEvidence: [String]
     public let returnedCount: Int
-    /// Count current-run exclusions separately so empty history cannot hide decoded rows intentionally skipped.
     public let excludedByRunId: Int
     public let truncated: Bool
     public let decodeCacheHits: Int
@@ -126,12 +125,10 @@ public struct SessionHistoryReadStats: Sendable, Equatable {
 public struct SessionHistoryReadResult: Sendable {
     public fileprivate(set) var messages: [HistoryChatMessage]
     public fileprivate(set) var stats: SessionHistoryReadStats
-    public fileprivate(set) var contextStatistics: (totalChars: Int, messageCount: Int)
 
-    public init(messages: [HistoryChatMessage], stats: SessionHistoryReadStats, contextStatistics: (totalChars: Int, messageCount: Int) = (0, 0)) {
+    public init(messages: [HistoryChatMessage], stats: SessionHistoryReadStats) {
         self.messages = messages
         self.stats = stats
-        self.contextStatistics = contextStatistics
     }
 
     public func checkedMessages() throws -> [HistoryChatMessage] {
@@ -179,11 +176,9 @@ public actor SessionHistoryReader {
         self.dataRoot = dataRoot
     }
 
-    /// Read oldest-first, tail-bounded when requested; exclude the already-persisted current run so it cannot replay as prior history.
     public func messagesWithStats(
         forSessionId id: String,
         limit: Int? = nil,
-        excludingRunId: String? = nil,
         strictEvidence: Bool = false,
         maximumBytes: Int? = nil,
         transcriptURL: URL? = nil
@@ -194,9 +189,6 @@ public actor SessionHistoryReader {
                 stats: SessionHistoryReadStats(mode: "invalid_session_id")
             )
         }
-        let excludedRunId = excludingRunId?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let shouldExcludeRun = excludedRunId?.isEmpty == false
         let path = try transcriptPath(for: safeId, transcriptURL: transcriptURL)
         if let limit, limit == 0 {
             return SessionHistoryReadResult(
@@ -266,10 +258,7 @@ public actor SessionHistoryReader {
             truncatedRead = false
             mode = "full"
         }
-        let decodeResult = Self.decodeMessages(
-            from: lines,
-            excludingRunId: shouldExcludeRun ? excludedRunId : nil
-        )
+        let decodeResult = Self.decodeMessages(from: lines)
         var msgs = decodeResult.messages
         let damaged = decodeResult.malformedRowCount > 0 || decodeResult.invalidShapeRowCount > 0
         if damaged { msgs = [] }
@@ -290,11 +279,9 @@ public actor SessionHistoryReader {
                 malformedRowCount: decodeResult.malformedRowCount,
                 invalidShapeRowCount: decodeResult.invalidShapeRowCount,
                 damageEvidence: decodeResult.damageEvidence,
-                excludedByRunId: decodeResult.excludedByRunId,
                 returnedCount: msgs.count,
                 truncated: truncated
-            ),
-            contextStatistics: decodeResult.contextStatistics
+            )
         )
     }
 
@@ -303,12 +290,9 @@ public actor SessionHistoryReader {
     package nonisolated static func continuityMessages(
         forSessionId id: String,
         dataRoot: URL,
-        limit: Int,
-        maximumBytes: Int,
         matching: @Sendable (HistoryChatMessage) -> Bool
     ) throws -> [HistoryChatMessage]? {
-        guard let safeId = NativeAgentChatSessionID.normalizedPathComponent(id),
-              limit > 0, maximumBytes > 0 else { throw CocoaError(.fileReadInvalidFileName) }
+        guard let safeId = NativeAgentChatSessionID.normalizedPathComponent(id) else { throw CocoaError(.fileReadInvalidFileName) }
         let path = dataRoot.appendingPathComponent("chat/messages/\(safeId).jsonl")
         let attributes = try FileManager.default.attributesOfItem(atPath: path.path)
         let handle = try FileHandle(forReadingFrom: path)
@@ -326,7 +310,7 @@ public actor SessionHistoryReader {
             guard let text = String(data: line, encoding: .utf8) else {
                 throw CocoaError(.fileReadInapplicableStringEncoding)
             }
-            let decoded = Self.decodeMessages(from: [text], excludingRunId: nil)
+            let decoded = Self.decodeMessages(from: [text])
             guard decoded.malformedRowCount == 0, decoded.invalidShapeRowCount == 0 else {
                 throw CocoaError(.coderReadCorrupt)
             }
@@ -334,7 +318,7 @@ public actor SessionHistoryReader {
                 guard matching(message) else { return false }
                 tail.append((message, line.count))
                 tailBytes += line.count
-                while tail.count > limit || tailBytes > maximumBytes {
+                while tail.count > 1 || tailBytes > 64 * 1024 {
                     tailBytes -= tail.removeFirst().bytes
                 }
             }
@@ -379,8 +363,7 @@ public actor SessionHistoryReader {
 
     /// Replay reads preserve every retained transcript row.
     public nonisolated func promptMessagesWithStats(
-        transcript: Data?,
-        excludingRunId: String? = nil
+        transcript: Data?
     ) -> SessionHistoryReadResult {
         guard let transcript else {
             return SessionHistoryReadResult(
@@ -388,9 +371,6 @@ public actor SessionHistoryReader {
                 stats: SessionHistoryReadStats(mode: "missing")
             )
         }
-        let excludedRunId = excludingRunId?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let shouldExcludeRun = excludedRunId?.isEmpty == false
         let memoReadStart = DispatchTime.now().uptimeNanoseconds
         let previousRows = Self.promptRowMemo.withLock { $0.rows }
         var rowMemoNs = DispatchTime.now().uptimeNanoseconds &- memoReadStart
@@ -427,7 +407,7 @@ public actor SessionHistoryReader {
         let prompt = Self.selectionResult(
             SessionHistoryLineReadResult(lines: lines, sourceBytes: Int64(transcript.count),
                 bytesRead: Int64(transcript.count), truncated: false),
-            mode: "replay_full", excludingRunId: shouldExcludeRun ? excludedRunId : nil, decode: decode)
+            mode: "replay_full", decode: decode)
         // Selection calls the memo per line; its time stays with the memo so the two steps never overlap.
         let promptRowMemoNs = rowMemoNs
         let selectNs = (DispatchTime.now().uptimeNanoseconds &- selectStart) &- (promptRowMemoNs &- memoBeforeSelect)
@@ -456,8 +436,7 @@ public actor SessionHistoryReader {
             excludedByRunId: stats.excludedByRunId, returnedCount: stats.returnedCount,
             truncated: stats.truncated, decodeCacheHits: cacheHits, decodeCacheMisses: cacheMisses,
             splitNanoseconds: selectStart &- splitStart, rowMemoNanoseconds: promptRowMemoNs,
-            selectNanoseconds: selectNs, memoWriteNanoseconds: memoWriteNs),
-            contextStatistics: prompt.contextStatistics)
+            selectNanoseconds: selectNs, memoWriteNanoseconds: memoWriteNs))
         return measured
     }
 
@@ -465,7 +444,6 @@ public actor SessionHistoryReader {
     /// JSONL stays authoritative without a sidecar index.
     public func relevanceMessagesWithStats(
         forSessionId id: String,
-        excludingRunId: String? = nil,
         transcriptURL: URL? = nil
     ) throws -> SessionHistoryReadResult {
         guard let safeId = NativeAgentChatSessionID.normalizedPathComponent(id) else {
@@ -479,7 +457,7 @@ public actor SessionHistoryReader {
             return SessionHistoryReadResult(messages: [], stats: SessionHistoryReadStats(mode: "read_failed"))
         }
         var unread = false
-        let result = relevanceMessagesWithStats(size: Int(size), excludingRunId: excludingRunId) { offset, count in
+        let result = relevanceMessagesWithStats(size: Int(size)) { offset, count in
             let chunk = (try? handle.seek(toOffset: UInt64(offset))).flatMap { _ in try? handle.read(upToCount: count) }
             if chunk?.count != count { unread = true }
             return chunk
@@ -515,15 +493,12 @@ public actor SessionHistoryReader {
         }
         let lines = text.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
         let previous = history.stats
-        let decoded = decodeMessages(from: lines, excludingRunId: nil, startingLine: previous.linesRead)
+        let decoded = decodeMessages(from: lines, startingLine: previous.linesRead)
         let malformed = try adding(previous.malformedRowCount, decoded.malformedRowCount)
         let invalidShape = try adding(previous.invalidShapeRowCount, decoded.invalidShapeRowCount)
         let damaged = malformed > 0 || invalidShape > 0
         if damaged { history.messages.removeAll() }
         else { history.messages.append(contentsOf: decoded.messages) }
-        history.contextStatistics = (
-            try adding(history.contextStatistics.totalChars, decoded.contextStatistics.totalChars),
-            try adding(history.contextStatistics.messageCount, decoded.contextStatistics.messageCount))
         history.stats = SessionHistoryReadStats(
             mode: damaged ? "damaged_history" : "full",
             sourceBytes: sourceBytes, bytesRead: sourceBytes,
@@ -531,7 +506,7 @@ public actor SessionHistoryReader {
             decodedCount: history.messages.count,
             malformedRowCount: malformed, invalidShapeRowCount: invalidShape,
             damageEvidence: Array((previous.damageEvidence + decoded.damageEvidence).prefix(8)),
-            excludedByRunId: try adding(previous.excludedByRunId, decoded.excludedByRunId),
+            excludedByRunId: previous.excludedByRunId,
             returnedCount: history.messages.count, truncated: false)
     }
 
@@ -543,12 +518,8 @@ public actor SessionHistoryReader {
 
     private nonisolated func relevanceMessagesWithStats(
         size: Int,
-        excludingRunId: String?,
         bytes: (_ offset: Int, _ count: Int) -> Data?
     ) -> SessionHistoryReadResult {
-        let excludedRunId = excludingRunId?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let shouldExcludeRun = excludedRunId?.isEmpty == false
         let lineRead: SessionHistoryLineReadResult
         let mode: String
         if size <= Self.relevanceFullReadMaximumBytes {
@@ -566,17 +537,15 @@ public actor SessionHistoryReader {
             )
             mode = "relevance_sampled"
         }
-        return Self.selectionResult(lineRead, mode: mode,
-            excludingRunId: shouldExcludeRun ? excludedRunId : nil, decode: SessionHistoryReader.decodeRow)
+        return Self.selectionResult(lineRead, mode: mode, decode: SessionHistoryReader.decodeRow)
     }
 
     private nonisolated static func selectionResult(
         _ lineRead: SessionHistoryLineReadResult, mode: String,
-        excludingRunId: String?, decode: (String) -> DecodedRow
+        decode: (String) -> DecodedRow
     ) -> SessionHistoryReadResult {
         let decodeResult = decodeMessages(
             from: lineRead.lines,
-            excludingRunId: excludingRunId,
             excludingAwaitingConsumption: true, decode: decode
         )
         let damaged = decodeResult.malformedRowCount > 0 || decodeResult.invalidShapeRowCount > 0
@@ -600,7 +569,6 @@ public actor SessionHistoryReader {
                 malformedRowCount: decodeResult.malformedRowCount,
                 invalidShapeRowCount: decodeResult.invalidShapeRowCount,
                 damageEvidence: decodeResult.damageEvidence,
-                excludedByRunId: decodeResult.excludedByRunId,
                 returnedCount: out.count,
                 truncated: lineRead.truncated || decoded.count != out.count
             )
@@ -715,71 +683,49 @@ public actor SessionHistoryReader {
         package let role: String?
         package let content: String?
         package let timestamp: String?
-        package let contextStatistics: (totalChars: Int, messageCount: Int)
         package let message: HistoryChatMessage?
 
-        init(_ value: JSONValue?, _ role: String?, _ content: String?, _ timestamp: String?,
-             _ statistics: (totalChars: Int, messageCount: Int)) {
+        init(_ value: JSONValue?, _ role: String?, _ content: String?, _ timestamp: String?) {
             self.value = value; self.role = role; self.content = content; self.timestamp = timestamp
-            contextStatistics = statistics
             message = role.flatMap { role in content.map {
                 HistoryChatMessage(role: role, content: $0, timestamp: timestamp ?? "", extras: value)
             } }
         }
     }
 
-    /// Preserve invalid JSON shapes while parsing canonical fields and raw-object context counts.
     package nonisolated static func decodeRow(_ line: String) -> DecodedRow {
         let lineData = Data(line.trimmingCharacters(in: .whitespacesAndNewlines).utf8)
-        var statistics = (totalChars: 0, messageCount: 0)
         let parsed: JSONValue? = autoreleasepool {
-            let row = try? ContactThread.decodeRow(lineData)
-            if let object = row {
-                statistics.messageCount = 1
-                if case .string(let content)? = object["content"] {
-                    statistics.totalChars = content.count
-                } else if let content = object["content"],
-                          let bytes = try? content.serializedData(pretty: false) {
-                    statistics.totalChars = bytes.count
-                }
-            }
-            return row.map(JSONValue.object)
+            (try? ContactThread.decodeRow(lineData)).map(JSONValue.object)
         }
-        guard case .object(let row)? = parsed else { return DecodedRow(parsed, nil, nil, nil, statistics) }
+        guard case .object(let row)? = parsed else { return DecodedRow(parsed, nil, nil, nil) }
         guard let id = row["id"]?.stringValue, !id.isEmpty,
               ContactThread.Line(row).provenanceFailure == nil else {
-            return DecodedRow(parsed, nil, nil, nil, statistics)
+            return DecodedRow(parsed, nil, nil, nil)
         }
-        return DecodedRow(parsed, row["role"]?.stringValue, row["content"]?.stringValue, row["createdAt"]?.stringValue, statistics)
+        return DecodedRow(parsed, row["role"]?.stringValue, row["content"]?.stringValue, row["createdAt"]?.stringValue)
     }
 
     private nonisolated static func decodeMessages(
         from lines: [String],
-        excludingRunId: String?,
         excludingAwaitingConsumption: Bool = false,
         startingLine: Int = 0,
         decode: (String) -> DecodedRow = SessionHistoryReader.decodeRow
     ) -> (
         messages: [HistoryChatMessage],
-        excludedByRunId: Int,
         malformedRowCount: Int,
         invalidShapeRowCount: Int,
-        damageEvidence: [String],
-        contextStatistics: (totalChars: Int, messageCount: Int)
+        damageEvidence: [String]
     ) {
         var msgs: [HistoryChatMessage] = []
-        var excludedCount = 0
         var malformedCount = 0
         var invalidShapeCount = 0
         var damageEvidence: [String] = []
-        var contextStatistics = (totalChars: 0, messageCount: 0)
         msgs.reserveCapacity(lines.count)
         for (position, line) in lines.enumerated() {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty { continue }
             let decoded = decode(line)
-            contextStatistics.totalChars += decoded.contextStatistics.totalChars
-            contextStatistics.messageCount += decoded.contextStatistics.messageCount
             func recordDamage() {
                 guard damageEvidence.count < 8 else { return }
                 damageEvidence.append("selected row \(startingLine + position + 1) sha256 "
@@ -789,11 +735,6 @@ public actor SessionHistoryReader {
             guard case .object(let obj) = parsed else { invalidShapeCount += 1; recordDamage(); continue }
             if excludingAwaitingConsumption, case .object(let metadata)? = obj["metadata"],
                metadata["awaitingConsumption"] == .bool(true) { continue }
-            if let excludingRunId,
-               message(parsed, hasRunId: excludingRunId) {
-                excludedCount += 1
-                continue
-            }
             guard let message = decoded.message else {
                 invalidShapeCount += 1
                 recordDamage()
@@ -801,18 +742,7 @@ public actor SessionHistoryReader {
             }
             msgs.append(message)
         }
-        return (msgs, excludedCount, malformedCount, invalidShapeCount, damageEvidence, contextStatistics)
-    }
-
-    private nonisolated static func message(_ value: JSONValue, hasRunId runId: String) -> Bool {
-        guard case .object(let obj) = value else { return false }
-        if case .string(let s)? = obj["runId"], s == runId { return true }
-        if case .string(let s)? = obj["run_id"], s == runId { return true }
-        if case .object(let metadata)? = obj["metadata"] {
-            if case .string(let s)? = metadata["runId"], s == runId { return true }
-            if case .string(let s)? = metadata["run_id"], s == runId { return true }
-        }
-        return false
+        return (msgs, malformedCount, invalidShapeCount, damageEvidence)
     }
 
 }

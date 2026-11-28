@@ -326,8 +326,6 @@ public struct MemoryEmbeddingActivationFailure: Sendable, Equatable {
 public struct MemoryEmbeddingEpochState: Sendable, Equatable {
     public let activeEpoch: String?
     public let dimensions: Int?
-    public let previousEpoch: String?
-    public let activatedAt: String?
     public let activationFailure: MemoryEmbeddingActivationFailure?
 
     public var protected: Bool { activeEpoch != nil }
@@ -339,8 +337,6 @@ public struct MemoryEmbeddingEpochActivationReport: Sendable, Equatable {
     public let proposals: Int
     public let tombstones: Int
     public let unembeddable: Int
-    public let previousEpoch: String?
-    public let activatedAt: String
 
     public var total: Int { memories + proposals + tombstones }
 }

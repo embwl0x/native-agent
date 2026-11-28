@@ -83,10 +83,9 @@ extension ApprovalExecution {
     @discardableResult
     public func reconcileUnappliedChatToolApprovalExecutions(
         dataRoot: URL,
-        records: [ApprovalRecord],
-        continuation: ChatApprovalContinuation? = nil
+        records: [ApprovalRecord]
     ) async -> (executed: Int, failures: Set<String>) {
-        let continuation: ChatApprovalContinuation = continuation ?? { root, session, turn, prompt in
+        let continuation: ChatApprovalContinuation = { root, session, turn, prompt in
             try await self.continueChatToolApproval(dataRoot: root, sessionID: session, turn: turn, prompt: prompt)
         }
         var failures: Set<String> = []

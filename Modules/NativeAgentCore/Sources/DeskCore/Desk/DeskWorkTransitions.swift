@@ -110,7 +110,12 @@ extension SwiftNativeDeskStore {
                 step.promiseCaptures = incoming.promiseCaptures
                 step.peers = incoming.peers
                 step.elevated = incoming.elevated
+                step.fileAccessCeiling = incoming.fileAccessCeiling
                 step.preserveOrigin(of: same.step)
+                if step.causalWait != nil, step.action != nil || step.say != nil || step.rhythm != nil {
+                    throw ToolFailureError("Clear wait_for before binding a habit, fixed speech or a repeating rhythm.",
+                                           argumentPath: "$.wait_for", effects: .none)
+                }
                 if incoming.source == nil, replacing == nil, case .userWrites? = MyQueue.When(step.when, card: step.card) {
                     step.filedAt = DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
                 }
@@ -233,7 +238,7 @@ extension SwiftNativeDeskStore {
                         bodies.append(.addRef(ref: DeskRef(kind: .step(step))))
                     }
                 } else if refreshRefs, let previous = existing.refs.last(where: { $0.kind.token == "step" }),
-                          case .step(let step) = previous.kind, !step.promiseCaptures.isEmpty {
+                          case .step(let step) = previous.kind, !step.promiseCaptures.isEmpty || step.causalWait != nil {
                     incomingRefs.append(previous)
                 }
                 let nextTitle = existing.title != title ? title : nil

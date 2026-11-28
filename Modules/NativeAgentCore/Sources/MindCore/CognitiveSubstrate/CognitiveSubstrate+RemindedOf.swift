@@ -151,7 +151,6 @@ extension CognitiveSubstrate {
         guard Self.remindedOfCadenceAllows(read.capsulePresentationState) else { return nil }
 
         let items = read.workspace.items.filter { capsuleEligibleWorkspaceNode($0.node) }
-        let dyn = read.personalityDynamics
         guard let signals = feltSignalsForCapsule(
             from: items,
             request: request,
@@ -159,10 +158,10 @@ extension CognitiveSubstrate {
         let fingerprint = feltFingerprintLine(
             signals: signals,
             workspaceItems: items,
+            reachable: reachable,
             request: request,
-            at: read.fixedAt,
-            dynamics: dyn,
-            affectEnabled: read.configuration.enabled)
+            from: read,
+            turn: turn)
         felt = (signals, fingerprint)
         guard let fingerprint else { return nil }
         // Require a named object or strong feeling; a faint diffuse state would retrieve an arbitrary care.

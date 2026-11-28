@@ -88,6 +88,9 @@ actor TelegramTurnProgressCardDriver {
                 await progressFlushTask?.value
                 return
             }
+        } catch is CancellationError {
+            transportFailed = true
+            return
         } catch {
             transportFailed = true
             await reportFailure(step: "initial send", error: error)
@@ -258,6 +261,9 @@ actor TelegramTurnProgressCardDriver {
                 try await TelegramPollLoop.defaultEditMessageTextWithReplyMarkup(token, destination.chatId, messageId, rendered, markup)
             }
             lastRenderedText = rendered
+        } catch is CancellationError {
+            transportFailed = true
+            return
         } catch {
             transportFailed = true
             await reportFailure(step: deleting ? "delete" : "edit", error: error)

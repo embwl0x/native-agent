@@ -160,10 +160,8 @@ extension SwiftNativeKnowledgeGraphIndexer {
     /// Query graph works without journal encounters using title-plus-creator keys supplied by the journal owner. Empty intake is valid when every graph work is
     /// already journaled.
     public func unjournaledWorkCandidates(
-        journaledWorks: Set<String>,
-        limit: Int = 20
+        journaledWorks: Set<String>
     ) async throws -> [StudioEncounterCandidate] {
-        guard limit > 0 else { return [] }
         let dbPool: DatabasePool
         do {
             dbPool = try await KnowledgeGraphPoolCache.shared.pool(at: sqlitePath)
@@ -175,7 +173,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         // Convert database-owned rows before crossing the async boundary.
         return try await dbPool.read { db in
             let rows = try Row.fetchCursor(db, sql: """
-                SELECT e.id AS id, e.name AS name, e.first_seen AS first_seen,
+                SELECT e.id AS id, e.name AS name,
                        (SELECT c.name FROM kg_relationships r
                           JOIN kg_entities c ON c.id = r.to_id
                          WHERE r.from_id = e.id AND r.type = ?
@@ -186,7 +184,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
                 ORDER BY e.first_seen ASC, e.id ASC
                 """, arguments: [creatorRelation, workType])
             var candidates: [StudioEncounterCandidate] = []
-            while candidates.count < limit, let row = try rows.next() {
+            while candidates.count < 20, let row = try rows.next() {
                 let name = Self.studioClean(row["name"] ?? "")
                 guard !name.isEmpty else { continue }
                 let creator = (row["creator"] as String?).map(Self.studioClean)
@@ -197,8 +195,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
                     source: .unjournaledWork,
                     title: name,
                     creator: creator,
-                    originID: row["id"] ?? name,
-                    noticedAt: Self.studioClean(row["first_seen"] ?? "")
+                    originID: row["id"] ?? name
                 ))
             }
             return candidates

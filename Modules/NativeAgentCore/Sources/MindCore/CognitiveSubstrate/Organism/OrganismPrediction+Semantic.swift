@@ -143,11 +143,15 @@ extension OrganismPredictiveBody {
     static func resolveSemanticExpectations(
         signal: SomaticSignal,
         ledger: inout OrganismPredictionLedger,
-        chemicalState: inout ChemicalState
+        chemicalState: inout ChemicalState,
+        correctionConfidence: Double = 0
     ) {
         guard let resolution = semanticPredictionsResolved(by: signal, in: ledger) else { return }
         let reaction = resolution.reaction
         let violated = reaction == OrganismSemanticExpectation.pushbackReaction
+        if violated, resolution.ids.isEmpty, correctionConfidence > 0 {
+            chemicalState.confidence = OrganismChemistry.lower(chemicalState.confidence, by: correctionConfidence)
+        }
         let intensity = OrganismBodyConfidence.clamp(max(0.2, signal.intensity))
         for id in resolution.ids {
             guard let prediction = ledger.predictions[id] else { continue }

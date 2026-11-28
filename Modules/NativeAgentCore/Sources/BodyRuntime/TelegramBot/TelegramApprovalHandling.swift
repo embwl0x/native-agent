@@ -10,15 +10,13 @@ public struct TelegramApprovalCommand: Sendable, Equatable {
     /// The matter a slash command names; nil for a button.
     public let matter: String?
     public let action: String
-    public let addressedBot: String?
 
-    public init(matter: String?, action: String, addressedBot: String? = nil) {
+    public init(matter: String?, action: String) {
         self.matter = matter
         self.action = action
-        self.addressedBot = addressedBot
     }
 
-    public static func parse(command: TelegramParsedSlashCommand, addressedBot: String?) -> TelegramApprovalCommand? {
+    public static func parse(command: TelegramParsedSlashCommand) -> TelegramApprovalCommand? {
         let action: String
         switch command.definition.handler {
         case .approve: action = "approve"
@@ -26,7 +24,7 @@ public struct TelegramApprovalCommand: Sendable, Equatable {
         default: return nil
         }
         guard let id = command.args.first else { return nil }
-        return TelegramApprovalCommand(matter: id, action: action, addressedBot: addressedBot)
+        return TelegramApprovalCommand(matter: id, action: action)
     }
 
     /// A card's button carries `na_card:` and its action's id: Telegram holds at most 64 bytes, so the matter is read from the message.

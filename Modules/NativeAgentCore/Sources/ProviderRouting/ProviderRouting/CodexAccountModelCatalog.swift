@@ -283,8 +283,8 @@ public enum CodexAccountModelCatalog {
         return nil
     }
 
-    static func fullListRefusal(dataRoot: URL, environment: [String: String], preview: Bool) -> String? {
-        guard let cache = chatGPTOAuthCache(dataRoot: dataRoot, environment: environment, preview: preview)?.cache,
+    static func fullListRefusal(dataRoot: URL, environment: [String: String]) -> String? {
+        guard let cache = chatGPTOAuthCache(dataRoot: dataRoot, environment: environment)?.cache,
               let refusal = cache.fullListRefusal else { return nil }
         return "The full ChatGPT model list could not be asked (\(refusal)). This list is for checked version \(cache.clientVersion ?? "unstated")."
     }

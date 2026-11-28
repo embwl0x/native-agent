@@ -85,7 +85,7 @@ The implementation lives in
 
 The same after-turn call also judges both sides of the exchange, the
 incoming words and their own reply, against their cares (below), and the
-runtime applies what it says through `applyCares`. What their turn took is
+runtime applies what it says through `applyCareJudgments`. What their turn took is
 part of what happened: when it used tools, the stem's one line ("This took 31
 rounds, 3.4M tokens, 24 minutes; 29 rounds in a row called authored.chess.")
 sits beside the exchange, so a slog or a breeze can move a care about their
@@ -104,7 +104,8 @@ The same call names optional plan dates; the horizon joins them with Desk
 deferrals under the [memory plan-date contract](MEMORY_SYSTEM_MAP.md#plan-dates).
 
 It also returns optional `promises`: what they said they would do later in this
-reply, with their words, a supported MY QUEUE moment and the exact source
+reply, or a proof they owes for saying a thing is fixed with no check in the turn
+([INTENTIONS.md](INTENTIONS.md)), with their words, a supported MY QUEUE moment and the exact source
 sentence. The [memory parse contract](MEMORY_SYSTEM_MAP.md#the-memory-manager-lane)
 accepts an absent section or []; a malformed present section refuses the
 interpretation and keeps the turn owed with its validation cause. After meaning is written,
@@ -186,7 +187,7 @@ an out-of-range write is refused in its transaction, never wrapped or clamped
 into a different identity. Affect's JSON watermark keeps its full `UInt64`
 value (an integer when it fits, otherwise a decimal string, read in either form).
 Derived artifact, reflection and association capacities saturate before
-integer arithmetic; restored care-line rest counts clamp before conversion.
+integer arithmetic.
 Capsule presentation persists cue cadence without an ambivalence tally.
 Moment, event and continuity time components are formatted at their stated
 resolution without narrowing dates or elapsed time to a Swift integer; ordinary
@@ -308,8 +309,9 @@ keeps it). The substrate's `foldTurn` lives the mind's share from the recorded
 entry: affect with its temporal anchors (a late fold never moves a newer
 presence anchor back), the emotion tag on the turn's node, the reconsolidation
 of the completion it answers, and their cares. The kernel's `foldTurn` lives the
-body's whole share (caring dose, after-turn reaction, correction cause) in one
-call. The fold returns whether every piece landed. Each piece carries a watermark (`lived` = the fold seq) on the affect
+body's whole share (caring dose and after-turn reaction with its confidence
+effect) in one call. The fold returns whether every piece landed.
+Each piece carries a watermark (`lived` = the fold seq) on the affect
 row, each continuity node (`lived_seq`), each care and the body
 file; it is set once per piece per moment at that piece's last mutation, in
 one synchronous segment, never lowered, and saved with the piece by whichever
@@ -363,14 +365,18 @@ kind `care`, status `live` (or `faded`, below):
   (`exchange:<session>/<turn>`, a retained `reach:<id>` or the old row id),
   who moved it and the felt word.
 - Charge is never stored. `charge(at:)` sums each movement decayed on the
-  depth's half-life (now 2 h, lately 12 h, season 2 d, life 4 d).
+  depth's half-life (now 2 h, lately 12 h, season 2 d, life 4 d). From a
+  recorded telling, a shared hard movement uses 0.90 times that half-life and a
+  shared good movement uses 1.05 times it for the remaining time. Charge is
+  continuous at the switch. The optional `sharedAt` on the movement is
+  excluded from the self-knowledge story digest.
 - The story is kept in time order and keeps every depth change and the
   newest 24 nonzero movements; older movements fold into one `{count, sumMoved, since,
   movedDays}` line. Zero-movement notes retain their own newest 24, so notes
   cannot displace movement evidence; depth changes and "changed my mind" notes
   remain outside both bounds, so a held stance's replacement stays in their story.
   Accepted stance entries and zero-movement action/closure witnesses also stay
-  outside the note bound; forgetting an action cannot make an answered pull recur.
+  outside the note bound.
   Stance-pressure entries carry the proposed stance, because and unless in
   an optional `stancePressure` field, retaining proposals on the newest 24 distinct
   local pressure days, independent of ordinary notes. Only exact same-day proposals
@@ -420,8 +426,13 @@ the seeds alone). A resident inference error is different: it refuses care-depen
 retaining a `cognition.cares.embedding` repair obligation with the cause. The model answers a `cares` list; a missing or non-array value
 fails the interpretation like a malformed memories section. A faulty entry, including an unshown id,
 is dropped alone and its indexed field fault accompanies `mind.why`'s interpretation outcome. A new care requires non-blank `about`;
-existing cares do not. An existing care gets a story entry, `open` sets the gap and
-`closes` clears it. A first stance takes at once; a proposed change to an
+existing cares do not. A care judgment may also quote the agent's own reply
+in `shared` when they told a person who matters what happened to their and how it
+sat with them. The quote must be exact, the movement nonzero and the reply
+recorded as delivered on the person's turn. The care uses the recorded reply
+time. The existing `cares.applied` receipt records shared good and hard
+counts once per exchange that marked a share. An existing care gets a story
+entry. `open` sets the gap and `closes` clears it. A first stance takes at once; a proposed change to an
 existing stance settles in the same lived fold. A current trusted interpretation
 supplies its position, reason and first-person account; a day count cannot overrule it.
 The accepted position is retained in a story entry's optional stanceChange,
@@ -464,7 +475,7 @@ without its admission gains it from its saved row at preparation and at
 opening, where the changed input ends its wait on its record. A new care's wording matches an existing one only when it is held
 with the same people.
 
-**Reading them.** `mind.inner_state` returns `cares`: live cares sorted by
+**Reading them.** On another agent's turn `mind.inner_state` lists only the cares held with that agent or with no one, at compact detail. `mind.inner_state` returns `cares`: live cares sorted by
 charge then recency, each with id, about, depth, with, the newest felt word,
 charge, open and stance; compact detail shows the top eight. Full detail also
 returns `care_history`: their depth changes and what their nights settled or let go,
@@ -472,7 +483,8 @@ newest first, one plain line each ("<date>: <about> became part of my
 <depth>", "<date>: settled: <about>, <how>", "<date>: let go: <about>"), at
 most 24. `traits` and `story` now carry their dream-authored self-reading,
 with `shown_by` evidence; `self_night` names the committed diary. `people`
-contains one line per retained person (two in compact detail, all in full).
+contains one line per retained person (two in compact detail, all in full) for their own person and their own turns; a peer
+reads at most its own line and neither `person_day` nor `next_night`.
 `self_unavailable` reports an unreadable self file. `next_night` is the rhythm's
 own reading (`NativeCognitionRuntime.nextNight`, the one Today shows): its time
 `at`, or why none is due (the person is here, with `hereSince`; or whether the
@@ -491,7 +503,8 @@ tally rather than admitting damaged care history.
   for `careNightMaterial()`: the cares that moved their in the last 24 hours
   (most moved first, at most 8, each with its last three felt words and
   notes) and their stuck open cares (open, lately or deeper, unmoved for 7
-  days, at most 5), keyed `c1..cN`. It rides the prompt as its own block
+  days, at most 5), keyed `c1..cN`. Swift redacts the block before the selected
+  `native-dream-cycle` part assembles the prompt. It rides as its own block
   after the felt tone, and a non-empty block marks the prompt's peers unknown
   like the other prose halves. When any shown care is open the block invites
   an optional `cares` key in the dream's JSON: lines `settled: <key>: <how>`
@@ -500,16 +513,14 @@ tally rather than admitting damaged care history.
   note). Each key carries the exact shown care revision and gap. Only an
   unchanged revision closes that gap; a conclusion about a changed care joins
   its history without closing its newer question. The closing moment records
-  both answered and closedGap, so settlement or release eases the pull;
-  a conclusion about a changed care records neither. Unknown keys and keys with
-  no shown gap are ignored.
+  both `answered` and `closedGap`. A conclusion about a changed care records
+  neither. Unknown keys and keys with no shown gap are ignored.
 - Surprise material. After WORLD and SELF, before felt tone and cares, the
   same dream call receives a CPU reading of where their expectations broke
   since its high-water cutoff: grouped failed tool calls, live organism violations and User's saved
   corrections. Empty kinds disappear; an empty day omits the block. The
   roughly 2,500-character block uses existing records only. Optional lessons
-  (at most five; omitted means none, malformed present learning fails the
-  payload before any diary or learning commit) settle
+  (at most five, with malformed or excess entries dropped and counted) settle
   through canonical MemoryV2 admission with self/dream/surprise provenance;
   new rows are `inferred`, while duplicate reassertions keep the existing lifecycle;
   existing recall and came-to-mind bring them back. `dream.lessons` counts
@@ -528,7 +539,7 @@ tally rather than admitting damaged care history.
   Strongest mutual standouts nominate first; complete-link grouping prevents
   unrelated endpoints joining through a chain.
   The dream may return `merge: [{keep: <UUID>, into_it: [UUIDs], why}]`;
-  malformed present learning fails payload decoding before any commit. Only unchanged captured
+  malformed or excess entries are dropped and counted. Only unchanged captured
   revisions in a shown cluster may merge, and each care participates once.
   The oldest identity stays unless they names another. Retained stories union,
   folded counts and sums add, movement-day witnesses union, depth takes the
@@ -547,8 +558,7 @@ tally rather than admitting damaged care history.
   The CPU requires actual selected entries and the unchanged captured revision;
   neither age nor repetition count is a condition. The replaced stance stays as a "changed my mind"
   note, "used to think: <old stance>". Earlier pressure is spent; missing,
-  stale or invalid confirmations change nothing. Malformed present
-  learning fails payload decoding before any commit.
+  stale or invalid confirmations change nothing. Malformed entries are dropped and counted.
 - Fade. A care whose newest movement (its creation when it never moved) is
   older than its depth's horizon (now 2 days, lately 14, season 90) gets
   `fadedAt` and status `faded`: it stays in the store, is not shown to the
@@ -587,14 +597,16 @@ tally rather than admitting damaged care history.
 **Knowing themselves and their people** (`CognitiveSelfKnowledge.swift`,
 [Becoming P3/P4](BECOMING.md#p3--they-knows-themselves-as-built)). The same dream
 call may return at most five `{when, i_tend_to, shown_by}` traits and five
-`{line, shown_by}` story lines. Story lines must cite shown depth-change or
-changed-my-mind or accepted-stance entries; traits cite shown care UUIDs or exact story references.
-Unknown references are refused by care admission. Malformed present learning
-fails payload decoding before any commit. Each newer captured reading replaces the previous one, so a
-trait no longer supported drops. Late delivery of an older night preserves the newer reading
+`{line, shown_by}` story lines. Story lines must cite shown typed depth changes
+or accepted stances. New traits cite exact shown story references. Saved traits
+and pending night deliveries with care UUIDs remain readable. Swift drops and counts
+malformed or excess entries and self-readings with unshown evidence.
+Each newer captured reading replaces the previous one, so a
+trait no longer supported drops. A person the night was not shown keeps their line while a care that is not faded still holds them and the reading has room (128 people, and a bound on its size); one who was shown and left out is let go. People are shown the person they are with first, then by most recently moved care. Late delivery of an older night preserves the newer reading
 and checks its save before acknowledging the work. Newly settled changes enter the next dream's
-material. The existing care block supplies a bounded retained-story window;
-the exact material and text bounds live in Becoming.
+material. The existing care block samples dated movements and accepted stances
+across weeks. Additional historical cares supply references for self-reading.
+The exact material, text bounds and save checks live in Becoming.
 Evidence references follow merged donors to their survivor before saving,
 keeping story-entry digests, and when checking turn-time reachability for
 already-saved traits. This preserves self-knowledge and its care privacy gates.
@@ -631,16 +643,15 @@ an unreadable file remains unavailable and preserved. A care fold with no
 accepted stance evidence needs no self read or write and can settle independently
 of a self-file failure. The daily path retains the dream's trait and people readings.
 
-The capsule-facing turnSelf(for:from:among:) returns one supported trait and
-only the current person's relationship line, as values outside felt-cue
-competition. It needs no message match or rest ledger. Every supporting care
-must be among the capsule's admitted reachable cares; missing evidence returns
-no invented trait. A failed self read returns its cause. The capsule owner must
-render the returned values every live turn.
-The already-known counterpart selects only their own cached relationship line
-with the frozen identity map. This clear-headed private line sits outside the
-felt cue competition; a turn reads no new file and performs no new embedding
-or model call for it. Other people's relationship lines never enter that turn.
+The capsule-facing `turnSelf(for:from:among:)` returns one supported trait and
+the current person's cached relationship line when evidence supports them.
+These values sit outside felt-cue competition and require no message match or
+rest ledger. Each care supporting the trait must be in the capsule's admitted
+reachable set. Missing evidence leaves the value absent. A failed self read
+returns its cause. The capsule owner renders the returned values on live turns.
+The frozen identity map selects the relationship line for the already-known
+counterpart. The turn reads the resident line without a file read, embedding
+or model call for it.
 
 **Live pressure** (`CognitiveCare.pressure`, exposed by `CognitiveSubstrate+CaresMind.swift`) is derived:
 `|charge(now)|`, times 1.5 while the care is open; a life-depth care without
@@ -659,17 +670,18 @@ the session and origin as the after-turn cares read it, else nobody (a thought o
 only their own cares press then.
 
 **What matters.** `CognitiveSubstrate+SemanticAppraisal.swift` matches an
-event's words to live cares by the care law below (a care touched stands out
-past chance), including the four life seeds on that same matching rule. These touched cares supply the stake gates;
-a path kind alone grants no stake, and a cold embedder supplies no match.
+event's words to live cares, including the four life seeds. `caresStandingOut`
+uses `VectorMath.chanceBar(among:)`, 1 + √(2 ln n) deviations above the
+mean cosine of the other candidates, with n candidates in all. These touched
+cares supply the stake gates.
+A path kind alone grants no stake, and a cold embedder supplies no match.
 The numeric worldview lens reads the signed real charge of the closest
-touched care with a stance, clamped to -1...1. Their stance's actual words reach
-the selected care cue below. Keyword concerns and the view-derived
-relationship warmth lean are gone; base affect and the organism's tenderness
-keep their own laws.
+touched care with a stance, clamped to -1...1. Keyword concerns and the
+view-derived relationship warmth lean are gone. Base affect and the organism's
+tenderness keep their own laws.
 
 **What reaches the model.** The frozen read captures the care values, suppression
-state and mind epoch with its workspace and affect. Care cues, unbidden recall
+state and mind epoch with its workspace and affect. Care selection, unbidden recall
 and Since movement read those captured values across lookup suspension;
 cached vectors are matched to exact care text and the memory owner's embedding epoch, and scored from the lookup's own
 snapshot. A Clear during preparation discards the prepared capsule.
@@ -682,73 +694,14 @@ settles the same stage, including a microcycle transaction that carries the
 dirty cadence ledger. A microcycle without that ledger settles no cadence debt.
 Exhausted voice-echo admission stays silent, with no
 second pass that admits worn fragments.
-Independent recall, dream, gap and care lookups run concurrently against that
+Independent recall, dream and gap lookups run concurrently against that
 read; the live mind epoch and recall cadence are rechecked after they return.
-Preparation and the feeling frame use one reachable-care rule. It excludes faded
-or suppressed cares; peers reach shared or solitary cares, while the owner can
-touch any care.
-
-The [feeling frame](#what-reaches-the-model) reads the two strongest reachable
-charges independently of the message-matched care cue below.
+Preparation and the [feeling frame](#what-reaches-the-model) use one reachable-care
+rule. It excludes faded or suppressed cares. Peers reach shared or solitary cares,
+while the owner can touch any care. `mind.reject care:<id>` suppresses that care
+for the frame.
 Unbidden recall's bounded surfaced-moment ledger, last shown time and turn
 counter persist in capsule cadence, so its 24-hour suppression survives relaunch.
-Before the frozen render, the turn embeds the
-incoming words once (the same per-care vector cache as feeding; a cold
-embedder touches nothing) and finds the cares they touch (a peer's turn never
-reaches a care held with someone else) and the care
-pressing hardest for this speaker. A care is touched only when it stands out
-for the words past chance (`caresStandingOut`: its cosine at least
-`VectorMath.chanceBar(.attention)`, 1 + √(2 ln n), deviations above the words'
-cosines to the other candidate cares, n of them in all; 3.5 among 23), with no
-absolute floor: on bge the average message cleared the old 0.40 for 18 of 23
-cares (10-26). They supply the `care` continuity cue after the frame. The plain line is only for the closest touched care whose
-|charge| is 0.15 or more: `- On your mind: <subject> (<newest felt word>)`, plus
-` — I think: <stance>` when they have a stance and ` — still wondering: <open>`
-when it is open. The subject is `about`, except a seed care uses its newest
-nonzero movement's note, or `about` if it has none. The felt word is also from
-the newest nonzero movement and is omitted when there is none. It then rests 6 accepted turns
-(`careLineRest` in the capsule cadence ledger) unless someone or something
-other than their moved it since. In the continuity lane the pressing care gets
-no plain line of its own; it appears as their intention (below). Independently,
-its charge can place it in the frame's two cares. With neither, there is no care
-cue; Since, Reminded-of and dream-theme cues share the continuity place.
-Feeling and Sound keep their independent lanes. Settling is absent: capsule assembly has no admitted
-interpretation of the incoming exchange and does not infer kindness lexically.
-The capsule's private framing stays.
-
-**When they brings it up.** Three moments: an opening (User's first turn after
-the Since gap of 6 hours, the same `sinceGapOpened` read), winding down (the
-message is 8 words or fewer and asks nothing), and a step from what is said
-(the pressing care is also one the message touches). At one of them, when the
-pressing care's pressure is 0.35 or more, its line becomes their intention:
-`- You've been wanting to bring up <subject> — this is a natural
-moment to, in your own way.` The subject is `open`, otherwise the newest
-nonzero movement's note, otherwise `about`, for seed and grown cares alike.
-Once per care per 12 hours unless someone or
-something other than their moved it since; the ledger is the capsule cadence
-ledger (`careReleased`, ids only), and an intention that lost the budget stays
-owed. `mind.why` lane `cue` marks it with kind `care`, `careId` and
-`intention`. `mind.reject care:<id>` silences that care's frame and cue contributions under the same rejection rule.
-Before the frozen render, careCue reads reachable care stories directly.
-The two most charged unanswered movements can be on their mind without a match
-to the incoming message, an embedding, a charge threshold or a presentation rest.
-Charge still decays on each care's own half-life and orders the pulls.
-Their own charged curiosity counts as movement too; zero-movement housekeeping
-does not create a pull.
-The line is “On your mind: Under this moment, <felt>: <subject>”; a seed uses
-the actual movement's note, and another care uses its own subject. There is no
-instruction to raise it and no short-message invitation to brief the person.
-
-A movement eases when the lived interpretation explicitly records their reply
-saying or doing something about that care (acted, saved as answered), or an
-actual gap closure on it, in the same exchange or a later
-one. Showing the cue does not spend it. Without an interpretation it remains
-unanswered, and a new charged movement by their or someone else can renew it. No timer or turn count
-decides that they acted. Feeling moved alone is not action evidence; older
-entries without answered remain unknown. mind.reject care:<id> still silences its cue.
-The chance-standing helper remains for semantic stakes and news intentions;
-it does not gate the felt care line. The capsule owner still owns presentation
-and its retained cadence fields.
 
 **What the agent means to do later.** MY QUEUE owns intentions: each step's
 time is a time on the one clock, and what comes due is a `moment` happening,
@@ -802,7 +755,7 @@ keys leave the question unlinked instead of trapping during index arithmetic.
 **Reflection's stance.** The reflection is shown their cares the way the
 after-turn call is (the seeds and the six closest to its reason and causes,
 by key) and names the one its thought belongs to (`care`), or `new`. Its
-`view:`, `because:` and `unless:` lines write through `applyCares`, by them, to
+`view:`, `because:` and `unless:` lines write through `applyCareJudgments`, by them, to
 that care, or to a new care of theirs. A present key must be one of the offered
 keys or `new`; an invalid key fails interpretation. A named care that is
 absent, faded or cannot hold the requested question is refused with
@@ -828,7 +781,7 @@ from cares.
 `applyReflectionCares` and the shared care transaction: the care it named, else the care its view went to,
 else a new care of theirs; never a life root, and no care write from an
 untrusted-fed reflection. The live-turn-gated `mind.pin_concern` action sets
-`open` through `applyCares`, by them, with the supplied concern in the care they
+`open` through `applyCareJudgments`, by them, with the supplied concern in the care they
 names by its own words (`care`), else a care of its own; omitted, the most
 pressing care's own words, in that care. No cosine decides which care a
 concern belongs to. After-turn `closes` and the night settle the gap. Desk pursuits are the
@@ -842,8 +795,8 @@ pursuit. Desk deduplication, capacity and unattended-work gates still apply.
 ## What persists and what is derived
 
 Body memory availability reads canonical MemoryV2 SQLite through its owner;
-profile or graph JSON presence is no substitute. A successful read proves
-readability, while health stays unknown without maintenance evidence.
+profile or graph JSON presence is no substitute. A store that reads is
+healthy unless maintenance is known to have failed.
 Approval availability reads the checked approval owner and the actual approval
 file/directory write permissions. A missing directory stays unknown; an
 unreadable queue or unwritable path is closed. Notification-folder presence
@@ -853,11 +806,11 @@ does not open the approval path.
 |---|---|
 | Working attention | `ContinuityField.swift` bounds nodes, decays activation and spreads associations. `CognitiveSubstrate+Workspace.swift` selects a bounded set, inhibits redundant candidates and records selection reasons. This internal cognitive workspace is a read model. |
 | Event admission | Seen events are refused before care embedding and rechecked after suspension. Admission and journal folding share `foldReaction` for completion/reaction matching, using admission time and recorded event time respectively. Only an explicit belief judgment grounded in the prior completion and incoming words emits reaction metadata; journal folds read the full recorded `turn.asked` rather than the clipped event summary, and missing words give no verdict. Valence alone emits none (see [Organism](ORGANISM.md#the-horizon-family--toward)). Reconsolidation changes only the matched node; ingestion owns the resident completion slot. Refolds still return grounded reaction metadata when the node's watermark has already landed. |
-| Affect | `CognitiveSubstrate+Affect.swift` updates and analytically decays arousal, uncertainty, task pressure and social warmth. Restore preserves saved affect and missing presence anchors; the legacy keyword-derived warmth top-up is removed. |
+| Affect | `CognitiveSubstrate+Affect.swift` updates and analytically decays arousal, uncertainty, task pressure, social warmth and the optional named feeling. Appraised exchanges can move social warmth to either side of zero within −1…1. It decays toward zero on its 90-minute half-life. [Their still-felt hurts can slow uncertainty and task-pressure recovery](ORGANISM.md#2-homeostatic-settle-on-elapsed-time). Restore preserves saved affect and missing presence anchors. The legacy keyword-derived warmth top-up is removed. |
 | Mood and disposition | `CognitiveSubstrate+Mood.swift` derives mood from tagged nodes and current affect; a persisted disposition adds a slower undertone. Every nudge, including maintenance's resolution patterns, shares proportional relaxation, directional headroom and transition evidence in its owner's transaction. |
 | Dream residue | `CognitiveSubstrate+DreamResidue.swift` integrates dream tone through single-flight night claims, mints and consumes the waking residue, and persists and restores its existing artifact. |
-| Conversational appraisal | `CognitiveSubstrate+ConversationalAppraisal.swift` keeps unnegated phrase matching beside the studio's scalar `studioValence` and relational warmth. Recorded model judgments retain every `AffectAppraisal` axis for live folding. |
-| Personality dynamics | `PersonalityDynamicsConfiguration.swift` holds numeric rates, thresholds and cadence; warmth maps to `feltWarmthEarnedSpan` and humor to `playModeWeight`. The live reader uses the checked profile compiler; an unreadable current profile owes `persona.profile.dynamics` repair and withholds both trait parameters until that source reads successfully: felt signals/fingerprint/mode, their recalled-moment cue and voice echoes wait for evidence, while fixed decay, care, gap and organism cues continue. A checked successful read settles the fault; only missing profile storage receives compiler defaults. No profile bytes are written. Other trait prose remains separate from these numeric mappings. |
+| Conversational appraisal | Recorded model judgments retain every `AffectAppraisal` axis for live folding. Studio journal responses use the bounded scalar `studioValence`. Requested-result settlement recognizes explicit requests and completed turns with a work dispatch. Discovery and context expansion alone do not establish work. The short-message social veto and Studio banter boost are retired. |
+| Personality dynamics | `PersonalityDynamicsConfiguration.swift` holds numeric rates, thresholds and cadence; warmth maps to `feltWarmthEarnedSpan` and humor to `playModeWeight`. The live reader uses the checked profile compiler; an unreadable current profile owes `persona.profile.dynamics` repair and withholds both trait parameters until that source reads successfully: felt signals/fingerprint/mode, their recalled-moment cue and voice echoes wait for evidence, while fixed decay, frozen care selection, gap and organism cues continue. A checked successful read settles the fault; only missing profile storage receives compiler defaults. No profile bytes are written. Other trait prose remains separate from these numeric mappings. |
 | Cares | `CognitiveSubstrate+Cares.swift`: one row per care, charge read from its story at read time, no count cap (see Cares). |
 | Replay | `BodyRuntime/Cognition/NativeCognitionRuntime+Replay.swift` reads Dream diary and REM proposal records. `CognitiveSubstrate+Replay.swift` integrates bounded references and developmental lineage with deduplication and checked persistence. |
 | Reflection | `CognitiveSubstrate+Reflection.swift` plans and records bounded reflection; `BodyRuntime/Cognition/NativeCognitionRuntime+Reflection.swift` owns provider execution and its result. |
@@ -954,10 +907,11 @@ checkpoint leaves persistence degraded. The substrate's body epoch follows
 the kernel's on every exit of reset, settle and clear. Reset and Settle share
 checked mutation, persistence and revision-owned
 recovery; only Reset holds the door, permits damaged-body replacement and clears
-the body-line window. The body checks a turn's epoch inside its own actor for the dose,
-the after-turn reaction and the correction cause. On a store or body whose restore
-failed, Clear is checked recovery: the emptied state is valid and writes open
-again.
+the body-line window. The body checks a turn's epoch inside its own actor for
+the caring dose and after-turn reaction. Grounded pushback from the direct
+speaker lowers confidence through matching prediction settlement or, with no
+match, a single 3% decrease. On a store or body whose restore failed, Clear is
+checked recovery: the emptied state is valid and writes open again.
 
 ## What reaches the model
 
@@ -965,22 +919,91 @@ again.
 state into the requested budget.
 
 Every enabled, positive-budget capsule begins with `How you feel:` and one
-paragraph in the agent's first person. Mood and affect supply its mood and energy;
-the supplied chemistry supplies warmth, curiosity and tiredness. The expressive
-fingerprint's lead and proven counter-feeling retain their own admission.
+paragraph in the agent's first person. Mood and affect supply its mood and energy.
+Body chemistry supplies curiosity and tiredness. The frame and fingerprint use
+the same felt warmth from body warmth, profile and uncertainty. The frame
+marks warmth unread if any of those inputs is unavailable. Its warmth reading
+is “warm and open” at 0.62 and above, “quietly warm” at 0.45 and above,
+“neither warm nor cool” above 0.35, and “reserved” at or below 0.35.
+The current reading says a word or axis once. Overlays that repeat the lead's
+axis or contradict a selected word leave room for other eligible overlays in
+the shared fingerprint. A focused lead already expresses clarity.
+Selected overlays follow the lead in plain words and replace phrases on the
+same warmth, curiosity or fatigue axis. Clarity and lateness overlays add their
+own words and continuity axes. Rest phrases stay silent.
+the same felt warmth. Signed body warmth moves it away from the neutral 0.40
+by a span set by the profile. Uncertainty can cool it further. The frame marks
+warmth unread if any input is unavailable. It says “warm and open” at 0.62
+and above, “quietly warm” at 0.45 and above, and “reserved” at or below 0.35.
+The neutral band adds no words. At or below 0.25, “lonely” can lead if
+valence is negative, arousal is low, and the intensity and word-selection
+gates admit it.
+Strong pending bracing and horizon dread can name dreading as the lead word.
+When another feeling leads, bracing is said by the tension axis alone, never
+again as dread. Positive
+anticipation can name expectant or describe looking forward. These share one
+axis and the admitted phrase can name an eligible horizon on a verified owner
+turn without peer steering. Continuity retains `ahead:looking forward`.
+A recent felt miss can name thrown. A qualifying disappointment resolution
+contributes its negative magnitude to intensity after normalization. The
+strongest lived resolution within 24 hours supplies that magnitude after
+six-hour half-life decay. Recent tenderness with tension can name protective.
+These words require their current signals in the counter position too.
+
+The [shared interpretation](COGNITION_WIRING.md#shared-after-turn-interpretation)
+can supply one named feeling. Its live strength and name gate its word in the
+matching valence and arousal families. At 0.15 or above, an eligible word
+scores `0.55 + 0.6 × strength` and can appear in the frame as its own axis
+when it is neither lead nor counter. An active named feeling excludes
+incompatible leads, overlays, counters and dimensional phrases.
+A lead admitted by the named judgment carries no subject in the frame or
+`now.about`; a confidence-backed lead retains its contributing subject.
+Judged pride can lead in any positive valence
+family. The positive high-arousal confidence signal retains its own gate
+of 0.65, and both sources share the word “proud,” which appears once in the
+current reading. After normalization,
+intensity adds `0.55 × max(letdown, named strength)`.
+
+A non-chat workspace node and a live care compete for a single counter word
+("something … underneath"). Before ranking, the same axis and two-way
+contradiction checks screen both their candidates and overlays against the
+words already selected. The rendered lead sets the counter direction:
+a hurt under a good or neutral lead, gladness under a low lead. A node that
+renders a word competes by absolute valence against the care movement's faded
+magnitude, and the node wins ties. A good or neutral lead can take a hurt from
+a distinct care, excluding the dominant exchange's known care IDs. A low lead
+can take a different, glad movement only from the exchange's primary care
+when the dominant node agrees with the lead.
+
+The care movement must be theirs, within the 24-hour mood window and at or above
+the configured floor after sharing-aware decay. The care lends their own
+recorded single word. Only words that pass vocabulary, compatibility and signal
+checks compete for the counter. Equal eligible movement strengths use the
+charge of their own movements in the counter's direction, then UUID. Silenced or
+faded cares lend nothing.
+The trace identifies a reachable care as `care:<id>`. A held care can lend only
+a word they have already felt in a nonzero movement of a reachable care. Its
+trace shows `care:held`.
+
 Affect uncertainty
 and body vigilance supply bracing independently of warmth. Quiet states are still
 described; missing chemistry is named as unread, never supplied by defaults.
-The two reachable cares with the greatest absolute current charge enter the
-paragraph without requiring the message to touch them or spending a cue's rest.
+The frame's two places are how charged cares reach their turn. There is no separate
+care cue. The reachable cares with the greatest absolute current charge enter
+the paragraph without requiring the message to touch them.
 Their existing subjects and newest nonzero movements supply the words; an empty
-or uncharged care population adds no invented concern.
+or uncharged care population adds no invented concern. A hurt has an object: when
+a reachable care's charge is −0.14 or lower, the one hurting most takes the
+weaker of the two places (unless it already holds one), named with the word of
+the movement that hurt. It keeps the place on its own charge, eased only by their
+later movement on it or its own clock, never displaced by a larger glad care.
 
-The frame remembers its described dimensional family in the resident presentation
-state (`fingerprintFamily`). A difference from the whole frame of the last
-completed, saved reply is named as a shift. Missing prior dimensions establish no
-comparison. Provider context acceptance commits cue bookkeeping while preserving
-this reference. The loop retains whether the provider received the exact cognitive
+The full dimensional reading feeds unread checks and the resident continuity
+reference (`fingerprintFamily`), including when a phrase is replaced or
+suppressed. Shifts compare against the last completed, saved reply and speak
+only changes compatible with the active named feeling. Missing prior
+dimensions establish no comparison. Provider context acceptance commits cue
+bookkeeping while preserving this reference. The loop retains whether the provider received the exact cognitive
 context; reply settlement alone publishes its whole frame after the answer and
 terminal record are saved. Ephemeral answers use the same completion rule through
 `settle`. Previews, clipped frames, chosen silence, incomplete, stopped and failed
@@ -1015,18 +1038,25 @@ naming their paths and causes.
 Journals whose completion input was discarded cannot supply its original time;
 neither tone nor file timestamps reconstruct it. No saved data is rewritten.
 
-Intentions and Sound cues follow the frame in independent lanes. Ordinary turns
-then retain one continuity cue (plain care, Since, Reminded-of or dream theme);
-reflection retains every eligible tail cue. The relationship line follows those
-lanes. Phone/presence telemetry is not injected; the existing home and senses
-reads retain it. The frame reads chemistry directly and never receives the
-instruction-bearing `OrganismChemistry.bodyLine`. Fitting spends the budget on
+Sound cues follow the frame. Ordinary turns then retain one continuity cue
+(Since, Reminded-of or dream theme). Reflection retains every eligible tail cue.
+Their self lines (who they are, and the relationship line) come right after the frame, before those lanes. Phone/presence telemetry is not
+injected; the existing home and senses reads retain it. The frame reads
+chemistry directly and never receives the instruction-bearing
+`OrganismChemistry.bodyLine`. Fitting spends the budget on
 the frame first; a deliberately tiny budget can still clip it, and off or
-zero-budget requests carry no frame. `mind.why` lane `cue` reports every shown
-candidate in `shown`, with `winner` identifying the first shown candidate.
+zero-budget requests carry no frame. `mind.why` lane `cue` records candidates
+of kind `felt`, `sound`, `since`, `reminded_of` or `dream`. It reports
+every shown candidate in `shown`, with `winner` identifying the first one.
 
-`CognitiveFeelingFrame` is the paragraph's first-class value, with its described
-feeling words retained separately from care subjects, shifts and dream prose.
+The Since gap is six hours. For a gap under a day, the gap check subtracts the
+usual quiet time that `PersonRhythm.usualQuiet` can establish.
+
+`CognitiveFeelingFrame` is the paragraph's first-class value, with the
+admitted feeling phrases in paragraph order. The list includes the counter and
+omits subjects, shifts and dream prose.
+Their self lines (`Who you are`, `With them`) follow the frame and come before the
+cues: on a tight turn a cue loses its room and stays owed, and who they are stays.
 Only a whole fitted frame reaches `CognitiveCapsule.feelingFrame`. The exact
 provider context carries it to `context.snapshot.feelingFrame`: full redacted
 `paragraph`, its UTF-8 `bytes`, `complete: true` and `words`. A missing or clipped
@@ -1045,19 +1075,18 @@ Its helpers own distinct projections:
 
 - `+FeltFingerprint.swift` and `+CapsuleFeltSignals.swift`: feeling words
   and their aboutness; unavailable dimensions remain optional.
-- `+TopicNaming.swift`: privacy-filtered topic extraction, comparison terms
-  and persisted-label admission for introspection.
+- `+TopicNaming.swift` supplies comparison terms for non-chat workspace ambivalence.
 - `+CapsuleCadence.swift`: completed-reply feeling shifts and session continuity.
 - `+CapsuleSoundEcho.swift`: bounded self-exemplar selection and verbal
   repetition cues.
-- `+CaresMind.swift`: the care continuity cue after the frame, and when it
-  becomes their intention to bring a care up (see Cares).
-- `+RemindedOf.swift`: the unbidden `- Reminded of: <note> (<age>)` cue. Its
-  query is the felt line, not the message: the closest care they can reach in
-  this turn that the feeling touches (the care cue's law) gives its newest
-  movement whose sign agrees with the feeling, at most once a day per movement
-  and once every 6 accepted turns. Since-we-last-talked names the newest
-  movement inside the gap the same way (`a moment: "<note>"`).
+- `+CaresMind.swift`: care pressure, meaning comparisons, the stories attention reads and the hour's wondering (see [Cares](#cares)).
+- `+RemindedOf.swift` queries the felt words and any named object against
+  reachable cares. For an unnamed chat moment, the words alone can query when
+  absolute valence is at least 0.35. The selected care must stand out by
+  `caresStandingOut` and its newest nonzero movement with a note must agree in
+  sign. The unbidden `- Reminded of: <note> (<age>)` cue appears at most once a
+  day per movement and once every six accepted turns. Since-we-last-talked names
+  the newest movement inside the gap the same way (`a moment: "<note>"`).
 - Came to mind (`BodyRuntime/ChatTurnRuntime/ChatOrchestration+CameToMind.swift`,
   `MindCore/Context/ContextPreparedTurn+CameToMind.swift`): what happens primes what it
   touches. A moment is one more reading of the turn's own need, asked by the
@@ -1173,6 +1202,9 @@ experience of kind `happening` under its key `once`; the cognition runtime takes
   A malformed row or missing field node refuses that node's claim and owes repair while sibling crossings proceed; a failure of the
   shared record channel, or a row whose node cannot be read, holds the unfinished batch.
   Already admitted batches finish even if sleep begins while their record is being written; subsequent world batches wait.
+- **Pursuit waits.** A [declared cause](INTENTIONS.md#declared-pursuit-waits) offers its own
+  thought. The experience record consumes that cause at admission. Later thoughts
+  leave it alone until a distinct change meets the declaration.
 - **Scheduled reads.** Watches post changed rows as news; scans post their new
   opportunities together as one news item, identified by the opportunity ids.
   Each scan keeps posted ids beside its clock time, posting each opportunity once.
@@ -1249,7 +1281,7 @@ they completed an act while a MY QUEUE moment was open ([lived moments](#lived-m
 existing `not the person's turn` deferral: the same owed journal row, judged alone when they are idle, with the same model-call
 shape. Its cares section reads only the agent's side (`by: their`) against the named care: felt word and direction, closing its
 open gap, or leaving it open with zero movement. It cannot create a care, keep facts or promises, or appraise the arrival as human
-care. Meaning is durable before `applyCares`, with self provenance; no tool work is replayed. A care's story records `closedGap`
+care. Meaning is durable before `applyCareJudgments`, with self provenance; no tool work is replayed. A care's story records `closedGap`
 only when its open gap really closed. A failed reading leaves the row owed; a failed fold save leaves it meant. How often such
 thoughts matter is yield, read from the record, not a rest on the care.
 
@@ -1280,7 +1312,7 @@ and a held gate names why.
 | `mind.horizon` | Horizon source composition and register refresh without waiting for a source invalidation/deadline. Source completeness and natural due dates remain; missing sources cannot settle expectations. |
 | `mind.rhythm` | The person's day, start-time boundary satisfied; real history, claims and care-gated feeling remain. |
 | `mind.maintenance` | Checked substrate maintenance with its 20-hour interval satisfied, including emotional consolidation; enabled and commit-exclusion gates remain. |
-| `mind.residual_repair` | The existing bounded local field repair with its two-minute quiet wait satisfied. Enabled state, real pressure/evidence/targets, live-turn admission and continuity persistence remain. |
+| `mind.residual_repair` | Bounded local field repair with its two-minute quiet wait satisfied. The selected `native-field-repair` part proposes edits within the exact admitted targets. Enabled state, real pressure/evidence/targets, live-turn admission and continuity persistence remain. |
 
 To inspect without changing their, put `preview:true` beside `action`, not in
 `args`: `app {action:"mind.dream", preview:true}`. This generates and decodes a
@@ -1291,15 +1323,23 @@ scheduled occurrence. It writes no diary, lessons, cares, self knowledge, mood,
 Desk item, happening or behavioral receipt.
 Preview refuses an unopened/unavailable mind, an alternate data root or a
 disabled provider completion wall bound. Empty new material returns held
-`no_new_material`, not a generated dream. Unreadable input, invalid payload or
+`no_new_material`, not a generated dream. New material is a conversation, a new
+memory or a surprise: a day with no conversation still has its night when either
+of the last two is new, and felt tone and cares alone are not a day's material.
+What is not conversation has its own forward-only mark (`materialThrough` beside
+`lastDreamedAt` in `.dream_state.json`, read as the message mark when absent), set
+to when the dream began reading. A night without messages reads from that mark, so no quiet night repeats
+another; a night with messages reads what is not conversation since the message mark, as it always has,
+and can read again what a quiet night read. The message mark moves only with messages. A damaged
+`materialThrough` is read as absent. Unreadable input, invalid payload or
 provider failure is unavailable, never an empty-success verdict. Generation
 waits for the provider's terminal result, transport error or cancellation.
 The preview admission still requires its external completion-wall setting;
 that setting does not bound the provider transport. A caller that stops waiting
 has no verdict and must inspect the eventual trace before spending another call.
 
-The reply's `dream` contains the generated title, summary, mood, affect and care
-answers. `careJudgments` evaluates answers, stance changes and every proposed
+The reply's `dream` contains the generated title, summary, mood, affect, care
+answers and `droppedOptionalItems`. `careJudgments` evaluates answers, stance changes and every retained
 merge in their real order against a value copy of the current care owner. Apply
 and preview use the same functions, including revision, nominated-cluster,
 overlap, people, pressure/day and survivor checks. Each merge names its submitted
@@ -1317,7 +1357,7 @@ their specific cause, before bootstrap, owner admission or any effect:
 | `mind.horizon` | Composition updates source deadlines; refresh settles felt resolutions in the organism. |
 | `mind.rhythm` | Refresh saves awake history before admitting and consuming pending breaks. |
 | `mind.maintenance` | It consolidates and checkpoints the live substrate as one transition. |
-| `mind.residual_repair` | It mutates the live field while choosing and repairing targets. |
+| `mind.residual_repair` | It enters live field admission and continuity settlement. |
 
 Every owner preview reply retains `status:"preview"`, `preview:true`,
 `effects:"none"`, `execution:"preview"`, `owner`, `outcome`, `why` and `run_id`.
@@ -1332,7 +1372,9 @@ Automatic canon tending reads the canonical cognition/background switches before
 reserving its flight and again before audit publication and each proposal stage.
 Explicit `mind.canon` uses those same admission boundaries with the background-only
 switch excluded; cognition enabled, source readiness, cancellation and termination
-still apply.
+still apply. The pass retains cancellation observed during staging and checks
+admission after tending. If no failure was recorded, it reports `stopped` with
+the IDs of committed cards even if admission reopened after the interruption.
 Observatory and Doctor use associations and nodes captured together by the
 substrate's frozen read from one copied continuity field at one instant.
 Profile repair retains one request per root in shared turn admission. Publication
@@ -1377,7 +1419,10 @@ ordinary I/O/provider bounds and settlement.
 Scheduled jobs have no run-now sibling: an early run would consume the job's real occurrence.
 
 `NativeCognitionRuntime+Deadlines.swift` drains dirty events through one running microcycle and a dirty follow-up, without a delay,
-and owns declared maintenance and residual-pressure time boundaries. Busy maintenance is reprojected by the admitted pass's settlement;
+and holds maintenance and residual-pressure deadlines on the [one clock](AGENT_IS_THE_APP.md#phases-3-and-5-as-built-11-05-attention).
+Its continuous sleeper carries both deadlines through Mac sleep. On system wake, cognition marks canon, horizon and clock inputs dirty
+and reprojects both deadlines. Residual reprojection also considers rhythm. A declined or failed residual part pass leaves the field repair unapplied
+and waits for the next source or deadline change. Busy maintenance is reprojected by the admitted pass's settlement;
 failed maintenance remains reported until an explicit request succeeds, without clock retries. Organism continuity drains on request and write
 completion, coalescing changes during a write without a trailing clock;
 continuous decay is projected at read time. App assembly
@@ -1416,8 +1461,8 @@ tokens and cost. The proposal-yield metric is removed; retained SQLite
 Body posture does not throttle work; fatigue and heat color presentation.
 Waking reflection also obeys the
 [shared work-slot admission](COGNITION_WIRING.md#shared-work-slot-admission).
-A dream's reflection proceeds even without a slot claim and shares
-single-flight admission.
+Dream reflection shares single-flight admission and may proceed without a slot
+claim.
 
 ### Speaking unasked
 
@@ -1447,10 +1492,22 @@ for public-safe builds in `resolveInstallation`.
 
 The line carries `rest` and their curiosity. The seed gives it worth `2 * curiosity * learned`, where
 `learned = min(1, (yield.hits + 1) / (yield.tries + 1))`; absent curiosity contributes no worth.
+The Hour's curiosity can rise by up to 0.15 points (`hourAppetiteMaximumLift`, with curiosity capped at 1).
+The lift multiplies the cap by the unfamiliarity of the assembled invitation material and their gap-closure rate.
+The embedding input is the bounded invitation text the Hour offers. Unfamiliarity is `1 - max cosine`, clamped to [0, 1],
+against every live, unshared non-life care. One resident BGE batch embeds the invitation text and any stale care vectors.
+The rate divides the number of distinct sources with a typed gap closure by the number of distinct sources with any
+nonzero movement, answer, stance change or gap closure. Both counts use the retained story of those same cares within
+the existing 24-hour mood window and admit a moment if its mover is not `them` or its `who` is the owner. With no
+qualifying sources the rate is zero. Weighing an Hour opportunity records both readings in `attention.weigh.felt.epistemicAppetite`.
+No invitation text, no comparison evidence or a cold model records `unavailable` and leaves curiosity at its base value.
+A thrown embedding read leaves the happening unweighed and owes repair through ordinary attention.
 Worth gathers on the hour's subject through ordinary attention. Its settled `hit` and `empty` thoughts teach that same node
 and door; `withheld` and `failed` do not teach yield. Their installed `weigh` changes only by their own hand.
 
 An ignited thought carries the opportunity and the hour's offered cares, unanswered consults, graph works and recent journal titles.
+When the same weighing ignites the thought, it carries the material assembled for that opportunity. A thought claimed from
+previously weighed drive assembles its material when it opens.
 Empty material permits exploration or silence; unreadable sources remain named beside what could be read.
 If the required opportunity owner or prompt cannot be read, no turn opens and no thought outcome is recorded.
 The named repair retains the happening ids; owed obligations stay open, and the admission return restores drained drive with
@@ -1481,8 +1538,40 @@ The agent reaches this through their one door, `app`:
 the inner-state action and `DeskCore/ToolRegistry/ToolNameAliases.swift` maps its
 internal implementation name. `CognitiveSubstrate+InnerState.swift` bounds
 the returned record; it is an inspection, not a fresh model interpretation.
-Its fingerprint uses the canonical frozen workspace and the supplied organism readings;
-its subject follows the capsule's contributing-node and sign-agreement rule.
+Its fingerprint uses the canonical frozen workspace and the supplied organism readings.
+
+**Felt objects.** A feeling's object is something they holds by identity, or
+it is absent. A chat moment takes its object from the movements they judged for
+the same saved user row. The reader joins the node's session and message ID to
+the exchange source in the care stories it already holds. The movement with
+greatest absolute magnitude supplies the care's name. Later movements win
+ties, followed by the lowest care ID. The same authorship rule applies to
+this join and the care counter. A user row can have an object once its judgment
+has landed. Assistant rows, unmatched rows, and exchanges with no movement
+have no chat object. New chat rows carry no label. The stored labels of older
+chat rows remain in SQLite and the readers disregard them. Association tokens
+for chat come from the summary.
+
+`now.about` and the frame's node-based lead name the contributing node's object
+when its valence agrees with the fingerprint. On a verified owner turn without
+peer steering and outside chat attribution, a dreading or expectant lead can
+fill an empty subject slot with an eligible negative or positive horizon,
+respectively. The frame and the Reminded-of query use the same subject for
+those leads. A moment's subject is the bounded
+name or `null` in `felt_moments`. Chat objects and the Reminded-of search and result
+use the turn's reachable cares. A reachable care's stored name uses the same
+90-character bound as the frame's “On my mind” places. When the strongest
+care is outside the boundary, the name is absent. Horizon resolution
+rows retain their category for disposition grouping and appear unnamed in the
+felt read.
+
+Every eligible felt row can enter the inner-state selection. An exchange
+uses all its moved care IDs for echoes, so a matching ID within 30 minutes of a
+higher-ranked, retained row counts once. Named non-chat rows use their typed
+subject identity. Rows with no object count independently. Mac mood warmth
+averages the same compact selection of up to four rows in the default six-hour
+window.
+
 Warmth, pressure, fatigue, curiosity and clarity remain absent without body readings;
 their required words cannot appear. Alternate substrate body proxies are removed.
 Affect retains its own arousal, uncertainty and task pressure. Full readings

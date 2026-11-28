@@ -166,7 +166,7 @@ public actor TurnInspectorFeed {
         let from = calendar.startOfDay(for: date)
         guard let nextDay = calendar.date(byAdding: .day, value: 1, to: from) else { throw CocoaError(.fileReadUnknown) }
         let through = Date(timeIntervalSince1970: nextDay.timeIntervalSince1970.nextDown)
-        let read = try await TurnTraceReplayReader.read(.init(from: from, through: through), root: lane.resolvedDataRoot())
+        let read = try await lane.events(.init(from: from, through: through))
         let events = read.events.filter { $0.ts < nextDay && $0.turnId != "unknown" }
         return (!events.isEmpty || read.unreadable > 0, read.unreadable, TurnInspectorGrouping.group(events))
     }

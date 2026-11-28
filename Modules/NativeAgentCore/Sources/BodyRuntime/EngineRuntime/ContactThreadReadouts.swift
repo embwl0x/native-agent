@@ -3,10 +3,10 @@ import NativeAgentShared
 import PersistenceCore
 import SenseCore
 import Observation
-import os
 import NativeAgentCore
 import Synchronization
 import ProviderRouting
+import os
 // Blueprint: | `ContactThreadReadouts.swift` | Root-scoped contact and independent helper watches; checked in-memory publication feeds the Helpers face |
 
 @MainActor @Observable
@@ -277,7 +277,7 @@ public final class ContactThreadReadouts {
                             return (next, AgentContactThreads.changes(from: last, to: next), unread)
                         }
                         let snapshot = try await AgentContactThreads.read(root: root, contacts: contactOwner,
-                            includeHelpers: false, refreshDoors: doors || !full)
+                            refreshDoors: doors || !full)
                         let next = snapshot
                         let delta = AgentContactThreads.changes(from: last, to: next)
                         var runs: [UUID: Result<AgentContactThreads.HelperResults, WireFailure>] = [:]

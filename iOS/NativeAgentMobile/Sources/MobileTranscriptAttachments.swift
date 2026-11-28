@@ -100,10 +100,10 @@ enum TranscriptAttachmentModel: Equatable {
                     // Inbox holds the matter as settled, so its own row says the outcome. A card the Inbox does not hold yet draws its own
                     // face with no answers until they arrive.
                     self = .matter(PartFace.Row(id: card.id, title: settled.title, detail: settled.detail, symbol: settled.symbol ?? card.symbol,
-                        tone: settled.tone, actions: settled.cardAnswers))
+                        tone: settled.tone, actions: settled.cardAnswers, pageRevision: settled.pageRevision))
                 } else {
                     card.actions = card.tone == .attention ? data.inbox[matter]?.cardAnswers : nil
-                    self = .matter(card)
+                    self = .matter(card.stampingPageRevision(data.inbox[matter]?.pageRevision))
                 }
             } else {
                 self = data.inbox[matter].map { Self.matter($0) }

@@ -36,8 +36,10 @@ thoughts joined to their mind-run answers and owed happenings (`returned`,
 `moment`, `body`) share a single 12,000-character block, with each line capped
 at 4,200 characters. Open obligations stay beside their exchange. The current conversation is already
 history. The selection excludes `world` and `self` happenings; perceptions reach
-their through `weigh` and, where present, Live sense news. Clean birth stamps admit
-words; steered or unstamped rows carry shapes.
+their through `weigh` and, where present, Live sense news. Speech shapes show
+direction and kind of party, with the door labelled separately. Clean birth
+stamps admit names and words on unsteered turns. Steered or unstamped rows
+carry shapes.
 Peer-steered turns receive shapes throughout, plus the existing person-door act
 names. Remember across conversations still gates the read; remote strangers
 receive no elsewhere feed. Exact act IDs already in the life packet are omitted.
@@ -154,6 +156,14 @@ Packet admission begins before reading the source and spans projection, includin
 read failures. Only accepted publication replaces the retained source and face;
 equal source epochs may carry changed selection or clock facts. A later-started
 read that publishes prevents an older completion or failure from replacing it.
+Each changed publication carries its own act revision. The Mac renderer holds
+it with the drawn row or form, including rows contributed by a scoped
+continuation. The owner refuses a missing or moved revision before dispatch,
+including Undo. A held reading is refreshed against the current parent before
+its revision can admit a gesture. The paired phone sends this same publication
+revision in its signed action payload, alongside its separate form revision and
+drawn call. Older phone commands can omit the publication revision and still
+use their existing checks.
 A reading drawn from a source epoch older than the page's publication returns to
 its caller as that caller's own coherent reading and publishes nothing; it never
 retires a newer read still in flight and is never error content on the page.
@@ -303,7 +313,12 @@ Mockups, pages and pictures share `beside:"pieces"` and stand as columns
 those leaves through the Make pane's granted preview (`PageMakePreview`,
 `WorkPaneMakeView.swift`), on its selection path too, and a board leaf
 (`leaf:"board"`) through `PageMakeBoard`, which keeps drawing the version it read
-until the next one is read; other doors read the `alt`. A CSV or TSV version
+until the next one is read; other doors read the `alt`. Standard Mac and iPhone pages
+paint a read-only `table_slice` from the standing Desk table through `BoardGeometry`
+and `BoardSliceView`. The phone uses the Desk drawing it already received.
+A text read joins current Desk facts on the Body side and groups the slice with the same spatial reading as the full table.
+A populated slice opens the table fitted to those elements. An empty slice displays a plain note.
+A CSV or TSV version
 there is `MakeSheetView`, a `.board` version `MakeBoardView`: a changed cell sends
 the whole table, and a change by hand the whole board, to the body's
 `save_piece` Desk command, which checks the changed version is a table or a
@@ -383,10 +398,11 @@ PartFaces' LatestRead remains the only publication gate.
 
 Mac Activity's Inbox/Approvals and inbox/approval work details draw
 `FacePageView(page: "inbox")`. The door's list read reaches the generic face
-hook; individual note reads retain the existing Inbox detail owner. Notifications
-projects preferences and trigger settings, with a pointer to the Inbox face
-instead of a second card list. Earlier opens the existing preferences history;
-the chat capsule retains its detail instrument and native transaction adapter.
+hook. Chat's note sheet draws the current Inbox row and reads its detail through
+the shared document reader. Its actions submit through the Inbox page's
+admission. Notifications projects preferences and trigger settings, with a
+pointer to the Inbox face instead of a second card list. Earlier opens the
+existing preferences history.
 Person actions call the existing Inbox host or ApprovalsFacade/ApprovalExecution;
 agent actions call the existing `inbox.*` actions with the original turn. An
 approval without readable details or awaiting the agent's own decision cannot
@@ -436,6 +452,9 @@ with no invented capabilities; a missing catalog does not produce compiled or
 provider-neutral replacement choices. Empty capability metadata offers no
 controls and never invents a high think level or borrows another account's row.
 An account projection or adoption inventory error is reported with its cause.
+Onboarding can be skipped once the Providers read finishes without a ready
+connection, including when the read reports an error. A ready connection
+requires a ready Chat model before setup can finish.
 Session context usage distinguishes an absent initial provider receipt (a named
 transcript estimate) from a damaged receipt or transcript, which is unavailable.
 After a turn, an unavailable session index keeps the prior display with its
@@ -456,7 +475,7 @@ picker, Dreams and confirmed reset as destinations, and proposal review remains
 in its approval card. No persona write or reset mechanism changes.
 
 Shared `FaceView` draws pages through `FaceDoor.act/open`. Mac `AlivePageKit` supplies
-`FaceStyle` for glass cards and opaque accessibility/capture surfaces. Main windows,
+`FaceStyle` for opaque content cards. Main windows,
 quiet captures and each transcript attachment host supply it explicitly, including
 attachments in detached conversations in both Mac window implementations. The shared
 default draws no card surface. Phone `AlivePage` supplies list density and native
@@ -756,10 +775,17 @@ setting and the account editor, the agent's `provider.set_fallback_model`,
 card, and a helper's pinned model (`bot.create`/`bot.update`, through
 `botModelRefusal` over the rows `bot.list include_models` lists for the very
 account the helper names, never a sibling of its vendor; the slot is the
-helper's own saved model). Pickers and menus list offered rows only, plus the slot's current model
-shown selected with its note; a picker with nothing offered says the account's
-sentence; a picker over several accounts (the composer, the image-model card)
-has no entries from an account that offers nothing. The phone and the agent's
+helper's own saved model). The account editor and the Chat menu read the same
+published account rows. The editor offers models with a usable declared thinking
+default and keeps Chat's current model visible with its catalog note. A selection
+saves an explicit Chat group choice with that thinking default and Fast off,
+including when Chat already inherits that model. The editor confirms the saved
+choice and controls from the routing readback. The account default is the model a
+surface using that account can inherit when it has no model choice. Pickers and
+menus list offered rows only, plus the slot's current model shown selected with its
+note. A picker with nothing offered shows the account's explanation. A picker over
+several accounts (the composer, the image-model card) has no entries from an account
+that offers nothing. The phone and the agent's
 `provider.*` results carry the flag. A model the provider drops leaves once a
 complete list says so; an empty or failed list retires nothing. The cache keeps what the provider stated so a
 later build resolves the contract again. One request's output allowance is
@@ -1025,16 +1051,18 @@ the total, and the Misses (corrections by lesson, this week against last, read f
 `MemoryRecoveryReadout.misses`; an unreadable ledger is a named unavailable fact, never zero),
 each failed read a named unavailable fact, plus the keys its rows may carry.
 The packet is assembled off the main actor; its storage reads suspend main,
-which only reads or publishes facade state. Kept and searched rows share one
+which only reads or publishes facade state. The active-memory reader checks
+when each kept or searched fact begins. Kept and searched rows share one
 live trust read per packet, including root names, through the
 [memory read contract](MEMORY_SYSTEM_MAP.md). No read clock enters the facts
 or levers but each memory's span (`when`: today, this ISO week as Misses
 counts weeks, or earlier, from the time its row is ordered by), which changes
 only when the day turns: an unchanged packet keeps the existing face and publishes no change.
-`MemoryFacade` resolves its memory owner through one `@concurrent` async boundary:
-symlink identity checks and store opening run off main for its reads and actions,
-including Today's kind-filtered moments read. That read retains the memory owner's
-full list policy; facade snapshot publication stays on main through `LatestRead`.
+Memory owner and storage resolution run off main. `MemoryFacade.todayMoments`
+checks the moments observation and reads from canonical SQLite. The query counts
+recall-eligible moments with readable text created that day and returns the six
+newest. It reports unreadable timestamps separately. Facade snapshot publication
+stays on main through `LatestRead`.
 `EnginePages` watches the canonical SQLite database/WAL and memory profile from launch,
 independently of mounted views. Wording, ordering (pinned first, newest), provenance
 phrases and sections are the part's: a readout (how many I remember, the store's

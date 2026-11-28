@@ -7,6 +7,31 @@ import PersistenceCore
 import NativeAgentShared
 // Blueprint: | `NativeContextFlowRuntime.swift` | `NativeContextFlowRuntime`: checked admission, joined lifecycle, health events, drain and provenance |
 
+enum AssociationAudience: Equatable, Sendable {
+    case person
+    case peer(String)
+
+    init?(turn: Turn, session: String?, surface: ContextSurface, origin: ContextOriginClass) {
+        if let id = PeerDataTaint.attestedPeerID(turn: turn) {
+            let peer = "peer:" + id
+            let steering = PeerDataTaint.carried(turn: turn, surface: surface.rawValue).sources
+            let trust = PeerDataTaint.readTrust(turn.dataRoot, steering)
+            guard steering.allSatisfy({ trust.principal($0) == peer }) else { return nil }
+            self = .peer(peer)
+        } else {
+            guard origin != .untrusted, surface != .bridge, turn.steeringStamp().isEmpty,
+                  SessionConversation.kind(session, dataRoot: turn.dataRoot)?.isPersonConversation == true else { return nil }
+            self = .person
+        }
+    }
+
+    func permits(_ atom: ContextAtomDraft) -> Bool {
+        guard case .peer(let peer) = self else { return true }
+        guard let roots = atom.memoryRoots, !roots.isEmpty else { return false }
+        return roots.allSatisfy { $0.through == [peer] }
+    }
+}
+
 public actor NativeContextFlowRuntime: ContextTurnPreparing {
     let dataRoot: URL
     private let healthEvents = ContextHealthEvents()
@@ -235,11 +260,6 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
         return task
     }
 
-    private func normalizedPersonaOverride() -> String? {
-        let value = PersonaSelection.current()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return value.isEmpty ? nil : value
-    }
-
     private func reconcilePersonaPickerIfNeeded(epoch: UInt64) async {
         guard epoch == semanticQueryEpoch, !Task.isCancelled, let coordinator else { return }
         // Only the published kernel acknowledges selection; sampled preferences can lose ABA changes.
@@ -248,7 +268,7 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
             $0.kernel(for: ContextSurfaceVariant(rawValue: ContextSurface.chat.rawValue))
         } ?? []
         let selectionPublished = chatKernels.count == 1
-            && chatKernels[0].requestedPersonaOverride == normalizedPersonaOverride()
+            && chatKernels[0].requestedPersonaOverride == PersonaSelection.current().trimmedNonEmpty
         lease?.release()
         guard epoch == semanticQueryEpoch, self.coordinator === coordinator,
               !Task.isCancelled else { return }
@@ -306,9 +326,18 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
             if let startupFailure { throw NativeContextFlowStartupError(detail: startupFailure) }
             throw ContextTurnPreparationError.coordinatorNotStarted
         }
-        let prepared = try await coordinator.prepareTurn(request)
+        let graph = KnowledgeGraphContext(dataRoot: dataRoot)
+        let associationReader: ContextPreparation.AssociationReader?
+        if let memoryRuntime, request.memoryRecallEnabled, request.allowedPrivacy.contains(.localPrivate), KnowledgeGraphContext.surfaces.contains(request.surface),
+           let audience = AssociationAudience(turn: turn, session: request.sessionID, surface: request.surface, origin: request.origin) {
+            associationReader = { ids, generation, need in
+                let verified = try await graph.verifiedRecords(ids, in: generation, need: need, audience: audience, memory: memoryRuntime)
+                return (verified, audience == .person)
+            }
+        } else { associationReader = nil }
+        let prepared = try await coordinator.prepareTurn(request, associationReader: associationReader)
         guard request.surface != .chat
-            || prepared.kernel.requestedPersonaOverride == normalizedPersonaOverride() else {
+            || prepared.kernel.requestedPersonaOverride == PersonaSelection.current().trimmedNonEmpty else {
             throw ContextTurnPreparationError.personaSelectionUnavailable
         }
         attachMemoryProvenance(to: prepared, surface: request.surface.rawValue, turn: turn)

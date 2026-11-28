@@ -100,7 +100,6 @@ public enum NativeOAuthFlow {
         do {
             callbackURL = try await platform.runAuthSession(
                 authURL: authURL,
-                expectedState: state,
                 providerId: providerId
             )
         } catch where platform.isCanceledLogin(error) {

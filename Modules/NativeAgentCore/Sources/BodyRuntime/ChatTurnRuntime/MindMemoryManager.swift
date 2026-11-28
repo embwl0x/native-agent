@@ -9,7 +9,7 @@ import DeskCore
 // Blueprint: | `MindMemoryManager.swift` | One judgment per moment, evidence-backed intention outcomes, promise matching and recall |
 
 public struct MindMemoryJudgment: MemoryManaging {
-    private let makeLLMClient: @Sendable (PrivateWorkContextAssembly) -> any LLMClient
+    private let makeLLMClient: @Sendable () -> any LLMClient
     private let relevanceCache = RecallJudgmentCache()
 
     private struct RecallRoute: Sendable, Equatable {
@@ -54,7 +54,7 @@ public struct MindMemoryJudgment: MemoryManaging {
         }
     }
 
-    public init(makeLLMClient: @escaping @Sendable (PrivateWorkContextAssembly) -> any LLMClient) {
+    public init(makeLLMClient: @escaping @Sendable () -> any LLMClient) {
         self.makeLLMClient = makeLLMClient
     }
 
@@ -472,7 +472,7 @@ public struct MindMemoryJudgment: MemoryManaging {
             let system = try Self.relevanceSystem
             call.systemSegments = SystemPromptSegments(stable: system, dynamic: "")
             call.memoryPolicyScope = .recallJudge
-            response = try await makeLLMClient(.taskOnly).complete(
+            response = try await makeLLMClient().complete(
                 prompt: prompt, system: system, model: model, tools: nil,
                 call: call)
         } catch {
@@ -529,7 +529,7 @@ public struct MindMemoryJudgment: MemoryManaging {
             call.admission = try route.admission.modelAdmission
             call.systemSegments = system
             call.memoryPolicyScope = policyScope
-            text = try await makeLLMClient(.taskOnly).complete(
+            text = try await makeLLMClient().complete(
                 prompt: prompt, system: system.combined, model: route.model, tools: nil,
                 call: call)
         } catch {
@@ -539,21 +539,62 @@ public struct MindMemoryJudgment: MemoryManaging {
         return text
     }
 
+    /// A memory statement over the bound is sent back once to be said in one sentence; at most two per judgment. A reply that is not an object with a
+    /// memories array is returned untouched for the ordinary checks to judge.
+    private static func fittingLongMemories(in text: String, route: JudgmentRoute, call: LLMCall,
+        shorter: @Sendable (String) async throws -> String) async -> String {
+        func length(_ statement: String) -> Int {
+            statement.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+                .trimmingCharacters(in: .whitespacesAndNewlines).count
+        }
+        guard var fields = try? JSONValue.decodeCompletion(text, as: [String: JSONValue].self),
+              case .array(var memories)? = fields["memories"] else { return text }
+        let long = memories.indices.filter { memories[$0].objectValue?["statement"]?.stringValue.map { length($0) > MemoryManagerLane.statementCap } == true }
+        guard !long.isEmpty else { return text }
+        var leftOut: [Int] = []
+        var stopped = false
+        for (asked, index) in long.enumerated() {
+            guard !stopped, asked < 2, case .object(var candidate) = memories[index], let statement = candidate["statement"]?.stringValue else {
+                leftOut.append(index); continue
+            }
+            // A retry that fails or is stopped costs only its own candidate: what the judgment already produced still lands.
+            guard let said = try? await shorter(statement).trimmingCharacters(in: .whitespacesAndNewlines) else {
+                stopped = Task.isCancelled
+                leftOut.append(index); continue
+            }
+            if (MemoryManagerLane.statementFloor...MemoryManagerLane.statementCap).contains(length(said)) {
+                candidate["statement"] = .string(said)
+                memories[index] = .object(candidate)
+            } else { leftOut.append(index) }
+        }
+        for index in leftOut.sorted(by: >) { memories.remove(at: index) }
+        if !leftOut.isEmpty {
+            TurnTraceBus.fire(TurnTraceEvent(turnId: call.turn?.id ?? TurnTraceContext.turnId ?? "unknown",
+                kind: "memory.rejected", sessionId: call.session, surface: route.surface,
+                payload: .object(["purpose": .string(call.purpose), "reason": .string("statement_over_bound"),
+                    "left_out": .int(Int64(leftOut.count)),
+                    "complaint": .string("memory candidates over \(MemoryManagerLane.statementCap) characters were left out of this judgment")]),
+                turn: call.turn))
+        }
+        fields["memories"] = .array(memories)
+        guard let data = try? JSONValue.object(fields).serializedData(pretty: false) else { return text }
+        return String(decoding: data, as: UTF8.self)
+    }
+
     /// Settlement parses JSON and returns the produced typed result, even after Stop.
     private static func settledObject<T: Sendable>(text: String, route: JudgmentRoute, call: LLMCall,
-        parse: @escaping @Sendable ([String: Any]) throws -> T) async throws -> T {
+        parse: @escaping @Sendable ([String: JSONValue]) throws -> T) async throws -> T {
         let result: Result<T, AfterTurnMemoryFailure> = await settle {
             do {
                 let fields = try JSONValue.decodeCompletion(text, as: [String: JSONValue].self)
-                return .success(try parse(fields.mapValues(\.foundationObject)))
+                return .success(try parse(fields))
             } catch {
                 let complaint = (error as? AfterTurnMemoryFailure)?.recovery ?? String(describing: error)
                 let failure = (error as? AfterTurnMemoryFailure) ?? route.failed(.invalidJSON, recovery: complaint)
                 TurnTraceBus.fire(TurnTraceEvent(turnId: call.turn?.id ?? TurnTraceContext.turnId ?? "unknown",
                     kind: "memory.rejected", sessionId: call.session, surface: route.surface,
                     payload: .object(["purpose": .string(call.purpose), "reason": .string(failure.reason.rawValue),
-                        "complaint": .string(TurnTraceRedactor.redactText(complaint)),
-                        "text": .string(TurnTraceRedactor.redactText(text))]), turn: call.turn))
+                        "complaint": .string(TurnTraceRedactor.redactText(complaint))]), turn: call.turn))
                 return .failure(failure)
             }
         }
@@ -564,24 +605,101 @@ public struct MindMemoryJudgment: MemoryManaging {
                           factsEnabled: Bool, call: LLMCall) async throws -> AfterTurnInterpretation? {
         // Whether a turn is judged is decided before this call; empty incoming words are judged like any other.
         let route = try await Self.judgmentRoute()
-        let existing = request.existing.map {
-            "[\($0.id)] \($0.content)" + ($0.kind == "correction" ? " (correction)" : "")
-                + ($0.correctionSubject.map { " (subject: \($0))" } ?? "")
+        guard var turn = call.turn else {
+            throw PartCallError(code: "door_unavailable", message: "The turn digest needs its originating turn.")
         }
-        let prompt = try Self.prompt(request, context: context, factsEnabled: factsEnabled, existing: existing)
-        let fixed = try completionPolicy("turn-interpretation", section: "system", arguments: [
-            completionPolicy("turn-interpretation", section: "rules"),
-            MemoryKindStamp.writerKinds.joined(separator: "|"),
-            "," + Self.caresShape,
-        ])
-        let form = try request.settlesOnly ? completionPolicy("turn-interpretation", section: "settlement-alone")
-            : context?.cares.isEmpty == false ? completionPolicy("turn-interpretation",
-                section: context?.careWakes.isEmpty == false ? "care-wake-cares" : "cares") : ""
-        let text = try await judgedText(prompt: prompt, system: SystemPromptSegments(stable: fixed, dynamic: form),
-            purpose: call.purpose == "memory_held" ? "memory_held" : "memory_interpret",
-            policyScope: .interpretation, route: route, call: call)
-        return try await Self.settledObject(text: text, route: route, call: call) { object in
-            try Self.parseInterpretation(object, request: request, context: context, route: route)
+        // An after-turn moment can carry a turn rebuilt from its record, which has no part catalog of its own.
+        if turn[AppActionBinding.Parts.self] == nil {
+            let catalogRoot = turn.dataRoot
+            turn[AppActionBinding.Parts.self] = { try NativeAgentEngine.forRoot(catalogRoot).partBinding($0, $1) }
+        }
+        let root = turn.dataRoot
+        let parts = Parts(root: root)
+        let program: OwnedProgram, version: String
+        do {
+            guard let selected = try parts.abilities.selectedPart(DigestPart.id), let file = selected.file,
+                  let fingerprint = selected.row["codeFingerprint"]?.stringValue else {
+                throw Parts.missing(DigestPart.id)
+            }
+            let candidate = try parts.store.selection(file).candidate
+            guard candidate.digest == fingerprint else {
+                throw Parts.revisionFailure("state_changed", "The selected digest contract changed.", id: DigestPart.id)
+            }
+            program = candidate.program
+            version = fingerprint
+        } catch {
+            if error is CancellationError { throw error }
+            throw PartCallError(code: (error as? ToolFailureError)?.code ?? (error as? SenseFailure)?.code ?? "digest_selection",
+                message: error.localizedDescription)
+        }
+        let legacy = if case .array(let required)? = program.schema.objectValue?["required"] {
+            required.contains(.string("evidence"))
+        } else { false }
+        let acts = request.completedActs.map(\.digestEvidence)
+        let personWords = TurnSecretRedactor.redactText(request.personWords)
+        // A digest that declares open_moments as its own input is shown them apart, ahead of the exchange, where they can be read from
+        // cache from one judgment to the next; any other digest receives them inside the settlement as before.
+        let momentsApart = !legacy && program.schema.objectValue?["properties"]?.objectValue?["open_moments"] != nil
+        let evidence = try Self.digestEvidence(request, context: context, turn: turn, surface: call.surface,
+            factsEnabled: factsEnabled, acts: acts, personWords: personWords, legacy: legacy, momentsApart: momentsApart,
+            limit: program.inputLimit)
+        let system = try Self.digestSystem(request, context: context)
+        let parse: @Sendable (JSONValue) throws -> AfterTurnInterpretation = { value in
+            guard let object = value.objectValue else {
+                throw route.failed(.missingSections, recovery: "The digest must return a judgment object.")
+            }
+            return try Self.parseInterpretation(object, request: request, context: context,
+                evidence: evidence, personWords: personWords, acts: acts, factsEnabled: factsEnabled, route: route)
+        }
+        let digest = DigestPart(parse: parse) { prompt in
+            let required = [evidence.incoming, evidence.reply, evidence.settlement, evidence.openMoments, evidence.beliefTarget ?? ""]
+                + evidence.memoryLines
+            guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  required.allSatisfy({ $0.isEmpty || prompt.range(of: $0, options: .literal) != nil }) else {
+                throw PartCallError(code: "bad_digest_policy", message: "The digest prompt must show the supplied exchange, prior statement, memory rows and settlement evidence intact.")
+            }
+            let judged = try await judgedText(prompt: prompt, system: system,
+                purpose: call.purpose == "memory_held" ? "memory_held" : "memory_interpret",
+                policyScope: .interpretation, route: route, call: call)
+            // One over-long memory does not fail the rest of the judgment: her model says it again in one sentence, and one that still does not fit
+            // is left out and named. It is never clipped.
+            let memoriesAllowed = factsEnabled && !request.careWake && !request.settlesOnly
+            let text = !memoriesAllowed ? judged : await Self.fittingLongMemories(in: judged, route: route, call: call) { statement in
+                try await self.judgedText(
+                    prompt: statement,
+                    system: SystemPromptSegments(stable: "You are given one statement. Say it as one plain sentence of at most "
+                        + "\(MemoryManagerLane.statementCap) characters, keeping its meaning. Return only that sentence: no JSON, no quotes, no comment.",
+                        dynamic: ""),
+                    purpose: call.purpose == "memory_held" ? "memory_held" : "memory_interpret",
+                    policyScope: .interpretation, route: route, call: call)
+            }
+            return try await Self.settledObject(text: text, route: route, call: call) { fields in
+                let value = JSONValue.object(fields)
+                _ = try parse(value)
+                return value
+            }
+        }
+        turn[DigestPart.Key.self] = digest
+        // Her own pass over a finished exchange, model-only: it runs as her own work, never as an act the exchange's door asked for.
+        // Under that door's envelope a remote exchange carded it for the person, and an approved card could not run it (it needs this turn).
+        let result = try await NativeAgentEngine.forRoot(root).withPartDoor(
+            envelope: TurnEnvelope.native("background:memory-digest"), fileAccess: turn.fileAccess ?? "auto", turn: turn
+        ) { door in
+            await parts.call(id: DigestPart.id, input: evidence.input, requiredFingerprint: version,
+                within: .init(actions: [], capabilities: [.model]), invocation: door.invocation, as: JSONValue.self)
+        }
+        switch result {
+        case .success:
+            guard let judgment = await digest.judgment else {
+                throw PartCallError(code: "bad_digest_policy", message: "The digest did not settle a verified judgment.")
+            }
+            return judgment
+        case .failure(let error) where error.code == "cancelled":
+            if let judgment = await digest.judgment { return judgment }
+            throw CancellationError()
+        case .failure(let error):
+            if let failure = await digest.modelFailure { throw failure }
+            throw error
         }
     }
 
@@ -592,7 +710,10 @@ public struct MindMemoryJudgment: MemoryManaging {
         guard !promises.isEmpty else { return [] }
         let route = try await Self.judgmentRoute()
         let candidates: [JSONValue] = promises.enumerated().map { index, promise in
-            .object(["id": .int(Int64(index)), "words": .string(promise.words), "when": .string(promise.when), "source": .string(promise.source)])
+            var row: [String: JSONValue] = ["id": .int(Int64(index)), "words": .string(promise.words),
+                                            "when": .string(promise.when), "source": .string(promise.source)]
+            if promise.prove == true { row["prove"] = .bool(true) }
+            return .object(row)
         }
         let input = try JSONValue.object(["candidates": .array(candidates), "open": .array(Self.deskRows(open)),
             "reply": .string(reply)]).serialize(pretty: false)
@@ -601,11 +722,11 @@ public struct MindMemoryJudgment: MemoryManaging {
             purpose: "memory_promise", policyScope: .promiseCapture, route: route, call: call)
         var captureCall = call
         captureCall.purpose = "memory_promise"
-        return try await Self.settledObject(text: text, route: route, call: captureCall) { object in
+        return try await Self.settledObject(text: text, route: route, call: captureCall) { fields in
             func invalid(_ words: String) -> AfterTurnMemoryFailure {
                 route.failed(.invalidMemories, recovery: "Invalid promise capture: " + words)
             }
-            guard let groups = object["captures"] as? [[String: Any]] else { throw invalid("captures must be an array of groups.") }
+            guard let groups = fields["captures"]?.foundationObject as? [[String: Any]] else { throw invalid("captures must be an array of groups.") }
             var covered: Set<Int> = [], targets: Set<String> = []
             var captures: [MemoryManagerPromiseCapture] = []
             for group in groups {
@@ -635,7 +756,10 @@ public struct MindMemoryJudgment: MemoryManaging {
                 let evidence = members.map(\.source).reduce(into: [String]()) { result, source in
                     if !result.contains(source) { result.append(source) }
                 }.joined(separator: "\n")
-                captures.append(.keep(MemoryManagerPromise(words: words.trimmingCharacters(in: .whitespacesAndNewlines), when: when, source: evidence),
+                // A group is a proof owed only when every sentence in it is; mixed with a promise to the person it stays that promise.
+                let prove = when == "own_turn" && members.allSatisfy { $0.prove == true }
+                captures.append(.keep(MemoryManagerPromise(words: words.trimmingCharacters(in: .whitespacesAndNewlines), when: when, source: evidence,
+                                                           prove: prove),
                                       target: target == "new" ? nil : target, candidates: ids))
             }
             guard covered == Set(promises.indices) else { throw invalid("The judgment left candidates unclassified.") }
@@ -645,11 +769,22 @@ public struct MindMemoryJudgment: MemoryManaging {
 
     /// Required sections form a complete interpretation or name their failure.
     /// Optional promises may be absent/empty; malformed present promises keep the turn owed.
-    private static func parseInterpretation(_ object: [String: Any], request: MemoryManagerRequest,
-                                            context: AfterTurnContext?, route: JudgmentRoute) throws -> AfterTurnInterpretation {
+    private static func parseInterpretation(_ fields: [String: JSONValue], request: MemoryManagerRequest,
+                                            context: AfterTurnContext?, evidence: DigestEvidence, personWords: String,
+                                            acts: [MemoryManagerAct], factsEnabled: Bool, route: JudgmentRoute) throws -> AfterTurnInterpretation {
         func failed(_ reason: AfterTurnMemoryFailure.Reason, _ complaint: String) -> AfterTurnMemoryFailure {
             route.failed(reason, recovery: complaint)
         }
+        let allowed: Set<String> = ["memories", "affect", "caring", "cares", "promises", "settled",
+            "appAuthored", "model", "surface", "careFaults", "redactedQuotes"]
+        let authority: [String: JSONValue] = ["appAuthored": .bool(request.appAuthored),
+            "model": .string(route.model), "surface": .string(route.surface), "redactedQuotes": .bool(true)]
+        guard Set(fields.keys).isSubset(of: allowed),
+              authority.allSatisfy({ fields[$0.key] == nil || fields[$0.key] == $0.value }) else {
+            throw failed(.missingSections, "The digest returned unknown fields or contradicted Swift's provenance or route.")
+        }
+        let object = fields.mapValues(\.foundationObject)
+        let reply = evidence.reply
         guard let memoriesValue = object["memories"] as? [Any],
               object.keys.contains("caring"), object.keys.contains("affect") else {
             throw failed(.missingSections, "memories must be an array; caring and affect must be present.")
@@ -657,37 +792,79 @@ public struct MindMemoryJudgment: MemoryManaging {
         guard let caringObject = object["caring"] as? [String: Any],
               let caring = CaringAppraisalLane.parse(caringObject) else { throw failed(.invalidCaring, "caring must be a valid caring appraisal.") }
         guard let affectObject = object["affect"] as? [String: Any] else { throw failed(.invalidAffect, "affect must be an object.") }
-        let affect: CognitiveSubstrate.AffectAppraisal
+        var affect: CognitiveSubstrate.AffectAppraisal
         do {
             let affectData = try JSONSerialization.data(withJSONObject: affectObject)
             affect = try JSONDecoder().decode(CognitiveSubstrate.AffectAppraisal.self, from: affectData)
         } catch { throw route.failed(.invalidAffect, recovery: String(describing: error)) }
         if let choice = affect.chosenRegister {
-            guard request.assistantMessage.contains(choice.source) else {
+            guard reply.contains(choice.source) else {
                 throw failed(.invalidAffect, "affect.chosenRegister.source must quote the assistant reply.")
             }
         }
-        // A turn judged for settlement alone keeps only what it settled.
+        if let feeling = affect.feeling {
+            let quoted = MemoryManagerPromise.quoted(feeling.quote, in: reply)
+                || (!request.appAuthored && MemoryManagerPromise.quoted(feeling.quote, in: evidence.incoming))
+            if request.settlesOnly || request.careWake || !quoted { affect.feeling = nil }
+        }
+        if let reaction = affect.beliefReaction {
+            guard let target = evidence.beliefTarget,
+                  MemoryManagerPromise.quoted(reaction.statement, in: target),
+                  MemoryManagerPromise.quoted(reaction.evidence, in: evidence.incoming) else {
+                throw failed(.invalidAffect, "affect.beliefReaction must quote the shown prior statement and incoming words.")
+            }
+        }
+        let allowsPromises = !request.settlesOnly && !request.careWake
+        let allowsMemories = allowsPromises && factsEnabled
+        guard allowsMemories || memoriesValue.isEmpty else {
+            throw failed(.invalidMemories, "This digest must leave memories empty when facts are disabled.")
+        }
+        guard allowsPromises || fields["promises"] == nil || fields["promises"] == .array([]) else {
+            throw failed(.invalidMemories, "A care wake or settlement-only digest must leave promises empty.")
+        }
         var memories: [MemoryManagerDecision] = []
-        if !request.settlesOnly {
+        var memoryFaults: [String] = []
+        if allowsMemories {
             do { memories = try MemoryManagerLane.parse(memoriesValue) }
             catch { throw route.failed(.invalidMemories, recovery: String(describing: error)) }
+            // One memory that fails its own check is left out and named; it is never admitted, and it no longer costs the rest of the judgment.
+            memories = memories.filter { memory in
+                guard memory.action != .skip else { return true }
+                if memory.action == .update, memory.updatesId.map(evidence.shownMemoryIDs.contains) != true {
+                    memoryFaults.append("a memory update named no shown memory and was left out")
+                    return false
+                }
+                if let grounding = memory.grounding, grounding.eligible,
+                   !MemoryManagerPromise.quoted(grounding.evidence, in: grounding.source == .incoming ? evidence.incoming : reply) {
+                    memoryFaults.append("a memory did not quote its source in this exchange and was left out")
+                    return false
+                }
+                return true
+            }
         }
         var cares: [CognitiveCareJudgment] = []
         var careFaults: [String] = []
         if !request.settlesOnly, let shown = context?.cares, !shown.isEmpty {
-            guard let parsed = CognitiveCareJudgment.parse(object["cares"], shown: shown) else {
+            guard let parsed = CognitiveCareJudgment.parse(object["cares"], shown: shown, reply: reply,
+                                                          personReplyAt: request.personReplyAt) else {
                 throw failed(.invalidCares, "cares must be an array.")
             }
             careFaults = parsed.faults
-            cares = context?.careWakes.isEmpty == false ? parsed.judgments.filter {
+            cares = request.careWake ? parsed.judgments.filter {
                 guard $0.by == .her, case .existing = $0.target else { return false }
                 return true
             } : parsed.judgments
+        } else if fields["cares"] != nil, fields["cares"] != .array([]) {
+            throw failed(.invalidCares, "A digest without shown cares must leave cares empty.")
         }
+        if let faults = fields["careFaults"], faults != .array(careFaults.map(JSONValue.string)) {
+            throw failed(.invalidCares, "The digest returned care faults that differ from Swift's validation.")
+        }
+        // Named in the same place her faulty care entries are, by what was wrong and never by its text.
+        careFaults += memoryFaults
         var promises: [MemoryManagerPromise] = []
-        if !request.settlesOnly {
-            do { promises = try MemoryManagerPromise.parse(object["promises"], reply: request.assistantMessage) }
+        if allowsPromises {
+            do { promises = try MemoryManagerPromise.parse(object["promises"], reply: reply) }
             catch { throw route.failed(.invalidMemories, recovery: "Invalid promises section: \(error)") }
         }
         guard let rows = object["settled"] as? [[String: Any]] else {
@@ -708,20 +885,20 @@ public struct MindMemoryJudgment: MemoryManaging {
             let evidence: MemoryManagerSettlement.Evidence
             switch row["basis"] as? String {
             case "person_words":
-                guard request.personWords.contains(source), row["act_id"] == nil else {
+                guard personWords.contains(source), row["act_id"] == nil else {
                     throw route.failed(.invalidMemories, recovery: "Person settlement requires an exact person_words quote and no act_id.")
                 }
                 evidence = .personWords(source)
             case "act":
                 guard outcome == .done, let actID = row["act_id"] as? String,
-                      let act = request.completedActs.first(where: { $0.id == actID }), act.contains(source) else {
+                      let act = acts.first(where: { $0.id == actID }), act.contains(source) else {
                     throw route.failed(.invalidMemories, recovery: "Act settlement requires done and exact evidence from a shown completed act_id.")
                 }
                 evidence = .act(id: actID, source: source)
             case "reply":
                 // Saying it is the deed only for a moment that ends once; a rhythm or standing step outlives one saying.
                 guard outcome == .done, request.replyDelivered, row["act_id"] == nil,
-                      MemoryManagerPromise.quoted(source, in: request.assistantMessage),
+                      MemoryManagerPromise.quoted(source, in: reply),
                       let step = MyQueue.entry(item)?.step, step.rhythm == nil, MyQueue.Until(step.until) != .standing else {
                     throw route.failed(.invalidMemories,
                         recovery: "Reply settlement requires done, a delivered reply, its exact quote, no act_id and a moment that ends once.")
@@ -736,19 +913,89 @@ public struct MindMemoryJudgment: MemoryManaging {
         return AfterTurnInterpretation(memories: memories, affect: affect, caring: caring,
                                        cares: cares, careFaults: careFaults,
                                        promises: promises, settled: settled,
-                                       appAuthored: request.appAuthored, model: route.model, surface: route.surface)
+                                       appAuthored: request.appAuthored, model: route.model, surface: route.surface, redactedQuotes: true)
     }
 
-    static func caresSection(_ shown: [CognitiveCareLine], careWake: Bool = false) throws -> String {
-        guard !shown.isEmpty else { return "" }
-        return try completionPolicy("turn-interpretation", section: careWake ? "care-wake-cares-data" : "cares-data", arguments: [
-            shown.map { "[\($0.key)] \($0.text)" }.joined(separator: "\n")
+    actor DigestPart {
+        enum Key: NativeAgentCore.TurnPart { static let unset: DigestPart? = nil }
+        static let id = "native-turn-digest"
+        private let parse: @Sendable (JSONValue) throws -> AfterTurnInterpretation
+        private let model: @Sendable (String) async throws -> JSONValue
+        private var started = false
+        private var answered = false
+        private(set) var modelFailure: AfterTurnMemoryFailure?
+        private(set) var judgment: AfterTurnInterpretation?
+
+        init(parse: @escaping @Sendable (JSONValue) throws -> AfterTurnInterpretation,
+             model: @escaping @Sendable (String) async throws -> JSONValue) {
+            self.parse = parse
+            self.model = model
+        }
+
+        static func helperUnavailable(_ code: String) -> Bool {
+            ["busy", "spawn_busy", "spawn_failed", "helper_unavailable", "helper_missing", "helper_not_executable", "crashed"].contains(code)
+        }
+
+        func judge(_ arguments: [String: JSONValue]) async throws -> JSONValue {
+            guard !started, arguments.count == 2, arguments["purpose"] == .string("turn_digest"),
+                  let prompt = arguments["prompt"]?.stringValue else {
+                throw PartCallError(code: "bad_digest_policy", message: "The digest may call the Memory route once with purpose turn_digest and a prompt.")
+            }
+            started = true
+            do {
+                let value = try await model(prompt)
+                answered = true
+                return value
+            } catch {
+                modelFailure = error as? AfterTurnMemoryFailure
+                throw error
+            }
+        }
+
+        func verify(_ value: JSONValue) throws -> AfterTurnInterpretation {
+            guard answered, value.objectValue?["status"] != .string("refused") else {
+                throw PartCallError(code: "bad_digest_policy", message: "The digest must return its proposed judgment after an accepted Memory answer.")
+            }
+            return try parse(value)
+        }
+
+        func keep(_ judgment: AfterTurnInterpretation) { self.judgment = judgment }
+    }
+
+    private static func digestSystem(_ request: MemoryManagerRequest, context: AfterTurnContext?) throws -> SystemPromptSegments {
+        let caresShape = #","cares":[{"care":"c1","about":null,"between":false,"moved":0.0,"by":"them","felt":"...","note":"...","open":null,"closes":false,"stance":null,"shared":null}]"#
+        let stable = try completionPolicy("turn-interpretation", section: "system", arguments: [
+            completionPolicy("turn-interpretation", section: "rules"),
+            MemoryKindStamp.writerKinds.joined(separator: "|"),
+            caresShape,
         ])
+        let dynamic = try request.settlesOnly ? completionPolicy("turn-interpretation", section: "settlement-alone")
+            : request.careWake ? completionPolicy("turn-interpretation", section: "care-wake-cares")
+            : context?.cares.isEmpty == false ? completionPolicy("turn-interpretation", section: "cares") : ""
+        return SystemPromptSegments(stable: stable, dynamic: dynamic)
     }
 
-    /// One parseable entry for a shown care; the prompt states when about and stance are filled.
-    static let caresShape = #""cares":[{"care":"c1","about":null,"between":false,"moved":0.0,"by":"them","felt":"...","note":"...","#
-        + #""open":null,"closes":false,"stance":null}]"#
+    /// What the judgment is shown of a record: every text by its opening (five sixths of the allowance) and end, every list by its first rows. The judgment weighs what an
+    /// act was, not the bulk it returned; a quote from what is shown is still a quote from the whole record, which is what it is checked against.
+    private static func shown(_ value: JSONValue, text: Int, rows: Int) -> JSONValue {
+        switch value {
+        // A long text keeps its opening and its end, where an outcome is usually said.
+        case .string(let words): words.count > text
+            ? .string(String(words.prefix(text * 5 / 6)) + "\n[… \(words.count - text) characters not shown …]\n" + String(words.suffix(text - text * 5 / 6))) : value
+        case .array(let items): .array(items.prefix(rows).map { shown($0, text: text, rows: rows) })
+        case .object(let fields): .object(fields.mapValues { shown($0, text: text, rows: rows) })
+        default: value
+        }
+    }
+
+    /// What the judgment is shown of a turn's acts. The bound is set by what her judgments have quoted as proof: every act-based
+    /// settlement on record quoted from the first 1,100 characters of a result, so a text keeps its first 1,500 and last 300; only when
+    /// a turn's acts together pass 24 KB does it tighten, and never below the first 1,100. Every act is always present with its id.
+    private static func shownActs(_ acts: [MemoryManagerAct]) -> JSONValue {
+        let wide = JSONValue.array(acts.map { shown($0.record, text: 1_800, rows: 24) })
+        if ((try? wide.serializedData(pretty: false).count) ?? .max) <= 24_000 { return wide }
+        return .array(acts.map { shown($0.record, text: 1_320, rows: 12) })
+    }
 
     private static func deskRows(_ open: [DeskItem]) -> [JSONValue] {
         open.map { item in
@@ -766,42 +1013,178 @@ public struct MindMemoryJudgment: MemoryManaging {
         }
     }
 
-    /// The moment's form and evidence follow the shared system policy.
-    static func prompt(_ request: MemoryManagerRequest, context: AfterTurnContext?,
-                       factsEnabled: Bool, existing: [String]) throws -> String {
-        let history = context?.caring?.context.map { "\($0.speaker.rawValue): \($0.text)" }.joined(separator: "\n") ?? ""
-        let encounters = context?.caring?.recentEncounters.map {
-            "\($0.at.ISO8601Format()) \($0.kind.rawValue): \($0.why)"
-        }.joined(separator: "\n") ?? ""
-        let shown = context?.cares ?? []
+    private struct DigestEvidence: Sendable {
+        let input: JSONValue
+        let incoming: String
+        let reply: String
+        let beliefTarget: String?
+        let settlement: String
+        /// The open moments as shown apart from the settlement; empty when they are inside it.
+        let openMoments: String
+        let memoryLines: [String]
+        let shownMemoryIDs: Set<String>
+    }
+
+    private static func digestText(_ row: JSONValue, _ key: String) -> String { row.objectValue?[key]?.stringValue ?? "" }
+
+    private static func digestMemoryLine(_ row: JSONValue) -> String {
+        let subject = digestText(row, "subject")
+        return "[\(digestText(row, "id"))] \(digestText(row, "text"))"
+            + (digestText(row, "kind") == "correction" ? " (correction)" : "")
+            + (subject.isEmpty ? "" : " (subject: \(subject))")
+    }
+
+    private static func digestHistoryLine(_ row: JSONValue) -> String { "\(digestText(row, "speaker")): \(digestText(row, "text"))" }
+
+    private static func digestEncounterLine(_ row: JSONValue) -> String {
+        "\(digestText(row, "at")) \(digestText(row, "kind")): \(digestText(row, "why"))"
+    }
+
+    private static func legacyDigestInput(_ packet: [String: JSONValue]) -> JSONValue {
+        func rows(_ value: JSONValue?) -> [JSONValue] {
+            if case .array(let rows)? = value { return rows }
+            return []
+        }
+        let caring = packet["caring_context"]?.objectValue
+        let mode = packet["mode"]?.stringValue
+        let known = rows(packet["known_memories"]), cares = rows(packet["cares"])
+        let evidence: [String: JSONValue] = [
+            "standingMemories": .string(known.filter { $0.objectValue?["standing"] == .bool(true) }.map(digestMemoryLine).joined(separator: "\n")),
+            "recalledMemories": .string(known.filter { $0.objectValue?["standing"] != .bool(true) }.map(digestMemoryLine).joined(separator: "\n")),
+            "pendingMemories": .string(rows(packet["pending_memories"]).map(digestMemoryLine).joined(separator: "\n")),
+            "cares": .string(cares.map { "[\(digestText($0, "key"))] \(digestText($0, "text"))" }.joined(separator: "\n")),
+            "speaker": packet["speaker"] ?? .string(""), "factsEnabled": .string(String(packet["facts_enabled"] == .bool(true))),
+            "localTime": packet["local_time"] ?? .string("[absent]"), "timeZone": packet["time_zone"] ?? .string(""),
+            "relayed": .string(String(caring?["relayed"] == .bool(true))), "caringEligible": .string(String(caring != nil)),
+            "history": .string(rows(caring?["history"]).map(digestHistoryLine).joined(separator: "\n")),
+            "encounters": .string(rows(caring?["recent_encounters"]).map(digestEncounterLine).joined(separator: "\n")),
+            "work": .string(packet["work"]?.stringValue.map { $0 + "\n" } ?? ""),
+            "beliefTarget": packet["belief_target"] ?? .string("[absent]"), "incoming": packet["user_message"] ?? .string(""),
+            "reply": packet["assistant_message"] ?? .string(""), "settlement": packet["settlement"] ?? .string(""),
+        ]
+        return .object(["settlesOnly": .bool(mode == "settlement"), "careWake": .bool(mode == "care_wake"),
+            "hasCares": .bool(!cares.isEmpty), "appAuthored": packet["app_authored"] ?? .bool(false),
+            "standingAgent": packet["standing_agent"] ?? .bool(false), "evidence": .object(evidence)])
+    }
+
+    private static func digestEvidence(_ request: MemoryManagerRequest, context: AfterTurnContext?, turn: Turn,
+                                       surface: String, factsEnabled: Bool, acts: [MemoryManagerAct],
+                                       personWords: String, legacy: Bool, momentsApart: Bool, limit: Int) throws -> DigestEvidence {
+        func redacted(_ text: String) -> JSONValue { .string(TurnSecretRedactor.redactText(text)) }
+        func identifier(_ id: String) throws -> JSONValue {
+            guard !id.isEmpty, TurnSecretRedactor.redactText(id) == id else {
+                throw PartCallError(code: "bad_digest_policy", message: "The digest needs intact, non-secret evidence IDs.")
+            }
+            return .string(id)
+        }
+        func memoryRow(_ memory: MemoryManagerExistingMemory, standing: Bool) throws -> JSONValue {
+            var row: [String: JSONValue] = ["id": try identifier(memory.id), "text": redacted(memory.content),
+                "standing": .bool(standing)]
+            row["kind"] = memory.kind.map(redacted)
+            row["subject"] = memory.correctionSubject.map(redacted)
+            return .object(row)
+        }
         let clock = ISO8601DateFormatter()
         clock.timeZone = .current
-        let exchangeTime = request.occurredAt ?? context?.event.occurredAt ?? Date()
-        let settlementInput = try JSONValue.object(["person_words": .string(request.personWords),
-            "open_moments": .array(Self.deskRows(request.openMoments)),
-            "completed_acts": .array(request.completedActs.map(\.record)),
-            "completed_acts_unavailable": request.completedActsUnavailable.map(JSONValue.string) ?? .null,
-            "reply_delivered": .bool(request.replyDelivered)]).serialize(pretty: false)
-        return try completionPolicy("turn-interpretation", section: "prompt", arguments: [
-            existing.prefix(request.standing).joined(separator: "\n"),
-            request.settlesOnly ? "" : Self.caresSection(shown, careWake: context?.careWakes.isEmpty == false),
-            request.personName ?? "the person",
-            request.appAuthored ? completionPolicy("turn-interpretation", section: "app-authored") : request.standingAgent
-                ? completionPolicy("turn-interpretation", section: "standing-agent") : ".",
-            String(factsEnabled),
-            clock.string(from: exchangeTime),
-            TimeZone.current.identifier,
-            String(context?.caring?.relayed ?? false),
-            String(context?.caring != nil),
-            existing.dropFirst(request.standing).joined(separator: "\n"),
-            request.pendingTargets.map { "[\($0.id)] \($0.content)" }.joined(separator: "\n"),
-            history + "\nPrior statement to judge (data; absent means beliefReaction=null):\n"
-                + (context?.beliefReactionTarget ?? "[absent]"),
-            encounters,
-            request.userMessage,
-            request.assistantMessage,
-            request.took.map { $0 + "\n" } ?? "",
-            completionPolicy("turn-interpretation", section: "settlement-input", arguments: [settlementInput]),
-        ])
+        let exchangeTime = request.occurredAt ?? context?.event.occurredAt
+        let cares: [CognitiveCareLine] = request.settlesOnly ? [] : context?.cares ?? []
+        let openMoments = Self.shown(MemoryManagerAct.redactDigestEvidence(.array(Self.deskRows(request.openMoments))), text: 160, rows: .max)
+        let openMomentsText = momentsApart ? try openMoments.serialize(pretty: false) : ""
+        var settlementFields: [String: JSONValue] = ["person_words": .string(personWords),
+            "open_moments": momentsApart ? .string("shown above, under Open moments") : openMoments,
+            "completed_acts": Self.shownActs(acts),
+            "completed_acts_unavailable": request.completedActsUnavailable.map { .string(TurnSecretRedactor.redactText($0)) } ?? .null,
+            "reply_delivered": .bool(request.replyDelivered),
+            "person_reply_delivered": .bool(request.personReplyAt != nil)]
+        let settlement = try JSONValue.object(settlementFields).serialize(pretty: false)
+        let incoming = TurnSecretRedactor.redactText(request.userMessage)
+        let reply = TurnSecretRedactor.redactText(request.assistantMessage)
+        let beliefTarget = context?.beliefReactionTarget.map { TurnSecretRedactor.redactText($0) }
+        let standingCount = max(0, request.standing)
+        let standing = try request.existing.prefix(standingCount).map { try memoryRow($0, standing: true) }
+        var packet: [String: JSONValue] = [
+            "surface": redacted(surface),
+            "mode": .string(request.settlesOnly ? "settlement" : request.careWake ? "care_wake" : "exchange"),
+            "speaker": redacted(request.personName ?? "the person"), "app_authored": .bool(request.appAuthored),
+            "standing_agent": .bool(request.standingAgent), "facts_enabled": .bool(factsEnabled),
+            "user_message": .string(incoming), "assistant_message": .string(reply),
+            "time_zone": .string(TimeZone.current.identifier), "settlement": .string(settlement),
+            "cares": .array(cares.map { .object(["id": .string($0.id.uuidString), "key": .string($0.key), "text": redacted($0.text)]) }),
+            "known_memories": .array(standing), "pending_memories": .array([]),
+        ]
+        if momentsApart { packet["open_moments"] = .string(openMomentsText) }
+        if let turnId = request.turnId, !turnId.isEmpty { packet["turn_id"] = try identifier(turnId) }
+        packet["session_id"] = try turn.session.map(identifier)
+        packet["origin"] = request.origin.map { .string($0.rawValue) }
+        packet["local_time"] = exchangeTime.map { .string(clock.string(from: $0)) }
+        packet["belief_target"] = beliefTarget.map(JSONValue.string)
+        if let caring = context?.caring {
+            packet["caring_context"] = .object(["relayed": .bool(caring.relayed), "at": .string(caring.at.ISO8601Format()),
+                "history": .array([]), "recent_encounters": .array([])])
+        }
+        func shape(_ fields: [String: JSONValue]) -> JSONValue { legacy ? legacyDigestInput(fields) : .object(fields) }
+        func bytes(_ value: JSONValue) throws -> Int { try value.serializedData(pretty: false).count }
+        var remaining = limit - (try bytes(shape(packet)))
+        if remaining < 0 {
+            // Does it fit without the open moments? Shown apart, they are the packet's own field; otherwise they sit in the settlement.
+            if momentsApart { packet["open_moments"] = .string("[]") }
+            else {
+                settlementFields["open_moments"] = .array([])
+                packet["settlement"] = .string(try JSONValue.object(settlementFields).serialize(pretty: false))
+            }
+            let refusal: (code: String, owner: String)
+            if try bytes(shape(packet)) <= limit { refusal = ("digest_desk_limit", "open Desk evidence") }
+            else {
+                packet["known_memories"] = .array([])
+                refusal = try bytes(shape(packet)) <= limit ? ("digest_memory_limit", "standing memories")
+                    : ("digest_record_limit", "recorded exchange and its required evidence")
+            }
+            throw PartCallError(code: refusal.code, message: "The \(refusal.owner) exceeds the digest's \(limit)-byte input limit. The moment remains owed.")
+        }
+        func budget(_ rows: [JSONValue], line: (JSONValue) -> String, afterRows: Bool = false) throws -> [JSONValue] {
+            var admitted: [JSONValue] = []
+            for row in rows {
+                let byteCount = try legacy ? bytes(.string(line(row))) - 2 : bytes(row)
+                let separator = admitted.isEmpty && (legacy || !afterRows) ? 0 : 2
+                guard byteCount + separator <= remaining else { continue }
+                remaining -= byteCount + separator
+                admitted.append(row)
+            }
+            return admitted
+        }
+        let pending = try budget(request.pendingTargets.map {
+            .object(["id": try identifier($0.id), "text": redacted($0.content)])
+        }, line: digestMemoryLine)
+        let recalled = try budget(request.existing.dropFirst(standingCount).map { try memoryRow($0, standing: false) },
+            line: digestMemoryLine, afterRows: !standing.isEmpty)
+        packet["known_memories"] = .array(standing + recalled)
+        packet["pending_memories"] = .array(pending)
+        if let caring = context?.caring, var row = packet["caring_context"]?.objectValue {
+            row["history"] = .array(try budget(caring.context.map {
+                .object(["speaker": .string($0.speaker.rawValue), "text": redacted($0.text)])
+            }, line: digestHistoryLine))
+            row["recent_encounters"] = .array(try budget(caring.recentEncounters.map {
+                .object(["at": .string($0.at.ISO8601Format()), "kind": .string($0.kind.rawValue), "why": redacted($0.why)])
+            }, line: digestEncounterLine))
+            packet["caring_context"] = .object(row)
+        }
+        if let work = request.took {
+            packet["work"] = redacted(work)
+            if try bytes(shape(packet)) > limit { packet["work"] = nil }
+        }
+        let memories = standing + recalled + pending
+        // Where a judgment's input goes, in bytes and never in words: the measure any trimming of it is decided on.
+        func size(_ value: JSONValue?) -> JSONValue { .int(Int64(value.flatMap { try? bytes($0) } ?? 0)) }
+        let caringRow = packet["caring_context"]?.objectValue
+        TurnTraceBus.fireFromContext(kind: "memory.judgment.evidence", surface: surface, payload: .object([
+            "limitBytes": .int(Int64(limit)), "standingBytes": size(.array(standing)), "recalledBytes": size(.array(recalled)),
+            "pendingBytes": size(.array(pending)), "historyBytes": size(caringRow?["history"]),
+            "encounterBytes": size(caringRow?["recent_encounters"]), "careBytes": size(packet["cares"]),
+            "incomingBytes": size(packet["user_message"]), "replyBytes": size(packet["assistant_message"]),
+            "openMomentBytes": size(momentsApart ? packet["open_moments"] : settlementFields["open_moments"]), "completedActBytes": size(settlementFields["completed_acts"]),
+            "settlementBytes": size(packet["settlement"]), "workBytes": size(packet["work"]),
+        ]), turn: turn)
+        return DigestEvidence(input: shape(packet), incoming: incoming, reply: reply, beliefTarget: beliefTarget, settlement: settlement,
+            openMoments: openMomentsText, memoryLines: memories.map(digestMemoryLine), shownMemoryIDs: Set(memories.compactMap { $0.objectValue?["id"]?.stringValue }))
     }
 }

@@ -1,6 +1,6 @@
+import PersistenceCore
 import Foundation
 import NativeAgentCore
-import PersistenceCore
 import SenseCore
 import DeskCore
 import Darwin

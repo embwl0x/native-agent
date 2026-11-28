@@ -73,7 +73,8 @@ extension AppToolExecutor {
         var names: [String: Int] = [:]
         if let refused = try Self.doorManyMalformed(entries, base: base, names: &names) { return refused }
         // Several changes that are all the person's to decide, asked together, are one ask: one card for the list, never a card each.
-        if let together = try await doorAsksTogether(entries, base: base, turn: turn, execution: execution) { return together }
+        if let together = try await doorAsksTogether(entries, base: base, turn: turn, execution: execution),
+           !(await Self.doorManyWithdrawn(turn)) { return together }
         let named = Dictionary(uniqueKeysWithValues: names.map { ($0.value, $0.key) })
         let snapshot = execution.notesSnapshot ?? DoorNotesSnapshot()
         var batchExecution = execution
@@ -86,7 +87,10 @@ extension AppToolExecutor {
             let pageID = await doorPage(scope)?.id ?? scope
             snapshot.versions?[pageID] = .string(given)
         }
-        let run = DoorManyRun(tally: DoorManyTally(entries: entries, base: base, names: names, named: named), turn: turn, perform: perform,
+        // The steps share one answer's room; a batch inside a batch shares its parent's.
+        var shared = turn
+        if shared[AnswerRoomPart.self] == nil { shared[AnswerRoomPart.self] = AnswerRoom(steps: entries.count) }
+        let run = DoorManyRun(tally: DoorManyTally(entries: entries, base: base, names: names, named: named), turn: shared, perform: perform,
             snapshot: snapshot, batchExecution: batchExecution)
         for (index, entry) in entries.enumerated() {
             guard await doorManyStep(run, index: index, entry: entry) else { break }
@@ -105,7 +109,7 @@ extension AppToolExecutor {
                 remedy: "correct_arguments", "Use try_instead's declared batch shape; split it into calls of at most \(AppScriptRunner.actionLimit).",
                 extra: ["try_instead": advice])
         }
-        // A step's name is for found alone: one name, one step, never a number.
+        // A step's name is for found and only: one name, one step, never a number.
         for (index, entry) in entries.enumerated() {
             guard let given = entry.objectValue?["as"] else { continue }
             guard case .string(let name) = given, !name.isEmpty, !name.contains("."), !name.allSatisfy(\.isWholeNumber), names[name] == nil else {
@@ -115,7 +119,7 @@ extension AppToolExecutor {
             }
             names[name] = index + 1
         }
-        // The closing words are text, and each slot they take is one found.
+        // The closing words are text, and each slot they take is one found or only.
         if let words = base["then_say"], (words.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return Self.doorRefusal("invalid_actions",
                 "then_say is the words to say when the deed comes back as said: text, not empty. Nothing was run.",
@@ -123,24 +127,41 @@ extension AppToolExecutor {
         }
         if let slots = base["with"] {
             guard base["then_say"] != nil, case .object(let fields) = slots,
-                  fields.values.allSatisfy({ $0.objectValue?.count == 1 && $0.objectValue?["found"]?.stringValue != nil }) else {
+                  fields.values.allSatisfy({ $0.objectValue.flatMap(Self.doorReference) != nil }) else {
                 return Self.doorRefusal("invalid_actions",
-                    "with fills the slots of then_say, beside it: an object whose every value is {found: \"<step>.<path>\"}. Nothing was run.",
+                    "with fills the slots of then_say, beside it: an object whose every value is {found: \"<step>.<path>\"} or {only: \"<step>.<list>.<field>\"}. Nothing was run.",
                     remedy: "correct_arguments", "Give then_say with it, and each slot as {found: \"<step>.<path>\"}, then call again.")
             }
         }
         return nil
     }
-    /// One step of the batch, admitted on its own: false ends the steps (Stop, or the person's message arrived).
+    private static func doorManyWithdrawn(_ turn: Turn) async -> Bool {
+        guard let session = turn.verifiedSessionID ?? turn.session else { return false }
+        return await ChatTurnSteering.shared.withdrawsUnstarted(in: session, turn: turn)
+    }
+
+    @MainActor
+    private static func doorManyAdmit(_ run: DoorManyRun) async -> Bool {
+        if run.tally.stopped || Task.isCancelled { run.tally.stopped = true; return false }
+        let turn = run.turn
+        let arrival: ChatTurnSteering.WaitingArrival? = if let session = turn.verifiedSessionID ?? turn.session {
+            await ChatTurnSteering.shared.waitingArrival(in: session)
+        } else { nil }
+        let withdrawn = await doorManyWithdrawn(turn)
+        if Task.isCancelled { run.tally.stopped = true; return false }
+        if let arrival {
+            run.tally.handedBack = .arrival(arrival)
+            return false
+        }
+        if withdrawn { run.tally.handedBack = .ownerWithdrawal; return false }
+        return true
+    }
+
     @MainActor
     private func doorManyStep(_ run: DoorManyRun, index: Int, entry: JSONValue) async -> Bool {
         let base = run.tally.base, names = run.tally.names, named = run.tally.named, turn = run.turn, perform = run.perform
         let snapshot = run.snapshot, batchExecution = run.batchExecution
-        if run.tally.stopped || Task.isCancelled { run.tally.stopped = true; return false }
-        if let session = turn.verifiedSessionID ?? turn.session, await ChatTurnSteering.shared.personWaiting(in: session) {
-            run.tally.handedBack = true
-            return false
-        }
+        guard await Self.doorManyAdmit(run) else { return false }
         var call = base.filter { $0.key != "expected_version" && !ToolNameAliases.appDeedKeys.contains($0.key) }
         do {
             guard case .object(let fields) = entry else {
@@ -175,11 +196,13 @@ extension AppToolExecutor {
                 do { call["args"] = try Self.doorFound(args, came: run.tally.came, names: names, previewed: run.tally.previewed, before: index + 1) }
                 catch let unfound as DoorUnfound {
                     run.tally.nextIndex = index + 1
-                    if run.tally.barrier != nil { run.tally.notRun.append((index + 1, name, "found_not_there")); return true }
-                    let reply = ToolResult(Self.failure("found_not_there",
-                        "{found: \"\(unfound.reference)\"} is not there: \(unfound.why). Step \(index + 1) was not run.",
+                    if run.tally.barrier != nil { run.tally.notRun.append((index + 1, name, unfound.notOne ? "only_not_one" : "found_not_there")); return true }
+                    let reply = ToolResult(Self.failure(unfound.notOne ? "only_not_one" : "found_not_there",
+                        unfound.notOne ? "only takes exactly one, and \(unfound.why). Step \(index + 1) was not run."
+                            : "\(unfound.reference) is not there: \(unfound.why). Step \(index + 1) was not run.",
                         extra: ["remedy": .object(["kind": .string("correct_arguments"),
-                            "instruction": .string("Name an earlier step that came back and a place in what it returned; earlier steps keep their receipts."),
+                            "instruction": .string(unfound.notOne ? "Narrow the earlier step until it returns one, or choose one yourself with found and its index; earlier steps keep their receipts."
+                                : "Name an earlier step that came back and a place in what it returned; earlier steps keep their receipts."),
                             "next_call": .null])]))
                     run.tally.receipts.append(reply)
                     run.tally.receiptSteps.append(index + 1)
@@ -198,11 +221,7 @@ extension AppToolExecutor {
                 page = try await QuietSettings.setting(id: JSONValue.trimmedScalarTextOrEmpty(args["setting"]), host: quietHost())?.page ?? ""
             } else { page = action?.page ?? "" }
             if call["expected_version"] == nil { call["expected_version"] = snapshot.versions?[page] }
-            if Task.isCancelled { run.tally.stopped = true; return false }
-            if let session = turn.verifiedSessionID ?? turn.session, await ChatTurnSteering.shared.personWaiting(in: session) {
-                run.tally.handedBack = true
-                return false
-            }
+            guard await Self.doorManyAdmit(run) else { return false }
             let receipt: JSONValue
             do {
                 let stepTurn = call["preview"] == .bool(true) ? turn.with(\.doorPreview, .program("actions")) : turn
@@ -218,6 +237,7 @@ extension AppToolExecutor {
                 receipt = ChatToolOutcome.failure(error: CancellationError(), tool: "app")
             } catch { receipt = ChatToolOutcome.failure(error: error, tool: "app") }
             var reply = ToolResult(receipt)
+            if call["actions"]?.arrayValue == nil { turn[AnswerRoomPart.self]?.take((try? receipt.serialize(pretty: false).utf8.count) ?? 0) }
             if call["expected_version"] != nil, case .object(let fields) = reply.payload, let after = fields["page_version"] { snapshot
                 .versions?[page] = after }
             let reads = readOnly || reply.payload.objectValue?["read_only"] == .bool(true)
@@ -313,7 +333,7 @@ extension AppToolExecutor {
             "instruction": .string("Each receipt says why it did not land and what to do next."), "next_call": .null]) : nil
         // A step that ran and failed is the batch's word over any card beside it: the deed is its worst real step.
         let realFailure = receipts.contains { $0.outcome.isFailure && !Self.doorNotAdmitted($0) }
-        if !stopped, !handedBack, !realFailure, case .object(let waiting)? = speaking?.payload {
+        if !stopped, handedBack == nil, !realFailure, case .object(let waiting)? = speaking?.payload {
             result = waiting.merging(["receipts": .array(shown)]) { _, value in value }
             // The steps admitted beside the wait ran on their own; the wait's words say so, so the card is not read as the whole deed.
             if landed + partial > 0 {
@@ -323,8 +343,6 @@ extension AppToolExecutor {
         }
         return (result, first, failure, landed)
     }
-    /// The batch's one envelope, settled however the steps ended: where it stopped, what the person's message left unstarted, a batch
-    /// refused or previewed whole, and whether the agent's closing words stand.
     @MainActor
     private static func doorManySettled(_ tally: DoorManyTally, turn: Turn) async -> JSONValue {
         let entries = tally.entries, base = tally.base, names = tally.names, named = tally.named, receipts = tally.receipts
@@ -363,18 +381,24 @@ extension AppToolExecutor {
             })
             result["steps_total"] = .int(Int64(entries.count))
         }
-        if !stopped, handedBack {
+        if !stopped, let handedBack {
             // An earlier step's real failure stays the batch's word, with its remedy; the hand-back only adds what did not start.
             if let failure {
                 result["remedy"] = failure.remedy ?? result["remedy"] ?? nil
+                if case .ownerWithdrawal = handedBack { result["ok"] = .bool(false) }
             } else {
                 result["status"] = .string(receipts.isEmpty ? "skipped" : "partial")
                 result["remedy"] = nil
             }
-            result["reason"] = .string("person_arrival")
-            result["detail"] = .string(JSONValue.trimmedScalarTextOrEmpty(result["detail"]) + " A message from the person is waiting. "
-                + "Steps \(nextIndex + 1) through \(entries.count) did not start; "
-                + "earlier steps keep their receipts. Read the message before deciding what to do next.")
+            let (reason, why, next): (String, String, String) = switch handedBack {
+            case .arrival(let arrival):
+                ("person_arrival", " A \(arrival.subject) is waiting.", " Read the \(arrival.subject) before deciding what to do next.")
+            case .ownerWithdrawal:
+                ("owner_withdrawal", " The person withdrew unstarted work.", "")
+            }
+            result["reason"] = .string(reason)
+            result["detail"] = .string(JSONValue.trimmedScalarTextOrEmpty(result["detail"]) + why
+                + " Steps \(nextIndex + 1) through \(entries.count) did not start; earlier steps keep their receipts." + next)
             let skipped = Set(notRun.map(\.index))
             result["unrun"] = .array(entries.enumerated().compactMap { index, entry in
                 index >= nextIndex || skipped.contains(index + 1) ? entry : nil
@@ -387,7 +411,7 @@ extension AppToolExecutor {
         }
         // Every step refused before it ran is the batch refused, written by the one refusal writer; every step a preview would refuse is the
         // batch's preview refusal. Neither is a failure or an unknown outcome.
-        if !stopped, !handedBack, !receipts.isEmpty {
+        if !stopped, handedBack == nil, !receipts.isEmpty {
             let first = receipts[0].payload.objectValue ?? [:]
             if receipts.allSatisfy({ $0.outcome == .refused && $0.payload.objectValue?["execution"] == .string("not_run") }),
                case .object(let refused) = ChatToolOutcome.refusedBeforeRunning(
@@ -403,6 +427,20 @@ extension AppToolExecutor {
                 result["effects"] = .string("none")
             }
         }
+        // A batch's effects are its steps': when every receipt says none, nothing landed, and the envelope says so with the stopping step's
+        // own code, rather than leaving both to the generic failure writer, which can only call them unknown.
+        // A read that succeeded carries read_only and no effects word of its own; it changed nothing either.
+        if result["effects"] == nil, !receipts.isEmpty, receipts.allSatisfy({ receipt in
+            let fields = receipt.payload.objectValue
+            return fields?["effects"] == .string("none")
+                || (fields?["effects"] == nil && fields?["read_only"] == .bool(true) && receipt.outcome == .succeeded)
+        }) {
+            result["effects"] = .string("none")
+            if result["reason"] == nil, surprise == nil, let barrier, barrier.reply.outcome.isFailure,
+               case .string(let code)? = barrier.reply.payload.objectValue?["reason"] {
+                result["reason"] = .string(code)
+            }
+        }
         // The agent's closing words stand when every step ran, was expected and held, nothing in it is beyond undoing, and nothing else arrived.
         // Set last, so no step's payload can supply them.
         result["then_say"] = nil
@@ -411,14 +449,15 @@ extension AppToolExecutor {
             var because: String?
             if base["preview"] == .bool(true) || !previewed.isEmpty {
                 because = "this was a preview"
-            } else if stopped || handedBack || barrier != nil || receipts.count != entries.count || landed != receipts.count {
+            } else if stopped || handedBack != nil || barrier != nil || receipts.count != entries.count || landed != receipts.count {
                 because = "the deed did not come back as said"
-            } else if let bare = entries.firstIndex(where: { ($0.objectValue?["expect"] ?? .null) == .null }) {
+            } else if let bare = entries.firstIndex(where: { $0.objectValue?["expect"] == nil }) {
                 because = "step \(bare + 1) carried no expect"
             } else if let final = zip(receipts, receiptSteps).first(where: { Self.doorFinal($0.0.payload) }) {
                 because = "step \(final.1) cannot be undone"
-            } else if let session = turn.verifiedSessionID ?? turn.session, await ChatTurnSteering.shared.personWaiting(in: session) {
-                because = "a message from the person arrived"
+            } else if let session = turn.verifiedSessionID ?? turn.session,
+                      let arrival = await ChatTurnSteering.shared.waitingArrival(in: session) {
+                because = "a \(arrival.subject) arrived"
             } else {
                 slots: for (name, slot) in (base["with"]?.objectValue ?? [:]).sorted(by: { $0.key < $1.key }) {
                     let value: JSONValue
@@ -546,11 +585,19 @@ extension AppToolExecutor {
     static func doorCarriesFound(_ value: JSONValue) -> Bool {
         switch value {
         case .object(let fields):
-            if fields.count == 1, fields["found"]?.stringValue != nil { return true }
+            if doorReference(fields) != nil { return true }
             return fields.values.contains { doorCarriesFound($0) }
         case .array(let items): return items.contains { doorCarriesFound($0) }
         default: return false
         }
+    }
+
+    /// A value taken from an earlier step: {found: path} takes what is at the path; {only: path} also needs each list the path passes
+    /// through by name, and the one it ends on, to hold exactly one.
+    static func doorReference(_ fields: [String: JSONValue]) -> (path: String, only: Bool)? {
+        guard fields.count == 1 else { return nil }
+        if let path = fields["found"]?.stringValue { return (path, false) }
+        return fields["only"]?.stringValue.map { ($0, true) }
     }
 
     /// A place that did not come back as said: where, the shape said there, and what was there (nil when nothing was).
@@ -559,13 +606,15 @@ extension AppToolExecutor {
     struct DoorUnfound: Error {
         let reference: String
         let why: String
+        /// An only that met none or several: the place is there, the single match is not.
+        var notOne = false
     }
 
     /// Every {found: "step.path"} in a step's arguments, replaced by that whole value from what an earlier step returned.
     static func doorFound(_ value: JSONValue, came: [Int: JSONValue], names: [String: Int], previewed: Set<Int>, before step: Int) throws -> JSONValue {
         switch value {
         case .object(let fields):
-            guard fields.count == 1, case .string(let reference)? = fields["found"] else {
+            guard let (reference, only) = doorReference(fields) else {
                 return .object(try fields.mapValues { try doorFound($0, came: came, names: names, previewed: previewed, before: step) })
             }
             let segments = reference.split(separator: ".", omittingEmptySubsequences: false).map(String.init)
@@ -579,7 +628,16 @@ extension AppToolExecutor {
                     : "step \(source) did not run or did not land, so nothing came back from it")
             }
             var reached = head
+            // only never picks among several: a list it would have to choose from stops the step, saying how many there were.
+            func sole(_ place: JSONValue) throws -> JSONValue {
+                guard only, case .array(let items) = place else { return place }
+                guard items.count == 1 else {
+                    throw DoorUnfound(reference: reference, why: "\(reached) holds \(items.count)", notOne: true)
+                }
+                return items[0]
+            }
             for segment in segments.dropFirst() {
+                if Int(segment) == nil { place = try sole(place) }
                 let next: JSONValue? = switch place {
                 case .object(let fields): fields[segment]
                 case .array(let items): Int(segment).flatMap { items.indices.contains($0) ? items[$0] : nil }
@@ -596,7 +654,7 @@ extension AppToolExecutor {
                 place = next
                 reached += "." + segment
             }
-            return place
+            return try sole(place)
         case .array(let items):
             return .array(try items.map { try doorFound($0, came: came, names: names, previewed: previewed, before: step) })
         default:
@@ -653,6 +711,10 @@ extension AppToolExecutor {
         case .object(let shape) where shape.count == 1 && shape["not"] != nil:
             return doorMisses(shape["not"] ?? .null, value, at: place, said: said).isEmpty ? miss : []
         case .object(let shape):
+            // count over a list is its length: the list itself, or the one list in what came back when it has no count of its own.
+            if shape.count == 1, let said = shape["count"], case .int = said, let length = doorSoleList(value)?.count {
+                return said == .int(Int64(length)) ? [] : [(place, pattern, .int(Int64(length)))]
+            }
             guard case .object(let fields)? = value else { return miss }
             return shape.keys.sorted().flatMap { key in
                 doorMisses(shape[key] ?? .null, fields[key], at: place == "result" ? key : place + "." + key)
@@ -673,6 +735,14 @@ extension AppToolExecutor {
         case .array(let items): items.contains { doorHolds($0, text, said: said) }
         default: value.scalarText.map { !said.contains($0) && $0.localizedCaseInsensitiveContains(text) } == true
         }
+    }
+
+    /// The list a count is about: the value when it is one, or the only list among what an action returned beside no count field.
+    static func doorSoleList(_ value: JSONValue?) -> [JSONValue]? {
+        if case .array(let items)? = value { return items }
+        guard case .object(let fields)? = value, fields["count"] == nil else { return nil }
+        let lists = fields.filter { $0.key != "argument_notes" }.values.compactMap(\.arrayValue)
+        return lists.count == 1 ? lists[0] : nil
     }
 
     /// What the action returned, without the receipt's bookkeeping around it.
@@ -770,7 +840,11 @@ private struct DoorManyTally: Sendable {
     // The step each receipt is for: a step barred from running leaves none.
     var receiptSteps: [Int] = []
     var stopped = false
-    var handedBack = false
+    enum HandBack: Sendable {
+        case arrival(ChatTurnSteering.WaitingArrival)
+        case ownerWithdrawal
+    }
+    var handedBack: HandBack?
     var barrier: (index: Int, action: String, reply: ToolResult)?
     var notRun: [(index: Int, action: String, because: String)] = []
     var readsAfter: [String] = []

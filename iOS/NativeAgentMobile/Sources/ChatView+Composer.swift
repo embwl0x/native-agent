@@ -104,7 +104,7 @@ extension ChatView {
                                         ? HazeColor(stored: hazeColorRaw).control(dark: colorScheme == .dark, labelled: true)
                                         : NativeAgentMobileTheme.Colors.softFill)
                                     .animation(
-                                        AppMotion.respecting(AppMotion.snappy, reduceMotion: reduceMotion),
+                                        Animation.respecting(AppMotion.snappy, reduceMotion: reduceMotion),
                                         value: active)
                                 }
                                 .frame(width: 44, height: 44)
@@ -123,7 +123,7 @@ extension ChatView {
         .overlay {
             PhoneThinkingLight(correlationIDs: Set(store.pendingICloudPlaceholders.keys))
         }
-        .frame(maxWidth: NativeAgentMobileTheme.Layout.roomColumn)
+        .frame(maxWidth: NativeAgentSpacing.chatRoomWidth)
         #if DEBUG
         .task { voiceInput.showDictationSample() }
         #endif

@@ -206,7 +206,7 @@ extension AgentScreen {
                 outcome.append(sendFailure(bare, receipt: receipt) ?? failureFace(.object(receipt)))
                 if peer?.canAnswerBack == false { outcome.append(
                     "Replies from \(contact.name) aren't connected: one comes only as an ordinary message, if it comes.") }
-                outcome.append(workspace.ports.conversations.unsettledAttention(record)
+                outcome.append(AgentConversationSession.unsettledAttention(record)
                     ? slug + ".say queues behind it until settlement or cancellation: app {action:\"agent.cancel\",args:{agent:\"\(contact.id)\"}}."
                     : slug + ".say sends a new message here; it never repeats the earlier one.")
             }
@@ -433,8 +433,7 @@ extension AgentScreen {
             [section("OWED", owed.agent), section("WAITING", owed.person + rows(split.waiting, 5)), section("ACTIVE", rows(split.active, 10)), section("PARKED",
                 parked),
              section("MY QUEUE", intentions),
-             section("ACTIONS", ["desk.wait {handle, on:\"<person>\", note?} · on:\"owner\" waits on the owner",
-                 "ledger.list is the shared task ledger, a separate list from this Desk"])],
+             section("ACTIONS", ["desk.wait {handle, on:\"<person>\", note?} · on:\"owner\" waits on the owner"])],
             verbs: [("desk.N", "open an item"), ("desk.N.note", "add a note (text)"), ("desk.N.done", "mark one done"), (#"app {action:"desk.add", args:{title}}"#, "add work")])
     }
 
@@ -602,25 +601,26 @@ extension AgentScreen {
     }
 
 
-    static func macFront(_ person: String, room: MacRoom) -> String {
-        guard room.readable else { return "Mac screen session unavailable; restore session access before reading it again." }
-        guard room.onConsole else { return "Another macOS session is active; this session's front app is not a current screen reading." }
-        if room.locked {
-            return "\(person)'s screen: " + (MacScreenLock.wakeFailed
-                ? "locked (a password is up; screen work waits for \(person))"
-                : "screensaver, not locked (mac.look and mac actions wake it with a harmless nudge; direct app scripts see no windows until wake)")
+    static func macFront(_ person: String, room: (value: MacRoom, at: Date), now: Date) -> [String] {
+        let observed = "Room last observed " + friendly(room.at, now: now)
+        guard room.value.readable else { return ["Mac screen session unavailable; restore session access before reading it again.", observed] }
+        guard room.value.onConsole else { return ["Another macOS session is active; this session's front app is not a current screen reading.", observed] }
+        if room.value.locked {
+            let prompt = MacScreenLock.passwordPromptObservedAt.map { "Password prompt last observed " + NativeTimestampFormat.plainZulu($0) }
+                ?? "Password prompt unknown"
+            return ["\(person)'s screen: covered", observed, prompt]
         }
-        return "\(person)'s front: " + clip(room.front ?? "unknown", 40)
+        return ["\(person)'s front: " + clip(room.value.front ?? "unknown", 40), observed]
     }
 
     private static func macRoom(bodyField: BodyField?, dataRoot: URL, person: String, now: Date) async -> String {
-        let room: MacRoom, windows: [MacRoomWindow]
+        let room: (value: MacRoom, at: Date), windows: [MacRoomWindow]
         do {
             let body = try BodyField.require(bodyField)
             room = try await body.macRoom(dataRoot)
             windows = try await body.recentWindows(dataRoot)
         } catch { return screen(["MAC", "unavailable"], [[nameFailure(error)]], verbs: []) }
-        let names = room.running
+        let names = room.value.running
         var rows: [String] = [], row = ""
         for name in names.prefix(24) {
             if !row.isEmpty, row.count + name.count > 64 { rows.append(row + ","); row = "" }
@@ -631,7 +631,7 @@ extension AgentScreen {
             pad(clip(window.app, 24), 14) + ([window.kind, window.readout.map { "reads " + clip($0, 24) }].compactMap { $0 }
                 + ["\(age(now.timeIntervalSince1970 - window.at)) ago"]).joined(separator: " · ")
         }
-        return screen(["MAC", macFront(person, room: room)],
+        return screen(["MAC"] + macFront(person, room: room, now: now),
             [section("APPS I ACTED IN", mine.isEmpty ? ["none in the last 4 hours"] : mine), section("RUNNING", rows)],
             verbs: [("mac.look <app>", "read that app's window where it sits"), ("mac.go <app>", "open that app behind; front:true brings it forward")])
     }
@@ -780,7 +780,7 @@ extension AgentScreen {
                 }
             }
             if !workspace.previewing {
-                AgentItemPages.shared.keep(dataRoot, pages, room: room)
+                itemPages.keep(dataRoot, pages, room: room)
             }
             var taken: Set<String> = [], verbs: [(String, String)] = []
             if items.contains(where: { !$0.item.actions.isEmpty }) { verbs.append((room + ".N", "open one")) }

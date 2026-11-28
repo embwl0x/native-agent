@@ -86,7 +86,6 @@ public final class iCloudBridge: ObservableObject {
     var deviceDrainTask: Task<Bool, Never>?
     var deviceDrainGeneration: Int?
     var deviceDrainQueued = false
-    var cloudKitPushEvidenceTask: Task<Void, Never>?
     var cloudKitPushUnavailable = false
     var deviceMetadataDrainTask: Task<Void, Never>?
     var deviceMetadataDrainQueued = false

@@ -12,9 +12,8 @@ public final class OpenRouterTransport: HTTPProviderProfile {
     public func requestOutputTokens(model: String, call: LLMCall) throws -> Int { 0 }
 
     public let providerId: String = "openrouter"
-    let session: URLSession
-    private let endpoint: URL?
-    private let apiKeyOverride: String?
+    let session = ProviderHTTP.session
+    private let endpoint = URL(string: "https://openrouter.ai/api/v1/chat/completions")
     private let dataRootOverride: URL?
     public let telemetry: LLMCallTraceRecorder
 
@@ -22,20 +21,9 @@ public final class OpenRouterTransport: HTTPProviderProfile {
         .underlying(message: "connection refused: \(request.url?.host ?? "openrouter")")
     }
 
-    public init(
-        session: URLSession = ProviderHTTP.session,
-        endpoint: URL? = URL(string: "https://openrouter.ai/api/v1/chat/completions"),
-        apiKeyOverride: String? = nil,
-        dataRootOverride: URL? = nil,
-        telemetryDataRootOverride: URL? = nil
-    ) {
-        self.session = session
-        self.endpoint = endpoint
-        self.apiKeyOverride = apiKeyOverride
+    public init(dataRootOverride: URL? = nil) {
         self.dataRootOverride = dataRootOverride
-        self.telemetry = LLMCallTraceRecorder(
-            dataRootOverride: telemetryDataRootOverride ?? dataRootOverride
-        )
+        self.telemetry = LLMCallTraceRecorder(dataRootOverride: dataRootOverride)
     }
 
     /// Send the exact admitted effort from this route's current catalog.
@@ -58,7 +46,6 @@ public final class OpenRouterTransport: HTTPProviderProfile {
     }
 
     private func resolveKey() throws -> String? {
-        if let k = apiKeyOverride, !k.isEmpty { return k }
         let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         return try LLMCredentialResolver.checkedAPIKey(
             providerConfigFile: "openrouter.json",
@@ -67,8 +54,10 @@ public final class OpenRouterTransport: HTTPProviderProfile {
     }
 
     var transport: any LLMTransport {
-        HTTPStreamTransport(profile: self, prepare: prepare, diagnostic: { status, _, model in
-            if status == 404 { throw LLMError.modelUnavailable(provider: "openrouter", model: model) }
+        HTTPStreamTransport(profile: self, prepare: prepare, diagnostic: { status, _, input in
+            if status == 404, input.tools?.isEmpty != false {
+                throw LLMError.modelUnavailable(provider: "openrouter", model: input.model)
+            }
         })
     }
 
@@ -94,6 +83,7 @@ public final class OpenRouterTransport: HTTPProviderProfile {
         ]
         try Self.applyReasoningControls(to: &body, model: model, dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(), call: call)
         try OpenAITransport.applyTools(to: &body, tools: tools)
+        if body["tools"] != nil { body["provider"] = ["require_parameters": true] }
         req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
         return ChatCompletionsWire(request: req, label: "OpenRouter", model: model, profile: self, call: call)
     }

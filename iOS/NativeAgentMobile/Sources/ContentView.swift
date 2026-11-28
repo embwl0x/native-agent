@@ -18,21 +18,25 @@ struct ContentView: View {
 
     @State private var inboxStore = InboxStore()
 
-    @State private var selection: Tab = ContentView.initialTabFromLaunchArgs()
+    @State private var selection = ContentView.surface(forScreen: ContentView.initialScreen) ?? .chat
     @State private var notificationOpenRefreshTask: Task<Void, Never>? = nil
     @State private var activityNavigationTarget: ActivitySection?
     /// A card a face's link asked Today to open.
     @State private var activityCardID: String?
     @Environment(\.openURL) private var openURL
     @State private var notifiedSessionID: String?
-    @State private var opensMemories = {
-        let args = ProcessInfo.processInfo.arguments
-        guard let index = args.firstIndex(of: "-initialTab"), args.indices.contains(index + 1) else { return false }
-        return ["memory", "memories"].contains(args[index + 1].lowercased())
-    }()
+    @State private var opensMemories = ["memory", "memories"].contains(ContentView.initialScreen)
+    @State private var opensToday = ["activity", "approvals", "inbox", "today"].contains(ContentView.initialScreen)
+    @State private var opensAdvanced = ContentView.opensAdvanced(forScreen: ContentView.initialScreen)
+    @State private var advancedDestination: AdvancedView.Destination? = ContentView.initialScreen == "diagnostics" ? .diagnostics : nil
+    @State private var agentDestination: AdvancedView.Destination?
 
-    enum Tab: Hashable {
-        case chat, activity, desk, settings, more
+    private var foregroundGroup: NAMobileSnapshotGroup {
+        switch selection {
+        case .chat: .chat
+        case .desk: opensToday ? .activity : .desk
+        case .agent, .control, .diagnostics: .advanced
+        }
     }
 
     private var activityBadgeCount: Int? {
@@ -44,15 +48,10 @@ struct ContentView: View {
         notificationOpenRefreshTask != nil || NativeAgentNotificationLaunchIntent.isPending
     }
 
-    private static func initialTabFromLaunchArgs() -> Tab {
-        initialTab(fromLaunchArguments: ProcessInfo.processInfo.arguments)
-    }
-
-    static func initialTab(fromLaunchArguments arguments: [String]) -> Tab {
-        guard let idx = arguments.firstIndex(of: "-initialTab"), idx + 1 < arguments.count else {
-            return .chat
-        }
-        return tab(forScreen: arguments[idx + 1]) ?? .chat
+    private static var initialScreen: String {
+        let args = ProcessInfo.processInfo.arguments
+        guard let index = args.firstIndex(of: "-initialTab"), args.indices.contains(index + 1) else { return "" }
+        return args[index + 1].lowercased()
     }
 
     private func openSharedChatIfNeeded() {
@@ -83,14 +82,11 @@ struct ContentView: View {
                     .id(request.id)
             }
             .task { await phoneRequests.resume() }
-            .onChange(of: selection, initial: true) { before, after in
-                sync.foregroundSnapshotGroup = switch after {
-                case .chat: .chat
-                case .activity: .activity
-                case .desk: .desk
-                case .settings, .more: .advanced
-                }
-                if before != after, after == .more {
+            .onChange(of: foregroundGroup, initial: true) { _, group in
+                sync.foregroundSnapshotGroup = group
+            }
+            .onChange(of: selection) { _, surface in
+                if surface == .agent {
                     Task { await sync.refreshSnapshotGroup(.advanced) }
                 }
             }
@@ -129,10 +125,10 @@ struct ContentView: View {
             selection = .chat
         case .approval:
             activityNavigationTarget = .inbox
-            selection = .activity
+            showToday()
         case .card(let id):
             activityCardID = id
-            selection = .activity
+            showToday()
         case .url(let url):
             openURL(url)
         case .page("today", let item?):
@@ -141,16 +137,27 @@ struct ContentView: View {
                 return "This queue opens on your Mac."
             }
             activityNavigationTarget = section
-            selection = .activity
+            showToday()
         case .page("today", nil):
-            selection = .activity
+            showToday()
         case .page("desk", _):
             selection = .desk
+            opensToday = false
         case .page("memory_proposals", _):
             // The Memories face carries what waits to be kept, with Keep and Don't keep on each.
             opensMemories = true
-            selection = .more
-        case .page(let page, _):
+            selection = .agent
+        case .page(let page, let item):
+            if item == nil, let surface = ShellSurface.named(page, agentName: sync.displayName(fallback: "Agent")) {
+                selection = surface == .diagnostics ? .control : surface
+                if surface == .control || surface == .diagnostics {
+                    advancedDestination = surface == .diagnostics ? .diagnostics : nil
+                    opensAdvanced = surface == .diagnostics
+                }
+                if surface == .agent { opensMemories = true }
+                if surface == .desk { opensToday = false }
+                return nil
+            }
             // A page is named by its own face; a page the phone has never read keeps its catalog name.
             return (sync.faces[page]?.face?.title ?? QuietToolPage.page(named: page)?.title ?? page) + " opens on your Mac."
         case .dream:
@@ -159,52 +166,60 @@ struct ContentView: View {
         return nil
     }
 
+    private func showToday() {
+        selection = .desk
+        opensToday = true
+    }
+
     private var tabContent: some View {
-        TabView(selection: $selection) {
+        let agentName = sync.displayName(fallback: "Agent")
+        return TabView(selection: $selection) {
             ChatView(notifiedSessionID: $notifiedSessionID)
                 .tabItem {
-                    Label("Chat", systemImage: "bubble.left.and.bubble.right")
+                    Label(ShellSurface.chat.title(agentName: agentName, simple: true), systemImage: ShellSurface.chat.firstPage.systemImage)
                     .environment(\.symbolVariants, .none)
                 }
-                .tag(Tab.chat)
-
-            ActivityView(
-                navigationTarget: $activityNavigationTarget,
-                cardTarget: $activityCardID
-            )
-                .environment(inboxStore)
-                .tabItem {
-                    Label("Today", systemImage: "sun.max")
-                    .environment(\.symbolVariants, .none)
-                }
-                .badge(activityBadgeCount.flatMap { $0 > 0 ? String($0) : nil })
-                .tag(Tab.activity)
+                .tag(ShellSurface.chat)
 
             NavigationStack {
-                // Directed work stays inside More's navigation stack; the Desk tab owns the canonical board.
-                MobileFacePage(page: "desk", style: .root)
+                MobileFacePage(page: "desk", style: .root, openToday: showToday)
+                    .navigationDestination(isPresented: $opensToday) {
+                        ActivityView(navigationTarget: $activityNavigationTarget, cardTarget: $activityCardID)
+                    }
+            }
+            .environment(inboxStore)
+            .macSyncErrorBanner()
+            .tabItem {
+                Label(ShellSurface.desk.title(agentName: agentName, simple: true), systemImage: "rectangle.3.group")
+                    .environment(\.symbolVariants, .none)
+            }
+            .badge(activityBadgeCount.flatMap { $0 > 0 ? String($0) : nil })
+            .tag(ShellSurface.desk)
+
+            NavigationStack { AdvancedView(isAgent: true, opensMemories: $opensMemories, localDestination: $agentDestination) }
+                .macSyncErrorBanner()
+                .tabItem {
+                    Label(ShellSurface.agent.title(agentName: agentName), systemImage: "person.crop.circle")
+                    .environment(\.symbolVariants, .none)
+                }
+                .tag(ShellSurface.agent)
+
+            NavigationStack {
+                SettingsViewFull(presentation: .root, showAdvanced: {
+                    advancedDestination = nil
+                    opensAdvanced = true
+                })
+                    .navigationDestination(isPresented: $opensAdvanced) {
+                        AdvancedView(localDestination: $advancedDestination)
+                            .task { await sync.refreshSnapshotGroup(.advanced) }
+                    }
             }
                 .macSyncErrorBanner()
                 .tabItem {
-                    Label("Desk", systemImage: "rectangle.3.group")
+                    Label(ShellSurface.control.title(agentName: agentName), systemImage: "gearshape")
                     .environment(\.symbolVariants, .none)
                 }
-                .tag(Tab.desk)
-
-            NavigationStack { SettingsViewFull(presentation: .root) }
-                .macSyncErrorBanner()
-                .tabItem {
-                    Label("Settings", systemImage: "gearshape")
-                    .environment(\.symbolVariants, .none)
-                }
-                .tag(Tab.settings)
-
-            AdvancedView(opensMemories: $opensMemories)
-                .tabItem {
-                    Label("More", systemImage: "ellipsis.circle")
-                    .environment(\.symbolVariants, .none)
-                }
-                .tag(Tab.more)
+                .tag(ShellSurface.control)
         }
         .tint(HazeColor(stored: hazeColorRaw).control(dark: colorScheme == .dark, labelled: false))
         .environment(\.symbolVariants, .none)
@@ -267,29 +282,33 @@ struct ContentView: View {
         }
     }
 
-    private static func tab(forScreen screen: String) -> Tab? {
-        switch screen.lowercased() {
-        case "chat": return .chat
-        case "memories", "memory": return .more
-        case "desk": return .desk
-        case "skills": return .more
-        case "settings": return .settings
-        case "more": return .more
-        case "mac_integration", "macintegration", "mac-integration": return .more
-        case "activity", "approvals", "inbox": return .activity
-        default: return nil
+    private static func opensAdvanced(forScreen screen: String) -> Bool {
+        ["more", "advanced", "mac_integration", "macintegration", "mac-integration", "diagnostics"].contains(screen)
+    }
+
+    private static func surface(forScreen screen: String) -> ShellSurface? {
+        switch screen {
+        case "memories", "memory", "skills": .agent
+        case "settings", "more", "advanced", "mac_integration", "macintegration", "mac-integration", "diagnostics": .control
+        case "activity", "approvals", "inbox", "today": .desk
+        default: ShellSurface.named(screen)
         }
     }
 
     @MainActor
     private func openActivityFromNotification(_ destination: NativeAgentNotificationLaunchIntent) {
-        let screen = destination.screen
-        let target = Self.tab(forScreen: screen) ?? .activity
-        if ["memory", "memories"].contains(screen.lowercased()) { opensMemories = true }
+        let screen = destination.screen.lowercased()
+        let target = Self.surface(forScreen: screen) ?? .desk
+        if ["memory", "memories"].contains(screen) { opensMemories = true }
+        if target == .control {
+            advancedDestination = screen == "diagnostics" ? .diagnostics : nil
+            opensAdvanced = Self.opensAdvanced(forScreen: screen)
+        }
         notifiedSessionID = destination.sessionID
-        activityNavigationTarget = target == .activity
-            ? ActivityScreenPresentation.activityDestination(for: screen)
-            : nil
+        if target == .desk {
+            activityNavigationTarget = ActivityScreenPresentation.activityDestination(for: screen)
+            opensToday = screen != "desk" && screen != "table"
+        }
         selection = target
 
         notificationOpenRefreshTask?.cancel()

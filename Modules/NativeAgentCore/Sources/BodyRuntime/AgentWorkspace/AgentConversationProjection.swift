@@ -6,8 +6,8 @@ import MindCore
 import MacNerves
 import NativeAgentCore
 import NativeAgentShared
-import os
 import PersistenceCore
+import os
 // Blueprint: | `AgentConversationProjection.swift` | `AgentConversationRecord`, `sendEvidence`, `sendStatus`, `sendFailed`, `sendReceipt`, `AgentConversationExchange.messageID`, `nextReadAt`, `ContactThread.project` |
 // nextReadAt bounds eligible read/delivery scheduling, never reply lifetime.
 // Resumable work retains DataRootLife; other-life work reads stopped/restored, and selected history failures stay unavailable.
@@ -236,6 +236,7 @@ public struct AgentConversationExchange: Codable, Sendable, Equatable {
     /// Bind the protocol's opaque message identity once; it is independent of the operation UUID.
     public var messageID: String?
     public var sentAt: Date
+    var scopeSessionID: String?
     public var prompt: String?
     public var reply: String?
     /// Keep the shelf binding across subsequent sends.
@@ -304,20 +305,41 @@ extension ContactThread {
     /// agent's turn on one of its replies is its own: it went nowhere.
     public static func mergedLines(dataRoot: URL, owner: String, tailBytes: Int? = nil, identity: AgentContactIdentity,
                                    transcripts: [(String, URL)]? = nil) throws -> [Line] {
+        try mergedTranscript(dataRoot: dataRoot, owner: owner, tailBytes: tailBytes, identity: identity, transcripts: transcripts).lines
+    }
+
+    struct Transcript: Sendable {
+        var lines: [Line]
+        var withheldSends: Set<String?> = []
+        var withheldAnswers: Set<String?> = []
+    }
+
+    static func mergedTranscript(dataRoot: URL, owner: String, tailBytes: Int? = nil, identity: AgentContactIdentity,
+                                 transcripts: [(String, URL)]? = nil) throws -> Transcript {
         let owners = identity.owners(owner)
         var seen: Set<String> = []
-        return try owners.flatMap { door -> [Line] in
-            try lines(dataRoot: dataRoot, owner: door, tailBytes: tailBytes, transcripts: transcripts).map { line in
+        var result = Transcript(lines: [])
+        for door in owners {
+            let snapshot = try transcript(dataRoot: dataRoot, owner: door, tailBytes: tailBytes, transcripts: transcripts)
+            result.withheldSends.formUnion(snapshot.withheldSends)
+            result.withheldAnswers.formUnion(snapshot.withheldAnswers)
+            result.lines += snapshot.lines.map { line in
                 var line = line
                 // The door a contact's line came through is the one its own row attests.
                 if owners.count > 1 { line.door = line.source.flatMap { identity.doors[$0] } }
                 return line
             }
-        }.sorted { $0.at < $1.at }.filter { seen.insert($0.id).inserted }
+        }
+        result.lines = result.lines.sorted { $0.at < $1.at }.filter { seen.insert($0.id).inserted }
+        return result
     }
 
     /// Exact route history; directory counts must not include another door.
     public static func lines(dataRoot: URL, owner: String, tailBytes: Int? = nil, transcripts: [(String, URL)]? = nil) throws -> [Line] {
+        try transcript(dataRoot: dataRoot, owner: owner, tailBytes: tailBytes, transcripts: transcripts).lines
+    }
+
+    private static func transcript(dataRoot: URL, owner: String, tailBytes: Int?, transcripts: [(String, URL)]?) throws -> Transcript {
         let ownerPrefix = prefix(owner: owner)
         let plan = try transcripts?.filter { $0.0.hasPrefix(ownerPrefix) }
             ?? ChatSessionRetention.transcriptFiles(dataRoot: dataRoot, prefix: ownerPrefix,
@@ -325,7 +347,7 @@ extension ContactThread {
         let key = "\(dataRoot.path)|\(owner)|\(tailBytes.map(String.init) ?? "")"
         let paths = plan.map(\.1) + [ContactReplyReads.url(dataRoot)]
         let stamp = paths.map { fileStamp($0.path) }
-        if !stamp.contains(nil), let hit = cache.withLock({ $0[key] }), hit.paths == paths, hit.stamp == stamp { return hit.lines }
+        if !stamp.contains(nil), let hit = cache.withLock({ $0[key] }), hit.paths == paths, hit.stamp == stamp { return hit.transcript }
         let fetched = try ContactReplyReads.read(dataRoot).filter { $0.final == true }
         var rows: [Line] = []
         for (session, file) in plan {
@@ -344,13 +366,24 @@ extension ContactThread {
                 rows.append(line)
             }
         }
-        let result = project(rows, style: .thread, thread: owner).sorted { $0.at < $1.at }
+        let lines = project(rows, style: .thread, thread: owner).sorted { $0.at < $1.at }
+        let sends = Set(lines.compactMap(\.sendID)), answers = Set(lines.compactMap(\.answers))
+        var withheldSends: Set<String?> = [], withheldAnswers: Set<String?> = []
+        for row in rows {
+            if let id = row.sendID, !sends.contains(id) { withheldSends.insert(id) }
+            if let id = row.answers, !answers.contains(id) { withheldAnswers.insert(id) }
+            if row.provenanceFailure != nil {
+                if row.mine, row.sendID == nil { withheldSends.insert(nil) }
+                if !row.mine, row.answers == nil { withheldAnswers.insert(nil) }
+            }
+        }
+        let result = Transcript(lines: lines, withheldSends: withheldSends, withheldAnswers: withheldAnswers)
         cache.withLock { $0[key] = (paths, stamp, result) }
         return result
     }
 
     /// Cache each owner's transcript lines until a session or reply file changes.
-    private static let cache = Mutex<[String: (paths: [URL], stamp: [SnapshotTailOpLog.FileStamp?], lines: [Line])]>([:])
+    private static let cache = Mutex<[String: (paths: [URL], stamp: [SnapshotTailOpLog.FileStamp?], transcript: Transcript)]>([:])
 
     private static func fileStamp(_ path: String) -> SnapshotTailOpLog.FileStamp? {
         var info = stat()

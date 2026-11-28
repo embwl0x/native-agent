@@ -4,59 +4,8 @@ import Foundation
 import PersistenceCore
 import NativeAgentCore
 import Synchronization
-// Blueprint: | `DeskArchiveQueries.swift` | Locked hierarchy queries and deepest-first archival. Each durable receipt precedes its item's removal and is replaced on retry. |
+// Blueprint: | `DeskArchiveQueries.swift` | Locked hierarchy queries and archive reads; carried settlement can update an existing archive receipt. |
 extension SwiftNativeDeskStore {
-    /// Archive only finished non-standing subtrees: summaries cannot recover unfinished work.
-    /// The ops flock keeps validation and deepest-first writes together so no live child is orphaned.
-    @discardableResult
-    public func archiveItem(_ handle: String) async throws -> ArchiveRecord {
-        return try await SwiftNativePersistenceCore.withFileLock(opsPath) {
-            var feed = try await readFeedUnlocked()
-            let state = Self.compact(base: feed.base, feed.ops)
-            guard let item = state.items.first(where: { $0.handle == handle }) else {
-                throw DeskError.unknownHandle(handle)
-            }
-            if item.kind == .standing {
-                throw DeskError.archiveRefusedStanding(handle: handle)
-            }
-            // Validate the whole subtree so archiving cannot orphan a live descendant.
-            let subtree = Self.descendants(of: handle, in: state)
-            if let standing = subtree.first(where: { $0.kind == .standing }) {
-                throw DeskError.archiveRefusedStanding(handle: standing.handle)
-            }
-            if !item.status.isTerminal {
-                throw DeskError.archiveRefusedNonTerminalSelf(handle: handle, status: item.status)
-            }
-            if let nonTerminal = subtree.first(where: { !$0.status.isTerminal }) {
-                throw DeskError.archiveRefusedNonTerminalChild(handle: handle, childHandle: nonTerminal.handle)
-            }
-            if let unresolved = ([item] + subtree).first(where: { !($0.continuation?.pending.isEmpty ?? true) }) {
-                throw DeskError.archiveRefusedUnresolvedContinuation(handle: unresolved.handle)
-            }
-            let now = DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
-            // A handle's receipt is the outcome at the archive that removed it: one left by an interrupted archive is replaced, never kept.
-            let archived = try await self.archivedRecords()
-            let target = Self.makeArchiveRecord(item, now: now)
-            let records = subtree.reversed().map { Self.makeArchiveRecord($0, now: now) } + [target]
-            // Finish each item's removal before staging the next receipt on the archive shelf.
-            for record in records {
-                let stored = archived.filter { $0.handle == record.handle }
-                if stored.isEmpty {
-                    try await appendJSONLCapped(
-                        record.toJSON(), to: archivePath, maxLines: JSONLLineCaps.deskArchive,
-                        logLabel: SwiftNativeDeskStore.logLabel,
-                        takeLock: false,
-                        durable: true
-                    )
-                } else if stored != [record] {
-                    try await replaceArchiveRecord(record)
-                }
-                let op = DeskOp(handle: record.handle, body: .archiveItem)
-                feed = try await commitUnlocked([op], feed: feed).feed
-            }
-            return target
-        }
-    }
     /// Durably rewrite the archive with `record` in place of every receipt for its handle. The caller holds the ops flock.
     private func replaceArchiveRecord(_ record: ArchiveRecord) async throws {
         let replacement = record.toJSON()
@@ -367,24 +316,5 @@ extension SwiftNativeDeskStore {
             current = item.parent
         }
         return nil
-    }
-    static func makeArchiveRecord(_ item: DeskItem, now: String) -> ArchiveRecord {
-        var refs = item.liveRefs(limit: 3)
-        if let captured = item.refs.last(where: { if case .step(let step) = $0.kind { return !step.promiseCaptures.isEmpty }; return false }),
-           !refs.contains(where: { $0.refId == captured.refId }) { refs.append(captured) }
-        return ArchiveRecord(
-            handle: item.handle,
-            title: item.title,
-            project: item.project,
-            finalStatus: (item.status == .canceled) ? .canceled : .done,
-            openedAt: item.openedAt,
-            closedAt: item.closedAt ?? now,
-            summary: item.summary ?? "",
-            refs: refs,
-            decisions: [],
-            artifacts: [],
-            findingKey: item.findingKey,
-            carriedNotes: item.notes.filter { $0.carriedOccurrence != nil }
-        )
     }
 }

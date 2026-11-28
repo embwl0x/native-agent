@@ -17,7 +17,7 @@ extension NativeCognitionRuntime {
     private func currentPursuitIntent(now: Date) -> (activeTask: String, goal: String)? {
         guard !isAdmissionClosed, pursuitReadRevision == SwiftNativeDeskStore.currentRevision else { return nil }
         let best = pursuitCandidates
-            .filter { $0.isPursuit && !$0.status.isTerminal }
+            .filter { $0.isPursuit && !$0.status.isTerminal && $0.step?.causalWait == nil }
             .prefix(Self.maximumPursuitCandidates)
             .compactMap { item in DeskPursuitChoice.score(for: item, now: now).map { (item, $0.total) } }
             .max { $0.1 < $1.1 }
@@ -77,7 +77,12 @@ extension NativeCognitionRuntime {
                 await AdaptiveMemoryPromoter.shared.drainOwedMomentsAtWake()
             }
         }
-        await OneClock.at(dataRoot).handle(MyQueueReady.owner) { [weak self] time, _ in
+        await OneClock.at(dataRoot).handle(MyQueueReady.owner) { [weak self] time, occurrence in
+            if let handle = time.payload?.objectValue?["causalHandle"]?.stringValue,
+               let since = time.payload?.objectValue?["since"]?.stringValue {
+                await self?.releaseCausalMoments(.time(handle: handle, since: since, occurrence: occurrence))
+                return
+            }
             await self?.startPursuitRefresh()
             if time.id == MyQueueReady.owner + ":owed" { await self?.reofferQueueMoments() }
         }
@@ -144,6 +149,91 @@ extension NativeCognitionRuntime {
         }
     }
 
+    enum CausalEdge: Sendable {
+        case time(handle: String, since: String, occurrence: Date)
+        case happening(Experience)
+        case desk(changed: Set<String>)
+    }
+
+    func releaseCausalMoments(_ edge: CausalEdge) async {
+        guard !isAdmissionClosed, !Task.isCancelled else { return }
+        let revision = SwiftNativeDeskStore.currentRevision
+        let store = SwiftNativeDeskStore(dataRoot: dataRoot)
+        do {
+            let items: [DeskItem]
+            if pursuitReadRevision == revision {
+                items = pursuitCandidates
+            } else {
+                items = try await store.liveState().items
+            }
+            let at = now()
+            let candidates = items.compactMap(MyQueue.causalEntry).filter { !MyQueue.isOver($0, at: at) }
+            guard !candidates.isEmpty else { return }
+            let targets: [String: DeskItem]
+            let archive: [String: ArchiveRecord]
+            if case .desk(let changed) = edge {
+                targets = Dictionary(items.filter { changed.contains($0.handle) }.map { ($0.handle, $0) },
+                    uniquingKeysWith: { first, _ in first })
+                if changed.contains(where: { targets[$0] == nil }) {
+                    archive = Dictionary(try await store.archivedRecords().map { ($0.handle, $0) },
+                        uniquingKeysWith: { _, last in last })
+                } else { archive = [:] }
+            } else {
+                targets = [:]
+                archive = [:]
+            }
+            var plan: DeskSequencing.Plan?
+            for entry in candidates {
+                guard !isAdmissionClosed, !Task.isCancelled,
+                      let wait = entry.step.causalWait, let filed = DeskClock.parseISO(wait.since) else { return }
+                let cause: String, result: String
+                var source: String?
+                var sources = entry.step.peers + entry.step.elevated
+                switch (wait.trigger, edge) {
+                case let (.at(date), .time(handle, since, occurrence))
+                    where handle == entry.item.handle && since == wait.since && date == occurrence && at >= date:
+                    cause = since
+                    result = since
+                case let (.happening(kind, subject), .happening(experience)):
+                    guard var happening = experience.happening, happening.kind == kind, happening.subject == subject,
+                          DeskClock.parseISO(experience.at).map({ $0 > filed }) == true else { continue }
+                    cause = experience.id
+                    source = experience.id
+                    sources += (happening.peers ?? []) + (happening.elevated ?? []) + (experience.steeredBy ?? [])
+                    happening.once = ""
+                    result = try JSONValue.fromEncodable(happening).serializedSHA256()
+                case let (.desk(handle), .desk(changed)):
+                    guard changed.contains(handle) else { continue }
+                    if let target = targets[handle] {
+                        cause = target.updatedAt
+                        result = try MyQueue.deskResult(target)
+                    } else if let target = archive[handle] {
+                        cause = target.closedAt
+                        result = MyQueue.deskTerminalResult(target.finalStatus.rawValue)
+                    } else { continue }
+                    guard DeskClock.parseISO(cause).map({ $0 > filed }) == true else { continue }
+                default: continue
+                }
+                if plan == nil { plan = DeskSequencing.compute(DeskState(items: items, generatedTs: ""), now: at) }
+                guard plan?.byHandle[entry.item.handle]?.isReady == true else { continue }
+                let root = dataRoot, item = entry.item
+                let prefix = MyQueue.causalPrefix(item.handle, wait)
+                let key = "queue:" + item.handle
+                let line = MyQueueReady.line(item, at: at, dataRoot: root)
+                let evidence = source.map { " Record: " + $0 + "." } ?? ""
+                let moment = Happening(.moment, subject: key, door: key, who: "self", words: line.head,
+                    once: prefix + SHA256Hex.of(utf8: cause), peers: Array(Set(sources)).sorted(),
+                    shows: "What you waited for came: \(wait.trigger.words)." + evidence + " " + line.rest)
+                await Attention.postCausalMoment(moment, prefix: prefix, result: result, baseline: wait.baseline,
+                                                 source: source, dataRoot: root).value
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            owe("causal", MyQueueReady.owner, "A declared cause could not be checked: " + error.localizedDescription)
+        }
+    }
+
     /// A line of news that touches a step waiting on news releases it: the release is the step's own Desk note, and the read that follows posts its
     /// moment. Each touching line is its own release.
     func releaseNewsIntentions(touchedBy line: String, watch: String) async {
@@ -182,6 +272,7 @@ extension NativeCognitionRuntime {
         let root = dataRoot, clock = now
         var published = false
         var signals: [(String, SomaticSignalKind)] = []
+        var changedDeskTargets: Set<String> = []
         let snapshot = await pursuitRead.read({
             let task = Task.detached(priority: .utility) {
                 // A commit during replay invalidates the read rather than relabelling it.
@@ -196,6 +287,13 @@ extension NativeCognitionRuntime {
                         context = try await AgentScreen.queueContext(items: state.items, dataRoot: root, now: clock(), ownTurn: true)
                     } else { context = nil }
                     conditionsFailure = nil
+                    // A clean read is the repair: the debt a failed read opened does not outlive it. Settling appends only where one is open.
+                    if state != nil {
+                        try? await RepairOwed.settle(ExperienceStore.at(root), operation: "queue.conditions",
+                            evidence: .init(source: "desk", id: String(describing: revision)))
+                    }
+                } catch is CancellationError {
+                    context = nil; conditionsFailure = nil
                 } catch {
                     context = nil
                     conditionsFailure = "queue conditions are unavailable: " + error.localizedDescription
@@ -215,14 +313,22 @@ extension NativeCognitionRuntime {
             pursuitReadRevision = nil
             guard !isAdmissionClosed, snapshot.revision == SwiftNativeDeskStore.currentRevision,
                   let state = snapshot.state else { return }
-            let before = Dictionary(pursuitCandidates.filter { !$0.status.isTerminal }.map { ($0.handle, $0) },
-                uniquingKeysWith: { first, _ in first })
+            let before = Dictionary(pursuitCandidates.map { ($0.handle, $0) }, uniquingKeysWith: { first, _ in first })
+            let watched = Set(state.items.compactMap { item -> String? in
+                guard let entry = MyQueue.causalEntry(item), case .desk(let handle)? = entry.step.causalWait?.trigger else { return nil }
+                return handle
+            })
+            if !watched.isEmpty {
+                let live = Dictionary(state.items.filter { watched.contains($0.handle) }.map { ($0.handle, $0.updatedAt) },
+                    uniquingKeysWith: { first, _ in first })
+                changedDeskTargets = Set(watched.filter { before.isEmpty || before[$0]?.updatedAt != live[$0] })
+            }
             pursuitCandidates = state.items
             pursuitCarriedContext = snapshot.context
             pursuitReadRevision = snapshot.revision
             published = true
             for item in state.items {
-                let wasCarried = before[item.handle].map(Self.carries) == true
+                let wasCarried = before[item.handle].map { !$0.status.isTerminal && Self.carries($0) } == true
                 guard Self.carries(item) || wasCarried else { continue }
                 if item.status.isTerminal || !Self.carries(item) {
                     if wasCarried && item.status.isTerminal {
@@ -237,6 +343,7 @@ extension NativeCognitionRuntime {
         })
         if published {
             await carriedConditionsChanged()
+            if !changedDeskTargets.isEmpty { await releaseCausalMoments(.desk(changed: changedDeskTargets)) }
             for (handle, kind) in signals {
                 await ingestOrganismSignal(kind: kind, sourceOrgan: "carry." + handle,
                     metadata: ["predictionCorrelationId": .string(handle)],
@@ -316,10 +423,13 @@ extension NativeCognitionRuntime {
         context.now = at
         let store = SwiftNativeDeskStore(dataRoot: root)
         for entry in items.compactMap(MyQueue.entry) where MyQueue.isOver(entry, at: at) {
+            guard !isAdmissionClosed, !Task.isCancelled else { return }
             do {
                 try await MyQueue.finish(entry, dropped: false, why: "its time ran out (until \(entry.step.until ?? ""))", store: store)
             } catch is MyQueue.Superseded {
                 // The step changed or closed first; the Desk read that change triggers takes it.
+            } catch is CancellationError {
+                return
             } catch {
                 owe("expiry", entry.item.handle, "Its time ran out, but it could not be closed: " + error.localizedDescription)
             }
@@ -518,6 +628,8 @@ extension NativeCognitionRuntime {
             } else {
                 await settle { await self.settleCarriedDelivery(entry, once: once, words: nil, habitNote: note, at: at) }
             }
+        } catch is CancellationError {
+            return
         } catch {
             owe("habit", handle, "Its habit needs reconciliation: " + error.localizedDescription)
         }
@@ -630,13 +742,16 @@ extension NativeCognitionRuntime {
         }
     }
 
-    /// Each open step's next time, the agent's next free time when work waits for it, and the next offer of a moment still owed to her (1, 1, 2, 4,
-    /// 8, 16, then every 30 minutes from its birth) are MY QUEUE's times on the one clock; a time whose step closed or changed, or with nothing
-    /// owed, is withdrawn. Each time is kept or reported on its own.
     private func keepTimes(_ items: [DeskItem], at: Date, freeAt: Date?) async {
         let clock = OneClock.at(dataRoot)
         var wanted: [String: OneClock.Time] = [:]
         for item in items {
+            if let entry = MyQueue.causalEntry(item), let wait = entry.step.causalWait,
+               case .at(let date) = wait.trigger, !MyQueue.isOver(entry, at: at) {
+                let id = MyQueueReady.causalTime(item.handle)
+                wanted[id] = OneClock.Time(id: id, next: date,
+                    payload: .object(["causalHandle": .string(item.handle), "since": .string(wait.since)]))
+            }
             guard let next = MyQueueReady.next(item, after: at) else { continue }
             let id = MyQueueReady.time(item.handle)
             wanted[id] = OneClock.Time(id: id, rhythm: MyQueueReady.rhythm(item), next: next, payload: .object(["handle": .string(item.handle)]))
@@ -644,8 +759,11 @@ extension NativeCognitionRuntime {
         if let freeAt { wanted[MyQueueReady.freeTime] = OneClock.Time(id: MyQueueReady.freeTime, next: freeAt) }
         let owedTime = MyQueueReady.owner + ":owed"
         do {
+            let parked = Set(items.filter { $0.step?.causalWait != nil }.map { "queue:" + $0.handle })
             let offers = try await Attention.owed(dataRoot: dataRoot).filter {
-                $0.happening?.kind == .moment && $0.happening?.subject.hasPrefix("queue:") == true
+                guard let happening = $0.happening else { return false }
+                return happening.kind == .moment && happening.subject.hasPrefix("queue:")
+                    && !MyQueue.isCausalMoment(happening) && !parked.contains(happening.subject)
             }.compactMap { NativeTimestampFormat.parseISO8601FractionalFirst($0.at) }.map { born in
                 var offset: TimeInterval = 60
                 while born + offset <= at { offset += min(offset, 1800) }

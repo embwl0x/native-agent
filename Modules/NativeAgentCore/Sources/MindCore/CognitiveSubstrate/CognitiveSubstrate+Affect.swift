@@ -231,9 +231,10 @@ extension CognitiveSubstrate {
         // Measured feeling takes no inferred per-kind delta; applying both would count one experience twice.
         guard !event.carriesMeasuredFeltValence else { return affect }
         let now = dependencies.now()
+        let dyn = dynamics
         // Settle elapsed quiet time on a copy before folding in the new event. This keeps the merge boundary correct even when no maintenance tick occurred
         // during the gap; the projection itself never mutates state.
-        var next = projectedAffect(at: now)
+        var next = projectedAffect(at: now, dynamics: dyn)
         switch event.kind {
         case .toolFailed, .toolStarted, .toolSucceeded, .toolCancelled, .providerFailure, .providerVitalsShift:
             // Dispatch traffic neither doses feeling nor spends dream residue.
@@ -242,15 +243,22 @@ extension CognitiveSubstrate {
             // Body chemistry already carries the resolution; retaining its node must not apply a second affect hit.
             break
         case .userCorrection, .userMessageReceived:
-            // Warmth modulates the persona baseline only for received warmth; focused work decays that modulation without erasing the baseline.
-            next.socialWarmth = saturatingApproach(next.socialWarmth, precomputedWarmthBoost)
-            // Conversational appraisal moves felt signals for good and bad exchanges; dismissal can make warmth negative.
+            next.socialWarmth = saturatingApproach(next.socialWarmth, precomputedWarmthBoost, floor: -1)
             let appraisal = precomputedAppraisal
             if appraisal.isActive {
-                if appraisal.warmth != 0 { next.socialWarmth = saturatingApproach(next.socialWarmth, appraisal.warmth) }
+                if appraisal.warmth != 0 { next.socialWarmth = saturatingApproach(next.socialWarmth, appraisal.warmth, floor: -1) }
                 if appraisal.tension != 0 { next.uncertainty = saturatingApproach(next.uncertainty, appraisal.tension) }
                 if appraisal.pressure != 0 { next.taskPressure = saturatingApproach(next.taskPressure, appraisal.pressure) }
                 if appraisal.arousal != 0 { next.arousal = saturatingApproach(next.arousal, appraisal.arousal) }
+            }
+            if let feeling = appraisal.feeling {
+                let age = max(0, now.timeIntervalSince(event.occurredAt))
+                let strength = feeling.strength * pow(0.5, age / dyn.moodRecencyHalfLife)
+                if next.namedFeeling.map({ $0.name == feeling.name || strength >= $0.strength }) ?? true {
+                    next.namedFeeling = strength >= CognitiveAffectState.NamedFeeling.retentionFloor
+                        ? .init(name: feeling.name, strength: strength, at: event.occurredAt)
+                        : nil
+                }
             }
         case .assistantTurnCompleted:
             // Speaking establishes no landing. The person's response and the agent's appraised care movements supply it.
@@ -316,7 +324,7 @@ extension CognitiveSubstrate {
             applied += 1
             let pull = Self.refeelNudge * node.emotionalValence.clampedSigned()
             if pull > 0 {
-                next.socialWarmth = saturatingApproach(next.socialWarmth, pull * node.emotionalWarmth)
+                next.socialWarmth = saturatingApproach(next.socialWarmth, pull * node.emotionalWarmth, floor: -1)
                 next.uncertainty = saturatingApproach(next.uncertainty, -pull * 0.5)
             } else {
                 next.uncertainty = saturatingApproach(next.uncertainty, -pull * 0.6)
@@ -362,7 +370,7 @@ extension CognitiveSubstrate {
         guard lean != 0 else { return state }
         var next = state
         if lean > 0 {
-            next.socialWarmth = saturatingApproach(next.socialWarmth, lean)
+            next.socialWarmth = saturatingApproach(next.socialWarmth, lean, floor: -1)
             next.uncertainty = saturatingApproach(next.uncertainty, -lean * 0.5)
         } else {
             next.uncertainty = saturatingApproach(next.uncertainty, -lean)
@@ -424,19 +432,96 @@ extension CognitiveSubstrate {
             updatedAt: updatedAt,
             lived: object["lived"]?.stringValue.flatMap(UInt64.init)
                 ?? UInt64(max(0, object["lived"]?.integerValue.flatMap(Int.init(exactly:)) ?? 0)),
-            chosenRegister: object["chosenRegister"].flatMap(CognitiveChosenRegister.init(payload:))
+            chosenRegister: object["chosenRegister"].flatMap(CognitiveChosenRegister.init(payload:)),
+            namedFeeling: object["namedFeeling"].flatMap(CognitiveAffectState.NamedFeeling.init(payload:))
         )
         lastUserPresenceAt = dateValue(object["lastUserPresenceAt"])
         lastWarmPresenceAt = dateValue(object["lastWarmPresenceAt"])
     }
 
-    /// Arousal fades over minutes and warmth over hours so alertness can settle without losing relational continuity.
+    private func affectRecoveryDelays(
+        from start: Date, quietFrom quietStart: Date, to now: Date, floor: Double
+    ) -> (base: TimeInterval, quiet: TimeInterval) {
+        guard now > start else { return (0, 0) }
+        let halfLife: TimeInterval = 4 * 3_600
+        let fadeRate = log(2.0) / halfLife
+        let maximumSlowdown = 0.25
+        var movements: [(careID: UUID, at: Date, moved: Double)] = []
+        for care in cares.values where care.fadedAt == nil && care.mergedInto == nil {
+            for moment in care.story where moment.at < now && (moment.moved <= -floor || moment.moved > 0)
+                && Self.feltOwnMovement(moment) {
+                movements.append((care.id, moment.at, moment.moved))
+            }
+        }
+        movements.sort {
+            if $0.at != $1.at { return $0.at < $1.at }
+            return $0.moved > 0 && $1.moved < 0
+        }
+
+        func floorDate(for magnitude: Double, at: Date) -> Date {
+            at.addingTimeInterval((log(magnitude) - log(floor)) / fadeRate)
+        }
+        func magnitude(at time: Date, floorAt: Date) -> Double {
+            floor * exp(fadeRate * floorAt.timeIntervalSince(time))
+        }
+
+        var hurts: [(careID: UUID, floorAt: Date)] = []
+        var anchor = movements.first?.at ?? now
+        var baseDelay = 0.0
+        var quietDelay = 0.0
+        func integrate(until end: Date) {
+            anchor = max(anchor, min(start, end))
+            while anchor < end {
+                hurts.removeAll { $0.floorAt <= anchor }
+                guard hurts.count > 1 else { break }
+                var boundary = end
+                var total = 0.0
+                var strongest = 0.0
+                for hurt in hurts {
+                    let strength = magnitude(at: anchor, floorAt: hurt.floorAt)
+                    total += strength
+                    strongest = max(strongest, strength)
+                    boundary = min(boundary, hurt.floorAt)
+                }
+                let strain = total - strongest
+                let endWeight = log1p(strain * exp(-fadeRate * boundary.timeIntervalSince(anchor)))
+                func delay(from beginning: Date) -> TimeInterval {
+                    let offset = beginning.timeIntervalSince(anchor)
+                    let startWeight = log1p(strain * exp(-fadeRate * offset))
+                    return (maximumSlowdown / fadeRate) * (startWeight - endWeight)
+                }
+                baseDelay += delay(from: anchor)
+                if quietStart < boundary { quietDelay += delay(from: max(anchor, quietStart)) }
+                anchor = boundary
+            }
+            anchor = end
+        }
+
+        for (careID, at, moved) in movements {
+            integrate(until: at)
+            hurts.removeAll { $0.floorAt < at }
+            if moved < 0 {
+                hurts.append((careID, floorDate(for: -moved, at: at)))
+                continue
+            }
+            var glad = moved
+            hurts = hurts.compactMap { hurt in
+                guard hurt.careID == careID, glad > 0 else { return hurt }
+                let remaining = magnitude(at: at, floorAt: hurt.floorAt) - glad
+                glad = max(0, -remaining)
+                return remaining >= floor ? (careID, floorDate(for: remaining, at: at)) : nil
+            }
+        }
+        integrate(until: now)
+        return (baseDelay, quietDelay)
+    }
 
     /// Decay an affect state to `now` using per-axis half-lives. Centralizes the decay math used by the pure live projection and persisted checkpoints.
     private func decayedAffect(
         _ state: CognitiveAffectState,
         to now: Date,
-        dynamics capturedDynamics: PersonalityDynamicsConfiguration?
+        recoveryDelay: TimeInterval,
+        dynamics dyn: PersonalityDynamicsConfiguration
     ) -> CognitiveAffectState {
         let elapsed = max(0, now.timeIntervalSince(state.updatedAt))
         guard elapsed > 0 else {
@@ -444,35 +529,34 @@ extension CognitiveSubstrate {
             carried.updatedAt = now
             return carried
         }
-        func decay(_ halfLife: TimeInterval) -> Double { pow(0.5, elapsed / halfLife) }
-        let dyn = capturedDynamics ?? dynamics
+        func decay(_ halfLife: TimeInterval, delay: TimeInterval = 0) -> Double {
+            pow(0.5, (elapsed - delay) / halfLife)
+        }
         return CognitiveAffectState(
             arousal: state.arousal * decay(dyn.arousalHalfLife),
-            uncertainty: state.uncertainty * decay(dyn.uncertaintyHalfLife),
-            taskPressure: state.taskPressure * decay(dyn.taskPressureHalfLife),
+            uncertainty: state.uncertainty * decay(dyn.uncertaintyHalfLife, delay: recoveryDelay),
+            taskPressure: state.taskPressure * decay(dyn.taskPressureHalfLife, delay: recoveryDelay),
             socialWarmth: state.socialWarmth * decay(dyn.socialWarmthHalfLife),
             updatedAt: now,
             lived: state.lived,
-            chosenRegister: state.chosenRegister
+            chosenRegister: state.chosenRegister,
+            namedFeeling: state.namedFeeling.flatMap { feeling in
+                var decayed = feeling
+                decayed.strength *= decay(dyn.moodRecencyHalfLife)
+                return decayed.strength >= CognitiveAffectState.NamedFeeling.retentionFloor ? decayed : nil
+            }
         )
     }
 
     /// Use remaining headroom so sustained input settles below the ceiling while stronger moments can still register.
-    private func saturatingApproach(_ value: Double, _ delta: Double) -> Double {
-        let v = (value).clamped01()
-        if delta >= 0 {
-            return (v + delta * (1 - v)).clamped01()
-        } else {
-            return (v + delta * v).clamped01()
-        }
+    private func saturatingApproach(_ value: Double, _ delta: Double, floor: Double = 0) -> Double {
+        let v = min(1, max(floor, value))
+        let headroom = delta >= 0 ? 1 - v : v - floor
+        return min(1, max(floor, v + delta * headroom))
     }
 
     /// Quiet must last this long before ambient presence applies.
     private static let ambientPresenceGap: TimeInterval = 30 * 60
-    /// Hold a quiet-presence floor during the user's absence.
-    private static let ambientPresenceWarmthBase: Double = 0.18
-    /// The floor itself fades over a long absence so it never becomes permanent fake warmth.
-    private static let ambientPresenceFloorHalfLife: TimeInterval = 12 * 60 * 60
     /// Elapsed quiet time determines calm independently of scheduler ticks: 0.95 per five minutes is a 67.56-minute half-life.
     private static let ambientQuietCalmingHalfLife: TimeInterval =
         (5 * 60) * log(0.5) / log(0.95)
@@ -485,32 +569,22 @@ extension CognitiveSubstrate {
     ) -> CognitiveAffectState {
         guard configuration.enabled else { return affect }
         let source = affect
-        var next = decayedAffect(source, to: now, dynamics: capturedDynamics)
-        guard let lastPresence = lastUserPresenceAt else { return next }
-        let quietBoundary = lastPresence.addingTimeInterval(Self.ambientPresenceGap)
-        guard now >= quietBoundary else { return next }
-
+        let dyn = capturedDynamics ?? dynamics
         // Apply only the quiet interval not already materialized in `source`. A later maintenance/shutdown checkpoint can therefore persist this projection and
         // a subsequent read will continue from that exact anchor.
-        let quietAnchor = max(source.updatedAt, quietBoundary)
+        let quietBoundary = lastUserPresenceAt?.addingTimeInterval(Self.ambientPresenceGap)
+        let quietAnchor = max(source.updatedAt, quietBoundary ?? now)
+        let recoveryDelay = affectRecoveryDelays(
+            from: source.updatedAt, quietFrom: quietAnchor, to: now, floor: dyn.feltAmbivalenceNodeFloor)
+        var next = decayedAffect(source, to: now, recoveryDelay: recoveryDelay.base, dynamics: dyn)
+        guard let quietBoundary, now >= quietBoundary else { return next }
         let quietElapsed = max(0, now.timeIntervalSince(quietAnchor))
         if quietElapsed > 0 {
-            let calmFactor = pow(0.5, quietElapsed / Self.ambientQuietCalmingHalfLife)
+            let calmFactor = pow(0.5, (quietElapsed - recoveryDelay.quiet) / Self.ambientQuietCalmingHalfLife)
             next.taskPressure *= calmFactor
             next.uncertainty *= calmFactor
         }
 
-        // Lingering warmth is anchored only by a genuinely warm user moment.
-        if let lastWarm = lastWarmPresenceAt {
-            let warmGap = now.timeIntervalSince(lastWarm)
-            if warmGap >= Self.ambientPresenceGap {
-                let warmthFloor = Self.ambientPresenceWarmthBase
-                    * pow(0.5, warmGap / Self.ambientPresenceFloorHalfLife)
-                if warmthFloor > 0.01 {
-                    next.socialWarmth = max(next.socialWarmth, warmthFloor)
-                }
-            }
-        }
         next.updatedAt = now
         return next
     }

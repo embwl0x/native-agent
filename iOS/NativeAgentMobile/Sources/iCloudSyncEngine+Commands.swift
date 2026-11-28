@@ -2,9 +2,34 @@ import Darwin
 import Foundation
 import SwiftUI
 import NativeAgentShared
-// Blueprint: | `iCloudSyncEngine+Commands.swift` | Signed subject commands, drawn-call page outcomes and read-only reconciliation |
+// Blueprint: | `iCloudSyncEngine+Commands.swift` | Signed subject and Table commands, drawn-call page outcomes and read-only reconciliation |
 
 extension iCloudSyncEngine {
+    func sendTableEdit(_ edit: TableElementEdit, openingText: String?, observeDispatch: @escaping @MainActor (String?) -> Void) async throws -> String {
+        var payload = ["id": edit.id]
+        if edit.verb == .put {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            payload["fields"] = String(decoding: try encoder.encode(edit.fields), as: UTF8.self)
+            payload["openingText"] = openingText
+        }
+        let request = InboxAction.make(action: edit.verb.rawValue, payload: payload)
+        return try await sendAction(request, observeDispatch: observeDispatch)
+    }
+
+    func tableEditVersion(_ response: [String: String]) throws -> Int? {
+        do { _ = try requireSuccessfulActionResponse(response) }
+        catch SyncError.macRejected(let message) {
+            throw WireFailure(code: response["code"] ?? "table_edit_refused", message: message, cause: nil,
+                effects: response["effects"].flatMap(FaceEffects.init(rawValue:)) ?? .none)
+        }
+        guard let value = response["version"] else { return nil }
+        guard let version = Int(value), version >= 0 else {
+            throw SyncError.responseUnconfirmed("The Mac returned an unreadable table revision. Read the table before editing again.")
+        }
+        return version
+    }
+
     func faceOutcome(page: String, submission: FaceActSubmission) async -> FaceActOutcome {
         do {
             var payload = ["page": page, "row": submission.row, "action": submission.action, "answers": "true",
@@ -14,6 +39,7 @@ extension iCloudSyncEngine {
                 payload["values"] = String(decoding: try JSONEncoder().encode(values), as: UTF8.self)
             }
             if let revision = submission.formRevision { payload["formRevision"] = revision }
+            if let revision = submission.expectedPageRevision { payload["expectedPageRevision"] = revision }
             if let undoOf = submission.undoOf { payload["undoOf"] = undoOf.uuidString }
             if submission.checking { payload["checking"] = "true" }
             let response = try await sendActionAndWait(InboxAction.make(action: "faceAction", payload: payload))
@@ -29,23 +55,19 @@ extension iCloudSyncEngine {
 
     // A Desk task waits on its original identity; a refusal never submits another task.
 
-    /// Run the row's call through the person's signed phone door; await its owned decision result.
-    func faceAction(page: String, row: String, action: String, value: String?) async throws -> String? {
+    func inboxDecision(id: String, approve: Bool) async throws -> (row: PartFace.Row, submission: FaceActSubmission) {
         guard await refreshFacesSnapshot() else {
             throw SyncError.unsupported("The page's actions have not synced from the Mac yet.")
         }
-        let snapshot = faces[page]
+        let snapshot = faces["inbox"]
         let sections = (snapshot?.levers ?? []) + (snapshot?.keyLevers ?? []) + (snapshot?.drawnFace?.sections ?? [])
-        let rows = sections.flatMap(\.rows).filter { $0.id == row }
-        let call: PartFace.Call?
-        if action == "set", let value { call = rows.compactMap(\.control).first?.settingCall(value) }
-        else { call = rows.flatMap { $0.actions ?? [] }.first { $0.id == action }?.call }
-        guard let call else { throw SyncError.unsupported("Read this page on the phone before acting on its row.") }
-        let outcome = await faceOutcome(page: page, submission: .init(id: UUID(), row: row, action: action,
-                                                                    value: value, expectedCall: call))
-        if let failure = outcome.failure { throw failure }
-        if outcome.unresolved { throw SyncError.responseUnconfirmed(outcome.words ?? "Read the action's current state before repeating it.") }
-        return outcome.words
+        let action = approve ? "approve" : "reject"
+        for row in sections.flatMap(\.rows) where row.id == id {
+            guard let call = row.actions?.first(where: { $0.id == action })?.call else { continue }
+            return (row, .init(id: UUID(), row: id, action: action, value: nil, expectedCall: call,
+                               expectedPageRevision: snapshot?.pageRevision))
+        }
+        throw SyncError.unsupported("Read this page on the phone before acting on its row.")
     }
 
     @discardableResult
@@ -92,10 +114,8 @@ extension iCloudSyncEngine {
         try await macControlResult(InboxAction.make(action: "mac_control", payload: action.payload(arguments)))
     }
 
-    func macNotify(title: String, message: String, sound: String? = nil) async throws -> String {
-        var arguments = ["title": title, "message": message]
-        if let sound { arguments["sound"] = sound }
-        return try await sendMacControl(.notification, arguments: arguments)
+    func macNotify(title: String, message: String) async throws -> String {
+        try await sendMacControl(.notification, arguments: ["title": title, "message": message])
     }
 
     func macSetVolume(percent: Int) async throws -> String {
@@ -105,11 +125,8 @@ extension iCloudSyncEngine {
         return try await sendMacControl(.volume, arguments: ["value": "\(percent)"])
     }
 
-    func macSpotlight(query: String, hoursAhead: Int? = nil, limit: Int? = nil) async throws -> String {
-        var arguments = ["query": query]
-        if let hoursAhead { arguments["hours_ahead"] = "\(hoursAhead)" }
-        if let limit { arguments["limit"] = "\(limit)" }
-        return try await sendMacControl(.spotlight, arguments: arguments)
+    func macSpotlight(query: String) async throws -> String {
+        try await sendMacControl(.spotlight, arguments: ["query": query])
     }
 
     // MARK: - Telegram control

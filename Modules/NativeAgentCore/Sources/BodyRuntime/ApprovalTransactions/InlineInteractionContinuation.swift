@@ -34,7 +34,7 @@ extension InlineInteractionCoordinator {
               resumesInFlight[interaction.id] == nil else { return nil }
         let carried: (sources: [String], elevated: [String])
         do {
-            carried = try PeerDataTaint.steer(dataRoot: dataRoot, in: .object([
+            carried = try PeerDataTaint.steer(in: .object([
                 "sources": interaction.continuation?.peerSources.map { .array($0.map(JSONValue.string)) } ?? .null,
                 "elevated": interaction.continuation?.elevatedPeerSources.map { .array($0.map(JSONValue.string)) } ?? .null,
             ]))
@@ -50,9 +50,8 @@ extension InlineInteractionCoordinator {
         } == true
         let host = servesRunningTurn ? turn : nil
         let base = host ?? Turn(dataRoot: dataRoot, run: continuation.resumeRunId, session: sessionID)
-        let taint = base.peerSteering ?? PeerDataTaint(dataRoot: base.dataRoot, restoring: carried.sources, elevated: carried.elevated)
-        carried.sources.forEach { taint.mark(dataRoot: base.dataRoot, peer: $0) }
-        carried.elevated.forEach { taint.elevate(dataRoot: base.dataRoot, peer: $0) }
+        let taint = base.peerSteering ?? PeerDataTaint()
+        for source in carried.sources + carried.elevated { taint.mark(dataRoot: base.dataRoot, peer: source) }
         do {
             let currentLife = try await Task.detached { try DataRootLife.isCurrent(interaction.continuation?.lifeID, in: self.dataRoot) }.value
             guard currentLife else { return nil }
@@ -137,13 +136,13 @@ extension InlineInteractionCoordinator {
         func failure(_ reason: String) -> NSError {
             NSError(domain: "InteractionCard", code: 2, userInfo: [NSLocalizedDescriptionKey: reason])
         }
-        guard let recordedOrigin = try await originEnvelope(of: record.id, sessionID: sessionID) else {
+        guard let recordedOrigin = try await continuationOrigin(of: record.id, sessionID: sessionID) else {
             throw failure("This card has no recorded origin. Review it and raise a new request before continuing.")
         }
         guard let originTurnID = record.continuation?.originTurnId, !originTurnID.isEmpty else {
             throw failure("This card has no recorded turn identity. Raise a new request before continuing.")
         }
-        var origin = recordedOrigin
+        var origin = recordedOrigin.envelope
         // A persisted envelope is not authority: recheck the signed phone's witness against the current pairing before either world effect.
         if let continuation = record.continuation, continuation.signatureReceipt?.isEmpty == false {
             let witness = InlineInteractionSignatureWitness.Witness(
@@ -160,8 +159,6 @@ extension InlineInteractionCoordinator {
                 macContinuation: origin.macContinuation, workIdentity: origin.workIdentity,
                 answerExperienceID: origin.answerExperienceID)
         }
-        // Every replay takes authority and routing from the card. A matching
-        // host contributes its other parts; the answering door contributes neither.
         var replayTurn = turn.with(\.envelope, origin).with(\.verifiedSessionID, sessionID)
         if let ceiling = record.continuation?.fileAccessCeiling {
             replayTurn.fileAccessCeiling = ceiling
@@ -185,7 +182,10 @@ extension InlineInteractionCoordinator {
             // A call the person decided resumes as the person's own act once the person answered its card: the gate admits that exact
             // call once, with no second ask. Any other parked call (and arguments that do not read as one object) replays as the agent's.
             // The person's act names the call held in memory when it parked; a replayed call that differs from it is judged as the agent's.
-            var replayAs = replayTurn.with(\.cardCause, CardCause(record.id))
+            let raisingReceipt = recordedOrigin.raisingReceipt
+            let raisingInvocation = raisingReceipt != nil && raisingReceipt == replayTurn.act ? replayTurn.invocationID : nil
+            var replayAs = replayTurn.with(\.act, raisingReceipt).with(\.invocationID, raisingInvocation)
+                .with(\.cardCause, CardCause(record.id))
             let personParked = PersonParkedCalls.take(record.id, dataRoot: dataRoot)
             if let personParked {
                 replayAs = replayAs.with(\.personAct, PersonAct(by: .card(id: record.id), tool: personParked.tool, input: personParked.input,
@@ -213,9 +213,8 @@ extension InlineInteractionCoordinator {
         try Task.checkCancellation()
         // The card's after_card steps ride this one continued turn; none of them wakes a turn of its own.
         let queued = await AgentScreen.resume(card: record.id, decision: record.state.outcome != nil ? "approved" : "declined",
-            completed: record.state.outcome != nil, handOff: true, dataRoot: dataRoot)
+            completed: record.state.outcome != nil, handOff: true, fileAccessCeiling: replayTurn.fileAccessCeiling, dataRoot: dataRoot)
         queued.sources.forEach { turn.peerSteering?.mark(dataRoot: turn.dataRoot, peer: $0) }
-        queued.elevated.forEach { turn.peerSteering?.elevate(dataRoot: turn.dataRoot, peer: $0) }
         if servesRunningTurn, waitingHosts.contains(record.id) {
             guard var hostResult else { throw failure("The blocked call could not resume.") }
             if !queued.text.isEmpty, case .object(var fields) = hostResult {
@@ -254,7 +253,13 @@ extension InlineInteractionCoordinator {
         try await persistTransition(record, from: .claimed, sessionID: sessionID)
         try Task.checkCancellation()
         let synthetic = prompt != record.continuation?.resumeText
-        let resumedTurn = (servesRunningTurn ? replayTurn.derived() : replayTurn)
+        var continuationTurn = replayTurn
+        if servesRunningTurn {
+            let steering = PeerDataTaint.carried(turn: replayTurn)
+            continuationTurn = replayTurn.derived().with(\.peerSteering, PeerDataTaint(dataRoot: dataRoot, restoring: steering.sources))
+            continuationTurn.origin?.elevatedPeerSources = nil
+        }
+        let resumedTurn = continuationTurn
             .with(\.session, sessionID)
             .with(\.modelOverride, binding)
             .with(\.rows.questionRunID, synthetic ? record.continuation?.originRunId : nil)

@@ -18,6 +18,7 @@ final class ModelRound: ModelRoundKernel.Stream {
     var emitted = false
     var toolBoundaryReason: LLMToolBoundaryReason?
     var arrivalCut = false
+    var associationBodies: Set<ContextAtomID> = []
     var closeClass: String?
     var closeOutcome: String?
     /// The turn already said something visible, to anyone, and the round before this one landed every call with nothing waiting: an empty answer here is the turn ending.
@@ -136,7 +137,7 @@ extension SwiftNativeTurnEngine {
                 if breath.read { stem.owed.agentNow = AgentNowCursor(at: at) }
             }
         }
-        if try await readArrivals(stem) { round.closeClass = nil }
+        if !(try await readArrivals(stem)).isEmpty { round.closeClass = nil }
         if stem.sessionId != nil, !(stem.work.prefixTelemetry?.marksRequestShapeUnmeasured == true) {
             let additional = try ConversationPrefixSeeding.additionalMessages(in: stem.wire.conversation, after: stem.wire.prefixSeed)
             if stem.tally.providerCallCount == 0 {
@@ -168,6 +169,7 @@ extension SwiftNativeTurnEngine {
                 root: root, surface: stem.surface, session: stem.sessionId, owner: owner, turn: stem.turn,
                 call: stem.call.with(\.turn, stem.turn))
             stem.wire.conversation = fitted.conversation
+            round.associationBodies = stem.wire.resolvedTurnContext.fluidContextTurn?.associationBodies(in: fitted.conversation) ?? []
             fittedWire = fitted.wire
         }
         // Publish only the fitted opening request actually passed to `streamMessages`, after opening reads and tail fitting.
@@ -236,7 +238,7 @@ extension SwiftNativeTurnEngine {
                 hearing: (arrivals, { offer in
                     guard let sessionId = stem.sessionId,
                           await ChatTurnSteering.shared.canHear(offer, sessionId: sessionId, run: turn.run),
-                          try await stem.part.hear(offer) else { return false }
+                          try await stem.part.hear(offer, turn: stem.turn) else { return false }
                     return await ChatTurnSteering.shared.canHear(offer, sessionId: sessionId, run: turn.run)
                 })) { event, safe in
                 switch event {
@@ -256,7 +258,7 @@ extension SwiftNativeTurnEngine {
                 case .textDelta(let delta):
                     if !delta.isEmpty {
                         round.emitted = true
-                        try await commitDelivery(stem)
+                        try await commitDelivery(stem, round: round)
                         if !stem.voice.emittedProviderFirstDelta {
                             stem.voice.emittedProviderFirstDelta = true
                             TurnLifecycleTelemetry.emit(
@@ -280,7 +282,7 @@ extension SwiftNativeTurnEngine {
                     }
                 case .toolCall(let call):
                     round.emitted = true
-                    try await commitDelivery(stem)
+                    try await commitDelivery(stem, round: round)
                     await moved(stem, nil, turn: turn)
                     guard let parsed = try stem.toolCallCodec.decode(call) else { return }
                     round.streamedCalls.append(parsed)
@@ -378,7 +380,7 @@ extension SwiftNativeTurnEngine {
             let kept = await keepPartial(stem, round)
             stem.wire.keep(prose: kept)
             try await capture(stem, turn: stem.turn, work: stem.work)
-            let read = try await readArrivals(stem)
+            let read = !(try await readArrivals(stem)).isEmpty
             try await observe(stem, .cut(arrivalRead: read))
             try await capture(stem, turn: stem.turn, work: stem.work)
             TurnTraceBus.fireFromContext(kind: "provider.roundCut", surface: stem.surface, payload: .object([
@@ -407,7 +409,7 @@ extension SwiftNativeTurnEngine {
             return
         }
         if allowsSilence, round.streamedCalls.isEmpty, !iterProse.contains(where: { !$0.isWhitespace }) {
-            try await commitDelivery(stem)
+            try await commitDelivery(stem, round: round)
         }
         let markerCodec = stem.toolCallCodec == .textMarkers
             ? TextMarkerCodec(schemas: stem.wire.ctx.toolSchemas,
@@ -415,7 +417,7 @@ extension SwiftNativeTurnEngine {
             : nil
         let violation: ToolCallProtocolViolation?
         if let markerCodec {
-            violation = markerCodec.malformedCall(in: iterProse)
+            violation = markerCodec.malformedCall(in: round.iterAccumulated)
         } else {
             violation = ToolCallParser.formattedToolCallViolation(in: iterProse, toolNames: Set(stem.wire.ctx.toolsAvailable))
         }
@@ -470,7 +472,7 @@ extension SwiftNativeTurnEngine {
             }
             // The agent's answer stays in the conversation for whatever the agent's part does next.
             stem.wire.keep(prose: iterProse)
-            if try await readArrivals(stem) {
+            if !(try await readArrivals(stem)).isEmpty {
                 // Retain the completed answer before any prose the arrival's next round produces.
                 stem.voice.retainProse(iterProse)
                 try await observe(stem, .arrival)
@@ -478,7 +480,7 @@ extension SwiftNativeTurnEngine {
             }
             var event: [String: JSONValue] = ["type": .string("model"), "text": .string(iterProse), "calls": .array([])]
             event["reflect"] = await reflectionReading(stem, closing: iterProse)
-            try await stem.part.deliver([.object(event)])
+            try await stem.part.deliver([.object(event)], turn: stem.turn)
             return
         }
 
@@ -490,10 +492,14 @@ extension SwiftNativeTurnEngine {
         }
         stem.voice.visibleText = Self.paragraphJoined(round.roundBaseVisibleText, round.iterEmittedProse)
         stem.voice.retainProse(round.iterEmittedProse, commentary: true)
-        if let sessionId = stem.sessionId, ChatTurnSteering.hasPersonWaiting(sessionId), try await readArrivals(stem, keeping: round.iterEmittedProse) {
-            stem.tally.round = nil
-            try await observe(stem, .arrival, unstarted: providerCalls)
-            return
+        if let sessionId = stem.sessionId, ChatTurnSteering.hasPersonWaiting(sessionId) {
+            let offers = try await readArrivals(stem, keeping: round.iterEmittedProse)
+            if !offers.isEmpty {
+                let arrival = offers.first(where: \.blocksUnstarted)?.arrivalKind ?? .message
+                stem.tally.round = nil
+                try await observe(stem, .arrival, unstarted: (providerCalls, arrival))
+                return
+            }
         }
         stem.tally.round = (providerCalls, stem.toolCallCodec == .textMarkers ? round.iterAccumulated : round.iterEmittedProse, markerCodec, round.toolBoundaryReason)
         let made = providerCalls.map { JSONValue.object(["name": .string($0.name), "input": .object($0.input)]) }
@@ -505,7 +511,7 @@ extension SwiftNativeTurnEngine {
             "calls": .array(providerCalls.enumerated().map {
                 .object(["index": .int(Int64($0.offset)), "id": .string($0.element.id), "name": .string($0.element.name),
                          "input": .object($0.element.input)])
-            })])])
+            })])], turn: stem.turn)
     }
 
     /// Every provider byte is movement, ticked at most once a second for every door's card; this door's own words show themselves.

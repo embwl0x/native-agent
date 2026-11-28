@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 import NativeAgentCore
 import PersistenceCore
 import SenseCore
@@ -25,6 +26,11 @@ public struct CognitiveCareJudgment: Codable, Sendable, Equatable {
         case new(about: String, between: Bool)
     }
 
+    struct Share: Codable, Sendable, Equatable {
+        let source: String
+        let at: Date
+    }
+
     public var target: Target
     public var moved: Double
     public var by: CognitiveCare.Mover
@@ -34,6 +40,7 @@ public struct CognitiveCareJudgment: Codable, Sendable, Equatable {
     public var closes: Bool
     public var stance: CognitiveCare.Stance?
     public var acted: Bool?
+    var shared: Share?
 
     public init(target: Target, moved: Double, by: CognitiveCare.Mover, felt: String, note: String,
                 open: String? = nil, closes: Bool = false, stance: CognitiveCare.Stance? = nil, acted: Bool? = nil) {
@@ -49,7 +56,8 @@ public struct CognitiveCareJudgment: Codable, Sendable, Equatable {
     }
 
     /// A non-array refuses interpretation; each faulty entry names its field and leaves valid siblings intact.
-    public static func parse(_ raw: Any?, shown: [CognitiveCareLine]) -> (judgments: [CognitiveCareJudgment], faults: [String])? {
+    public static func parse(_ raw: Any?, shown: [CognitiveCareLine], reply: String = "",
+                             personReplyAt: Date? = nil) -> (judgments: [CognitiveCareJudgment], faults: [String])? {
         guard let items = raw as? [Any] else { return nil }
         let ids = Dictionary(shown.map { ($0.key.lowercased(), $0.id) }, uniquingKeysWith: { first, _ in first })
         func text(_ value: Any?) -> String? { (value as? String).trimmedNonEmpty }
@@ -65,8 +73,8 @@ public struct CognitiveCareJudgment: Codable, Sendable, Equatable {
             guard let object = item as? [String: Any] else { fault("", "must be an object"); continue }
             guard let care = text(object["care"])?.lowercased() else { fault(".care", "needs a shown id or new"); continue }
             guard let number = object["moved"] as? NSNumber,
-                  CFGetTypeID(number) != CFBooleanGetTypeID(), number.doubleValue.isFinite else {
-                fault(".moved", "needs a finite number"); continue
+                  CFGetTypeID(number) != CFBooleanGetTypeID(), (-1...1).contains(number.doubleValue) else {
+                fault(".moved", "needs a number from -1 to 1"); continue
             }
             guard let by = text(object["by"]).flatMap({ CognitiveCare.Mover(rawValue: $0.lowercased()) }) else {
                 fault(".by", "needs a known mover"); continue
@@ -77,7 +85,7 @@ public struct CognitiveCareJudgment: Codable, Sendable, Equatable {
             let closes: Bool
             switch object["closes"] {
             case nil, is NSNull: closes = false
-            case let value as Bool: closes = value
+            case let value as NSNumber where CFGetTypeID(value) == CFBooleanGetTypeID(): closes = value.boolValue
             default: fault(".closes", "needs a boolean or null"); continue
             }
             let acted: Bool?
@@ -100,7 +108,7 @@ public struct CognitiveCareJudgment: Codable, Sendable, Equatable {
                 let between: Bool
                 switch object["between"] {
                 case nil, is NSNull: between = false
-                case let value as Bool: between = value
+                case let value as NSNumber where CFGetTypeID(value) == CFBooleanGetTypeID(): between = value.boolValue
                 default: fault(".between", "needs a boolean or null"); continue
                 }
                 guard let about = text(object["about"]) else { fault(".about", "a new care needs about"); continue }
@@ -109,8 +117,17 @@ public struct CognitiveCareJudgment: Codable, Sendable, Equatable {
                 guard let id = ids[care] else { fault(".care", "id was not shown: " + care); continue }
                 target = .existing(id)
             }
-            out.append(CognitiveCareJudgment(target: target, moved: number.doubleValue, by: by, felt: felt, note: note,
-                                             open: open, closes: closes, stance: stance, acted: acted))
+            var judgment = CognitiveCareJudgment(target: target, moved: number.doubleValue, by: by, felt: felt, note: note,
+                                                 open: open, closes: closes, stance: stance, acted: acted)
+            if let raw = object["shared"], !(raw is NSNull) {
+                guard let source = raw as? String, MemoryManagerPromise.quoted(source, in: reply),
+                      let personReplyAt, judgment.moved != 0 else {
+                    fault(".shared", "needs a nonzero movement and an exact quote from a delivered reply to the person")
+                    continue
+                }
+                judgment.shared = Share(source: source, at: personReplyAt)
+            }
+            out.append(judgment)
         }
         return (out, faults)
     }
@@ -402,15 +419,6 @@ extension CognitiveSubstrate {
         StableHash.sha256UUID(utf8: "\(momentID)|care|\(ordinal)")
     }
 
-    /// Read each care watermark once before applying all judgments, then stamp after the last one; pre-Clear generations apply nothing.
-    @discardableResult
-    public func applyCares(_ judgments: [CognitiveCareJudgment], provenance: CognitiveCareProvenance,
-                           generation: UInt64, seq: UInt64? = nil,
-                           momentID: String? = nil) async throws -> [UUID] {
-        try await applyCareJudgments(judgments, provenance: provenance, generation: generation,
-            seq: seq, momentID: momentID)
-    }
-
     /// Reflection prepares both judgments before mutating either; its care effects and their done receipt share the owner's transaction.
     func applyCareJudgments(_ judgments: [CognitiveCareJudgment], provenance: CognitiveCareProvenance,
                             generation: UInt64, seq: UInt64? = nil, momentID: String? = nil,
@@ -443,7 +451,7 @@ extension CognitiveSubstrate {
         let changes = try applyPreparedCareJudgments(judgments, provenance: provenance, seq: seq, momentID: momentID,
             joinReflectionTakeaway: joinReflectionTakeaway, birth: birth)
         return try await persistCareJudgments(changes, provenance: provenance, generation: generation,
-            seq: seq, reflectionReceipt: reflectionReceipt)
+            seq: seq, momentID: momentID, reflectionReceipt: reflectionReceipt)
     }
 
     private typealias CareBirthVectors = (queries: [String: [Float]], inventory: [UUID: [Float]], epoch: String?)
@@ -581,9 +589,13 @@ extension CognitiveSubstrate {
             let current = care.story.last.map { provenance.at >= $0.at } ?? true
             let closesGap = provenance.trusted && current && judgment.closes
                 && care.open != nil && judgment.open == nil
-            care.record(CognitiveCare.Moment(at: provenance.at, moved: judgment.moved, by: judgment.by, who: who,
-                                             felt: judgment.felt, note: birthWords ?? judgment.note, source: provenance.source,
-                                             closedGap: closesGap ? true : nil, answered: judgment.acted == true ? true : nil)) { care in
+            var movement = CognitiveCare.Moment(at: provenance.at, moved: judgment.moved, by: judgment.by, who: who,
+                                               felt: judgment.felt, note: birthWords ?? judgment.note, source: provenance.source,
+                                               closedGap: closesGap ? true : nil, answered: judgment.acted == true ? true : nil)
+            if !provenance.appAuthored, provenance.speaker == CognitiveCare.ownerKey {
+                movement.sharedAt = judgment.shared?.at
+            }
+            care.record(movement) { care in
                 if provenance.trusted, current {
                     if judgment.closes { care.open = nil }
                     if let open = judgment.open, care.origin != .seed { care.open = String(open.prefix(CognitiveCare.openCharacters)) }
@@ -607,16 +619,17 @@ extension CognitiveSubstrate {
     }
 
     private func persistCareJudgments(_ changes: CareJudgmentChanges, provenance: CognitiveCareProvenance,
-                                      generation: UInt64, seq: UInt64?, reflectionReceipt: CognitiveReflectionReceipt?) async throws -> [UUID] {
+                                      generation: UInt64, seq: UInt64?, momentID: String?,
+                                      reflectionReceipt: CognitiveReflectionReceipt?) async throws -> [UUID] {
         let (touched, relived, created, refused) = changes
         let now = dependencies.now()
-        let payload: JSONValue = .object([
+        var fields: [String: JSONValue] = [
             "cares": .array(touched.map { .string($0.uuidString) }),
             "created": .int(Int64(created)),
             "refused": .int(Int64(refused)),
             "trusted": .bool(provenance.trusted),
-        ])
-        TurnTraceBus.fireFromContext(kind: "mind.cares", payload: payload, turn: nil)
+        ]
+        TurnTraceBus.fireFromContext(kind: "mind.cares", payload: .object(fields), turn: nil)
         if let seq {
             // Read, then write: `cares[id]?.lived = max(cares[id]?.lived …)` reads `cares` inside its own write access, which aborts at runtime.
             for id in touched {
@@ -637,9 +650,22 @@ extension CognitiveSubstrate {
             return []
         }
         if !touched.isEmpty { markDirty(at: now) }
+        var receiptID = UUID()
+        if let momentID {
+            let shared = Set(toSave).flatMap { cares[$0]?.story ?? [] }
+                .filter { $0.source == provenance.source && $0.sharedAt != nil }
+            if let at = shared.first?.sharedAt {
+                fields["shared"] = .object([
+                    "at": .double(at.timeIntervalSince1970),
+                    "good": .int(Int64(shared.count(where: { $0.moved > 0 }))),
+                    "hard": .int(Int64(shared.count(where: { $0.moved < 0 }))),
+                ])
+                receiptID = StableHash.sha256UUID(utf8: "cares.applied|\(momentID)")
+            }
+        }
         let saving = await saveCares(toSave, at: now)
-        await recordReceipt(kind: "cares.applied", payload: payload)
         try saving.get()
+        await recordReceipt(kind: "cares.applied", payload: .object(fields), id: receiptID)
         guard generation == caringAppraisalGeneration else { throw CognitiveWriteDiscarded() }
         let selfChanges = toSave.filter { id in
             cares[id]?.story.contains {
@@ -677,7 +703,7 @@ extension CognitiveSubstrate {
                 effects.append(CognitiveArtifactWrite(kind: "disposition", id: stableArtifactID("disposition"),
                     status: "current", score: (disposition.valence + 1) / 2, payload: dispositionArtifactPayload(at: now)))
             }
-            try await persistArtifactTransition(artifacts: effects, deletedArtifactIDs: [], at: now)
+            try await persistArtifactTransition(artifacts: effects, at: now)
         } catch { failure = error }
         // Retain per-care repair accounting even though the write is atomic.
         for id in Set(ids) {

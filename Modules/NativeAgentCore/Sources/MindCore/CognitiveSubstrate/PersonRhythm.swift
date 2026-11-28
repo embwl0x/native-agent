@@ -265,6 +265,21 @@ public struct PersonRhythm: Codable, Sendable, Equatable {
             if let lower = standing(hits, n) { claims.append(Claim(kind: .activeIn, from: h, to: (h + 1) % 24, confidence: lower)) }
         }
     }
+    /// The part of one gap that fell in the person's usual quiet: the hours in which they were absent on most observed days. One observed day is set
+    /// aside, since this gap may already be in the bins and cannot be evidence of its own habit, and two more count as present, so thin evidence
+    /// never makes an hour quiet. A day or more is an absence whatever the rhythm: bins keep observing while the person is gone.
+    public func usualQuiet(from: Date, to: Date) -> TimeInterval {
+        guard to > from, to.timeIntervalSince(from) < 86_400, bins.count == 24, let zone = TimeZone(identifier: timeZone) else { return 0 }
+        var calendar = Calendar.current
+        calendar.timeZone = zone
+        var quiet = 0.0, cursor = from
+        while cursor < to, let hour = calendar.dateInterval(of: .hour, for: cursor) {
+            let end = min(to, hour.end), bin = bins[calendar.component(.hour, from: cursor)]
+            if (bin.observed - 1 - bin.active) / (bin.observed + 1) > 0.5 { quiet += end.timeIntervalSince(cursor) }
+            cursor = end
+        }
+        return quiet
+    }
     public func started(on day: Date) -> Bool {
         starts.contains { Calendar.current.isDate($0, inSameDayAs: day) }
     }

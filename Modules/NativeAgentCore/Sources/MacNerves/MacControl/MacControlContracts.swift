@@ -207,7 +207,6 @@ public let macControlDispatchableActions: Set<String> = Set([
     "notify",
     "applescript",
     "volume",
-    "media",
     "file/read",
     "file/write",
     "file/list",
@@ -239,7 +238,7 @@ public let macControlAccessibilityReadActions: Set<String> = [
     "view",
     // Semantic perception is read tier and requires no Screen Recording grant.
     "look",
-    // Bound observation lifetime and retain only coarse input/scene changes, never key contents; start/next returns a fresh redacted view.
+    // Bound observation lifetime and retain only coarse input/scene changes, never key contents; start returns a fresh redacted view.
     "attention",
     // Menu discovery reads AXMenuBar without opening or pressing any item.
     "menu",
@@ -300,7 +299,7 @@ public func macControlGateCategory(forAction action: String) -> String? {
     switch action {
     case "applescript":                                   return "applescript"
     case "focus_app", "quit_app":                          return "accessibility"
-    case "system", "volume", "media":                     return "system"
+    case "system", "volume":                              return "system"
     case "file/read", "file/write", "file/list",
          "file/move", "file/trash":                       return "file_ops"
     case "notify":                                        return "notifications"

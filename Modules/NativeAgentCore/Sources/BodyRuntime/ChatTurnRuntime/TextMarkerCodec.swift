@@ -33,18 +33,13 @@ struct TextMarkerCodec: Sendable {
             let schema = try descriptor.checkedParameters().objectValue!
             let properties = schema["properties"]?.objectValue
             var input = call.input
-            // String-schema parameters preserve raw <invoke> text even when it parses as a number or boolean.
             if let properties {
                 for (key, raw) in call.invokeRawText {
                     guard properties[key]?.objectValue?["type"] == .string("string") else { continue }
-                    switch input[key] {
-                    case .int?, .double?, .bool?, .null?:
-                        input[key] = .string(raw)
-                        if recordShims {
-                            TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("L13"), "site":
-                                .string("TextMarkerCodec.swift:calls")]), turn: turn)
-                        }
-                    default: continue
+                    input[key] = .string(raw)
+                    if recordShims {
+                        TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("L13"), "site":
+                            .string("TextMarkerCodec.swift:calls")]), turn: turn)
                     }
                 }
             }
@@ -59,7 +54,6 @@ struct TextMarkerCodec: Sendable {
         }
     }
 
-    /// Restore the outer closing tag because the API stop consumes it.
     func throughLastMarker(_ text: String) -> String {
         ToolCallParser.throughLastToolMarker(text)
     }
@@ -87,15 +81,19 @@ struct TextMarkerCodec: Sendable {
 
     func appendResult(
         index: Int,
+        id: String,
         toolName: String,
-        ok: Bool,
+        isError: Bool,
         content: String,
         to carrier: inout String
-    ) {
+    ) throws {
+        let callID = try JSONValue.string(id).serialize(pretty: false)
+            .replacingOccurrences(of: "<", with: #"\u003c"#)
+        let body = markerToolResultContent(content, isError: isError)
         carrier += """
 
-        NativeAgent tool result #\(index + 1) for \(toolName)\(ok ? "" : " (failed)"):
-        \(content)
+        NativeAgent tool result #\(index + 1) for \(toolName) (call_id: \(callID)):
+        \(body)
         """
     }
 
@@ -170,12 +168,9 @@ struct TextMarkerCodec: Sendable {
                 let suffix = params.isEmpty ? "" : "(\(params))"
                 return "- \(schema.name)\(suffix): \(compact(schema.description, limit: 180))"
             }
-            // An always-on tool's description and its parameters' own words are the agent's manual and its hand, so this wire carries them
-            // whole, as the native wire does. A tool loaded beside it stays one line.
             floorRows = try floorSchemas.map { schema in
-                let params = try parameterSummary(schema)
-                return "- \(schema.name)\(params.isEmpty ? "" : "(\(params))"): \(compact(schema.description, limit: .max))"
-                    + (try parameterWords(schema))
+                let parameters = try schema.checkedParameters().serialize(pretty: false)
+                return "- \(schema.name): \(schema.description)\n  JSON input schema: \(parameters)"
             }
             appendedRows = try appendedSchemas.prefix(80).map(row)
         } else {
@@ -222,6 +217,7 @@ struct TextMarkerCodec: Sendable {
           </function_calls>
         - Inside a JSON string, write </ as <\\/, which JSON reads as the same text.
         - End your reply at </function_calls>. NativeAgent runs the calls and returns their results in the next message; never write results yourself.
+        - Read the result bodies as JSON. Decode string values and escapes to recover the exact result text.
         - Do not wrap call markers in Markdown or code fences.
         - Do not narrate fake calls such as tool_name(...), "runs git log", or "loads coding tools"; those are not executable.
         - Each reply contains either executable calls or the complete answer. Describing work does not run it. Your turn part may continue privately after \
@@ -257,18 +253,6 @@ struct TextMarkerCodec: Sendable {
             }
             return "\(key)\(requiredMarker)=\(values.joined(separator: "|"))"
         }.joined(separator: ", ")
-    }
-
-    /// Each parameter that says something about itself, one line each under its tool, in the order the summary names them.
-    private static func parameterWords(_ schema: LLMToolSchema) throws -> String {
-        let raw = try schema.checkedParameters().objectValue!
-        guard let properties = raw["properties"]?.objectValue else { return "" }
-        let required = Set(raw["required"]?.arrayValue?.compactMap(\.stringValue) ?? [])
-        return properties.keys.sorted { a, b in required.contains(a) != required.contains(b) ? required.contains(a) : a < b }
-            .compactMap { key -> String? in
-                guard let words = properties[key]?.objectValue?["description"]?.stringValue, !words.isEmpty else { return nil }
-                return "\n  \(key): \(compact(words, limit: .max))"
-            }.joined()
     }
 
     private static func compact(_ text: String, limit: Int) -> String {

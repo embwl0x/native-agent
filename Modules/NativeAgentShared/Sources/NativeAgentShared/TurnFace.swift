@@ -228,7 +228,6 @@ public struct TurnFace: FaceValue {
     public let phase: TurnPresentationPhase?
     public let isInFlight: Bool
     public let card: MacChatTurnCardModel?
-    public let hasReservation: Bool
     public let isBusy: Bool
     public let isStreaming: Bool
     public let isReplying: Bool
@@ -256,7 +255,7 @@ public struct TurnFace: FaceValue {
     }
 
     public init(sessionID: String, turnID: String?, activeTurnID: String?, phase: TurnPresentationPhase?, isInFlight: Bool,
-                card: MacChatTurnCardModel?, hasReservation: Bool, isBusy: Bool, isStreaming: Bool, isReplying: Bool, isThinking: Bool,
+                card: MacChatTurnCardModel?, isBusy: Bool, isStreaming: Bool, isReplying: Bool, isThinking: Bool,
                 liveLine: String?, workPill: String?, steps: [Step], preview: Preview?, approvalStatus: String?, nowOn: String? = nil) {
         self.sessionID = sessionID
         self.turnID = turnID
@@ -264,7 +263,6 @@ public struct TurnFace: FaceValue {
         self.phase = phase
         self.isInFlight = isInFlight
         self.card = card
-        self.hasReservation = hasReservation
         self.isBusy = isBusy
         self.isStreaming = isStreaming
         self.isReplying = isReplying
@@ -280,16 +278,21 @@ public struct TurnFace: FaceValue {
     /// One step of the turn, one identity from its start to its end. Only her acts (calls) are steps; a wait is a state of the turn.
     public struct Step: Sendable, Equatable, Codable, Identifiable {
         public enum Outcome: String, Sendable, Equatable, Codable { case ok, refused, failed }
+        public enum Disposition: String, Sendable, Equatable, Codable {
+            case withdrawnBeforeStart, stoppedBeforeStart, effectsUnconfirmed, stopped, failedWithoutEffect, landed, noEffect, effectRecorded
+        }
         /// Its turn and its number there, the same while it runs and after it ends.
         public let id: String
         public let text: String
         public let outcome: Outcome?
+        public let disposition: Disposition?
         /// Started and not yet ended, in a turn still running.
         public let isRunning: Bool
         /// When it started; a face draws its elapsed time from this, never from a posted tick.
         public let startedAt: Date
-        public init(id: String, text: String, outcome: Outcome?, isRunning: Bool, startedAt: Date) {
+        public init(id: String, text: String, outcome: Outcome?, isRunning: Bool, startedAt: Date, disposition: Disposition? = nil) {
             self.id = id; self.text = text; self.outcome = outcome; self.isRunning = isRunning; self.startedAt = startedAt
+            self.disposition = disposition
         }
     }
 

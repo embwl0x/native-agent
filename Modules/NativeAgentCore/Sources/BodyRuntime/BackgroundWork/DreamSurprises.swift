@@ -347,7 +347,7 @@ enum DreamSurprises {
         return present.map { lines in
             var left = allowance
             return lines.compactMap { line -> String? in
-                let flat = line.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+                let flat = DreamPart.redact(line).split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
                 guard !flat.isEmpty, left > 4 else { return nil }
                 let clipped = flat.count <= min(220, left - 3)
                     ? flat : String(flat.prefix(min(219, left - 4))) + "…"

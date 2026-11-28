@@ -1,6 +1,6 @@
 import Foundation
 
-// Blueprint: | `ProviderCallEvidence.swift` | Payload-free provider lifecycle and first-output timing evidence |
+// Blueprint: | `ProviderCallEvidence.swift` | Payload-free provider lifecycle evidence |
 
 /// Payload-free evidence emitted by the shared provider router around one real adapter invocation. The call id is minted before the adapter starts and is
 /// reused for its terminal phase, so the organism can predict an outcome before observing it instead of inferring provider health after the fact.
@@ -23,12 +23,8 @@ public struct LLMCallLifecycleEvent: Sendable, Equatable, Identifiable {
     public let reasoningEffort: String?
     public let streaming: Bool
     public let occurredAt: Date
-    /// A terminal call's first text or tool output in milliseconds from its request, as the adapter stamped it on the call's `llm.call` row.
-    public let firstOutputMs: Int?
     /// A terminal streamed call's `LLMMessagesStreamKind` raw value; nil when it did not come through `streamMessages`.
     public let streamKind: String?
-    /// The stream guard cut this call (`ProviderFailure.noReply`).
-    public let noReply: Bool
     public let requestBytes: Int?
 
     public init(
@@ -42,9 +38,7 @@ public struct LLMCallLifecycleEvent: Sendable, Equatable, Identifiable {
         reasoningEffort: String? = nil,
         streaming: Bool,
         occurredAt: Date = Date(),
-        firstOutputMs: Int? = nil,
         streamKind: String? = nil,
-        noReply: Bool = false,
         requestBytes: Int? = nil
     ) {
         self.requestBytes = requestBytes
@@ -60,13 +54,11 @@ public struct LLMCallLifecycleEvent: Sendable, Equatable, Identifiable {
         }.flatMap { $0.isEmpty ? nil : $0 }
         self.streaming = streaming
         self.occurredAt = occurredAt
-        self.firstOutputMs = firstOutputMs
         self.streamKind = streamKind
-        self.noReply = noReply
     }
 
-    public func terminal(_ phase: LLMCallLifecyclePhase, at date: Date = Date(), firstOutputMs: Int? = nil,
-                         streamKind: String? = nil, noReply: Bool = false, requestBytes: Int? = nil) -> Self? {
+    public func terminal(_ phase: LLMCallLifecyclePhase, at date: Date = Date(),
+                         streamKind: String? = nil, requestBytes: Int? = nil) -> Self? {
         guard phase != .started else { return nil }
         return Self(
             id: id,
@@ -79,9 +71,7 @@ public struct LLMCallLifecycleEvent: Sendable, Equatable, Identifiable {
             reasoningEffort: reasoningEffort,
             streaming: streaming,
             occurredAt: date,
-            firstOutputMs: firstOutputMs,
             streamKind: streamKind,
-            noReply: noReply,
             requestBytes: requestBytes
         )
     }
@@ -93,7 +83,8 @@ public protocol LLMCallLifecycleObserving: Sendable {
 
 extension LLMMessage {
     /// Text presented to this request, in characters. Image encoding is not text; its token cost remains part of the provider's reported input.
-    public static func inputCharacters(_ messages: [LLMMessage], system: String?, tools: [LLMToolSchema]) -> Int {
+    public static func inputCharacters(_ messages: [LLMMessage], system: String?, tools: [LLMToolSchema],
+                                       toolResultContent: (String, Bool) -> String = { content, _ in content }) -> Int {
         (system?.count ?? 0) + tools.reduce(0) {
             $0 + $1.name.count + $1.description.count + String(decoding: $1.parametersJSON, as: UTF8.self).count
         } + messages.reduce(0) { total, message in
@@ -101,21 +92,22 @@ extension LLMMessage {
                 switch block {
                 case .text(let text): total + text.count
                 case .toolUse(let id, let name, let input): total + id.count + name.count + String(decoding: input, as: UTF8.self).count
-                case .toolResult(let id, let content, _): total + id.count + content.count
+                case .toolResult(let id, let content, let isError): total + id.count + toolResultContent(content, isError).count
                 case .image: total
                 }
             }
         }
     }
     /// What a request asks the provider to read, in bytes as sent: the system prompt, every block (an image as its base64) and the tool schemas.
-    public static func inputBytes(_ messages: [LLMMessage], system: String?, tools: [LLMToolSchema] = []) -> Int {
+    public static func inputBytes(_ messages: [LLMMessage], system: String?, tools: [LLMToolSchema] = [],
+                                  toolResultContent: (String, Bool) -> String = { content, _ in content }) -> Int {
         (system?.utf8.count ?? 0) + tools.reduce(0) { $0 + $1.name.utf8.count + $1.description.utf8.count + $1.parametersJSON.count }
             + messages.reduce(0) { total, message in
                 message.content.reduce(total) { total, block in
                     switch block {
                     case .text(let text): total + text.utf8.count
                     case .toolUse(let id, let name, let input): total + id.utf8.count + name.utf8.count + input.count
-                    case .toolResult(let id, let content, _): total + id.utf8.count + content.utf8.count
+                    case .toolResult(let id, let content, let isError): total + id.utf8.count + toolResultContent(content, isError).utf8.count
                     case .image(_, let base64, _, _): total + base64.utf8.count
                     }
                 }

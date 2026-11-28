@@ -75,12 +75,11 @@ public enum ContactThread {
     }
 
     /// Edit one admitted row; every other byte, including blank lines and final-newline state, belongs to the original transcript.
-    public static func editingRow(in bytes: Data, last: Bool = false,
+    public static func editingRow(in bytes: Data,
                                   matching: ([String: JSONValue]) -> Bool,
                                   replacement: ([String: JSONValue]) throws -> [JSONValue]) throws -> Data? {
         var lines = bytes.split(separator: 10, omittingEmptySubsequences: false).map { Data($0) }
-        let indices = last ? Array(lines.indices.reversed()) : Array(lines.indices)
-        for index in indices {
+        for index in lines.indices.reversed() {
             guard case .object(let row)? = try? JSONValue.parse(lines[index]), matching(row) else { continue }
             lines[index] = Data(try replacement(row).map { try $0.serialize(pretty: false) }.joined(separator: "\n").utf8)
             var edited = Data()

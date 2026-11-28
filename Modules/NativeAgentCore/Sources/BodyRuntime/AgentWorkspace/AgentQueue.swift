@@ -77,6 +77,7 @@ public enum MyQueueReady {
     package static let owner = "moment"
     package static let freeTime = owner + ":free"
     package static func time(_ handle: String) -> String { owner + ":" + handle }
+    package static func causalTime(_ handle: String) -> String { owner + ":causal:" + handle }
 
     /// A moment's key. The same occurrence of a step always gets the same key, so it is posted once; a new occurrence gets a new key.
     package static func once(_ item: DeskItem, _ occurrence: Date) -> String {
@@ -169,7 +170,9 @@ public enum MyQueueReady {
         let words = step?.words ?? item.summary ?? item.title
         let name = "desk." + item.alias
         let doIt = "Do it now if it is safe, reversible and within what you are allowed. "
-        let wait = " If it can't move yet, desk.wait {handle:\"\(name)\", on:<what it needs>} holds it until that settles."
+        let wait = step?.causalWait == nil
+            ? " If it can't move yet, desk.wait {handle:\"\(name)\", on:<what it needs>} holds it until that settles."
+            : " To change what brings it back, use queue.update {id:\"\(name)\", wait_for:<cause>}."
         let head: String
         var rest: String
         if let step, step.rhythm != nil {
@@ -252,8 +255,8 @@ extension AgentScreen {
         static let waiting = Self(decision: nil, completed: false)
     }
 
-    package static func queueApprovalSteering(_ record: ApprovalRecord, dataRoot: URL) throws -> (sources: [String], elevated: [String]) {
-        try PeerDataTaint.steer(dataRoot: dataRoot, in: record.payload.objectValue?["peer"], scope: record.decision == "approved" ? record.scope : nil)
+    package static func queueApprovalSteering(_ record: ApprovalRecord) throws -> (sources: [String], elevated: [String]) {
+        try PeerDataTaint.steer(in: record.payload.objectValue?["peer"])
     }
 
     /// Read the durable decision and execution evidence from the owner of the named card.
@@ -265,7 +268,7 @@ extension AgentScreen {
                 return .waiting
             }
             if approval.payload.objectValue?["kind"] == .string("chat_tool_approval") {
-                _ = try queueApprovalSteering(approval, dataRoot: dataRoot)
+                _ = try queueApprovalSteering(approval)
                 if SwiftNativeApprovalInbox.continuationIsPending(approval) { return .waiting }
             }
             return QueueCard(decision: decision, completed: approvalCompleted(approval))
@@ -338,22 +341,24 @@ extension AgentScreen {
     }
 
     /// Settle the card's open follow-ups. If its turn continues, take the still-waiting steps into that turn.
-    package static func resume(card: String, decision: String, completed: Bool, handOff: Bool, dataRoot: URL) async
-        -> (text: String, sources: [String], elevated: [String]) {
+    package static func resume(card: String, decision: String, completed: Bool, handOff: Bool,
+                               fileAccessCeiling: ICloudChatFileAccessPolicy.Ceiling? = nil, dataRoot: URL) async
+        -> (text: String, sources: [String]) {
         let store = SwiftNativeDeskStore(dataRoot: dataRoot)
         let state: DeskState
         do { state = try await store.liveState() }
         catch { return ("""
             Queued follow-up unavailable: \(error.localizedDescription). The card settled, but its queued work could not be read; repair Desk storage \
             before continuing it.
-            """, [], []) }
-        var lines: [String] = [], sources: [String] = [], elevated: [String] = []
+            """, []) }
+        var lines: [String] = [], sources: [String] = []
         for entry in MyQueue.entries(state) where MyQueue.when(entry) == .afterCard(card) {
-            sources += entry.step.peers
-            elevated += entry.step.elevated
+            sources += entry.step.peers + entry.step.elevated
             let queued = "\(entry.name) \"\(entry.step.words)\""
+            let habitCeiling = entry.step.action == nil ? nil : entry.step.fileAccessCeiling
+            let takesStep = handOff && (habitCeiling.map { $0.modes.isEmpty || fileAccessCeiling?.holds($0) == true } ?? true)
             do {
-                switch try await settleCardStep(entry, card: card, decision: decision, completed: completed, handOff: handOff, store: store) {
+                switch try await settleCardStep(entry, card: card, decision: decision, completed: completed, handOff: takesStep, store: store) {
                 case .dropped:
                     let why = droppedAfterCard(decision, dataRoot: dataRoot)
                     lines.append("The step you queued for after this card was \(why): \(queued).")
@@ -377,6 +382,6 @@ extension AgentScreen {
                 lines.append("Settlement needs repair for the step queued after this card, \(queued): " + error.localizedDescription + ".")
             }
         }
-        return (lines.joined(separator: "\n"), sources, elevated)
+        return (lines.joined(separator: "\n"), sources)
     }
 }

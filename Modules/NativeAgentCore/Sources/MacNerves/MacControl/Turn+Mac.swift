@@ -76,6 +76,8 @@ public struct MacOperationContext: Sendable {
     /// The apps this operation's Accessibility messages go to, noted as each message is prepared.
     var axTargets: MacAXTargets?
     var capture: MacSightCaptureBinding?
+    var textRestore: MacTextRestore?
+    var textDeedStop: URL?
     public var frameSource = "direct"
     public var batchFrames: [String: MacLookFrame]?
     var nativeSurfaceApp: String?

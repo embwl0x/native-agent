@@ -153,7 +153,7 @@ extension AppQuietToolHost: AgentContactsFaceHost {
                 throw PartCallError(code: "chat_unavailable", message: "A new chat was not created. Nothing was asked.")
             }
             try await face.present(.openConversation(session: session, message: nil))
-            let reply = try await face.act(.send(.init(session: session, text: words, attachments: [], composerRevision: 0,
+            let reply = try await face.act(.send(.init(session: session, text: words, attachments: [],
                 expectedSelection: nil, options: .init(hideUserBubble: false, choice: nil, continuationReference: nil))))
             switch reply {
             case .accepted: return "Asked in a new chat: " + words
@@ -195,14 +195,10 @@ extension AppQuietToolHost: CapabilitiesFaceHost {
     }
 
     func buildSkillInChat() async throws -> String {
-        if let face {
-            try BodyInboxCardActionEffects.requireDraft(try await face.call(.prepareChatDraft(text: "Build me a skill that ")))
-            return "Chat is open with the request started in the message box; finish it and send."
+        guard let face, face.isConnected else {
+            throw PartCallError(code: "composer_unavailable", message: "Open NativeAgent's window before preparing a chat draft.")
         }
-        return switch appModel.requestSkillBuild(starter: "Build me a skill that ") {
-        case .draftPrepared: "Chat is open with the request started in the message box; finish it and send."
-        case .existingDraftPreserved: "Chat is open; the unsent words already in the message box were kept, so add the request to them."
-        case .awaitingChatSession: "Opening a new chat for the request."
-        }
+        try BodyInboxCardActionEffects.requireDraft(try await face.call(.prepareChatDraft(text: "Build me a skill that ")))
+        return "Chat is open with the request started in the message box; finish it and send."
     }
 }

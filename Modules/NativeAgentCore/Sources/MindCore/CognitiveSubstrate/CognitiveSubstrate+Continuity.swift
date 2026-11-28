@@ -75,16 +75,18 @@ extension CognitiveSubstrate {
     // MARK: - B2 since we last talked
 
     /// Use `UserTurnStamp` across surfaces so door switches are not gaps and wakes or peers cannot move the anchor. Clipped gap cues remain owed.
+    /// The gap is the person's waking time away: in a gap under a day, their usual quiet hours do not count toward `sessionBridgeGapHours`.
     static func sinceGapOpened(
         _ state: CognitiveCapsulePresentationState,
         previousUserTurn: Date?,
+        usualQuiet: TimeInterval,
         dynamics dyn: PersonalityDynamicsConfiguration,
         at now: Date
     ) -> Date? {
         if let owed = state.owedSinceGap { return owed }
         let gap = dyn.sessionBridgeGapHours * 3_600
         guard gap > 0, let last = previousUserTurn,
-              now.timeIntervalSince(last) >= gap else { return nil }
+              now.timeIntervalSince(last) - usualQuiet >= gap else { return nil }
         // Once per gap: `lastSessionBridgeAt` holds the opening of the gap a bridge last spoke for, so only that same gap is closed.
         if state.lastSessionBridgeAt == last { return nil }
         return last
@@ -103,7 +105,7 @@ extension CognitiveSubstrate {
               request.fromUser,
               let opened = Self.sinceGapOpened(
                 read.capsulePresentationState, previousUserTurn: request.previousUserTurnAt,
-                dynamics: read.personalityDynamics, at: read.fixedAt) else { return nil }
+                usualQuiet: request.usualQuietSincePreviousUserTurn, dynamics: read.personalityDynamics, at: read.fixedAt) else { return nil }
         let gap = await dependencies.sinceGap(opened, read.fixedAt, request.surface)
         unreadable += gap.unreadable
         let moved = read.cares.flatMap(\.story)

@@ -158,12 +158,6 @@ public protocol EventDeadlineLoopRunner: LoopRunner {
     func physiologyEvents() -> AsyncStream<Void>
     /// Return nil without a future crossing; reconcile already-due dates once rather than rescheduling a spin loop.
     func nextMeaningfulDeadline(after now: Date) async -> Date?
-    /// Coalesce event bursts before rereading the canonical owner.
-    var eventCoalescingDelay: TimeInterval { get }
-}
-
-public extension EventDeadlineLoopRunner {
-    var eventCoalescingDelay: TimeInterval { 0.25 }
 }
 
 internal func timeoutNanoseconds(_ seconds: TimeInterval) -> UInt64 {

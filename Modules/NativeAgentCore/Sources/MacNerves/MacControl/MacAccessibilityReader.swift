@@ -7,6 +7,12 @@ import AppKit
 // Blueprint: | `MacAccessibilityReader.swift` | `SystemMacAXElementSource`: Bounded read-only walker; exact window/menu roots |
 // The walker is read-only: structured AX data needs no input synthesis. Renderer preparation may enable an advertised mode without emitting UI input.
 public enum MacAccessibilityReader {
+    enum StrictReadCut: Error {
+        case secureField(MacAXAttributes)
+        case protectedContent
+        case protectionUnknown
+    }
+
     package struct NativeReadFailure: Error, LocalizedError {
         package let detail: String
         package let status: AXError?
@@ -156,6 +162,7 @@ public enum MacAccessibilityReader {
         root: MacAXElementRef,
         limits: MacAXLimits = MacAXLimits(),
         complete: Bool = false,
+        strict: Bool = false,
         read: ((MacAXElementRef, MacOperationContext) throws -> MacAXAttributes?)? = nil,
         deadline: Date? = nil,
         stopAtCut: Bool = false,
@@ -196,6 +203,16 @@ public enum MacAccessibilityReader {
             do {
                 if let read { readAttributes = try read(item.ref, context) }
                 else { readAttributes = try source.checkedAttributes(of: item.ref, context: context) }
+            } catch let cut as StrictReadCut where strict {
+                switch cut {
+                case .secureField(let attributes) where !item.path.isEmpty:
+                    nodes.append(MacAXNode(attributes: attributes, path: item.path))
+                case .secureField, .protectedContent:
+                    reasons.insert("protected_content")
+                case .protectionUnknown:
+                    reasons.insert("protection_unknown")
+                }
+                continue
             } catch {
                 readAttributes = nil
                 vanished = !item.path.isEmpty && (error as? NativeReadFailure)?.status == .invalidUIElement
@@ -205,6 +222,11 @@ public enum MacAccessibilityReader {
                 skipped += 1
                 reasons.insert(vanished ? "changed" : "unreadable_element")
                 onUnreadable?(item.ref, item.path)
+                continue
+            }
+            if strict, MacActClosedLoop.secureFieldRoles.contains(attributes.role)
+                || attributes.subrole.map(MacActClosedLoop.secureFieldRoles.contains) == true {
+                reasons.insert("protected_content")
                 continue
             }
             if attributes.isHiddenMenuItem { continue }

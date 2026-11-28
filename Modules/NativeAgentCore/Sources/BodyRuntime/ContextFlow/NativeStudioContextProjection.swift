@@ -104,7 +104,8 @@ struct StudioContext: ContextCompiledProjectionProvider, Sendable {
         }
         if sourceIDs?.subtracting([Self.shelfSourceID, Self.canonSourceID]).isEmpty != true {
             do {
-                let journal = Self.prepare(try await store.journalEntriesIncludingArchive(), sourceIDs: sourceIDs)
+                let entries = try await store.journalEntriesIncludingArchive()
+                let journal = Self.prepare(entries, sourceIDs: sourceIDs)
                 prepared += journal.sources
                 unavailable.merge(journal.failures, uniquingKeysWith: { _, current in current })
             } catch is CancellationError { throw CancellationError() }

@@ -44,6 +44,13 @@ public struct CognitiveSubjectReference: Codable, Sendable, Hashable, Equatable 
     var stableKey: String {
         "\(type.lowercased()):\(id.lowercased())"
     }
+
+    var isChatTurn: Bool {
+        switch type.lowercased() {
+        case "chat.user_turn", "chat.assistant_turn", "chat_turn": true
+        default: false
+        }
+    }
 }
 
 public struct CognitiveNode: Sendable, Equatable, Identifiable {
@@ -194,21 +201,13 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
     /// Dream residue phrase id → when it surfaced. The newest stamp is the line's cooldown; a phrase never surfaces twice in a diary's life. Ids only, never
     /// text.
     public var dreamThemeSurfaced: [String: Date]
-    /// Care id → when the agent last meant to bring it up. It rests 12 h unless it moved again since. Ids only, never text.
-    public var careReleased: [String: Date]
-    /// Care id → when its plain "On your mind" line showed and how many accepted turns it still rests. Ids only, never text.
-    public var careLineRest: [String: CareLineRest]
-
-    public struct CareLineRest: Sendable, Equatable {
-        public var shownAt: Date
-        public var turnsLeft: Int
-        public init(shownAt: Date, turnsLeft: Int) {
-            self.shownAt = shownAt
-            self.turnsLeft = turnsLeft
-        }
-    }
+    /// The feeling words she last read, by when (epoch seconds), newest twelve: her own record of her drift. Words from her vocabulary only.
+    public var feltHistory: [Double: String] = [:]
+    /// The feeling words as the last delivered frame actually said them, in order; what her history records.
+    public var feltShown: String?
 
     public static let remindedOfLedgerCapacity = 16
+    public static let feltHistoryCapacity = 12
 
     public init(
         fingerprintFamily: String? = nil,
@@ -221,9 +220,7 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
         remindedOfLastSurfacedAt: Date? = nil,
         remindedOfTurnsSinceSurfaced: Int = 0,
         remindedOfSurfaced: [String: Date] = [:],
-        dreamThemeSurfaced: [String: Date] = [:],
-        careReleased: [String: Date] = [:],
-        careLineRest: [String: CareLineRest] = [:]
+        dreamThemeSurfaced: [String: Date] = [:]
     ) {
         self.fingerprintFamily = fingerprintFamily
         self.owedSinceGap = owedSinceGap
@@ -236,8 +233,6 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
         self.remindedOfTurnsSinceSurfaced = max(0, remindedOfTurnsSinceSurfaced)
         self.remindedOfSurfaced = remindedOfSurfaced
         self.dreamThemeSurfaced = dreamThemeSurfaced
-        self.careReleased = careReleased
-        self.careLineRest = careLineRest
     }
 }
 

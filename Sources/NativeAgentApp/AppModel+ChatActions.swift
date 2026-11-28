@@ -68,14 +68,6 @@ extension AppModel {
 
 
     func regenerateChatResponse(_ message: ChatMessage, parent: Turn?) async {
-        if message.metadata?.providerRefusal == true {
-            if message.metadata?.providerRefusalDraft == true {
-                await prepareRejectedTurnDraft(message)
-            } else {
-                statusText = "outcome unknown — inspect before retry. This rejected turn may have run steps."
-            }
-            return
-        }
         let sessionId = message.sessionId ?? activeChatSessionId
         await engine.regenerateMacChatResponse(
             port: self,
@@ -87,58 +79,6 @@ extension AppModel {
                 ChatTurnCompleted.post(sessionID: sessionId)
             }
         )
-    }
-
-    @MainActor
-    func prepareRejectedTurnDraft(_ message: ChatMessage) async {
-        let sessionId = message.sessionId ?? activeChatSessionId
-        let messages: [ChatMessage]
-        do { messages = try await engine.transcripts.loadMessages(sessionId: sessionId, cached: true) }
-        catch { setFailureStatus(error, action: "read the retry's conversation"); return }
-        guard message.metadata?.providerRefusalDraft == true,
-              sessionId == activeChatSessionId,
-              let snapshot = MacChatRetrySnapshot.capture(
-                target: message,
-                messages: messages,
-                sessionId: sessionId,
-                isSyntheticNotice: false
-              ) else {
-            statusText = "Retry draft unavailable: open the original conversation."
-            return
-        }
-        guard !snapshot.inputHadAttachments else {
-            statusText = "Retry draft needs its original attachment; attach it again before sending."
-            return
-        }
-        guard chatDraft(for: sessionId).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            statusText = "The composer already has a draft; clear it before using Retry draft."
-            return
-        }
-        injectChatDraft(snapshot.priorUserText, sessionId: sessionId)
-        statusText = "Retry draft ready. Choose another configured model in the chat model picker, then send."
-    }
-
-    @MainActor
-    func addMemoryFact(_ text: String) async -> AppMutationResult {
-        do {
-            try await macChatTurns.storeMacChatMemoryFact(text)
-            statusText = "Memory saved"
-            return .success(statusText)
-        } catch {
-            setFailureStatus(error, action: "save that to memory")
-            return .failure(statusText, cause: statusCause)
-        }
-    }
-
-    func addNote(_ text: String) async -> AppMutationResult {
-        do {
-            try await macChatTurns.storeMacChatNote(text)
-            statusText = "Note committed"
-            return .success(statusText)
-        } catch {
-            setFailureStatus(error, action: "save that note")
-            return .failure(statusText, cause: statusCause)
-        }
     }
 
     /// Nil `sessionId` targets the conversation on screen.

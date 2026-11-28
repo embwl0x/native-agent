@@ -87,16 +87,16 @@ struct DetachedChatPanelView: View {
     }
 
     var body: some View {
-        GlassEffectContainer(spacing: 0) {
-            VStack(spacing: 0) {
-                InboxStripContainer { notes in
-                    notes
-                        .frame(maxWidth: .infinity, alignment: .trailing)
-                        .padding(.horizontal, 12)
-                }
-                messageScrollback
-                    .overlay(alignment: .bottom) { turnCard }
-                Divider()
+        VStack(spacing: 0) {
+            InboxStripContainer { notes in
+                notes
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+                    .padding(.horizontal, 12)
+            }
+            messageScrollback
+                .overlay(alignment: .bottom) { turnCard }
+            Divider()
+            HouseGlassContainer(spacing: 0) {
                 inputBar
                     .disabled(!sessionIsAvailable)
             }
@@ -186,7 +186,7 @@ struct DetachedChatPanelView: View {
             }
         }
         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { turnCardHeight = $0 }
-        .animation(NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion), value: shows)
+        .animation(Animation.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion), value: shows)
     }
 
     private func retryDetachedHistoryLoad() {
@@ -291,7 +291,7 @@ struct DetachedChatPanelView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
         .animation(
-            NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion),
+            Animation.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion),
             value: pendingAttachments.count
         )
     }
@@ -321,7 +321,7 @@ struct DetachedChatPanelView: View {
             let acceptance = await appModel.startChatTurnForSession(
                 text,
                 attachments: attachments,
-                sessionId: sessionId, composerRevision: revision
+                sessionId: sessionId
             )
             switch acceptance {
             case .accepted:
@@ -413,10 +413,10 @@ struct DetachedChatPanelView: View {
                 isCapturing = false
                 isSubmittingSend = false
             }
-            await ChatAttachmentTypeResolver.sendScreenshot(captured, client: appModel.client, expectedSelection: nil, canSubmit: {
+            await ChatAttachmentTypeResolver.sendScreenshot(captured, client: appModel.client, canSubmit: {
                 true
             }, submit: { prompt, attachments in
-                await appModel.startChatTurnForSession(prompt, attachments: attachments, sessionId: sessionId, composerRevision: captured.revision)
+                await appModel.startChatTurnForSession(prompt, attachments: attachments, sessionId: sessionId)
             }, accepted: { acceptedSessionId in
                 guard acceptedSessionId == sessionId else { return }
                 transcriptHandle.goToLatest()

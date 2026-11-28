@@ -362,6 +362,10 @@ public final class MacApplications: Sendable {
             if let url = explicitApplicationURL(named: query) { return .success(url) }
             let apps = try await MacAppIndex.shared.apps(context: context)
             return .success(try installedApplicationURL(named: query, apps: { apps }))
+        } catch let stop as CancellationError {
+            return .failure(stop)
+        } catch let late as OperationWaitBudget.Exceeded {
+            return .failure(late)
         } catch {
             return .failure(ToolFailureError(error.localizedDescription, effects: .none,
                 owner: "macOS Spotlight app index", tap: "System Settings > Spotlight"))

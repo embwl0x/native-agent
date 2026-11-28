@@ -133,9 +133,7 @@ extension DelegationReadout {
             domainState: stateParts.joined(separator: ":"),
             verification: verification,
             expectedNextEvidence: next,
-            updatedAt: completedAt ?? lastLiveness,
-            cancellationIdentity: nil,
-            deadline: nil
+            updatedAt: completedAt ?? lastLiveness
         )
     }
     /// Without a completion stamp, dedupe by identity alone rather than inventing cursor order.

@@ -33,7 +33,7 @@ struct AppInlineInteractionPlatformPort: InlineInteractionPlatformPort {
         // The admitted turn retains the continuation's origin through delivery.
         let started = await appModel.startChatTurn(
             prompt, attachments: [], sessionId: sessionID, hideUserBubble: hideUserBubble,
-            requireActiveSession: false, origin: origin, parent: turn
+            requireActiveSession: false, origin: origin, parent: turn, cardAnswer: true
         )
         if !hideUserBubble { appModel.publishConversationAnchor(for: started.acceptance) }
         switch started.acceptance {

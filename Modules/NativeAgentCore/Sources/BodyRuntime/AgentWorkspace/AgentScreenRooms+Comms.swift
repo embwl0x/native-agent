@@ -41,11 +41,11 @@ extension AgentScreen {
             try workspace.ports.conversations.records(dataRoot: dataRoot, locked: true).filter { !$0.agent.hasPrefix("bot") }
         }
         let chats = try bridgeChats(dataRoot: dataRoot)
-        let identity = try workspace.ports.conversations.identity(dataRoot: dataRoot)
+        let identity = try AgentContactIdentity(dataRoot: dataRoot)
         let contacts = contacts(identity: identity)
         let transcripts = try ChatSessionRetention.transcriptFiles(dataRoot: dataRoot, archived: [:])
         var out: [String: String] = [:]
-        let health = try workspace.ports.conversations.liveHealth(dataRoot: dataRoot)
+        let health = try AgentContactHealth.read(dataRoot: dataRoot)
         for agent in Set(agents.map { $0.lowercased() }) {
             if let problem = health[agent]?.problem { out[agent] = problem; continue }
             guard let contact = contacts.first(where: { $0.id == agent || $0.agents.contains(agent) }),

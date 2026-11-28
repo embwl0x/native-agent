@@ -300,7 +300,7 @@ actor SenseHelperProcess {
                     continue
                 }
                 try reply(fields, type: "notify_reply", value: .null)
-            case "source_read", "source_watch", "state_get", "state_set", "app_read":
+            case "source_read", "source_watch", "state_get", "state_set", "state_delete", "state_list", "state_cas", "app_read":
                 let waitStarted = try transport.suspend(id)
                 do {
                     try await service(fields, source: source, operation: operation, address: isEvent ? address : sourceAddress,
@@ -522,7 +522,8 @@ actor SenseHelperProcess {
                         guard case .object(var fields) = try JSONValue.parse(frame.header) else {
                             throw SenseFailure(code: "bad_output", message: "Sense helper sent a non-object message.")
                         }
-                        let needsPayload = ["app_read", "act", "state_get", "state_set", "publish", "present", "notify"].contains(fields["type"]?.stringValue ?? "")
+                        let needsPayload = ["app_read", "act", "state_get", "state_set", "state_delete", "state_list", "state_cas",
+                                            "publish", "present", "notify"].contains(fields["type"]?.stringValue ?? "")
                         guard frame.flags == (needsPayload ? 2 : 0) else {
                             throw SenseFailure(code: "bad_frame", message: "Unexpected sense attachment.")
                         }
@@ -597,18 +598,33 @@ actor SenseHelperProcess {
             try Task.checkCancellation()
             if let attachment { try reply(fields, type: "source_reply", value: wire, field: "material", attachment: attachment) }
             else { try jsonReply(fields, type: "source_reply", value: wire) }
-        case .string("state_get"), .string("state_set"):
-            guard case .string(let key)? = fields["key"], SenseWire.validStateKey(key) else {
-                throw SenseFailure(code: "bad_output", message: "Sense state requires a key of 1–256 bytes.")
+        case .string(let type) where ["state_get", "state_set", "state_delete", "state_list", "state_cas"].contains(type):
+            let args: [JSONValue]
+            if type == "state_list" {
+                args = fields["prefix"].map { [$0] } ?? []
+            } else {
+                guard let key = fields["key"] else { throw SenseFailure(code: "bad_state", message: "Sense state requires a key.") }
+                if type == "state_cas" || type == "state_set" {
+                    guard let value = fields["value"] else { throw SenseFailure(code: "bad_state", message: "Sense state requires a JSON value.") }
+                    let options = fields["options"].map { [$0] } ?? []
+                    if type == "state_cas" {
+                        guard let expected = fields["expected"] else { throw SenseFailure(code: "bad_state", message: "Compare-and-swap requires an expected value.") }
+                        args = [key, expected, value] + options
+                    } else { args = [key, value] + options }
+                } else { args = [key] }
             }
-            let setting = fields["type"] == .string("state_set")
-            if setting {
-                guard let value = fields["value"], try JSONEncoder().encode(value).count <= SenseWire.stateValueBytes else {
-                    throw SenseFailure(code: "bad_output", message: "Sense state values must be JSON of at most 16 KiB.")
+            let call = try AbilityStore.NotebookCall(String(type.dropFirst("state_".count)), args, legacy: false)
+            _ = try call.checkedWriteValue()
+            let value = try AbilityStore.withLock {
+                if call.writes, record.status != .draft {
+                    let registry = FileSenseRegistry(dataRoot: dataRoot)
+                    guard let current = try registry.presentationRecords().first(where: { $0.id == record.id }),
+                          current.status == .on, (try? registry.helperSelection(current)) == selection else {
+                        throw SenseFailure(code: "state_changed", message: "The notebook's sense was stopped or replaced.")
+                    }
                 }
+                return try AbilityStore.notebook(notebook, call: call)
             }
-            let value = try AbilityStore.notebook(notebook, key: key, setting: setting, value: fields["value"] ?? .null,
-                failure: { SenseFailure(code: $0, message: $1) })
             try jsonReply(fields, type: "state_reply", value: value)
         case .string("source_watch"):
             guard record.mode == .live, fields["corner"] == .string(record.corner.key) else {

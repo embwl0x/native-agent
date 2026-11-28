@@ -84,6 +84,8 @@ extension MacScreenWatch {
         }
         // Retain admission only while the watch and its secret verdicts remain valid; newer frame arrival alone is harmless.
         try Task.checkCancellation()
+        // Recognition can take long enough for access to be withdrawn: text is returned only while it still stands.
+        if recognized != nil { guard await allowed() else { throw over ?? SenseFailure(code: "expired", message: "That frame has been replaced; read the frame screen.next() returns.") } }
         guard state.withLock({ state -> Bool in
             guard state.ended == nil, state.verdict == painted else { return false }
             state.queries += queries.count

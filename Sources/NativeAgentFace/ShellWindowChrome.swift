@@ -1,4 +1,5 @@
 import AppKit
+import NativeAgentShared
 import SwiftUI
 
 // Blueprint: | `ShellWindowChrome.swift` | `ShellWindowChrome`, `ShellFrame`, `WindowFrame`: chrome, kept frames, split layout, keyboard order |
@@ -188,11 +189,9 @@ struct ShellFrame<Sidebar: View, Detail: View>: View {
     @ViewBuilder var detail: () -> Detail
 
     var body: some View {
-        HouseGlassContainer(spacing: 0) {
-            HStack(spacing: 0) {
-                sidebar().focusSection()
-                detail().focusSection()
-            }
+        HStack(spacing: 0) {
+            sidebar().focusSection()
+            detail().focusSection()
         }
         .background {
             ShellSheet().contentShape(Rectangle()).gesture(WindowDragGesture())
@@ -279,7 +278,6 @@ private struct ShellKeyboardTarget: ViewModifier {
     @State private var y: CGFloat = 0
     @State private var visible = false
     let region: ShellKeyboardOrder.Region
-    var sortsLast = false
     var composerFocused: Bool = false
     var focusComposer: (() -> Void)?
     /// Let local composer settings finish their focus ring before the window-wide order takes Tab.
@@ -310,7 +308,7 @@ private struct ShellKeyboardTarget: ViewModifier {
             }
         }
         .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).midY } action: {
-            y = sortsLast ? .greatestFiniteMagnitude : $0
+            y = $0
             register()
         }
         .onScrollVisibilityChange(threshold: 0.01) {
@@ -333,11 +331,6 @@ private struct ShellKeyboardTarget: ViewModifier {
     }
 }
 
-extension KeyEquivalent {
-    /// Shift-Tab arrives as U+0019, so a shifted .tab handler cannot intercept it.
-    static let backTab = KeyEquivalent("\u{19}")
-}
-
 extension View {
     /// Native buttons already take focus with Keyboard navigation on; add focusable only when needed to avoid double stops.
     @MainActor @ViewBuilder
@@ -345,9 +338,8 @@ extension View {
         if NSApp.isFullKeyboardAccessEnabled { self } else { focusable() }
     }
 
-    /// Pinned controls must sort after every scrolling row regardless of scroll position.
-    func shellKeyboardTarget(_ region: ShellKeyboardOrder.Region, sortsLast: Bool = false) -> some View {
-        modifier(ShellKeyboardTarget(region: region, sortsLast: sortsLast))
+    func shellKeyboardTarget(_ region: ShellKeyboardOrder.Region) -> some View {
+        modifier(ShellKeyboardTarget(region: region))
     }
 
     func shellComposerKeyboardTarget(

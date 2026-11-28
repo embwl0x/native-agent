@@ -1,8 +1,8 @@
 import Foundation
-import OSLog
 import PersistenceCore
 import NativeAgentShared
 import DeskCore
+import OSLog
 // Blueprint: | `DeskPagePresentation.swift` | Desk page snapshots, measured activity, parking and next state deadline; stuck-reason and chat-draft words |
 public struct DeskPageSnapshot: Sendable {
     public let id = UUID()
@@ -44,10 +44,9 @@ public enum DeskWanderHourPresentation {
     }
 
     static func state(
-        installed: Bool,
         entry: StudioWanderLane.ThoughtReading?
     ) -> State {
-        guard installed, let entry else { return .absent }
+        guard let entry else { return .absent }
         switch entry.outcome {
         case .hit: return .line(text: "My hour: a thought that acted.", symbol: "eye", at: entry.at)
         case .empty: return .line(text: "My hour: a thought left quiet.", symbol: "moon.zzz", at: entry.at)
@@ -101,11 +100,10 @@ public enum DeskPageContent {
         var parked: Set<String> = []
         var parkingExpiry: Date?
         if loaded.deskUnavailable == nil {
-            let state = DeskState(items: items, generatedTs: "")
             for item in DeskBoardLayout.activeItems(items) where item.parent == nil {
                 let handles = DeskParking.subtreeHandles(item.handle, in: loaded.plan.children)
                 let live = loaded.agentJobs.items.contains { $0.desk.map(handles.contains) == true && !$0.state.isTerminal }
-                let parking = DeskParking.parking(item, in: state, plan: loaded.plan, live: live, now: presentationNow)
+                let parking = DeskParking.parking(item, plan: loaded.plan, live: live, now: presentationNow)
                 if parking.parked { parked.insert(item.handle) }
                 if let boundary = parking.boundary, boundary > presentationNow {
                     parkingExpiry = min(parkingExpiry ?? boundary, boundary)

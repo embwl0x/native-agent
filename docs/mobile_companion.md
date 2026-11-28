@@ -12,11 +12,15 @@ brain. The agent's interface remains its one door, `app`:
 SwiftUI observes the store properties each phone view reads. The Share extension binds its note field
 to its observable compose model.
 
-The main tabs are **Chat**, **Today**, **Desk**, **Settings**, and **More**.
+The tabs are **Together**, **Table**, the agent's name (**Agent** before naming),
+and **Control**. **Table** opens the synced board and holds **Today** and
+**Helpers**. The named tab holds **Home**, **Memories**, **Knowledge Graph**,
+**Personality**, **Dreams**, **Capabilities**, and published pages received from
+the Mac.
 A page the Mac publishes as a face (`faces.json`, delivered in its CloudKit status group) is
 drawn by the shared `FaceView`: Today, the Desk, their home, Memories, Personality,
 Trust, Providers, Connectors, Capabilities, Helpers, Diagnostics and the Mac's settings
-under Settings. A row's link opens its place on the phone (a faced page or a
+under Control. A row's link opens its place on the phone (a faced page or a
 saved run in the same stack; Chat, Today's queues, a card, the Desk or the browser
 through the shell), or says the place opens on the Mac; a row's action goes to the
 page's owner on the Mac as the signed `faceAction`, and its answer or refusal shows
@@ -28,14 +32,14 @@ folds belong to the page session, so scrolling cells away and back does not disc
 At narrow widths the value or control sits below the title and detail, and actions
 beyond two move into a menu. Embedded conversation cards use the same row without
 creating another list.
-Settings opens with a System/Light/Dark switch; this iPhone's own settings (appearance,
-connection, Places, senses, Live Activities) remain on that page beside the Mac's settings
-face. Memories is behind More; memory proposals are Today's "Memories to keep".
-More follows the phone's surface layout: Rooms holds the agent's home, Memories, Helpers, Agents,
-Capabilities, Skills & Tools, Personality, Connectors and Trust; Setup opens Settings;
-Power user holds deeper views. Settings nests Telegram and Providers.
-More uses only the Mac's accepted layout. A missing or unreadable refresh retains
-that layout; an unreadable refresh reports its cause. Before the first usable delivery, More
+Control holds Trust, Providers and Connectors alongside the iPhone's appearance,
+connection, Places, senses and Live Activities, and the Mac's settings face.
+Memory proposals still appear as Today's "Memories to keep" and open Memories.
+Control → Advanced follows the phone's surface layout. Rooms keeps the prior
+page links. Setup opens Settings. Power user has Knowledge Graph, Turn Inspector,
+Mac Tools and Diagnostics.
+Advanced uses only the Mac's accepted layout. A missing or unreadable refresh retains
+that layout, and an unreadable refresh reports its cause. Before the first usable delivery, Advanced
 shows layout unavailable with connection recovery. The phone neither seeds nor
 repairs a Mac layout. Approvals and notes are one Inbox, the Mac's Inbox face:
 Today's queues, approval and card links, notifications and a note's card in chat
@@ -208,7 +212,7 @@ unpaired phone asks to pair. Agent snippets stay in Chat, from the same
 tapping opens the contact conversation in a sheet.
 
 Settings shows the release version without the internal `-dev.<revision>.dirty`
-suffix. More → Power user → Diagnostics draws the Mac's diagnostics face, then this
+suffix. Control → Advanced → Power user → Diagnostics draws the Mac's diagnostics face, then this
 iPhone's recent push receipts, unverified Mac records and connection. A run row opens
 its saved detail, whose raw prompts/requests remain behind disclosures. Turn Inspector reads
 only timing/count summaries and carries no prompts.
@@ -496,15 +500,8 @@ that delivery receipt or invents a return.
 
 ## Pairing and setup
 
-Use the same Apple Account on the Mac and phone:
-
-1. Open the Mac pairing page, available under **Connectors → iPhone** in the
-   Mac rail, and **Pair with Mac** on the phone.
-2. Wait for the pairing key to arrive through iCloud. Tap **Check for Mac** if
-   it has not arrived; tap **Connect** when available.
-3. Match **This phone’s code** (two groups of four) to the **Code** on the waiting device on the Mac and choose
-   **Pair** there. Then tap **Connect** on the phone again.
-4. Keep both apps open until the Mac confirms the connection.
+Follow [Pair with your Mac](USER_GUIDE.md#pair-with-your-mac) for the steps
+on both devices.
 
 `PairingSecret` owns the shared secret; `PairedPhoneStore` owns the
 Mac's device records. The phone also has a signing identity for device approval
@@ -926,16 +923,24 @@ decision and names the missing read; it never publishes a fabricated absent row.
 Notification receipts require their explicit
 direction; Stop refuses unsupported payload fields before resolving any target.
 
-`faceAction` sends `{page, row, action, value?}` in that same signed envelope.
-The Mac passes the exact page and row ids, action id and optional string value
-through the phone’s engine to `engine.pages.act`; the page's owner answers it.
+`faceAction` carries the exact page, row and action in that same signed envelope.
+Drawn acts carry their call and operation identity, with the drawn publication
+UUID in `expectedPageRevision` and the separate `formRevision` on forms.
+The page owner checks a supplied publication UUID before dispatch and returns
+`stale_row` with no effects if the page has changed. Its reply asks the reader
+to read the page again. Older phones that omit the UUID keep their existing
+call and form checks.
+Transcript cards that draw Inbox answers retain the Inbox row's UUID.
+Approve in Shortcuts shows the Inbox row's details and retains its call and UUID
+before asking for confirmation. The confirmed action sends that same submission.
 A successful answer returns `status:ok`, `ok:true` and its words as `message`
 when it has any. A part refusal returns `status:error`, `ok:false` and the
 owner's `code` and `message`; a page without an action owner says it has
 "nothing a row can do". Missing or empty page, row or action fields are refused
 before dispatch. Buttons submit their action id; controls submit `action:set`,
 with `value:on` or `off` for a toggle, or the selected option id for a choice.
-Phones before faces never send this action.
+Drawn acts also return the structured outcome for the row, with the owner's
+effect evidence.
 
 `faceRead` is a signed read, outside the cognitive `observed` path. Its payload is
 `{request:<encoded DocumentRequest>,cursor:<scalar offset>,revision?:<digest>}`. The Mac
@@ -1138,11 +1143,6 @@ Phone connection standing reads the bridge's existing contact owner. A retained
 read failure outranks a held successful contact; missing contact stays unknown.
 Request silence has no local expiry verdict.
 
-Push-proof restoration and writes use the same off-main
-storage boundary, serialize in arrival order, and publish through `LatestRead`.
-Push timestamps record event arrival rather than time spent awaiting storage;
-retired lifecycles cannot publish their results. Issued writes finish even if
-the caller is cancelled; failure keeps the prior evidence and reports its cause.
 On the phone, receive-ledger restoration, encoding and file writes use serial
 `VolumeIO`. Ingress and held-record replay wait for checked restoration; an
 unreadable ledger is preserved and blocks admission with a storage repair message.
@@ -1208,6 +1208,27 @@ owed state, with `face_budget_exceeded` explaining its size, the shared budget a
 how to read or reduce it. Its content and levers do not enter that phone copy.
 Other pages keep their encoded values. The existing unavailable/error shape is
 readable by installed phones; no enum value or required field is added.
+The Desk's standing table leaf can carry a redacted drawing in its existing
+text field. The Mac reads the exact retained board revision named by that leaf.
+The iPhone draws it with the shared interactive canvas. Touch and Pencil can
+move, resize, draw and place elements. Table tools open the note editor and
+cross off or remove a selected element. VoiceOver and hardware-keyboard
+navigation follow the same measured element frames. Each edit sends an element
+ID and the changed fields, when present, through the existing signed
+iPhone-to-Mac action channel. Updates to existing note text also carry its
+opening text. The Mac compares it with the stored words under the Table write
+lock and refuses a mismatch while the phone keeps the draft. **Cancel waiting**
+pauses the reply wait, and **Resume waiting** checks the original request
+from the same Desk session. After a signed reply with an unknown outcome,
+**Check table** compares the requested change with that element in the committed
+Desk drawing. Other elements can still be edited. Older phones continue to read
+the same drawing and leaf fields. If the revision is unavailable or
+the drawing would exceed either face budget, the Desk remains available and
+the table reports that its drawing is unavailable.
+Table slices use the received Desk drawing and its live card facts. Tapping a populated slice opens the table fitted to those elements.
+**Show the whole table** returns to the overview from a focused view. An empty table or a slice with no matching elements displays a
+plain note. If the drawing is unavailable, the slice displays its `alt` words, as older phones do for the `leaf` envelope. A malformed
+drawing displays the table's decode error. The optional `ids` key carries exact table element IDs.
 If even these unavailable entries cannot fit, the file fails with its actual size.
 The shared codec still checks its 800 KiB status and 8 MiB uncompressed envelope
 limits. An encoding, envelope, write or publication failure retains its own cause

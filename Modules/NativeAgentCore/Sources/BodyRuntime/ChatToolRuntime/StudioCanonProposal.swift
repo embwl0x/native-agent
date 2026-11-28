@@ -17,7 +17,6 @@ public enum StudioCanonProposal {
     /// One proposal gets one card; staging cannot decide canon membership.
     @discardableResult
     public static func stage(
-        turn: Turn?, handsBack: Bool,
         _ draft: StudioCanonProposalDraft,
         inbox: SwiftNativeApprovalInbox
     ) async throws -> ApprovalRecord {
@@ -41,7 +40,7 @@ public enum StudioCanonProposal {
             // Verbatim evidence lets the agent inspect the cited entries before deciding.
             "payloadPreview": .string(preview(draft)),
             "payload": binding(draft),
-        ]), turn: turn, handsBack: handsBack)
+        ]), turn: nil)
     }
 
     static func preview(_ draft: StudioCanonProposalDraft) -> String {

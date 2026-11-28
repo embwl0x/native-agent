@@ -96,8 +96,6 @@ public final class MemoryFacade {
     }
     @ObservationIgnored public var proposalsDidChange: (@MainActor () -> Void)?
 
-    public private(set) var proposalsReadError: String?
-    public private(set) var hasLoadedProposals = false
     public private(set) var rejectedProposals: [ProposalRecord] = []
     public private(set) var rejectedHistoryError: String?
     @ObservationIgnored private lazy var rejectedHistoryRead = LatestRead()
@@ -146,11 +144,6 @@ public final class MemoryFacade {
     }
 
     // MARK: - Reads
-
-    /// Keep kind reads on the memory owner's list policy, including its full result set and errors.
-    public nonisolated func listMemory(kind: String?) async throws -> [MindCore.MemoryRecord] {
-        try await resolveOwner().listMemory(kind: kind)
-    }
 
     public func checkPageObservation(_ projection: MemoryStorage.PageProjection) throws {
         if let issue = pageObservationIssues[projection] { throw MemoryStorageError.databaseUnavailable(issue) }
@@ -212,7 +205,9 @@ public final class MemoryFacade {
             let shown = Set(newest.map(\.id))
             stored = newest + pinned.filter { !shown.contains($0.id) }
         }
-        return stored.map(MindCore.MemoryRecord.init(stored:))
+        let now = Date()
+        return stored.filter { MemoryRecallScoring.hasStarted(validFrom: $0.validFrom, at: now) }
+            .map(MindCore.MemoryRecord.init(stored:))
     }
 
     /// Pending review excludes superseded or inadmissible statements; history retains all rows.
@@ -220,20 +215,12 @@ public final class MemoryFacade {
         publish: @MainActor @Sendable (_ change: () -> Void) -> Void = { $0() }
     ) async throws -> [ProposalRecord] {
         guard status == "pending" else { return try await readProposals(status: status) }
-        let result: Result<[ProposalRecord], Error> = await proposalsRead.read({
-            do { return .success(try await readProposals(status: status)) }
-            catch { return .failure(error) }
-        }, publish: { result in
-            switch result {
-            case .success(let records):
-                proposalsReadError = nil
-                hasLoadedProposals = true
-                if proposals != records { publish { proposals = records } }
-                else { proposalsDidChange?() }
-            case .failure(let error): proposalsReadError = error.localizedDescription
-            }
+        return try await proposalsRead.read({
+            try await readProposals(status: status)
+        }, publish: { records in
+            if proposals != records { publish { proposals = records } }
+            else { proposalsDidChange?() }
         })
-        return try result.get()
     }
 
     @concurrent private nonisolated func readProposals(status: String) async throws -> [ProposalRecord] {
@@ -282,40 +269,8 @@ public final class MemoryFacade {
 
     // MARK: - Writes
 
-    /// Resolve and open the memory store off the caller’s actor because it may migrate.
-    /// These page mutations have no chat turn or sense-read ledger.
-    public nonisolated func store(content: String, source: String, metadata: JSONValue?) async throws {
-        _ = try await resolveOwner().store(content: content, source: source, metadata: metadata,
-            context: MemoryWriteContext(turn: nil, senseReads: nil, telling: MemoryDataProvenance.toldByPerson(dataRoot: dataRoot)))
-    }
-
-    /// Merge only `pinned` within the canonical transaction.
-    public nonisolated func setPinned(_ pinned: Bool, id: String) async throws {
-        do {
-            _ = try await resolveOwner().updateMemory(id: id, update: .object(["pinned": .bool(pinned)]),
-                context: MemoryWriteContext(turn: nil, senseReads: nil, telling: nil))
-        } catch MemoryV2Error.recordNotFound {
-            throw Self.notFound(id)
-        }
-    }
-
     public nonisolated func delete(id: String) async throws {
         guard try await resolveOwner().deleteMemoryIfPresent(id: id) else { throw Self.notFound(id) }
-    }
-
-    public func accept(proposalID: String,
-        publish: @MainActor @Sendable (_ change: () -> Void) -> Void = { $0() }
-    ) async throws -> MindCore.MemoryRecord {
-        let accepted = try await resolveOwner().acceptProposal(id: proposalID, context: MemoryWriteContext(turn: nil, senseReads: nil, telling: nil))
-        proposalsRead.write { publish { proposals.removeAll { $0.id == proposalID } } }
-        return accepted
-    }
-
-    public func reject(proposalID: String, reason: String,
-        publish: @MainActor @Sendable (_ change: () -> Void) -> Void = { $0() }
-    ) async throws {
-        _ = try await resolveOwner().rejectProposal(id: proposalID, reason: reason.isEmpty ? nil : reason)
-        proposalsRead.write { publish { proposals.removeAll { $0.id == proposalID } } }
     }
 
     nonisolated private static func notFound(_ id: String) -> NSError {
@@ -400,10 +355,6 @@ public final class MemoryFacade {
 
     // MARK: - Knowledge Graph
 
-    nonisolated private var graphPath: URL {
-        DataRootPaths.memoryDatabase(in: dataRoot)
-    }
-
     /// Keep the prior snapshot with its error on failure. Share one graph read across mounts; joining refreshes get a fresh trailing read so captured bytes
     /// cannot predate the change.
     public func loadGraph() async {
@@ -423,7 +374,7 @@ public final class MemoryFacade {
     private func readGraph() async {
         _ = await graphSnapshotRead.read {
             do { return Result<CanonicalAgentGraphReadout, Error>.success(try await AgentGraphReads.canonicalAgentGraphProjection(
-                graphPath: graphPath, timestamp: SwiftNativeManifestSigner.isoTimestamp
+                graphPath: DataRootPaths.memoryDatabase(in: dataRoot), timestamp: SwiftNativeManifestSigner.isoTimestamp
             )) } catch { return .failure(error) }
         } publish: { result in
             switch result {

@@ -8,6 +8,27 @@ import PersistenceCore
 import DeskCore
 // Blueprint: | `ProviderToolResultRecovery.swift` | `SwiftToolDispatcher`, `impl_tool_result_page`: Retain results for the record's detail horizon. |
 
+/// The room one answer still has, shared by the steps of one `actions` call. A page read fills only what is left, so a batch of
+/// reads never outgrows the answer and is never itself retained and paged.
+package final class AnswerRoom: @unchecked Sendable {
+    /// What a step that reads nothing still costs the answer: its receipt saying so, with its place.
+    private static let pointer = 1_000
+    private let lock = NSLock()
+    private var left = ProviderToolResultPage.defaultMaxUTF8Bytes - 2_000
+    private var steps: Int
+    package init(steps: Int) { self.steps = max(1, steps) }
+    /// What the step now running may fill: `whole` is the room less a pointer for each step still to come, so a first page is read
+    /// whenever it fits; `share` is that room split evenly with them, which bounds how many further pages this read joins.
+    package var allowance: (whole: Int, share: Int) {
+        lock.withLock {
+            let whole = left - Self.pointer * (steps - 1)
+            return (whole, whole / steps)
+        }
+    }
+    package func take(_ bytes: Int) { lock.withLock { left -= bytes; steps = max(1, steps - 1) } }
+}
+package enum AnswerRoomPart: NativeAgentCore.TurnPart { package static let unset: AnswerRoom? = nil }
+
 /// Bound a view only after its redacted body is retained. Script steps and outer calls use this same owner.
 package enum ProviderToolResultPage {
     package static let defaultMaxUTF8Bytes = 48_000
@@ -340,13 +361,33 @@ package actor ProviderToolResultRecoveryStore {
     ) -> JSONValue {
         let key = dataRoot.standardizedFileURL.appendingPathComponent("tool_results/" + handle)
         var result = readPage(handle: handle, page: page, dataRoot: dataRoot, turn: turn, query: query)
+        func bytes(_ value: JSONValue?) -> Int { (try? (value ?? .null).serialize(pretty: false).utf8.count) ?? .max }
+        // The same read, named by its page: inside a batch several results are read at once, and the turn holds one cursor.
+        func call(at page: Int) -> JSONValue {
+            var args: [String: JSONValue] = ["result_handle": .string(handle), "page": .int(Int64(page))]
+            if let query { if !query.isEmpty { args["query"] = .string(query) } } else { args["raw"] = .bool(true) }
+            if pages < Self.usualSectionPages { args["pages"] = .int(Int64(pages)) }
+            return .object(["tool": .string("app"), "input": .object(["action": .string("result.page"), "args": .object(args)])])
+        }
+        let room = turn[AnswerRoomPart.self]?.allowance
+        // A page with no room left beside the batch's other steps is not read; its place is kept.
+        if let room, ToolResult(result).said("completed"), bytes(result) + bytes(entries[key]?.version) + 1_000 > room.whole {
+            let read = result.objectValue ?? [:]
+            return .object(["status": .string("completed"), "result_handle": .string(handle), "page": .int(Int64(page)),
+                "page_count": read["page_count"] ?? .null,
+                "raw_page_count": .int(Int64(max(1, (entries[key]?.pageByteOffsets.count ?? 2) - 1))),
+                "original_bytes": entries[key].map { .int(Int64($0.originalBytes)) } ?? .null,
+                "pages_read": .int(0), "next_page": .int(Int64(page)), "has_more": .bool(true), "reading_complete": .bool(false),
+                "recovery_only": .bool(true),
+                "detail": .string("This answer is full, so this page was not read. Read it with next_call."),
+                "next_call": call(at: page)])
+        }
         // A read of several pages joins them in order while the whole answer stays within what one answer holds. Each mode's page size
         // differs, so the body is measured, never assumed: that measure alone sets how many pages one answer carries.
         if pages > 1, case .object(var answer) = result, ToolResult(result).said("completed") {
             let body = query.map { ToolResultSections.queryTerms($0).isEmpty ? "sections" : "matches" } ?? "content"
-            func bytes(_ value: JSONValue?) -> Int { (try? (value ?? .null).serialize(pretty: false).utf8.count) ?? .max }
             // The body may fill what one answer holds less everything else the answer carries, with 1,000 bytes for what it gains below.
-            let budget = ProviderToolResultPage.defaultMaxUTF8Bytes - 1_000 - max(0, bytes(result) - bytes(answer[body]))
+            let budget = (room?.share ?? ProviderToolResultPage.defaultMaxUTF8Bytes) - 1_000 - max(0, bytes(result) - bytes(answer[body]))
             func int(_ key: String) -> Int { if case .int(let value)? = answer[key] { Int(value) } else { 0 } }
             var used = bytes(answer[body]), read = 1
             while read < pages, case .int(let next)? = answer["next_page"] {
@@ -394,9 +435,9 @@ package actor ProviderToolResultRecoveryStore {
             object["version"] = entries[key]?.version
             var args: [String: JSONValue] = ["continue": .bool(true), "result_handle": .string(handle)]
             // Continuing already reads as much as fits; only an asked count travels with it.
-            if pages > 1, pages < Self.usualSectionPages { args["pages"] = .int(Int64(pages)) }
-            object["next_call"] = next == nil ? .null : .object(["tool": .string("app"), "input": .object([
-                "action": .string("result.page"), "args": .object(args)])])
+            if pages < Self.usualSectionPages { args["pages"] = .int(Int64(pages)) }
+            object["next_call"] = next.map { room == nil ? .object(["tool": .string("app"), "input": .object([
+                "action": .string("result.page"), "args": .object(args)])]) : call(at: $0) } ?? .null
             result = .object(object)
         }
         return result
@@ -669,6 +710,101 @@ package actor ProviderToolResultRecoveryStore {
         return .object(answer)
     }
 
+    /// The named fields of a whole retained result and nothing else of it: the read for a large result she needs two fields of. It reads
+    /// what paging reads, the retained redacted body, under the same conversation rule, so nothing that judged or recorded the call changes.
+    package func selected(handle: String, paths: [String], dataRoot: URL, turn: Turn) -> JSONValue {
+        let first = readPage(handle: handle, page: 0, dataRoot: dataRoot, turn: turn, query: nil)
+        let key = dataRoot.standardizedFileURL.appendingPathComponent("tool_results/" + handle)
+        guard ToolResult(first).said("completed"), let entry = entries[key] else { return first }
+        func failed(_ reason: String, _ hint: String) -> JSONValue {
+            .object(["status": .string("failed"), "effects": .string("none"), "reason": .string(reason), "result_handle": .string(handle),
+                     "recovery_hint": .string(hint)])
+        }
+        guard entry.omittedBytes == 0, let whole = try? JSONDecoder().decode(JSONValue.self, from: entry.content) else {
+            return failed("select_needs_whole_json", "This retained result is not one whole JSON value; read it by page or with query.")
+        }
+        let answer = ToolResult.stepAnswer(whole)
+        var kept: JSONValue = .null, missing: [JSONValue] = []
+        for path in paths {
+            let segments = path.split(separator: ".", omittingEmptySubsequences: false).map(String.init)[...]
+            // A path is read as it stands in the retained result, and otherwise against what the action returned inside its receipt.
+            if let part = Self.pick(whole, segments) ?? Self.pick(answer, segments) {
+                kept = Self.merged(kept, part)
+            } else {
+                // A path that found nothing says what was at the place it stopped, so a wrong path and an absent field read differently.
+                missing.append(.object(["path": .string(path), "there": .array(Self.keysWhereLost(whole, segments).map(JSONValue.string))]))
+            }
+        }
+        var reply: [String: JSONValue] = ["status": .string("completed"), "recovery_only": .bool(true),
+            "verification_scope": .string("retained_tool_response_not_external_outcome"), "tool": .string(entry.toolName),
+            "original_result_class": .string(entry.resultClass.rawValue), "result_handle": .string(handle),
+            "original_bytes": .int(Int64(entry.originalBytes)), "selected": kept]
+        if !missing.isEmpty { reply["select_missing"] = .array(missing) }
+        reply["source_continues"] = entry.source
+        reply["selected_bytes"] = .int(Int64((try? kept.serialize(pretty: false).utf8.count) ?? 0))
+        let size = (try? JSONValue.object(reply).serialize(pretty: false).utf8.count) ?? .max
+        let room = turn[AnswerRoomPart.self]?.allowance.whole ?? ProviderToolResultPage.defaultMaxUTF8Bytes - 2_000
+        guard size <= room else {
+            return failed("selection_too_large", "The selected fields are \(size) bytes and \(max(0, room)) fit here. Name fewer or deeper paths, or read by page.")
+        }
+        return .object(reply)
+    }
+
+    /// One path into a value, kept in its structure: object keys, a numeric index into a list, and at a list reached by a name every element.
+    static func pick(_ value: JSONValue, _ path: ArraySlice<String>) -> JSONValue? {
+        guard let key = path.first else { return value }
+        switch value {
+        case .object(let fields):
+            if let child = fields[key] { return pick(child, path.dropFirst()).map { .object([key: $0]) } }
+            // A receipt holds its answer flat or under `result`: a path written either way finds it. Any other object is read as written.
+            guard Self.isReceipt(fields) else { return nil }
+            if key == "result" { return pick(value, path.dropFirst()) }
+            return fields["result"].flatMap { $0.objectValue == nil ? nil : pick($0, path) }.map { .object(["result": $0]) }
+        case .array(let items):
+            // One element taken by number keeps its number, so two such paths never fold into one row.
+            if let index = Int(key) { return items.indices.contains(index) ? pick(items[index], path.dropFirst()).map { .object([key: $0]) } : nil }
+            let rows = items.map { pick($0, path) }
+            return rows.contains { $0 != nil } ? .array(rows.map { $0 ?? .null }) : nil
+        default: return nil
+        }
+    }
+
+    /// A door receipt, whose answer sits flat on it or under `result`. Any other object is read exactly as written.
+    static func isReceipt(_ fields: [String: JSONValue]) -> Bool {
+        fields["action"] != nil && (fields["status"] != nil || fields["result"] != nil)
+    }
+
+    /// The field names at the place a path stopped finding anything.
+    static func keysWhereLost(_ value: JSONValue, _ path: ArraySlice<String>) -> [String] {
+        guard let key = path.first else { return [] }
+        switch value {
+        case .object(let fields):
+            if let child = fields[key] { return keysWhereLost(child, path.dropFirst()) }
+            if key == "result", Self.isReceipt(fields) { return keysWhereLost(value, path.dropFirst()) }
+            if case .object(let inner)? = fields["result"], Self.isReceipt(fields) {
+                // The answer is under result: what is there is its fields, not the receipt's own.
+                return inner[key] != nil ? keysWhereLost(.object(inner), path) : Array(inner.keys.sorted().prefix(30))
+            }
+            return Array(fields.keys.sorted().prefix(30))
+        case .array(let items):
+            if let index = Int(key) { return items.indices.contains(index) ? keysWhereLost(items[index], path.dropFirst()) : ["list of \(items.count)"] }
+            return items.first.map { keysWhereLost($0, path) } ?? ["empty list"]
+        default: return []
+        }
+    }
+
+    static func merged(_ one: JSONValue, _ other: JSONValue) -> JSONValue {
+        switch (one, other) {
+        case (.object(let a), .object(let b)): .object(a.merging(b) { merged($0, $1) })
+        case (.array(let a), .array(let b)) where a.count == b.count: .array(zip(a, b).map { merged($0, $1) })
+        // One element taken by number beside a field taken from every row: the element joins its own row.
+        case (.array(let rows), .object(let byNumber)), (.object(let byNumber), .array(let rows)):
+            .array(rows.enumerated().map { index, row in byNumber[String(index)].map { merged(row, $0) } ?? row })
+        case (.null, _): other
+        default: one
+        }
+    }
+
     private func cache(_ entry: Entry, at key: URL) {
         entries[key] = entry
         cacheOrder.removeAll { $0 == key }
@@ -713,6 +849,15 @@ extension SwiftToolDispatcher {
                     original operation.
                     """),
             ])
+        }
+        if let select = input.select {
+            let paths = select.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+            guard let handle = input.resultHandle?.trimmingCharacters(in: .whitespacesAndNewlines), !handle.isEmpty, (1...12).contains(paths.count) else {
+                return .object(["status": .string("failed"), "effects": .string("none"), "reason": .string("invalid_select"),
+                    "recovery_hint": .string("Give result_handle and select as 1 to 12 comma-separated paths, such as \"rows.id, rows.title, total\".")])
+            }
+            return await heldReceiptPointer(turnId: turn.id, await ProviderToolResultRecoveryStore.shared.selected(
+                handle: handle, paths: paths, dataRoot: dataRoot, turn: turn))
         }
         if input.resume == true {
             // Continue owns the position, even when a page is also supplied. A query or raw named with it reads the continued result that

@@ -75,7 +75,7 @@ extension CognitiveSubstrate {
         case .frustration: nudge = -maximumNudge * 0.75
         case .grief, .seeking: nudge = 0
         }
-        return (roomWarmth + nudge).clamped01()
+        return (roomWarmth + nudge).clampedSigned()
     }
 
     struct SoundEchoSelection: Sendable, Equatable {

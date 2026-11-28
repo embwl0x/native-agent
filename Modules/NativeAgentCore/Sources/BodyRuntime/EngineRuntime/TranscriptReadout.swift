@@ -1,6 +1,5 @@
 import SenseCore
 import Foundation
-import Observation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
@@ -8,6 +7,7 @@ import ProviderRouting
 import MindCore
 import MacNerves
 import Darwin
+import Observation
 // Blueprint: | `TranscriptReadout.swift` | Transcript/card structures, page-bounded inline mounts and structural message grouping |
 extension InlineCards {
     @MainActor
@@ -112,7 +112,7 @@ public struct TranscriptReadout: Sendable {
                 detail: detail.isEmpty ? nil : NativeAppSecretRedactor.redactText(detail.joined(separator: "\n\n")),
                 symbol: "hand.raised.fill",
                 tone: model.needsAttention ? PartFace.Tone.attention : [.failed, .stopped].contains(model.state) ? .failed : nil,
-                actions: answers?.isEmpty == false ? answers : nil)
+                actions: answers?.isEmpty == false ? answers : nil, pageRevision: inboxRow?.pageRevision)
         }
     }
     public var messages: [ChatMessage]

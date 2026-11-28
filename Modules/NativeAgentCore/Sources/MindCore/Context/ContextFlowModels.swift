@@ -206,12 +206,14 @@ public struct ContextFreshness: Codable, Equatable, Sendable {
     public let recallSeedAt: Date?
     public let updatedAt: Date
     public let expiresAt: Date?
+    public let startsAt: Date?
 
-    public init(updatedAt: Date, expiresAt: Date? = nil, createdAt: Date? = nil, recallSeedAt: Date? = nil) {
+    public init(updatedAt: Date, expiresAt: Date? = nil, createdAt: Date? = nil, recallSeedAt: Date? = nil, startsAt: Date? = nil) {
         self.createdAt = createdAt
         self.recallSeedAt = recallSeedAt
         self.updatedAt = updatedAt
         self.expiresAt = expiresAt
+        self.startsAt = startsAt
     }
 
     public func isExpired(at date: Date) -> Bool {

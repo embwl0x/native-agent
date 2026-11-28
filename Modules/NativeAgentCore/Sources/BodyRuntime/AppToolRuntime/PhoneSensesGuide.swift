@@ -18,7 +18,7 @@ public enum PhoneSensesGuide {
     still absent, inspect pairing rather than guessing permissions. An off switch, denied permission, unsupported device or no saved place each has its own \
     remedy. A grant is the person's choice.
 
-    In NativeAgent on iPhone, open the Settings tab (or More → Settings). Places and Phone senses are below the Mac settings. Every sense starts off; each \
+    In NativeAgent on iPhone, open Control. Places and Phone senses are below the Mac settings. Every sense starts off; each \
     switch explains its summary, paired iCloud delivery and use by the AI provider selected on the Mac. Turning it off stops new observations and shares \
     disabled; previously accepted evidence stays historical. Setup state is shared to help with guidance, including when a sense is off. After a change in \
     iPhone Settings, reopen NativeAgent to refresh setup. iOS may defer a background wake indefinitely; foreground is the direct way to request a reading. \
@@ -28,7 +28,7 @@ public enum PhoneSensesGuide {
     place the person saved. Location is the phone's last known position, which the agent can look up when wanted. A one-time look at where the phone is now \
     is neither: it is a phone request (phone.location) the person answers on the phone, so do not send them to turn on Places for it.
 
-    Places: stand at the place. NativeAgent → Settings → Places → Place name → Home, Work or Custom (enter Place name) → Save this location. Turn on \
+    Places: stand at the place. NativeAgent → Control → Places → Place name → Home, Work or Custom (enter Place name) → Save this location. Turn on \
     the saved place's own switch. No Home place is assumed or created for someone. Allow location when asked, then iPhone Settings → Apps → NativeAgent \
     → Location → Always; turn Precise Location on. If global location is off: Settings → Privacy & Security → Location Services → on. Enabled place \
     names and transition times leave the phone; a requested phone settings inspection also shares saved names and switches, including disabled places. \
@@ -39,39 +39,39 @@ public enum PhoneSensesGuide {
     permission acquisition; disabling uses the same owner without a card. No answer remains unconfirmed after the bounded wait. New current-location capture \
     and place deletion remain the phone's Places actions.
 
-    Location: NativeAgent → Settings → Phone senses → Location → on; allow Location Always (iPhone Settings → Apps → NativeAgent → Location → \
+    Location: NativeAgent → Control → Phone senses → Location → on; allow Location Always (iPhone Settings → Apps → NativeAgent → Location → \
     Always, Precise on). The phone sends its last known position when iOS wakes the app or it moves about 500 m; this page holds the latest one with \
     its time. It is for looking up when wanted, not live tracking; an old time means where the phone was then. A one-time fresh fix is the phone request phone.location.
 
-    Motion: NativeAgent → Settings → Phone senses → Motion → on; allow Motion & Fitness when asked. To repair denial: iPhone Settings → Privacy & \
+    Motion: NativeAgent → Control → Phone senses → Motion → on; allow Motion & Fitness when asked. To repair denial: iPhone Settings → Privacy & \
     Security → Motion & Fitness → Fitness Tracking on and NativeAgent on (also exposed under Settings → Apps → NativeAgent → Motion & Fitness). \
     Unsupported hardware, including the simulator, cannot produce activity; permission alone does not fix that. Running, walking, cycling, driving and \
     stationary flags can overlap. Report them with confidence and activity time; low confidence is an estimate, never enough to establish absence or sleep.
 
-    Focus: NativeAgent → Settings → Phone senses → Focus → on; allow Focus Status. In iPhone Settings → Focus → Focus Status, turn Share Focus \
+    Focus: NativeAgent → Control → Phone senses → Focus → on; allow Focus Status. In iPhone Settings → Focus → Focus Status, turn Share Focus \
     Status on and enable the desired Focus; allow NativeAgent's Focus access under Settings → Apps → NativeAgent. iOS exposes a Boolean, not the Focus \
     name. Nil means unavailable, never off.
 
-    Sleep clues: NativeAgent → Settings → Phone senses → Sleep clues → on. No extra iOS permission. Shares charging and whether it is night on the \
+    Sleep clues: NativeAgent → Control → Phone senses → Sleep clues → on. No extra iOS permission. Shares charging and whether it is night on the \
     phone. Probably asleep is an inference requiring fresh stationary Motion and no positive Mac-here input; it is never a HealthKit sleep reading.
 
-    Battery: NativeAgent → Settings → Phone senses → Battery → on. No extra iOS permission. Shares percentage on a wake or battery notification while \
+    Battery: NativeAgent → Control → Phone senses → Battery → on. No extra iOS permission. Shares percentage on a wake or battery notification while \
     the app can run; an unavailable battery reading stays unknown.
 
-    Headphones: NativeAgent → Settings → Phone senses → Headphones → on. No Bluetooth or microphone permission is requested for this read. Shares this \
+    Headphones: NativeAgent → Control → Phone senses → Headphones → on. No Bluetooth or microphone permission is requested for this read. Shares this \
     app's current audio route without device names. A Bluetooth route could be a speaker or car; another route is not proof of disconnected headphones. It \
     never activates an audio session to sense.
 
-    Connection: NativeAgent → Settings → Phone senses → Connection → on. No extra iOS permission. Shares Wi-Fi/cellular/wired/other or an explicitly \
+    Connection: NativeAgent → Control → Phone senses → Connection → on. No extra iOS permission. Shares Wi-Fi/cellular/wired/other or an explicitly \
     unavailable path, without SSID, carrier, IP address or network names. Missing path callback becomes unknown after five seconds. A satisfied path is not \
     proof of Internet reachability or Mac delivery.
 
-    Apple Music: NativeAgent → Settings → Phone senses → Apple Music → on; allow Media & Apple Music. To repair denial: iPhone Settings → Privacy & \
+    Apple Music: NativeAgent → Control → Phone senses → Apple Music → on; allow Media & Apple Music. To repair denial: iPhone Settings → Privacy & \
     Security → Media & Apple Music → NativeAgent on (also exposed under Settings → Apps → NativeAgent). Open Music and play a song, then reopen \
     NativeAgent. Shares the Music app's reported playback state and available title/artist; other music apps are outside this API. Missing now-playing \
     metadata does not prove nothing is playing. No playback commands, audio or history are sent.
 
-    Photos today: NativeAgent → Settings → Phone senses → Photos today → on. Choose Limited Access or Full Access when Photos asks. To repair/change \
+    Photos today: NativeAgent → Control → Phone senses → Photos today → on. Choose Limited Access or Full Access when Photos asks. To repair/change \
     selection: iPhone Settings → Apps → NativeAgent → Photos → Limited Access → Edit Selected Photos, or Full Access. Limited Access is enough; \
     never ask for Full Access just to remove a warning. Shares only the number of visible non-hidden image assets dated today and the phone-local date/time \
     zone, including imported/synced images. Limited Access is always labelled partial, including zero. This is not proof of photos captured here; no images, \

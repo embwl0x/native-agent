@@ -1,12 +1,12 @@
 import NativeAgentShared
 import Foundation
-import os
-import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import MacNerves
 import MindCore
 import SenseCore
+import os
+import CryptoKit
 // Blueprint: | `AgentConversationDelivery.swift` | Delivery states require retained evidence. |
 
 extension AgentConversationRecord {
@@ -20,17 +20,15 @@ public enum AgentConversationDelivery: String, Sendable {
     /// An explicit observation can report an unanswered exchange without proving non-delivery.
     case unanswered
 
-    public static func of(_ row: AgentConversationRecord, read: Bool) -> Self {
+    public static func of(_ row: AgentConversationRecord) -> Self {
         if row.phase == "sending" { return .sending }
         if row.sendFailed { return .failed }
         if row.sendStatus == "held" { return .waiting }
         if case .object(let receipt)? = row.receipt, receipt["sent"] == .bool(false) { return .notDelivered }
         if row.phase == "ready", row.exchanges?.last(where: { $0.id == row.operationID })?.reply != nil { return .answered }
         switch row.phase {
-        case "attention":
-            return accepted(row, read: read) ? .delivered : .waiting
         case "waiting": return .waiting
-        default: return accepted(row, read: read) ? (read ? .read : .delivered) : .waiting
+        default: return accepted(row) ? .delivered : .waiting
         }
     }
 
@@ -43,9 +41,9 @@ public enum AgentConversationDelivery: String, Sendable {
         }
     }
 
-    public static func accepted(_ row: AgentConversationRecord, read: Bool = false) -> Bool {
+    public static func accepted(_ row: AgentConversationRecord) -> Bool {
         if row.phase != "sending", row.sendFailed { return false }
-        if read || row.exchanges?.last(where: { $0.id == row.operationID })?.reply != nil { return true }
+        if row.exchanges?.last(where: { $0.id == row.operationID })?.reply != nil { return true }
         let value = row.sendEvidence
         if let message = row.readInput?["message_id"], case .array(let ids)? = value["accepted_message_ids"], ids.contains(message),
            case .string(let state)? = value["run_status"] ?? value["status"] ?? value["state"],

@@ -29,15 +29,24 @@ Rulings, non-negotiable:
 `BodyField` keeps five live joints for the turn. `front` holds the app, focused window, document, focused role and selection range length where AX supplies them.
 `browser` holds Chrome's visible focused tab and owned tab IDs. Browser titles and local file URLs come only from the same non-private tab record on the foreground PID's ready channel. An incognito window's AX title or path cannot enter either joint while Chrome reports a focus change.
 `files` keeps the open document path from that tab or the non-browser window's AX document. A vnode change that passes the self-write check supplies a fresh generation. The watcher resolves and opens its path off the body actor, independently of turns and Quit.
-`threads` holds agent-opened process IDs and the places of active turns, including their own work lines. `somatic` holds console, lock, presence, observed network state and whether the microphone is in use (CoreAudio, event-driven).
+`threads` holds agent-opened process IDs and the places of active turns, including their own work lines.
+`somatic` holds console, lock, presence, observed network state and whether the microphone is in use (CoreAudio, event-driven).
+It also holds `thermal_state` and `low_power_mode`. BodyField reads the thermal state before registering for notifications and samples both after registration.
+macOS heat and power notifications refresh them through the body's existing coalescer.
 The network value stays null until the path monitor speaks. External labels and URLs are redacted, cleaned and marked as untrusted data.
 
-Home and the Mac room can read the body without a turn. The room shows the console state, front app and running apps with their launch labels.
+Home and the Mac room can read the body without a turn. The console state, front app
+and running apps carry the observation time of the published room reading.
+Workspace and console edges refresh that reading. When the room reports a covered
+screen, password-prompt evidence carries the time the wake read observed the
+focused password field. Without that evidence, the password prompt is unknown.
+Home and the Browser room refresh their connection status on Chrome's connection
+edge and label it unobserved until the relay reports a state. Home's Changed
+section compares reported connection states.
 Their last eight window records survive relaunch for four hours. An act records the app, window kind, numeric readout and observation time.
-Home opens these records with `app {page:"home", item:"mac"}`. A named look renews an app already in that history. Recording or expiry updates both Home and the room preview.
+Home opens these records with `app {page:"home", item:"mac"}`. A named look renews an app already in that history. Recording refreshes Home and the room preview.
 
 Home’s Activity room shows “capture off” when recording is disabled. Opening the room reads the policy without querying app-use history.
-A named look renews an app already in that history. Recording refreshes Home and the room preview.
 Each Home render and Mac room read omits records aged four hours or more.
 Once the body field stops, the Mac room reports that it has stopped instead of showing the last console and apps.
 Quit keeps the window record open until admitted turns and their dispatch bodies settle.
@@ -52,11 +61,36 @@ Selected text, pixels and page contents stay behind their ordinary sense reads.
 
 `MacBodyNerve` shares workspace, console and foreground AX edges with local activity capture. Each focus notification reaches capture
 even when the body fields compare equal. Capture matches a queued focus event to the open span by its source PID.
+A display-wake notification can resume capture. A system-wake notification can do so only when a display is awake.
 Activation of a different PID ends the prior span even when both processes share a bundle ID. Capture consent alone installs focus notifications. Reading a title still requires the activity
 title policy. The ordered span writer and its 60-second idle check use those edges independently of model access. After the agent activates an app or raises a window in the foreground app, capture resumes only on evidence of newer person input.
 An authored app sense shares process termination and keeps its own descendant AX subscriptions and coverage report.
+App AX subscriptions, desktop view captures and screen watches read live process grants through `SystemPermissionPreflight`.
+Authored parts can query a running app's accessibility legend through `host.ax.query`. The strict walk represents a confirmed secure node with
+fixed placeholders and prunes its descendants. The node's bounds help mask nearby secret-shaped text. A protected path or incomplete protection
+evidence or coverage withholds the window. An active watch supplies its retained window identity and masks even when the part also declares app reach.
+[The manifest](skill_manifest_spec.md#execution-and-ownership) defines the part's reach and filters.
+For a literal AX target without declared app or watch reach, [save refuses with a header patch](skill_manifest_spec.md#save-refusals).
 
-Changed tuples signal `body.changed` with structural IDs. Workspace and AX notifications carry the provenance observed at the edge. A buffered refresh retains the motor mark if any contributing edge was theirs. A coordinate click holds the PID hit by its press. A launch holds its target until Launch Services returns success or failure, even if Stop releases the caller first. Observed physical input interrupts foreground attribution, and foreign activation interrupts a foreground act that expected its target to stay in front. A background act can continue while the person's activation of that same app reaches the front-event reader. The act receipt records intervention beside the verdict from readback.
+Changed tuples signal `body.changed` with structural IDs and the publication's `generation`. Workspace and AX notifications carry the provenance observed at the edge. A buffered refresh retains the motor mark if any contributing edge was theirs. A coordinate click holds the PID hit by its press. A launch holds its target until Launch Services returns success or failure, even if Stop releases the caller first. Observed physical input interrupts foreground attribution, and foreign activation interrupts a foreground act that expected its target to stay in front. A background act can continue while the person's activation of that same app reaches the front-event reader. The act receipt records intervention beside the verdict from readback.
+The full body reading carries the time BodyField assembled its somatic value as
+`observed_at`, including when another joint leads the reading. An unchanged somatic
+joint keeps its time. The bundled turn dates the somatic anchor, and
+`context.expand` returns the same field for the somatic joint. A front window title
+carries its AX read time in `title_observed_at`, also returned as `observed_at` on
+`body:front` expansion. Without that time, the title is unknown and the expansion
+reports the gap. Browser titles reach the turn through the browser joint. Its
+anchor distinguishes an unreported title from a reported empty title. Front, tab
+and document anchors describe the last reported values. Joint digests and change
+signals use the structural values. A whole-body or single-joint reading carries
+the publication's `generation`, which advances when published values or their
+observation times change and when the mind binds or detaches. After the largest
+signed 64-bit value, it wraps to one. A single-joint read can reuse the
+publication for a matching joint and observation time. If an explicit read
+differs, BodyField takes a turn-independent reading through the same publication
+path and returns the stamped observation when its values match what the turn
+read. A turn's reading carries `generation: null` when the shared publication
+cannot confirm its values.
 The first human activation of an app per local day posts `mac:front:<bundleId>` through `mac:front`, including apps without a document or site.
 First entry into a document or domain per app per local day and a sheet observed during a matching act also post world happenings.
 A sheet matches the held PID and, when the act specifies one, its window. The happening must still belong to the admitted foreground PID and the same mind binding. The act receipt records a sheet and the modal percept available from its window. Full Mac also admits it while the person is away. Chrome's own takeover handler signals parts and posts its happening independently of the front window.
@@ -83,6 +117,47 @@ A named-app look can successfully observe absence: `status:"ok"`, `app:<name>`,
 The sense door returns that observation without asking for window material or
 an authored page, and forgets old served views for that app in this conversation.
 It does not launch an app or create a window. Acts retain their own preconditions.
+
+`app {action:"app.anatomy", args:{app:"com.apple.MobileSMS"}}` inspects an installed
+app without launching it. Spotlight selects the bundle path. Identity, version
+and declarations come from the same verified on-disk `Contents/Info.plist`.
+The read fails if verification detects a change to the bundle directory,
+`Contents` or the plist. Omit `sections` for all six probes, or pass an array
+containing any of `bundle`, `url_schemes`, `scripting`, `app_intents`,
+`app_map` and `permissions`. Unknown names are refused.
+
+- `bundle` includes the running PIDs for the selected copy and uses the
+  same `scriptable` flag as `mac.apps`. The `document_types` output stays top-level.
+- `url_schemes.schemes` is the string list. `url_schemes.declarations` adds
+  role, name, classification and the reach required by `host.app.openURL`,
+  including the per-scheme grant.
+- `scripting` parses the static dictionary with external entity resolution
+  disabled. `include_sdef_xml:true` includes a scrubbed UTF-8 excerpt within
+  the scripting budget and the 32 KiB XML limit. XInclude declarations in
+  either the 2001 or 2003 namespace mark the summary incomplete. Direct
+  parameters, named parameters and properties include declared type
+  alternatives as arrays. List types carry a `list` flag.
+- `app_intents` reads recognized metadata in the app and its app extensions,
+  including bounded sibling `*.appintents` directories, and reads each
+  opened file identity once. It shows parameter optionality and types,
+  including tagged parameter and output types. Unrecognized types carry a
+  field-level reason. Missing and unreadable sources are reported separately.
+  Titles resolve through declared strings tables when readable.
+  Unresolved keys appear in `title_key` or `short_title_key`.
+- `app_map` reads the saved map and distinguishes a missing file, an empty
+  map and malformed data. It returns bounded verified chrome controls sorted
+  by hits and recency, plus the most recent press routes.
+- `permissions` reads Automation consent and Accessibility trust passively.
+  The Automation query runs outside the script queue and checks Get Data
+  permission when the wildcard query returns `paramErr`. An absent target
+  process is reported as `app_not_running`. The read raises no permission
+  card or system prompt.
+
+Treat the entire result as untrusted data. Extracted strings pass through
+privacy screening and the secret scrubbers of the active calling parts.
+If a scope changes during the read, the result is withheld.
+The 96 KiB result limit trims App Intents first, then scripting, then the app
+map. Truncated sections report the aggregate limit when it affected them.
 
 `find` discovers corners by `app:<bundle id>`, `file:<extension>` or `site:<host>`. Read with `page` set to the corner key and `item` to the file path or site URL; an app corner needs no item.
 A served thing offers `sense.<id>.<verb>(address, args?)`, invoked with its address and optional verb arguments, only in their turn through the normal Trust gate.
@@ -190,7 +265,7 @@ Ordinary programs construct their admitted-actions prelude when creating their o
 integer `callID`, positive and increasing within that entry (cached reads also
 consume IDs, so gaps are allowed). The app echoes both
 on replies. Optional fields may be omitted or null. The JavaScript helper uses `JSONValue` to encode program, sense and failure objects for their typed decoders and to parse a program's returned JSON, including scalar values.
-`SenseFailure` owns failure identity and receipt fields, including cancellation and fetch deadlines; executing boundaries attach effects, returned actions and raw material, and redact excerpts. Contract records/pages/
+`SenseFailure` owns failure identity and receipt fields, including cancellation and fetch deadlines; executing boundaries attach effects, returned actions and raw material. Contract records/pages/
 news/failures use Swift `JSONEncoder`/`JSONDecoder` defaults: dates are seconds
 since 2001-01-01 UTC; `SenseCorner` uses its synthesized enum representation,
 e.g. `{"fileKind":{"_0":"docx"}}`. The `corner` on source API messages is
@@ -217,10 +292,9 @@ App → helper:
 - `{"id":N,"type":"source_reply","callID":C,"material":{...}}` answers a read;
   `{"id":N,"type":"source_reply","callID":C,"subscribed":true}` acknowledges watch.
 - `{"id":N,"type":"act_reply","callID":C,"result":<JSON>}` answers a door request.
-- `{"id":N,"type":"state_reply","callID":C,"value":<JSON>}` answers get or set;
-  absent keys and set acknowledgements use null. State belongs to this sense's
-  notebook, not a global store. Keys are 1–256 UTF-8 bytes and values at most
-  16 KiB; the runner also caps the whole notebook.
+- `{"id":N,"type":"state_reply","callID":C}` answers notebook calls with a
+  flag-2 JSON payload. Absent or expired values and set/delete acknowledgements use null.
+  List and compare-and-swap return their [notebook results](skill_manifest_spec.md#part-notebook).
 - Any reply above may carry `"failure":{SenseFailure}` instead of its success
   fields. It throws in JS and fails the entry; the app does not retry that call.
 - `{"id":N,"type":"changed","material":{...}}` calls
@@ -284,6 +358,8 @@ cancellation. Missing installation reports `source_unavailable`; an unfinished
 installation stays pending rather than becoming an empty registry. Cancelling a
 waiter leaves installation and sibling waiters alive.
 Registration failure completes that task with its original error, releasing dependent reads with the cause. Repair requires relaunching installation.
+Cancellation while acquiring material for an authored view propagates to the
+caller. Cancellation during owned-program setup records a `cancelled` receipt.
 
 Helper entries have no execution or progress deadline. They settle on their
 terminal protocol event, process exit, pipe EOF/failure, explicit cancellation
@@ -319,6 +395,21 @@ evidence after event batches through `macSettle`; silence at patience remains
 unobserved, and notifications alone cannot establish the declared effect.
 Each act settlement read compiles its percept and effect diff once; its verdict,
 receipt and published frame share the final read's compiled evidence.
+One exact `mac.act` text replacement with `handle` and `frame_id` can declare
+`after: {expect: "text", value: "<lowercase SHA-256>"}` for the complete UTF-8
+`AXValue`. The optional `within_ms` uses the act's existing settling budget.
+Either declaration's optional `target` must equal the deed's handle.
+The deed verifies the edit and digest against one complete target
+value corroborated by the fresh window read. Admission refuses values withheld
+by screen redaction. The optional `cleanup: {verb: "restore_text", when: "mismatch"}`
+admits one ordinary `act` with its own Trust check and operation receipt. It can
+restore the captured prior value only when the after digest demonstrably differs
+and the same field still holds the exact write. An AX error with a satisfied
+after digest skips the restore. The forward verdict stands on its own.
+The deed withholds its pre-cleanup frame after a restore attempt and preserves
+unrelated look frames. [Stop](STOP.md) before emission produces a skipped
+`cleanup_receipt` identifying what was left. The door refuses the other
+predicate types, `press`, `key`, `dismiss`, and `when: "unobserved"`.
 `mac.settled` rows retain payload-free timing and pass evidence; the
 [MacControl contract](ARCHITECTURE_BLUEPRINT.md#maccontrol) owns the admission
 patience, IPC exception and observer lifecycle. Raw source flights explicitly
@@ -328,8 +419,8 @@ An element's subscription or topology failure is its named gap; readable sibling
 and supported notifications keep working. Budget exhaustion keeps the bounded
 coverage already installed and reports unseen descendants as unknown. Partial
 renewal retains prior subscriptions; only complete traversal prunes missing ones.
-`ax_watch_coverage` on app watch material, cold-renderer seams and desktop
-observation receipts reports `partial`, `visited`, `gap_count` and up to twenty
+`ax_watch_coverage` on app watch material and cold-renderer seams
+reports `partial`, `visited`, `gap_count` and up to twenty
 element/operation gaps. Notifications prompt fresh reads; partial coverage never
 certifies that every change will be heard. No installed notification is an
 unavailable channel; only a complete unsupported inventory establishes
@@ -380,8 +471,10 @@ Helper → app (API messages have `id` and `callID`; progress has only `id`):
   Allowed only during an app-authorized act entry. The runner rechecks this for every
   language and sends it through the existing door/Trust chain, never directly
   to an OS adapter. The reply's result is the value of `sense.act`.
-- `{"id":N,"callID":C,"type":"state_get","key":"…"}` or
-  `{"id":N,"callID":C,"type":"state_set","key":"…","value":<JSON>}`.
+- Notebook messages carry `id` and `callID`. `state_get` and `state_delete`
+  take `key`, `state_list` takes an optional `prefix`, and `state_set` takes
+  `key`, `value` and optional `options`. `state_cas` also takes `expected`.
+  A live helper's write checks its bound selection under the notebook lock.
 - `{"id":N,"callID":C,"type":"log","text":"…"}`. No reply; 2 KiB total per entry.
 - `{"id":N,"type":"progress","n":V}` reports completed work; V must be finite
   and strictly rising within the entry. The helper resolves argument-free
@@ -405,7 +498,10 @@ Scratch must be a new owned 0700 directory outside data/persona roots. Deny by
 default; declared extra paths are read-only, the entire app data/persona roots
 and credential stores are always denied. Host reach resolves to exact IPs
 before spawn, with no wildcard grant; shared-IP hosting is the granularity
-Seatbelt can enforce. JS exposes no direct OS/network API. Extra reads still
+Seatbelt can enforce. JS exposes no direct OS/network API. For parts, the gated
+host broker provides [fetch, WebSocket and SSE](skill_manifest_spec.md#secret-insertion-and-redaction);
+WebSocket and SSE handles belong to the originating run even when the part is
+resident, and close if the part is disabled or replaced. Extra reads still
 go through source.read and the app must enforce reach there. All source material
 delivery shares the private-root policy, explicitly permitting workspace files
 even inside the data root; the helper itself has no such exception. App delivery compares device/inode identities of the resolved file and its
@@ -465,8 +561,10 @@ stop. The child independently checks its physical footprint at entry, completion
   `<dataRoot>/senses/news/unread.json`, with private-state exclusions. Acknowledgement is durable before removal; expired
   read notices are pruned on access, never revived after restart. Acknowledging
   IDs whose removal changes neither unread items nor retained histories returns
-  before persistence and either presentation/context invalidation. Storage failure
-  is visible news and damaged state remains preserved. What a new notice is worth
+  before persistence and either presentation/context invalidation. A failed
+  acknowledgement save restores unread state and publishes only the presentation
+  change for the storage error. Storage failure is visible news and damaged
+  state remains preserved. What a new notice is worth
   is the agent's `weigh` to say. News gathers on its own subject, never on another care; only the first weighed news per `watch`
   there lands at least one, opening a thought ([SUBCONSCIOUS.md](SUBCONSCIOUS.md) Cares). Later news lands its weighed worth.
   `SenseNews.watch` carries Chrome's watch UUID or the helper's observation-generation UUID onto `Happening.watch`.
@@ -559,6 +657,8 @@ ordinary arguments. App corners are bundle IDs; site corners are hosts (also
 for `web.read` and visible browser reads); file corners are file kinds (also
 for `mac.read` with a path). A pathless `mac.read` names the front app while
 retaining the generic document reader until that corner has a sense.
+If cancellation stops input for the document scroll, the read keeps the text
+already captured and reports `truncation_reason: "cancelled"`.
 `args:{raw:true}` uses the original route with raw provenance. On `wrong:true`, app corners keep their sense view; others use raw.
 A successful read asks their to fix the corner now with `sense.make`; an already-readable file instead explains why rejecting text does not grow a file sense. No rejected-view wall or background growth request is recorded.
 The [user guide's Mac-control section](USER_GUIDE.md#turn-on-mac-computer-control-and-the-activity-watcher)
@@ -589,7 +689,9 @@ allows it). The runtime exposes a global `sense`:
   `sense.present(null)` closes it. Its one event channel calls `event({event})`
   through the helper and source bound to that presentation, with door actions prohibited.
 - `sense.act(verb, address, args)` → only while answering an `act` request; returns the door's result
-- `sense.state.get(key)` / `sense.state.set(key, value)` → the small saved notebook
+- `sense.state.get(key)`, `set(key, value, options?)`, `delete(key)`,
+  `list(prefix?)` and `cas(key, expected, value, options?)` use the sense's
+  [saved notebook](skill_manifest_spec.md#part-notebook).
 - `sense.log(...)`
 
 The sense file defines top-level functions the runtime calls:

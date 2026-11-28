@@ -15,8 +15,6 @@ public final class MacSyncEngine: ObservableObject {
     unowned let sync: DeviceSync
 
     @Published public internal(set) var isActive = false
-    @Published public internal(set) var lastSnapshotAt: Date?
-    @Published public internal(set) var lastInboxAt: Date?
     @Published public var syncError: String? {
         didSet { if oldValue != syncError { sync.bridge.refreshPhoneConnection() } }
     }

@@ -1,4 +1,11 @@
 import Foundation
+import CoreFoundation
+import CoreGraphics
+import CoreText
+#if os(macOS)
+import AppKit
+#endif
+import SwiftUI
 // Blueprint: | `BoardDocument.swift` | A board kept as a `.board` Make piece: one JSON document of elements, read, changed and written whole |
 
 /// A board kept as a `.board` file, a Make piece like a table: `{"board": 1, "elements": [...]}`. Each element is an object with a unique
@@ -133,5 +140,133 @@ public struct BoardDocument: Sendable, Equatable {
         let before = elements.count
         elements.removeAll { $0.id == id || ($0.type == "arrow" && ($0.string("from") == id || $0.string("to") == id)) }
         return elements.count != before
+    }
+}
+
+#if os(macOS)
+extension BoardGeometry {
+    public static var macTextScale: CGFloat {
+        min(max(NSFont.preferredFont(forTextStyle: .body, options: [:]).pointSize / 13, 0.85), 2)
+    }
+}
+#endif
+
+extension BoardDocument.Element {
+    var boardStrokeWidth: CGFloat { CGFloat(number("width") ?? 3) }
+
+    func boardFrame(table: Bool, title: String?, textScale: CGFloat) -> CGRect? {
+        guard let x = number("x"), let y = number("y"), x.isFinite, y.isFinite else { return nil }
+        switch type {
+        case "shape", "container":
+            let width = CGFloat(number("w") ?? 160)
+            var height = CGFloat(number("h") ?? 80)
+            guard width.isFinite, height.isFinite else { return nil }
+            if table, type == "shape" {
+                if let title {
+                    let measured = Self.measured(AttributedString(title), width: max(1, width - 24),
+                        font: boardFont(table: true, heading: true, textScale: textScale))
+                    height = max(height, ceil(measured.height) + Self.boardCardTitlePadding(textScale: textScale))
+                } else { height = boardNoteHeight(words: string("text") ?? "", textScale: textScale) }
+            }
+            return CGRect(x: x, y: y, width: width, height: height)
+        case "text":
+            let width = CGFloat(number("w") ?? 640)
+            guard width.isFinite else { return nil }
+            let words = Self.boardWords(string("text") ?? "")
+            let measured = Self.measured(words.characters.isEmpty ? AttributedString(" ") : words,
+                width: max(1, width), font: boardFont(textScale: textScale))
+            return CGRect(x: x, y: y, width: max(ceil(measured.width), 24), height: ceil(measured.height))
+        default: return nil
+        }
+    }
+
+    func boardPoints(table: Bool, textScale: CGFloat) -> CGFloat {
+        let size: CGFloat = switch string("size") ?? "" {
+        case "title": 28
+        case "large": 20
+        case "small": 12
+        default: type == "container" ? 15 : 14
+        }
+        return (table ? max(22, size) : size) * textScale
+    }
+
+    private func boardWeight() -> Font.Weight {
+        switch string("size") ?? "" {
+        case "title": .semibold
+        case "large": .medium
+        default: type == "container" ? .semibold : .regular
+        }
+    }
+
+    nonisolated(unsafe) private static let measuredHeights = NSCache<NSString, NSNumber>()
+
+    private func boardNoteHeight(words: String, textScale: CGFloat) -> CGFloat {
+        let font = boardFont(table: true, textScale: textScale), width = max(1, CGFloat(number("w") ?? 160) - 24)
+        let key = "\(width)|\(CTFontGetSize(font))|\(boardWeightValue)|\(words)" as NSString
+        let needed: CGFloat
+        if let known = unsafe Self.measuredHeights.object(forKey: key) { needed = CGFloat(known.doubleValue) } else {
+            needed = Self.measured(Self.boardWords(words), width: width, font: font).height
+            unsafe Self.measuredHeights.setObject(NSNumber(value: Double(needed)), forKey: key)
+        }
+        return ceil(max(CGFloat(number("h") ?? 80), needed + 16))
+    }
+
+    private var boardWeightValue: Double {
+        switch boardWeight() {
+        case .semibold: 0.3
+        case .medium: 0.23
+        default: 0
+        }
+    }
+
+    static func boardCardTitlePadding(textScale: CGFloat) -> CGFloat { 22 * textScale + 22 }
+
+    func boardFont(table: Bool = false, heading: Bool = false, textScale: CGFloat) -> CTFont {
+        let font = CTFont(.system, size: boardPoints(table: table, textScale: textScale))
+        return Self.styledFont(font, weight: heading ? 0.23 : boardWeightValue)
+    }
+
+    public func boardEditorFont(table: Bool, textScale: CGFloat, zoom: CGFloat) -> Font {
+        let font = boardFont(table: table, textScale: textScale)
+        return Font(CTFontCreateCopyWithAttributes(font, CTFontGetSize(font) * zoom, nil, nil))
+    }
+
+    private static func styledFont(_ font: CTFont, weight: Double, italic: Bool = false) -> CTFont {
+        guard weight != 0 || italic else { return font }
+        var traits = [kCTFontWeightTrait as String: weight]
+        if italic { traits[kCTFontSlantTrait as String] = 0.2 }
+        let descriptor = CTFontDescriptorCreateCopyWithAttributes(CTFontCopyFontDescriptor(font),
+            [kCTFontTraitsAttribute as String: traits] as CFDictionary)
+        return CTFontCreateCopyWithAttributes(font, 0, nil, descriptor)
+    }
+
+    private static func inlineFont(_ font: CTFont, _ intent: InlinePresentationIntent) -> CTFont {
+        let base = intent.contains(.code) ? CTFont(.userFixedPitch, size: CTFontGetSize(font)) : font
+        if intent.contains(.emphasized) || intent.contains(.stronglyEmphasized) {
+            let weight = intent.contains(.stronglyEmphasized) ? 0.4 :
+                ((CTFontCopyTraits(base) as NSDictionary)[kCTFontWeightTrait as String] as? NSNumber)?.doubleValue ?? 0
+            return styledFont(base, weight: weight, italic: intent.contains(.emphasized))
+        }
+        return base
+    }
+
+    private static func measured(_ words: AttributedString, width: CGFloat, font: CTFont) -> CGSize {
+        let attributed = NSMutableAttributedString(string: "")
+        for run in words.runs {
+            let face = inlineFont(font, run.inlinePresentationIntent ?? [])
+            attributed.append(NSAttributedString(string: String(words[run.range].characters),
+                attributes: [NSAttributedString.Key(kCTFontAttributeName as String): face]))
+        }
+        let framesetter = CTFramesetterCreateWithAttributedString(attributed as CFAttributedString)
+        return CTFramesetterSuggestFrameSizeWithConstraints(framesetter, CFRange(location: 0, length: 0), nil,
+            CGSize(width: width, height: .greatestFiniteMagnitude), nil)
+    }
+
+    static func boardWords(_ text: String, font: CTFont? = nil) -> AttributedString {
+        var words = (try? AttributedString(markdown: text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? .init(text)
+        if let font { for run in words.runs {
+            words[run.range].swiftUI.font = Font(inlineFont(font, run.inlinePresentationIntent ?? []))
+        } }
+        return words
     }
 }

@@ -8,7 +8,7 @@ import DeskCore
 
 extension NativeAgentEngine {
     public func refreshDiagnosticsLivingStatus() async {
-        await cognitionView.livingStatus.refresh(view: cognitionView, desk: desk, agentDisplayName: { await self.persona.displayName })
+        await cognitionView.livingStatus.refresh(view: cognitionView, desk: desk)
     }
 
     func observeDiagnosticsLivingStatus() async {
@@ -103,10 +103,10 @@ public actor LivingStatusOwner {
         changed()
     }
 
-    public func refresh(view: CognitionViewFacade, desk: DeskFacade, agentDisplayName: @Sendable () async -> String) async {
+    public func refresh(view: CognitionViewFacade, desk: DeskFacade) async {
         guard coalescer.requestRefresh() else { return }
         repeat {
-            _ = await latest.read({ await read(view: view, desk: desk, agentDisplayName: agentDisplayName) }, publish: { outcome in
+            _ = await latest.read({ await read(view: view, desk: desk) }, publish: { outcome in
                 // A failed read keeps the last snapshot; with no mind running there is none, never the last mind's shown as current.
                 if outcome.snapshot != nil || outcome.failed.isEmpty { reading.livingSnapshot = outcome.snapshot }
                 let now = Date()
@@ -118,7 +118,7 @@ public actor LivingStatusOwner {
         } while coalescer.completePass()
     }
 
-    private func read(view: CognitionViewFacade, desk: DeskFacade, agentDisplayName: @Sendable () async -> String) async
+    private func read(view: CognitionViewFacade, desk: DeskFacade) async
         -> (snapshot: LivingStatusSnapshot?, failed: [String]) {
         guard let organism = await view.organismSnapshot() else { return (nil, view.runtime == nil ? [] : ["Cognition"]) }
         let board = await desk.loadBoard()
@@ -139,6 +139,6 @@ public actor LivingStatusOwner {
             blockedDeskCount: deskBoard.items.filter { DeskSequencing.isActionableBlocked($0, now: now) }.count,
             ownerWaiting: overview.needsYouCount,
             pendingApprovals: approvals.filter { OwnerAttentionPolicy.approvalWaits(status: $0.status, agentOwned: $0.isAgentsOwnDecision) }.count,
-            latestDream: diary.entries.first, agentDisplayName: await agentDisplayName()), [])
+            latestDream: diary.entries.first), [])
     }
 }

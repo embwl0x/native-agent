@@ -78,7 +78,10 @@ extension ApprovalExecution {
                   decided < AbandonedTurnReconciler.processEpoch else { continue }
             // The owner's slot, and a fresh read under it: an execution record written meanwhile wins and nothing is settled twice.
             if await ApprovalExecutionOwners.perform(rec, inbox: inbox, operation: {
-                guard try await inbox.get(rec.id).executedAction == nil else { return nil }
+                let live: ApprovalRecord
+                do { live = try await inbox.get(rec.id) }
+                catch is CancellationError { return nil }
+                guard live.executedAction == nil else { return nil }
                 return Self.interruptedSettlement(action: rec.action, detail: """
                     No record shows the person's yes reached the agent conversation that asked, and that conversation ended with the app; \
                     whether it acted on the answer is unknown. Nothing is sent again.

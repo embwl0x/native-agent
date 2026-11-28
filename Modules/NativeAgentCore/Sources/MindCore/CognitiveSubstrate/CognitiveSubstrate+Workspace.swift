@@ -222,7 +222,7 @@ extension CognitiveSubstrate {
             node.kind.rawValue,
             node.subjectReference.type,
             node.subjectReference.id,
-            node.subjectReference.label ?? "",
+            node.subjectReference.isChatTurn ? "" : (node.subjectReference.label ?? ""),
             node.summary,
         ] + node.metadata.keys.sorted().flatMap { key -> [String] in
             [key] + CognitiveMetadataSignals.stringSignals(from: node.metadata[key] ?? .null)

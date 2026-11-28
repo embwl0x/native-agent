@@ -79,7 +79,7 @@ extension NativeAgentEngine {
         let root = dataRoot
         let timing = try await bots.effectiveSchedule()
         await unattendedChanged(timing.unattended)
-        let followingModel = try? await SwiftNativeProviderRouting(dataRoot: root).modelForSurface("chat").model
+        let followingModel = try? await SwiftNativeProviderRouting(dataRoot: root).modelForSurface().model
         return try await Task.detached(priority: .userInitiated) {
             try BotsShelfRecord.read(root: root, timing: timing, followingModel: followingModel)
         }.value

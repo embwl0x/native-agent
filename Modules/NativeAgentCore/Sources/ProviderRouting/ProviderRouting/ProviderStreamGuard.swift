@@ -482,7 +482,7 @@ public enum ProviderStreamGuard {
                                 || ProviderRecoveryPolicy.reconnect(failure) == nil { throw failure }
                             // The reconnect is its own upstream attempt: the failed one's row stays, and the request's receipt opens
                             // again so the attempt that answers records its usage, first output and row.
-                            LLMCallTraceRecorder.requestRecorded?.withLock { $0.recorded = false; $0.ttftMs = nil }
+                            LLMCallTraceRecorder.requestRecorded?.withLock { $0.recorded = false }
                         }
                     }
                 } catch { continuation.finish(throwing: error) }

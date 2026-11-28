@@ -59,7 +59,7 @@ extension CognitiveSubstrate {
         let dispositionPersisted = dreamDispositionNights.contains(night)
             ? true
             : await integrateDisposition(
-                tone: tone, at: now, dreamNight: night, source: "dream \(night)", undoable: true)
+                tone: tone, at: now, dreamNight: night, source: "dream \(night)")
         // Mint residue at the committed dream's integration point.
         let residuePersisted = await mintDreamResidue(tone: tone, at: now, dreamId: dreamId)
         return dispositionPersisted && residuePersisted

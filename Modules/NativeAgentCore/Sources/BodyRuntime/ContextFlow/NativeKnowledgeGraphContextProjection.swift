@@ -1,3 +1,4 @@
+import SenseCore
 import MindCore
 import Foundation
 import NativeAgentCore
@@ -9,7 +10,7 @@ import NativeAgentShared
 /// Keep relations selectable rather than always injected; adaptive policy and the relationship cap bound packet mass. Per-entity and total caps prevent hub
 /// entities from flooding the index; bodies stay short pointers to structure. An unreadable graph retains rebuild inputs but withholds unverified relations,
 /// leaving other context sources available. A missing graph starts empty; an unreadable graph cannot fail unrelated persona, memory or work context.
-struct KnowledgeGraphContext: ContextCompiledProjectionProvider, Sendable {
+struct KnowledgeGraphContext: ContextCompiledProjectionProvider, ContextAssociationProjecting, Sendable {
     static let owner = "nativeagent.knowledge-graph"
     static let schemaVersion = "knowledge-graph-context-projection-v1"
     static let maximumRelations = 192
@@ -22,7 +23,7 @@ struct KnowledgeGraphContext: ContextCompiledProjectionProvider, Sendable {
 
     var projectionIdentifier: String { Self.owner }
     /// Facts and profile identity both determine the memory-derived graph.
-    var invalidationNamespaces: Set<String> { ["memory-v2", "persona"] }
+    var invalidationNamespaces: Set<String> { ["memory-v2", "persona", StudioContext.invalidationNamespace] }
     var invalidationSourceURL: URL? { sqlite }
     private let sqlite: URL
 
@@ -31,8 +32,11 @@ struct KnowledgeGraphContext: ContextCompiledProjectionProvider, Sendable {
     func isInvalidated(by change: DerivedSourceChange) -> Bool {
         guard change.semantic, invalidationNamespaces.contains(change.namespace),
               let locator = change.canonicalLocator else { return false }
-        let expected = change.namespace == "persona"
-            ? dataRoot.appendingPathComponent("memory/profile.json") : sqlite
+        let expected = switch change.namespace {
+        case "persona": dataRoot.appendingPathComponent("memory/profile.json")
+        case StudioContext.invalidationNamespace: SwiftNativeStudioStore(dataRoot: dataRoot).journalPath
+        default: sqlite
+        }
         return expected.standardizedFileURL == URL(fileURLWithPath: locator).standardizedFileURL
     }
 
@@ -85,10 +89,11 @@ struct KnowledgeGraphContext: ContextCompiledProjectionProvider, Sendable {
         }
         guard !supported.isEmpty else { return exclusion }
         do {
-            let records = try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot).memoryRecords(ids: supported.map(\.1))
-            let byID = Dictionary(records.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            let ids = supported.map(\.1)
+            let memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
+            let byID = try await memory.uniqueContextRecords(ids: ids)
             exclusion.atomIDs.formUnion(supported.lazy.filter { _, id, compiled in
-                !MemoryContext.speakable(byID[id], compiledAt: compiled, on: surface)
+                !MemoryContext.speakable(byID[MemoryStorage.contextRecordID(id)], compiledAt: compiled, on: surface)
             }.map(\.0.draft.id))
         } catch {
             exclusion.atomIDs.formUnion(supported.map(\.0.draft.id))
@@ -137,6 +142,76 @@ struct KnowledgeGraphContext: ContextCompiledProjectionProvider, Sendable {
         return try await indexer.contextRelations(perSubjectLimit: Self.maximumRelationsPerEntity,
                                                 maximumRelations: Self.maximumRelations)
     }
+
+    func associationGraph(in generation: ContextStoredGeneration) async throws -> ContextAssociationGraph {
+        guard try MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: dataRoot) else { return .init([]) }
+        let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
+        let input = try await SwiftNativeKnowledgeGraphIndexer.associationInputs(
+            storage: storage, perSubject: Self.maximumRelationsPerEntity, total: Self.maximumRelations)
+        var records: [String: ContextAtomID] = [:]
+        for source in generation.sources where source.descriptor.owner == MemoryContext.owner {
+            guard let id = MemoryContext.recordID(inLocator: source.descriptor.canonicalLocator),
+                  generation.atoms(sourceID: source.descriptor.id).count == 1,
+                  let atom = generation.atoms(sourceID: source.descriptor.id).first else { continue }
+            records[MemoryStorage.contextRecordID(id)] = atom.draft.id
+        }
+        func memory(_ id: String) -> ContextAtomID? { records[MemoryStorage.contextRecordID(id)] }
+        let projected = Dictionary(Self.prepare(input.relations).sources.map { ($0.descriptor.id, $0.sourceHash) },
+                                   uniquingKeysWith: { first, _ in first })
+        var studioSources: [String: ContextAtomID] = [:]
+        var edges: [ContextAssociationGraph.Edge] = []
+        var claims: [(KnowledgeGraphContextRelation, ContextAtomID, ContextAtomID)] = []
+        for r in input.relations {
+            let sourceID = ContextStableID.source(owner: Self.owner, locator: Self.subjectLocator(r.subjectID))
+            let atomID = Self.relationAtomID(r, sourceID: sourceID)
+            guard let atom = generation.atoms(id: atomID).first, projected[sourceID] == atom.draft.sourceHash else { continue }
+            let witness: ContextAtomID
+            if let id = r.memoryID {
+                guard let memoryID = memory(id), let memoryAtom = generation.atoms(id: memoryID).first,
+                      let version = NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(r.memoryVersion),
+                      abs(version.timeIntervalSince(memoryAtom.draft.freshness.updatedAt)) <= 0.001 else { continue }
+                witness = memoryID
+            } else {
+                guard input.studio.contains(StudioEdgeKey(from: r.subjectID, to: r.objectID, type: r.predicate)) else { continue }
+                witness = atomID
+                studioSources[r.subjectID] = witness
+                studioSources[r.objectID] = witness
+            }
+            claims.append((r, witness, atomID))
+        }
+        func entity(_ id: String, source: String?) -> ContextAssociationGraph.Node? {
+            if let source { return memory(source).map { .entity(id, source: $0) } }
+            return studioSources[id].map { .entity(id, source: $0) }
+        }
+        for mention in input.mentions {
+            guard let id = memory(mention.memory), let node = entity(mention.entity, source: mention.entitySource) else { continue }
+            edges.append(.init(.memory(id), node, witness: id, weight: 1))
+            edges.append(.init(node, .memory(id), witness: id, weight: 1))
+        }
+        for (r, witness, atomID) in claims {
+            guard let from = entity(r.subjectID, source: input.sources[r.subjectID]),
+                  let to = entity(r.objectID, source: input.sources[r.objectID]) else { continue }
+            edges.append(.init(from, to, witness: witness, weight: r.weight * log1p(Double(r.mentionCount)), relation: atomID))
+        }
+        return .init(edges, records: records)
+    }
+
+    func verifiedRecords(_ ids: [String: ContextAtomID], in generation: ContextStoredGeneration, need: NeedSignal,
+                         audience: AssociationAudience, memory: SwiftNativeMemoryV2) async throws -> Set<ContextAtomID> {
+        guard try MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: dataRoot) else { return [] }
+        let records = try await memory.uniqueContextRecords(ids: Array(ids.keys))
+        let trust = MemoryDataProvenance.reading(dataRoot: dataRoot, records.values.map(\.extras))
+        var verified: Set<ContextAtomID> = []
+        for (key, record) in records {
+            guard let id = ids[key], let atom = generation.atoms(id: id).first else { continue }
+            if MemoryContext.speakable(record, compiledAt: atom.draft.freshness.updatedAt, on: need.surface),
+               MemoryRecordDisclosurePolicy.classify(record)?.privacy.rawValue == atom.draft.privacy.rawValue,
+               MemoryContext.provenanceMatches(record, atom: atom, trust: trust), audience.permits(atom.draft) {
+                verified.insert(id)
+            }
+        }
+        return verified
+    }
 }
 
 extension KnowledgeGraphContext {
@@ -155,8 +230,7 @@ extension KnowledgeGraphContext {
         var failures: [ContextSourceID: String] = [:]
         for subjectID in grouped.keys.sorted() {
             guard let edges = grouped[subjectID], !edges.isEmpty else { continue }
-            let locatorDigest = ContextStableID.digest(parts: [subjectID])
-            let locator = "knowledge-graph/entities/\(locatorDigest)"
+            let locator = subjectLocator(subjectID)
             let sourceID = ContextStableID.source(owner: owner, locator: locator)
             guard sourceIDs?.contains(sourceID) != false else { continue }
             let ordered = edges.sorted {
@@ -198,6 +272,15 @@ extension KnowledgeGraphContext {
             + TextClipping.prefix(object, to: 120)
     }
 
+    private static func subjectLocator(_ subject: String) -> String {
+        "knowledge-graph/entities/" + ContextStableID.digest(parts: [subject])
+    }
+
+    private static func relationAtomID(_ relation: KnowledgeGraphContextRelation, sourceID: ContextSourceID) -> ContextAtomID {
+        ContextStableID.atom(sourceID: sourceID, kind: .relationship, headingPath: [],
+            blockAnchor: "kg-relation-" + ContextStableID.digest(parts: [relation.predicate, relation.objectID]))
+    }
+
     static func atom(
         _ relation: KnowledgeGraphContextRelation,
         sourceID: ContextSourceID,
@@ -205,13 +288,7 @@ extension KnowledgeGraphContext {
     ) throws -> ContextAtomDraft {
         if let failure = relation.sourceDateFailure { throw MemoryV2Error.underlying(failure) }
         let body = self.body(relation)
-        let edgeDigest = ContextStableID.digest(parts: [relation.predicate, relation.objectID])
-        let atomID = ContextStableID.atom(
-            sourceID: sourceID,
-            kind: .relationship,
-            headingPath: [],
-            blockAnchor: "kg-relation-" + edgeDigest
-        )
+        let atomID = relationAtomID(relation, sourceID: sourceID)
         // Only named endpoints establish eligibility; predicates would let generic questions pull unrelated edges.
         let entities = [ContextEntity(kind: supportKind, id: Self.support(relation), label: "")] + [
             ContextEntity(

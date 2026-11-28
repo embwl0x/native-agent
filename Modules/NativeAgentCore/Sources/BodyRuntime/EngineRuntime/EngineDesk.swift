@@ -142,8 +142,6 @@ public final class DeskFacade {
 
     // MARK: the clock
 
-    nonisolated static let timerOwners = ["part", "watch", "scan"]
-
     /// What is on the one clock for the Desk's timer, read from the clock itself; an unreadable clock is unavailable, never an empty timer.
     @discardableResult
     public func timesFeed() async -> ClockFeedState {
@@ -156,7 +154,7 @@ public final class DeskFacade {
     private nonisolated func readTimes() async -> ClockFeedState {
         do {
             var rows: [OneClock.Time] = []
-            for owner in Self.timerOwners { rows += try await OneClock.at(dataRoot).times(owner: owner) }
+            for owner in NativeAgentEngine.mindClockOwners { rows += try await OneClock.at(dataRoot).times(owner: owner) }
             return .current(rows.sorted { $0.next < $1.next })
         } catch {
             return .unavailable(error.localizedDescription)
@@ -172,8 +170,8 @@ extension DeskFacade {
             SwiftNativeDeskStore(dataRoot: dataRoot).basePath,
             SwiftNativeApprovalInbox(root: dataRoot).approvalsPath,
             dataRoot.appendingPathComponent("clock/times.json"),
-            dataRoot.appendingPathComponent("mind/rhythm.json"),
-            dataRoot.appendingPathComponent("cognition/user_turn.json"),
+            PersonRhythm.path(dataRoot),
+            UserTurnStamp.url(dataRoot),
             AgentJobStore(dataRoot: dataRoot).fileURL,
             dataRoot.appendingPathComponent("bots/definitions", isDirectory: true),
             dataRoot.appendingPathComponent("bots/missed-runs.json"),
@@ -253,7 +251,7 @@ extension DeskFacade {
         }
         do {
             let hour = try await Self.residentHour(dataRoot: dataRoot)
-            snapshot.wanderHour = DeskWanderHourPresentation.state(installed: true, entry: hour)
+            snapshot.wanderHour = DeskWanderHourPresentation.state(entry: hour)
         } catch {
             snapshot.wanderHour = .line(text: "My hour’s thought record is unavailable.", symbol: "exclamationmark.triangle")
         }

@@ -42,7 +42,6 @@ extension AppModel {
         let persona = engine.persona
         let previousName = persona.profile?.name
         let memory = engine.memory
-        let approvalStore = engine.approvals
         let toolStore = engine.tools
         var failedEndpoints: [String] = []
         // Branches that perform no read must not claim refreshed data.

@@ -37,14 +37,14 @@ extension AppToolExecutor {
         verb: String, input: [String: JSONValue], runtime: NativeCognitionRuntime,
         dataRoot: URL, remPolicy: TrustPolicy?, turn: Turn,
         dreamEnabled: () async throws -> Bool,
-        runDream: () async -> (succeeded: Bool, status: String, error: String?, busy: [String]),
+        runDream: () async -> (succeeded: Bool, status: String, error: String?, busy: [String], stopped: Bool),
         previewDream: () async -> QuietMindOutcome,
         runREM: () async -> (succeeded: Bool, message: String)
     ) async -> QuietMindOutcome {
         if input["preview"] == .bool(true) {
             if verb == "dream" { return await previewDream() }
             if let clock = MindClockVerb(rawValue: verb) {
-                let result = await runtime.runClockNow(verb: clock, input: input)
+                let result = await runtime.runClockNow(verb: clock, input: input, parent: turn)
                 return (result.ok, result.why, result.json)
             }
         }
@@ -59,6 +59,7 @@ extension AppToolExecutor {
                     ["status": .string("unavailable"), "error": .string("trust_policy_unavailable")])
             }
             let run = await runDream()
+            if run.stopped { return (false, run.status, ["status": .string("stopped")]) }
             guard run.succeeded else {
                 return (false, (run.error ?? "The dream pass failed.") + Self.quietMindRetry, [:])
             }
@@ -86,7 +87,7 @@ extension AppToolExecutor {
         }
         await runtime.bootstrap()
         if let clock = MindClockVerb(rawValue: verb) {
-            let result = await runtime.runClockNow(verb: clock, input: input)
+            let result = await runtime.runClockNow(verb: clock, input: input, parent: turn)
             return (result.ok, result.why, result.json)
         }
         let config = await runtime.substrate.configurationSnapshot()

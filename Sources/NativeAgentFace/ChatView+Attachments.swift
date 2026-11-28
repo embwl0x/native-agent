@@ -77,7 +77,7 @@ extension ChatView {
                 isCapturing = false
                 isSubmittingSend = false
             }
-            await ChatAttachmentTypeResolver.sendScreenshot(captured, client: appModel.client, expectedSelection: captureSessionId, canSubmit: {
+            await ChatAttachmentTypeResolver.sendScreenshot(captured, client: appModel.client, canSubmit: {
                 guard appModel.activeChatSessionId == captureSessionId else {
                     showToast("Screen capture canceled because the chat changed")
                     return false
@@ -85,7 +85,7 @@ extension ChatView {
                 return true
             }, submit: { prompt, attachments in
                 await appModel.startActiveChatTurn(
-                    prompt, attachments: attachments, expectedSessionId: captureSessionId, composerRevision: captured.revision)
+                    prompt, attachments: attachments, expectedSessionId: captureSessionId)
             }, accepted: { acceptedSessionId in
                 guard acceptedSessionId == captureSessionId,
                       appModel.activeChatSessionId == acceptedSessionId,

@@ -100,9 +100,9 @@ extension MacFourVerbs {
         Self.addAttention(attention, to: &body)
         let opened: MacControlResult
         do { opened = try await host.dispatch(action: "act", body: body, turn: turn, context: context) } catch {
-            let refusal = fail("Couldn't open \(Self.name(popup)): \(error)", "popup_not_opened", screen: before.render)
-            return MacFourVerbsReply(ok: false, text: refusal.text,
-                                     detail: refusal.detail.merging(["outcome_unknown": .bool(true)]) { _, new in new })
+            let unknown = Self.unknownActionReply(error, operation: "opening \(Self.name(popup))", app: before.appName)
+            return MacFourVerbsReply(ok: false, text: unknown.text + "\nThe option click was never sent.\n" + before.render,
+                detail: unknown.detail.merging(["verb": .string("select"), "target": .string(option)]) { current, _ in current })
         }
         guard opened.ok else {
             let refusal = fail("Couldn't open \(Self.name(popup)): "
@@ -235,9 +235,7 @@ extension MacFourVerbs {
         if let frontPid { body["require_front_pid"] = .int(Int64(frontPid)) }
         let found: MacControlResult
         do { found = try await host.dispatch(action: "menu", body: body, turn: turn, context: context) } catch {
-            return MenuLookup(row: nil, failure: MacFourVerbsReply(ok: false,
-                text: "I couldn't read the menus: \(error).",
-                detail: ["error": .string("menu_unavailable"), "message": .string("\(error)")]))
+            return MenuLookup(row: nil, failure: Self.unknownActionReply(error, operation: "reading the menus", app: app, readOnly: true))
         }
         let output = Self.object(found.output)
         guard found.ok else {

@@ -114,9 +114,8 @@ struct StandingBotsDisk: Sendable {
 
     /// Spend the claimed civil minute so a repeated DST hour cannot run the same daily occurrence twice.
     static func nextOccurrence(_ bot: BotDefinition, after date: Date,
-                               lastRunAt: Date? = nil, beyond due: Date? = nil,
-                               minimumInterval: TimeInterval? = nil) throws -> Date {
-        let minimumInterval = try minimumInterval ?? BotRunLimits.checkedMinimumInterval()
+                               lastRunAt: Date? = nil, beyond due: Date? = nil) throws -> Date {
+        let minimumInterval = try BotRunLimits.checkedMinimumInterval()
         switch bot.cadence {
         case .manual: return .distantFuture
         case .interval(let seconds): return date.addingTimeInterval(max(seconds, minimumInterval))

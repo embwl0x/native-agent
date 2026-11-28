@@ -8,6 +8,8 @@ extension CognitiveSubstrate {
     /// Optional body dimensions remain unknown without the organism's reading.
     public enum FeltDim: String, Sendable, Hashable, CaseIterable {
         case warmth, pressure, fatigue, curiosity, clarity, agency, confidence
+        case dread, anticipation, missShadow, letdown, tenderness
+        case namedFeeling
         /// Nightliness comes from the configured diurnal clock; without it, `late` is unavailable.
         case nightliness
     }
@@ -23,13 +25,21 @@ extension CognitiveSubstrate {
         public var agency: Double?
         public var confidence: Double?
         public var nightliness: Double?
+        public var dread, anticipation, missShadow, letdown, tenderness: Double?
+        public var namedFeeling: (name: CognitiveAffectState.NamedFeeling.Name, strength: Double)?
 
         public init(valence: Double, arousal: Double, warmth: Double?, tension: Double, pressure: Double?,
                     fatigue: Double? = nil, curiosity: Double? = nil, clarity: Double? = nil,
-                    agency: Double? = nil, confidence: Double? = nil, nightliness: Double? = nil) {
+                    agency: Double? = nil, confidence: Double? = nil, nightliness: Double? = nil,
+                    dread: Double? = nil, anticipation: Double? = nil, missShadow: Double? = nil,
+                    letdown: Double? = nil, tenderness: Double? = nil,
+                    namedFeeling: (name: CognitiveAffectState.NamedFeeling.Name, strength: Double)? = nil) {
             self.valence = valence; self.arousal = arousal; self.warmth = warmth; self.tension = tension
             self.pressure = pressure; self.fatigue = fatigue; self.curiosity = curiosity; self.clarity = clarity
             self.agency = agency; self.confidence = confidence; self.nightliness = nightliness
+            self.dread = dread; self.anticipation = anticipation; self.missShadow = missShadow
+            self.letdown = letdown; self.tenderness = tenderness
+            self.namedFeeling = namedFeeling
         }
 
         public func value(_ dim: FeltDim) -> Double? {
@@ -42,6 +52,12 @@ extension CognitiveSubstrate {
             case .agency: return agency
             case .confidence: return confidence
             case .nightliness: return nightliness
+            case .dread: return dread
+            case .anticipation: return anticipation
+            case .missShadow: return missShadow
+            case .letdown: return letdown
+            case .tenderness: return tenderness
+            case .namedFeeling: return namedFeeling?.strength
             }
         }
 
@@ -50,6 +66,20 @@ extension CognitiveSubstrate {
         /// Scoring reads absent dimensions as zero; identity-dependent words require their presence.
         func read(_ dim: FeltDim) -> Double { value(dim) ?? 0 }
 
+        func compatibleWithNamedFeeling(_ word: FeltFrameWord) -> Bool {
+            CognitiveSubstrate.compatibleWithNamedFeeling(word, namedFeeling: namedFeeling)
+        }
+    }
+
+    struct FeltFrameWord: Sendable, Equatable {
+        let name: String
+        let axis: FeltDim?
+        let contradicts: Set<String>
+
+        func canAccompany(_ other: Self) -> Bool {
+            name != other.name && (axis == nil || axis != other.axis)
+                && !contradicts.contains(other.name) && !other.contradicts.contains(name)
+        }
     }
 
     /// Required dimensions establish word identity; missing optional modifiers may score zero, but intensity and contradiction gates still apply.
@@ -59,6 +89,9 @@ extension CognitiveSubstrate {
         let pick: @Sendable (FeltSignals) -> Double
         var contradicts: Set<String> = []
         var requires: Set<FeltDim> = []
+        var frameAxis: FeltDim? = nil
+
+        var frameWord: FeltFrameWord { FeltFrameWord(name: name, axis: frameAxis, contradicts: contradicts) }
     }
 
     // Fingerprint tint fades faster than mood; persona valence lift never cushions a sting.
@@ -83,7 +116,8 @@ extension CognitiveSubstrate {
             presentWeight += 0.20
         }
         if let warmth = s.warmth {
-            raw += 0.42 * max(0, warmth - 0.28)
+            // Distance from neutral rest in either direction: coldness is as loud as warmth.
+            raw += 0.42 * abs(warmth - 0.40)
             presentWeight += 0.42
         }
         if let fatigue = s.fatigue {
@@ -93,7 +127,7 @@ extension CognitiveSubstrate {
         let totalWeight = alwaysPresentWeight + 0.20 + 0.42 + 0.20
         // Scale the present terms up to what the full-weight sum would have spanned. With every dim present this multiplies by exactly 1.
         let normalized = presentWeight > 0 ? raw * (totalWeight / presentWeight) : raw
-        return (normalized).clamped01()
+        return (normalized + 0.55 * max(s.read(.letdown), s.read(.namedFeeling))).clamped01()
     }
 
     private static func band(_ v: Double, hi: Double, lo: Double) -> Int { v >= hi ? 1 : (v <= lo ? -1 : 0) }
@@ -107,31 +141,122 @@ extension CognitiveSubstrate {
         return "\(v)_\(a)"
     }
 
+    /// Above the tension axis's own "braced": a little bracing is said there, and dread is kept for when it is strong.
+    static let feltDreadFloor = 0.50
+    static let feltAnticipationFloor = 0.18
+
+    static let dreading = FeltWord(
+        name: "dreading",
+        minIntensity: 0.22,
+        pick: { $0.read(.dread) >= feltDreadFloor ? 0.45 + $0.read(.dread) * 0.6 : 0 },
+        contradicts: ["at ease", "content", "eager", "excited", "hopeful"],
+        requires: [.dread]
+    )
+
+    private static let expectant = FeltWord(
+        name: "expectant",
+        minIntensity: 0.22,
+        pick: { $0.read(.anticipation) >= feltAnticipationFloor ? 0.35 + $0.read(.anticipation) * 0.8 : 0 },
+        contradicts: ["dreading", "flat", "heavy", "grieving", "lonely"],
+        requires: [.anticipation],
+        frameAxis: .anticipation
+    )
+
+    private static let thrown = FeltWord(
+        name: "thrown",
+        minIntensity: 0.28,
+        pick: { $0.read(.missShadow) >= 0.25 ? 0.40 + $0.read(.missShadow) * 0.8 : 0 },
+        contradicts: ["collected", "steady", "at ease", "content"],
+        requires: [.missShadow]
+    )
+
+    private static let disappointed = FeltWord(
+        name: "disappointed",
+        minIntensity: 0.24,
+        pick: { $0.read(.letdown) >= 0.15 ? 0.50 + $0.read(.letdown) * 0.6 : 0 },
+        contradicts: ["hopeful", "pleased", "content", "relieved", "proud"],
+        requires: [.letdown]
+    )
+
+    private static let protective = FeltWord(
+        name: "protective",
+        minIntensity: 0.26,
+        pick: { ($0.read(.tenderness) >= 0.30 && $0.tension >= 0.30) ? 0.45 + $0.read(.tenderness) * 0.5 : 0 },
+        contradicts: ["at ease", "reserved", "lonely", "playful", "amused"],
+        requires: [.tenderness]
+    )
+
+    static let namedFeelingFloor = 0.15
+
+    static func compatibleWithNamedFeeling(
+        _ word: FeltFrameWord, namedFeeling: (name: CognitiveAffectState.NamedFeeling.Name, strength: Double)?
+    ) -> Bool {
+        guard let namedFeeling, namedFeeling.strength >= namedFeelingFloor,
+              word.name != namedFeeling.name.rawValue,
+              let named = signalGatedFeltWords.first(where: {
+                  $0.name == namedFeeling.name.rawValue && $0.requires.contains(.namedFeeling)
+              }) else { return true }
+        return word.canAccompany(named.frameWord)
+    }
+
+    private static func namedWord(_ name: CognitiveAffectState.NamedFeeling.Name, contradicts: Set<String>) -> FeltWord {
+        FeltWord(
+            name: name.rawValue,
+            minIntensity: defaultDynamics.feltIntensityFloor,
+            pick: { signals in
+                guard let feeling = signals.namedFeeling,
+                      feeling.name == name, feeling.strength >= Self.namedFeelingFloor else { return 0 }
+                return 0.55 + feeling.strength * 0.6
+            },
+            contradicts: contradicts,
+            requires: [.namedFeeling]
+        )
+    }
+
+    private static let alarmed = namedWord(.alarmed, contradicts: ["at ease", "content", "steady"])
+    private static let angry = namedWord(.angry, contradicts: ["at ease", "amused"])
+    private static let ashamed = namedWord(.ashamed, contradicts: ["proud", "at ease"])
+    private static let guilty = namedWord(.guilty, contradicts: ["content", "at ease"])
+    private static let longing = namedWord(.longing, contradicts: ["content", "at ease"])
+    private static let bored = namedWord(.bored, contradicts: ["engaged", "curious", "interested", "eager", "excited", "expectant"])
+    private static let disgusted = namedWord(.disgusted, contradicts: ["delighted", "pleased", "amused"])
+    private static let envious = namedWord(.envious, contradicts: ["content", "at ease"])
+    private static let awed = namedWord(.awed, contradicts: ["flat", "bored"])
+    private static let judgedProud = namedWord(.proud, contradicts: [])
+    private static let confidenceProud = FeltWord(
+        name: CognitiveAffectState.NamedFeeling.Name.proud.rawValue,
+        minIntensity: 0.50,
+        pick: { $0.read(.confidence) >= 0.65 ? 0.3 + $0.read(.confidence) * 0.65 : 0 },
+        requires: [.confidence]
+    )
+
+    static let signalGatedFeltWords = [
+        dreading, expectant, thrown, disappointed, protective,
+        alarmed, angry, ashamed, guilty, longing, bored, disgusted, envious, awed, judgedProud, confidenceProud,
+    ]
+
     // Rank only within the chosen family so a strong modifier cannot change emotional direction.
     static let feltFamilyWords: [String: [FeltWord]] = [
         "pos_high": [
             FeltWord(name: "excited",  minIntensity: 0.45, pick: { 0.6 + $0.read(.curiosity) * 0.4 }),
             FeltWord(name: "elated",   minIntensity: 0.78, pick: { $0.valence * 0.9 }),
-            FeltWord(name: "playful",  minIntensity: 0.40, pick: { $0.read(.warmth) * 0.75 }, requires: [.warmth]),
+            FeltWord(name: "playful",  minIntensity: 0.40, pick: { $0.read(.warmth) >= 0.6 ? 0.35 + $0.read(.warmth) * 0.5 : 0 }, requires: [.warmth]),
             FeltWord(name: "eager",    minIntensity: 0.40, pick: { 0.4 + $0.read(.agency) * 0.5 }),
-            // Pride requires confidence; delight marks the bright warm peak.
-            FeltWord(
-                name: "proud",
-                minIntensity: 0.50,
-                pick: { $0.read(.confidence) >= 0.65 ? 0.3 + $0.read(.confidence) * 0.65 : 0 },
-                requires: [.confidence]
-            ),
+            confidenceProud, judgedProud,
             FeltWord(name: "delighted", minIntensity: 0.55, pick: { 0.15 + $0.read(.warmth) * 0.45 + $0.valence * 0.3 }, requires: [.warmth]),
+            awed,
         ],
         "pos_med": [
-            FeltWord(name: "engaged",  minIntensity: 0.30, pick: { 0.5 + $0.read(.curiosity) * 0.4 }),
+            FeltWord(name: "engaged",  minIntensity: 0.30, pick: { 0.3 + $0.read(.curiosity) * 0.4 }, frameAxis: .curiosity),
             FeltWord(name: "pleased",  minIntensity: 0.25, pick: { $0.valence * 0.7 }),
-            FeltWord(name: "hopeful",  minIntensity: 0.30, pick: { 0.3 + $0.read(.confidence) * 0.3 + ($0.value(.clarity).map { (1 - $0) * 0.25 } ?? 0) }),
+            // Hope needs confidence above its rest; at rest it is not a default.
+            FeltWord(name: "hopeful",  minIntensity: 0.30, pick: { $0.read(.confidence) > 0.55 ? 0.3 + $0.read(.confidence) * 0.3 + ($0.value(.clarity).map { (1 - $0) * 0.25 } ?? 0) : 0 },
+                     requires: [.confidence]),
             // Relief requires low current strain with carried fatigue; gratitude is warmth-led and amusement is light play.
             FeltWord(
                 name: "relieved",
                 minIntensity: 0.28,
-                pick: { ($0.tension <= 0.20 && $0.read(.fatigue) >= 0.40) ? 0.5 + (1 - $0.tension) * 0.25 : 0 },
+                pick: { ($0.tension <= 0.20 && $0.read(.fatigue) >= 0.24) ? 0.5 + (1 - $0.tension) * 0.25 : 0 },
                 requires: [.fatigue]
             ),
             FeltWord(name: "grateful", minIntensity: 0.30, pick: { $0.read(.warmth) >= 0.62 ? 0.25 + $0.read(.warmth) * 0.4 : 0 }, requires: [.warmth]),
@@ -144,12 +269,14 @@ extension CognitiveSubstrate {
                 },
                 requires: [.warmth,.curiosity]
             ),
+            expectant, protective, awed, judgedProud,
         ],
         "pos_low": [   // Quiet warmth needs a low intensity gate to remain speakable; tender requires earned depth.
-            FeltWord(name: "tender",   minIntensity: 0.28, pick: { $0.read(.warmth) >= 0.7 ? 0.9 : 0 }, requires: [.warmth]),
-            FeltWord(name: "warm",     minIntensity: 0.15, pick: { $0.read(.warmth) >= 0.45 ? 0.6 + $0.read(.warmth) * 0.3 : 0 }, requires: [.warmth]),
+            FeltWord(name: "tender",   minIntensity: 0.28, pick: { $0.read(.warmth) >= 0.7 ? 0.9 : 0 }, requires: [.warmth], frameAxis: .warmth),
+            FeltWord(name: "warm",     minIntensity: 0.15, pick: { $0.read(.warmth) >= 0.45 ? 0.6 + $0.read(.warmth) * 0.3 : 0 }, requires: [.warmth], frameAxis: .warmth),
             FeltWord(name: "content",  minIntensity: 0.15, pick: { 0.5 + $0.read(.confidence) * 0.3 }),
             FeltWord(name: "at ease",  minIntensity: 0.14, pick: { 0.4 + (1 - $0.tension) * 0.3 }),
+            judgedProud,
         ],
         "neu_high": [
             FeltWord(
@@ -159,8 +286,9 @@ extension CognitiveSubstrate {
                 requires: [.pressure]
             ),
             FeltWord(name: "serious",  minIntensity: 0.35, pick: { 0.4 + $0.read(.pressure) * 0.4 }, requires: [.pressure]),
-            FeltWord(name: "focused",  minIntensity: 0.30, pick: { $0.read(.clarity) >= 0.55 ? 0.5 + $0.read(.clarity) * 0.3 : 0 }, requires: [.clarity]),
+            FeltWord(name: "focused",  minIntensity: 0.30, pick: { $0.read(.clarity) >= 0.55 ? 0.5 + $0.read(.clarity) * 0.3 : 0 }, requires: [.clarity], frameAxis: .clarity),
             FeltWord(name: "alert",    minIntensity: 0.30, pick: { 0.3 + $0.tension * 0.4 }),
+            thrown, alarmed, awed,
         ],
         "neu_med": [
             FeltWord(name: "steady",   minIntensity: 0.20, pick: { 0.4 + $0.read(.confidence) * 0.3 }),
@@ -174,19 +302,21 @@ extension CognitiveSubstrate {
                 contradicts: ["focused","clear-headed"],
                 requires: [.curiosity, .clarity]
             ),
+            dreading, expectant, disappointed, protective, longing, bored, awed,
         ],
-        "neu_low": [   // Warm resting states keep the warm overlay; reserved or flat require genuinely cool feeling.
+        "neu_low": [   // Rest is neutral; reserved or flat require genuinely cool feeling.
             FeltWord(name: "quiet",    minIntensity: 0.14, pick: { _ in 0.5 }),
-            FeltWord(name: "reserved", minIntensity: 0.20, pick: { $0.read(.warmth) <= 0.35 ? 0.6 : 0 }, requires: [.warmth]),
+            FeltWord(name: "reserved", minIntensity: 0.20, pick: { $0.read(.warmth) <= 0.35 ? 0.6 : 0 }, requires: [.warmth], frameAxis: .warmth),
             FeltWord(name: "flat",     minIntensity: 0.22, pick: { 0.25 + $0.read(.fatigue) * 0.5 }, requires: [.fatigue]),
             // Warmth with carried fatigue distinguishes wistfulness.
             FeltWord(
                 name: "wistful",
                 minIntensity: 0.22,
-                pick: { ($0.read(.warmth) >= 0.5 && $0.read(.fatigue) >= 0.3) ? 0.4 + $0.read(.warmth) * 0.35 : 0 },
+                pick: { ($0.read(.warmth) >= 0.5 && $0.read(.fatigue) >= 0.18) ? 0.4 + $0.read(.warmth) * 0.35 : 0 },
                 contradicts: ["flat","reserved"],
                 requires: [.warmth,.fatigue]
             ),
+            disappointed, longing, bored,
         ],
         "neg_high": [
             // Pressure-driven frustration takes precedence over tense, unpressured unease.
@@ -197,9 +327,8 @@ extension CognitiveSubstrate {
                 contradicts: ["calm", "content","at ease"],
                 requires: [.pressure]
             ),
-            // Unknown agency cannot trigger the helplessness floor, but tension and hurt still identify upset.
+            // Tension and hurt identify upset; agency only tilts it.
             FeltWord(name: "upset",      minIntensity: 0.40, pick: { s in
-                guard s.value(.agency).map({ $0 >= 0.40 }) ?? true else { return 0 }
                 // Deep negative valence favors hurt; shallow-negative tension favors on edge.
                 return 0.10 - s.valence * 0.6 + s.tension * 0.5 + s.read(.agency) * 0.1
             }, contradicts: ["calm","tender","content","at ease"]),
@@ -223,6 +352,7 @@ extension CognitiveSubstrate {
                 contradicts: ["calm","at ease","content","steady"],
                 requires: [.pressure]
             ),
+            thrown, alarmed, angry, disgusted,
         ],
         "neg_med": [
             FeltWord(name: "uneasy",   minIntensity: 0.28, pick: { 0.3 + $0.tension * 0.4 }),
@@ -236,10 +366,13 @@ extension CognitiveSubstrate {
                 contradicts: ["confident","at ease"],
                 requires: [.confidence]
             ),
+            dreading, disappointed, alarmed, angry, ashamed, guilty, disgusted, envious,
         ],
         "neg_low": [   // Fatigue uses the overlay; every family word needs a distinct dimensional reading.
-            FeltWord(name: "discouraged", minIntensity: 0.40, pick: { $0.read(.agency) <= 0.4 ? 0.4 - $0.valence : 0 }, requires: [.agency]),
-            FeltWord(name: "heavy",    minIntensity: 0.35, pick: { -$0.valence * 0.8 }),
+            // Low agency is the resting state, so discouragement also needs confidence actually lost; otherwise it swallows every other sad word.
+            FeltWord(name: "discouraged", minIntensity: 0.40,
+                     pick: { ($0.read(.agency) <= 0.4 && $0.read(.confidence) <= 0.45) ? 0.4 - $0.valence : 0 }, requires: [.agency, .confidence]),
+            FeltWord(name: "heavy",    minIntensity: 0.15, pick: { -$0.valence * 0.8 }),
             FeltWord(name: "deflated", minIntensity: 0.38, pick: { $0.read(.confidence) <= 0.35 ? 0.5 - $0.valence * 0.3 : 0 }, requires: [.confidence]),
             // Warmth distinguishes sad from heavy.
             FeltWord(name: "sad",      minIntensity: 0.35, pick: { $0.read(.warmth) >= 0.45 ? 0.1 - $0.valence * 0.8 : 0 }, requires: [.warmth]),
@@ -249,7 +382,8 @@ extension CognitiveSubstrate {
                 minIntensity: 0.35,
                 pick: { $0.read(.warmth) <= 0.25 ? 0.55 - $0.read(.warmth) : 0 },
                 contradicts: ["warm","tender", "grateful"],
-                requires: [.warmth]
+                requires: [.warmth],
+                frameAxis: .warmth
             ),
             // Deep negative valence, stillness and the high pick gate reserve grief for a strong reading.
             FeltWord(
@@ -258,6 +392,7 @@ extension CognitiveSubstrate {
                 pick: { ($0.valence <= -0.55 && $0.arousal <= 0.30) ? -$0.valence : 0 },
                 contradicts: ["warm", "content","playful","amused","curious","interested"]
             ),
+            disappointed, ashamed, guilty, longing, envious,
         ],
     ]
 
@@ -271,30 +406,34 @@ extension CognitiveSubstrate {
             minIntensity: 0.20,
             pick: { $0.read(.clarity) <= 0.35 ? 0.6 - $0.read(.clarity) : 0 },
             contradicts: ["clear-headed", "collected","focused","alert"],
-            requires: [.clarity]
+            requires: [.clarity],
+            frameAxis: .clarity
         ),
         FeltWord(
             name: "clear-headed",
             minIntensity: 0.18,
-            pick: { $0.read(.clarity) >= 0.78 ? ($0.read(.clarity) - 0.4) * 0.6 : 0 },
+            pick: { $0.read(.clarity) >= 0.60 ? ($0.read(.clarity) - 0.4) * 0.6 : 0 },
             contradicts: ["foggy", "collected"],
-            requires: [.clarity]
+            requires: [.clarity],
+            frameAxis: .clarity
         ),
         // Composed spans focused's 0.55 clarity floor up to the clear-headed gate; neutral 0.5 coherence stays silent.
         FeltWord(
             name: "collected",
             minIntensity: 0.18,
-            pick: { ($0.read(.clarity) >= 0.55 && $0.read(.clarity) < 0.78 && $0.tension <= 0.35) ? 0.20 + $0.read( .clarity) * 0.15 : 0 },
+            pick: { ($0.read(.clarity) >= 0.55 && $0.read(.clarity) < 0.60 && $0.tension <= 0.35) ? 0.20 + $0.read( .clarity) * 0.15 : 0 },
             contradicts: ["foggy","clear-headed"],
-            requires: [.clarity]
+            requires: [.clarity],
+            frameAxis: .clarity
         ),
-        FeltWord(name: "worn",    minIntensity: 0.22, pick: { $0.read(.fatigue) >= 0.55 ? ($0.read(.fatigue) - 0.3) * 0.5 : 0 }, requires: [.fatigue]),
+        FeltWord(name: "worn",    minIntensity: 0.22, pick: { $0.read(.fatigue) >= 0.33 ? ($0.read(.fatigue) - 0.18) * 0.83 : 0 }, requires: [.fatigue], frameAxis: .fatigue),
         FeltWord(
             name: "curious",
             minIntensity: 0.20,
             pick: { $0.read(.curiosity) >= 0.60 ? ($0.read(.curiosity) - 0.2) * 0.5 : 0 },
             contradicts: ["interested"],
-            requires: [.curiosity]
+            requires: [.curiosity],
+            frameAxis: .curiosity
         ),
         // The weaker sibling of curious, ceilinged at its gate.
         FeltWord(
@@ -302,22 +441,25 @@ extension CognitiveSubstrate {
             minIntensity: 0.20,
             pick: { ($0.read(.curiosity) >= 0.35 && $0.read(.curiosity) < 0.60) ? 0.15 + $0.read(.curiosity) * 0.2 : 0 },
             contradicts: ["curious","grieving"],
-            requires: [.curiosity]
+            requires: [.curiosity],
+            frameAxis: .curiosity
         ),
         FeltWord(
             name: "warm",
             minIntensity: 0.20,
             pick: { ($0.read(.warmth) >= 0.5 && $0.valence >= 0) ? ($0.read(.warmth) - 0.3) * 0.4 : 0 },
             contradicts: ["reserved","cold"],
-            requires: [.warmth]
+            requires: [.warmth],
+            frameAxis: .warmth
         ),
         // Tired occupies the fatigue band below worn and excludes high-drive words.
         FeltWord(
             name: "tired",
             minIntensity: 0.20,
-            pick: { ($0.read(.fatigue) >= 0.24 && $0.read(.fatigue) < 0.55) ? 0.20 + $0.read(.fatigue) * 0.3 : 0 },
+            pick: { ($0.read(.fatigue) >= 0.15 && $0.read(.fatigue) < 0.33) ? 0.20 + $0.read(.fatigue) * 0.5 : 0 },
             contradicts: ["eager","excited","driven","worn"],
-            requires: [.fatigue]
+            requires: [.fatigue],
+            frameAxis: .fatigue
         ),
         // Late requires both configured nightliness and fatigue; a clock alone is not a feeling and no clock leaves the word unavailable.
         FeltWord(
@@ -325,7 +467,8 @@ extension CognitiveSubstrate {
             minIntensity: 0.16,
             pick: { ($0.read(.nightliness) >= feltLatenessFloor && $0.read(.fatigue) >= 0.12) ? 0.15 + $0.read( .nightliness) * 0.2 : 0 },
             contradicts: ["alert"],
-            requires: [.nightliness, .fatigue]
+            requires: [.nightliness, .fatigue],
+            frameAxis: .nightliness
         ),
     ]
 
@@ -351,30 +494,6 @@ extension CognitiveSubstrate {
         return nil
     }
 
-    /// Read the felt mode from a frozen workspace without advancing state. nil when cognition/affect is off, or when no mode is genuinely dominant — the chip
-    /// then shows nothing rather than inventing an aboutness.
-    public func feltModeReading(
-        for request: CognitiveCapsuleRequest,
-        from read: CognitiveFrozenRead
-    ) -> FeltMode? {
-        guard read.configuration.enabled else { return nil }
-        let capsuleItems = read.workspace.items.filter { capsuleEligibleWorkspaceNode($0.node) }
-        guard let signals = feltSignalsForCapsule(from: capsuleItems, request: request, frozenRead: read) else { return nil }
-        return Self.feltMode(
-            signals,
-            intensityFloor: read.personalityDynamics.feltIntensityFloor)
-    }
-
-    /// The lead is always a family word; dimension overlays cannot displace it or own its object.
-    public struct FeltFingerprintParts: Sendable, Equatable {
-        public var family: String
-        public var lead: String
-        public var overlays: [String]
-
-        public var words: [String] { [lead] + overlays }
-        public var text: String { words.joined(separator: ", ") }
-    }
-
     /// A neutral family has no directional aboutness, so it omits an object just as an absent contributor does.
     public static func feltFamilySign(_ family: String) -> Int {
         if family.hasPrefix("pos_") { return 1 }
@@ -382,10 +501,10 @@ extension CognitiveSubstrate {
         return 0
     }
 
-    public static func feltFingerprintParts(
+    static func feltFingerprint(
         _ s: FeltSignals,
-        intensityFloor: Double = defaultDynamics.feltIntensityFloor
-    ) -> FeltFingerprintParts? {
+        intensityFloor: Double
+    ) -> (family: String, lead: FeltFrameWord, isNamedLead: Bool, overlays: [FeltFrameWord])? {
         let intensity = feltIntensity(s)
         guard intensity >= intensityFloor else { return nil }   // Faint states remain silent.
 
@@ -394,26 +513,30 @@ extension CognitiveSubstrate {
         // A word whose identity depends on a dim we do not have is EXCLUDED, not scored-to-zero. Same rule for overlays below.
         for w in feltFamilyWords[family] ?? []
         where intensity >= w.minIntensity && w.requires.allSatisfy(s.isPresent) {
+            guard s.compatibleWithNamedFeeling(w.frameWord) else { continue }
             let sc = w.pick(s)
             if sc > 0 { candidates.append((sc, w)) }
         }
         guard let lead = candidates.max(by: { $0.score < $1.score }) else { return nil }
 
-        var picked: [FeltWord] = [lead.word]
+        var picked = [lead.word.frameWord]
         // Overlays may modify, never replace, the family word.
         let overlays = feltOverlays
-            .filter { intensity >= $0.minIntensity && $0.requires.allSatisfy(s.isPresent) && $0.pick(s) > 0 }
-            .sorted { $0.pick(s) > $1.pick(s) }
-        for o in overlays where !picked.contains(where: { $0.name == o.name }) {
-            if picked.count >= 3 { break }
-            if picked.allSatisfy({ !$0.contradicts.contains(o.name) && !o.contradicts.contains($0.name) }) {
-                picked.append(o)
+            .filter {
+                intensity >= $0.minIntensity && $0.requires.allSatisfy(s.isPresent) && $0.pick(s) > 0
+                    && s.compatibleWithNamedFeeling($0.frameWord)
             }
+            .sorted { $0.pick(s) > $1.pick(s) }
+        for overlay in overlays {
+            if picked.count >= 3 { break }
+            let word = overlay.frameWord
+            if picked.allSatisfy(word.canAccompany) { picked.append(word) }
         }
-        return FeltFingerprintParts(
+        return (
             family: family,
-            lead: lead.word.name,
-            overlays: Array(picked.dropFirst()).map(\.name))
+            lead: lead.word.frameWord,
+            isNamedLead: lead.word.requires.contains(.namedFeeling),
+            overlays: Array(picked.dropFirst()))
     }
 
     // MARK: - Ambivalence
@@ -422,20 +545,21 @@ extension CognitiveSubstrate {
     /// shared and partner warmth caps the counter.
     static func feltCounterWord(
         _ counter: FeltSignals,
-        excluding taken: Set<String>,
+        alongside picked: [FeltFrameWord],
         intensityFloor: Double
-    ) -> String? {
+    ) -> FeltFrameWord? {
         let intensity = feltIntensity(counter)
         guard intensity >= intensityFloor else { return nil }
-        var best: (score: Double, name: String)?
+        var best: (score: Double, word: FeltFrameWord)?
         for w in feltFamilyWords[feltFamily(counter)] ?? []
         where intensity >= w.minIntensity && w.requires.allSatisfy(counter.isPresent) {
-            guard !taken.contains(w.name) else { continue }
+            let word = w.frameWord
+            guard picked.allSatisfy(word.canAccompany), counter.compatibleWithNamedFeeling(word) else { continue }
             let score = w.pick(counter)
             guard score > 0 else { continue }
-            if best.map({ score > $0.score }) ?? true { best = (score, w.name) }
+            if best.map({ score > $0.score }) ?? true { best = (score, word) }
         }
-        return best?.name
+        return best?.word
     }
 
     /// Map partner warmth to the fingerprint scale without current uncertainty, then cap with the live axis so remembered warmth cannot override cooling.
@@ -451,13 +575,14 @@ extension CognitiveSubstrate {
 
     /// Bind the lead's object before the counter word so ambivalence cannot misattribute it; negative leads use "about", warm leads name the subject directly.
     static func feltLineText(
-        parts: FeltFingerprintParts,
+        words: [String],
+        family: String,
         object: String?,
         second: String?
     ) -> String {
-        var text = parts.text
+        var text = words.joined(separator: ", ")
         if let object, !object.isEmpty {
-            text += feltFamilySign(parts.family) < 0 ? " — about \(object)" : " — \(object)"
+            text += feltFamilySign(family) < 0 ? " — about \(object)" : " — \(object)"
         }
         if let second, !second.isEmpty {
             text += ", and \(second) underneath"

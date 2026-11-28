@@ -119,15 +119,10 @@ public struct ProviderSettingsFace: FaceValue {
     public var snapshot: ProviderSettingsSnapshot?
     public var error: String?
     public var sessions: [String: ProviderSessionPresentation] = [:]
-    public var providerProbeStarts: [String: Date] = [:]
-    public var catalogRefreshStarted: Date?
-    public var codexAuth: CodexAuthStatus?
     public var isSavingChatBrain = false
     public var readiness: Readiness = .loading
     public var chatChoice: ProviderTurnChoice?
     public var chatModelReady = false
-    public var connectedProviderLabel: String?
-    public var apiKeyAccountIDs: [String] = []
     public init() {}
 
     public enum Readiness: Sendable, Codable, Equatable {

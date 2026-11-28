@@ -3,7 +3,7 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import SenseCore
-// Blueprint: | `MemoryDataProvenance.swift` | `MemoryDataProvenance` builds a write's root from the stem and reads the steer from roots; `MemoryWriteContext` holds the turn, sense reads and telling |
+// Blueprint: | `MemoryDataProvenance.swift` | `MemoryWriteContext` builds roots from tellings and attested tellers; `MemoryDataProvenance` reads steering and presents each root |
 
 /// One write's evidence owners and what its writer states. A caller outside any turn says so explicitly; a later database/settlement closure holds
 /// these same owners.
@@ -16,14 +16,20 @@ public struct MemoryWriteContext: Sendable {
     public let lifecycle: String?
     /// Principals behind material the stem itself attests outside a turn.
     let material: [String]?
+    private let tellers: [String]?
     let writtenAt: Date
 
     public init(turn: Turn?, senseReads: SenseTurnReads?, telling: MemoryRoot.Telling?, lifecycle: String? = nil) {
+        self.init(turn: turn, senseReads: senseReads, telling: telling, lifecycle: lifecycle, tellers: nil)
+    }
+
+    package init(turn: Turn?, senseReads: SenseTurnReads?, telling: MemoryRoot.Telling?, lifecycle: String? = nil, tellers: [String]?) {
         self.turn = turn
         self.senseReads = senseReads
         self.telling = telling
         self.lifecycle = lifecycle
         self.material = nil
+        self.tellers = tellers
         self.writtenAt = Date()
     }
 
@@ -34,6 +40,7 @@ public struct MemoryWriteContext: Sendable {
         self.telling = telling
         self.lifecycle = lifecycle
         self.material = material
+        self.tellers = nil
         self.writtenAt = Date()
     }
 
@@ -57,7 +64,11 @@ public struct MemoryWriteContext: Sendable {
 
     /// The root one telling becomes in this write: the stem's principals and the write's time, a steering principal's telling when one steered.
     public func rooting(_ telling: MemoryRoot.Telling, dataRoot: URL) -> MemoryRoot {
-        MemoryDataProvenance.root(telling, through: through, turnSteers: material == nil, at: writtenAt, dataRoot: dataRoot)
+        let through = self.through
+        if telling.how == .told, let teller = telling.by, tellers?.contains(teller) == true, through.contains(teller) {
+            return attestedRoot(teller, through: through, trust: PeerDataTaint.readTrust(dataRoot, through))
+        }
+        return MemoryDataProvenance.root(telling, through: through, turnSteers: material == nil, at: writtenAt, dataRoot: dataRoot)
     }
 
     /// The writer restates the agent's own past, and the stem kept it as stated: remembered, or dated before the write.
@@ -67,9 +78,26 @@ public struct MemoryWriteContext: Sendable {
         return root.how == .remembered || root.at != NativeTimestampFormat.fractionalZulu(writtenAt)
     }
 
-    /// The write's metadata holding exactly its own root; roots the writer supplied are never taken.
     func stamping(_ metadata: JSONValue?, dataRoot: URL) throws -> JSONValue? {
-        MemoryRoot.setting([try root(dataRoot: dataRoot)], in: try MemorySenseProvenance.stamping(metadata, reads: senseReads))
+        let roots: [MemoryRoot]
+        if let tellers {
+            let through = self.through
+            guard !tellers.isEmpty, tellers.allSatisfy({ through.contains($0) }) else {
+                throw ToolFailureError("Every teller must be attested by this ask.", effects: .none,
+                    code: "memory_teller_steered", status: .refused)
+            }
+            let trust = PeerDataTaint.readTrust(dataRoot, through)
+            roots = tellers.map { attestedRoot($0, through: through, trust: trust) }
+        } else {
+            roots = [try root(dataRoot: dataRoot)]
+        }
+        return MemoryRoot.setting(roots, in: try MemorySenseProvenance.stamping(metadata, reads: senseReads))
+    }
+
+    private func attestedRoot(_ teller: String, through: [String], trust: PeerDataTaint.TrustRead) -> MemoryRoot {
+        let stamp = NativeTimestampFormat.fractionalZulu(writtenAt)
+        return MemoryRoot(how: .told, by: MemoryDataProvenance.attestedTellerName(teller, trust: trust), at: stamp,
+                          written: stamp, through: through, teller: teller)
     }
 }
 
@@ -160,11 +188,11 @@ public enum MemoryDataProvenance {
                           written: NativeTimestampFormat.fractionalZulu(written), through: through)
     }
 
-    /// How a root reads now. A root an agent the person does not trust steers reads as that agent's telling, by its live contact name, whatever
-    /// how and by it stores: never as someone else's words or the agent's own past. Material that is no agent (a dream's unattributed material,
-    /// untrusted stored content) keeps the root's own words; its steer reads through the memory's "from" mark. A told root naming no teller
-    /// reads by the contact of the peer that carried it.
     public static func presented(_ root: MemoryRoot, trust: PeerDataTaint.TrustRead) -> MemoryRoot {
+        if let teller = root.teller {
+            let name = attestedTellerName(teller, trust: trust) ?? root.by
+            return MemoryRoot(how: .told, by: name, at: root.at, written: root.written, through: root.through, teller: teller)
+        }
         if let teller = steering(root.through, trust: trust).first(where: { !material.contains($0) }) {
             // A telling an untrusted agent carried reads as that agent's, at the time the root records: a live turn's root is dated when it was
             // told, an attested record's when it was.
@@ -175,6 +203,11 @@ public enum MemoryDataProvenance {
             return MemoryRoot(how: .told, by: name, at: root.at, written: root.written, through: root.through)
         }
         return root
+    }
+
+    fileprivate static func attestedTellerName(_ teller: String, trust: PeerDataTaint.TrustRead) -> String? {
+        guard teller.hasPrefix("peer:") else { return nil }
+        return trust.doorName(String(teller.dropFirst(5))).flatMap(MemoryRoot.validName)
     }
 
     /// Steering principals that are no agent: they mark words untrusted without being anyone who told them.
@@ -226,7 +259,6 @@ public enum MemoryDataProvenance {
                                  trust: PeerDataTaint.TrustRead) -> JSONValue {
         switch MemoryRoot.reading(metadata) {
         case .held(let roots):
-            // Every field reads as the root reads now: a steering root's how and by are its steering agent's telling, as its line says.
             return .array(MemoryRoot.ordered(roots).map { root in
                 let shown = presented(root, trust: trust)
                 return .object(["line": .string(shown.line(calendar: calendar)), "how": .string(shown.how.rawValue),

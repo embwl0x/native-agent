@@ -8,6 +8,8 @@ import NativeAgentShared
 /// omitted. Extraction has no DOM node cutoff; excessive nesting is refused. Parsing and rendering check cancellation; Chrome snapshots own their separate
 /// node-limited readMore cursor, independent of this bounded-response extraction.
 enum ResearchHTMLExtraction {
+    private static let whitespaceRegex = try! NSRegularExpression(pattern: #"\s+"#)
+
     struct Evidence {
         let text: String
         let scriptCharacters: Int
@@ -106,7 +108,8 @@ enum ResearchHTMLExtraction {
                 let decoded = try decode(String(chars[start..<i]))
                 // Source wrapping is whitespace, not a paragraph boundary. Keep boundary spaces so adjacent inline elements join naturally.
                 node.text = stack.contains(where: { $0.tag == "pre" }) ? decoded
-                    : decoded.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+                    : whitespaceRegex.stringByReplacingMatches(
+                        in: decoded, options: [], range: NSRange(decoded.startIndex..., in: decoded), withTemplate: " ")
                 stack.last!.children.append(node)
                 continue
             }

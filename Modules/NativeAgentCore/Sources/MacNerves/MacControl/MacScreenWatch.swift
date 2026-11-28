@@ -142,7 +142,7 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, S
         guard !PersonOnlyWindows.isOwnProcess(pid) else {
             throw SenseFailure(code: "person_only_window", message: "NativeAgent's own window is person-only; use app pages to read its state.")
         }
-        guard CGPreflightScreenCaptureAccess() else {
+        guard SystemPermissionPreflight.heldByThisProcess(.screenRecording) else {
             throw SenseFailure(code: "screen_recording_not_trusted",
                 message: "Screen Recording is off for NativeAgent. System Settings > Privacy & Security > Screen Recording > NativeAgent switch on.",
                                remedy: MacFourVerbsReply.privacyRemedy("screen_recording_not_trusted"))
@@ -284,6 +284,27 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, S
             return false
         }
         return state.withLock { $0.ended == nil } && !Task.isCancelled
+    }
+
+    package struct AXQueryScope: Sendable, Equatable {
+        let pid: Int32
+        let window: MacAXFrame
+        let region: MacAXFrame
+        let identity: MacAXNativeElementIdentity
+        let masks: Set<MacAXFrame>
+    }
+
+    package var axQueryBundleID: String? { sighting.bundleIdentifier }
+    package var axQueryActive: Bool { state.withLock { $0.ended == nil && !$0.spent } }
+
+    package func axQueryScope() async -> AXQueryScope? {
+        guard let identity = sighting.window?.nativeWindow, await allowed(), axQueryActive,
+              let window = currentWindow(), abs(window.w - size.w) < 1, abs(window.h - size.h) < 1 else { return nil }
+        guard let masks = state.withLock({ state in
+            state.ended == nil && !state.spent && state.inspectedSuccessfully ? state.frameMasks : nil
+        }) else { return nil }
+        return AXQueryScope(pid: pid, window: window, region: place(window), identity: identity,
+            masks: Set(masks.map { MacAXFrame(x: window.x + $0.x, y: window.y + $0.y, w: $0.w, h: $0.h) }))
     }
 
     /// Skip intermediate captures rather than queueing them; next times out explicitly, and watch end returns null.

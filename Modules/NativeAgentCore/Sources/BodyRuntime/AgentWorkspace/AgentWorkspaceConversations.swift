@@ -96,13 +96,13 @@ struct AgentWorkSession {
         return found
     }
 
-    static func people(workspace: WorkspaceOperation, dataRoot: URL) throws -> [(agent: String, name: String)] {
-        try AgentScreen.contacts(identity: workspace.ports.conversations.identity(dataRoot: dataRoot)).map { ($0.id, $0.name) }
+    static func people(dataRoot: URL) throws -> [(agent: String, name: String)] {
+        try AgentScreen.contacts(identity: AgentContactIdentity(dataRoot: dataRoot)).map { ($0.id, $0.name) }
     }
 
-    static func sessions(workspace: WorkspaceOperation, with agent: String, dataRoot: URL) throws -> [Self] {
-        let people = try people(workspace: workspace, dataRoot: dataRoot)
-        let identity = try workspace.ports.conversations.identity(dataRoot: dataRoot)
+    static func sessions(with agent: String, dataRoot: URL) throws -> [Self] {
+        let people = try people(dataRoot: dataRoot)
+        let identity = try AgentContactIdentity(dataRoot: dataRoot)
         return try all(dataRoot: dataRoot).filter { identity.canonical($0.sender) == identity.canonical(agent)
             && people.contains(where: { identity.canonical($0.agent) == identity.canonical(agent) }) }
     }

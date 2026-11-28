@@ -11,13 +11,10 @@ import DeskCore
 // MARK: - Dreams and Memory Loops
 
 public enum DreamBackgroundWork {
-    /// The nightly job, its launch catch-up and mind.dream all run here, so the dream beats here once per run: worked with the lessons it saved, so a
-    /// night that saved none breaks its record.
     public static func runDream(
         dataRoot: URL,
         cycle: SwiftNativeDreamREMCycle,
         cognitionRuntime: NativeCognitionRuntime,
-        force: Bool,
         trigger: DreamTrigger,
         parent: Turn,
         beganAt: Date
@@ -25,16 +22,18 @@ public enum DreamBackgroundWork {
         let asked = trigger == .manual ? "asked: " : ""
         let report: DreamReport
         do {
-            report = try await dream(dataRoot: dataRoot, cycle: cycle, cognitionRuntime: cognitionRuntime, force: force,
+            report = try await dream(dataRoot: dataRoot, cycle: cycle, cognitionRuntime: cognitionRuntime,
                                      trigger: trigger, parent: parent, beganAt: beganAt)
         } catch {
             beatThrown(dreamOrgan, error, note: asked, cadence: dreamCadence)
             throw error
         }
+        let drops = report.entriesWritten > 0 ? "Dropped \(report.droppedOptionalItems) optional items. " : ""
         if !report.errors.isEmpty {
-            OrganJudge.beat(dreamOrgan, .failed, note: asked + report.errors.joined(separator: "; "), cadence: dreamCadence)
+            OrganJudge.beat(dreamOrgan, report.stopped ? .stopped : .failed,
+                            note: asked + drops + report.errors.joined(separator: "; "), cadence: dreamCadence)
         } else if report.entriesWritten > 0 || report.effectsSettled > 0 {
-            OrganJudge.beat(dreamOrgan, .worked, note: asked + "wrote \(report.entriesWritten) diary entries, saved \(report.lessonsSaved) lessons",
+            OrganJudge.beat(dreamOrgan, .worked, note: asked + drops + "wrote \(report.entriesWritten) diary entries, saved \(report.lessonsSaved) lessons",
                             yield: report.lessonsSaved, cadence: dreamCadence)
         } else if report.skipReason != alreadyRunning {
             // Another run holding the reservation beats its own decision.
@@ -65,14 +64,13 @@ public enum DreamBackgroundWork {
         dataRoot: URL,
         cycle: SwiftNativeDreamREMCycle,
         cognitionRuntime: NativeCognitionRuntime,
-        force: Bool,
         trigger: DreamTrigger,
         parent: Turn,
         beganAt: Date
     ) async throws -> DreamReport {
         // Live owed moments, including deferrals, before the dream reads the day.
         await AdaptiveMemoryPromoter.shared.drainOwedAtNight(dataRoot: dataRoot)
-        return try await cycle.runDream(force: force, trigger: trigger, delivery: { delivery in
+        return try await cycle.runDream(trigger: trigger, delivery: { delivery in
             switch delivery.effect {
             case .reflectionJudgment(let material):
                 switch try await cognitionRuntime.produceDreamReflection(id: delivery.id, material: material) {
@@ -108,20 +106,24 @@ public enum DreamBackgroundWork {
                     }
                     OrganJudge.beat("care_night", .failed, note: error.localizedDescription)
                     throw error
+                } catch let stopped as CancellationError {
+                    OrganJudge.beat("care_night", .stopped, note: "stopped before it finished")
+                    throw stopped
                 } catch {
                     OrganJudge.beat("care_night", .failed, note: error.localizedDescription)
                     throw error
                 }
                 OrganJudge.beat("care_night", .worked, note: "judged the night's cares")
                 return .done
-            case .completion(let occurredAt, let feltSummary):
+            case .completion(let occurredAt, let feltSummary, let droppedOptionalItems):
                 var metadata: [String: JSONValue] = [
                     "entriesWritten": .int(1), "sessionsProcessed": .int(Int64(delivery.sessionsProcessed)),
                     "force": .bool(delivery.force), "trigger": .string(delivery.trigger.rawValue),
                 ]
                 if let feltSummary { metadata["feltDaySummary"] = .string(feltSummary) }
+                if let droppedOptionalItems { metadata["droppedOptionalItems"] = .int(Int64(droppedOptionalItems)) }
                 let applied = try await cognitionRuntime.completeDreamSignal(id: delivery.id,
-                    occurredAt: occurredAt, metadata: metadata)
+                    occurredAt: occurredAt, metadata: metadata, parent: parent)
                 return applied ? .done : .skipped("body disabled")
             }
         }, parent: parent, beganAt: beganAt)
@@ -160,6 +162,9 @@ public enum DreamBackgroundWork {
                                         "about": .string(care.about)]),
                     "payloadPreview": .string(words),
                 ]), turn: nil)
+            } catch let stopped as CancellationError {
+                if failures.isEmpty { throw stopped }
+                break
             } catch {
                 failures.append("life card for \(care.id) not staged: \(error)")
             }
@@ -314,7 +319,7 @@ public enum DreamBackgroundWork {
                     ]),
                 ]),
                 // ApprovalRecord owns displacement rendering from the payload.
-                "payloadPreview": .string(remProposalPreview(row, experiences: experiences, includeReplacement: false)),
+                "payloadPreview": .string(remProposalPreview(row, experiences: experiences)),
             ])
             // The approval is the one matter the person sees; its owner draws its face.
             return try await inbox.create(body, turn: nil).id
@@ -343,7 +348,7 @@ public enum DreamBackgroundWork {
     }
 
     /// Keep support beside proposal wording so every REM surface carries the same provenance.
-    public static func remProposalPreview(_ row: REMProposalRow, experiences: Int?, includeReplacement: Bool = true) -> String {
+    public static func remProposalPreview(_ row: REMProposalRow, experiences: Int?) -> String {
         let lesson: String
         // Standing corrections move into GROWTH and must identify themselves before quoting the line.
         if row.support == .standing {
@@ -354,7 +359,7 @@ public enum DreamBackgroundWork {
         } else {
             lesson = row.proposalText
         }
-        return includeReplacement ? lesson + "\n\n" + REMReplacement.describe(row.replaced) : lesson
+        return lesson
     }
 
     /// The scheduled assembly needs the same self-memory provider; otherwise its dream omits that half.
@@ -371,6 +376,9 @@ public enum DreamBackgroundWork {
 
             let records = try await memory.listMemory(kind: nil)
             let sorted = records.sorted { $0.createdAt > $1.createdAt }
+            // Her own dreams are hers: a memory that came through someone who still steers stays out of the dream's own-mind material (it is still
+            // recalled with its source, and that person's conversation enters the dream under their name).
+            let trust = MemoryDataProvenance.reading(dataRoot: dataRoot, records.map(\.extras))
 
             var tagged: [String] = []
             var general: [String] = []
@@ -378,13 +386,12 @@ public enum DreamBackgroundWork {
                 let text = rec.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 if text.isEmpty { continue }
                 // Only absorption after the dream’s high-water mark is new material.
-                if let parsed = NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(rec.createdAt),
-                   parsed < cutoff {
-                    continue
-                }
+                // A row whose time cannot be read is not known to be new: it would otherwise be new every night.
+                guard let parsed = NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(rec.createdAt), parsed >= cutoff else { continue }
                 // Only what recall could speak: active, recall-eligible, admitted.
                 guard rec.status == "active", MemoryLifecycle.isRecallEligible(rec.lifecycle),
-                      !MemoryStorage.metadataFlag(rec.extras, MemoryStorage.pendingAdmissionKey)
+                      !MemoryStorage.metadataFlag(rec.extras, MemoryStorage.pendingAdmissionKey),
+                      MemoryDataProvenance.sources(in: rec.extras, trust: trust).isEmpty
                 else { continue }
                 let tags = rec.tags ?? []
                 let layer = (rec.layer ?? "").lowercased()
@@ -409,7 +416,7 @@ public enum DreamBackgroundWork {
         let runtime = cognitionRuntime
         return { @Sendable in
             let substrate = await runtime.substrateForIntegration()
-            return await substrate.feltDaySummary(at: Date())
+            return await substrate.feltDaySummary(at: Date(), redacting: DreamPart.redact)
         }
     }
 
@@ -467,14 +474,14 @@ public enum DreamBackgroundWork {
         cognitionRuntime: NativeCognitionRuntime
     ) -> DreamDatedMoodSink {
         let runtime = cognitionRuntime
-        return { @Sendable affect, dateKey in
+        return { @Sendable affect, dateKey, id in
             let substrate = await runtime.substrateForIntegration()
             guard await substrate.configurationSnapshot().enabled else { return .skipped("inner life off") }
             guard await substrate.integrateDreamDisposition(
                 tone: affect,
                 at: Date(),
-                // Claim residue per committed dream using the runner's date key.
-                dreamId: "dream:\(dateKey)"
+                // Claim residue per committed dream: a second dream on one date is its own.
+                dreamId: "dream:\(dateKey)#\(id.uuidString)"
             ) else {
                 throw PersistenceCoreError.ioFailure("dream mood \(dateKey) did not persist; its judgment remains owed")
             }

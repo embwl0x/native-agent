@@ -15,8 +15,7 @@ extension AppActions {
         try checkedInventory(dataRoot: dataRoot, turn: turn).authored
     }
 
-    static func authored(catalog: [AppAction], snapshot: SwiftToolDispatcher.AuthoredCatalog,
-                                 requested: String? = nil) throws -> [AppAction] {
+    static func authored(catalog: [AppAction], snapshot: SwiftToolDispatcher.AuthoredCatalog) throws -> [AppAction] {
         // A part that answers verbs is offered only as those verbs; a verb a native declaration still holds stays the native one.
         let tools = snapshot.tools.filter { tool in
             (!tool.answering || tool.answer != nil) && (tool.action.map { id in !catalog.contains { $0.id == id } } ?? true)
@@ -117,9 +116,7 @@ extension AppActions {
                              schema: schema, partAction: tool.action != nil, folded: false, bundled: tool.bundled)
             }
         }
-        let selected = requested.map { key in
-            toolsByID[key] != nil ? [key] : ToolNameAliases.authoredTool(key).flatMap { actionByTool[$0] }.map { [$0] } ?? []
-        } ?? Array(toolsByID.keys)
+        let selected = Array(toolsByID.keys)
         for id in selected { try classify(id) }
         return selected.sorted().compactMap { classified[$0] }
     }

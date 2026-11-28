@@ -63,6 +63,7 @@ enum EngineFaceWorkProjection {
             await engine.face.post(DeskPaletteFace(view: view, query: query, rows: rows, commands: commands,
                 state: state(page.deskUnavailable ?? issue, loaded: page.loaded, owner: "Desk search"), selectedHandle: selected), at: .deskPalette(view))
         }
+        await engine.face.remove(.deskPalette(view))
     }
 
     @concurrent static func observe(_ key: FaceKey, engine: NativeAgentEngine) async {

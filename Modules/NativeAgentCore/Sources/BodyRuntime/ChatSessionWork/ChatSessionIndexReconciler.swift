@@ -11,7 +11,6 @@ public struct ChatSessionIndexReconciliationReport: Sendable, Equatable {
     public var transcriptsExamined = 0
     public var sessionsRecovered = 0
     public var corruptTranscripts = 0
-    public var skippedForBounds = 0
     public var staleRowsRepaired = 0
 
     public init() {}
@@ -56,7 +55,6 @@ public actor ChatSessionIndexReconciler {
     }
 
     private struct SelectionPass: Sendable {
-        var report: ChatSessionIndexReconciliationReport
         var candidates: [StaleCandidate]
         var orphans: [URL]
     }
@@ -84,7 +82,6 @@ public actor ChatSessionIndexReconciler {
     private func selectRepairs(sessionsPath: URL, messagesDirectory: URL) async throws -> SelectionPass {
         // Select by metadata under the index lock; acquire transcript locks and parse outside it.
         return try await SwiftNativePersistenceCore.withFileLock(sessionsPath) { () -> SelectionPass in
-            var report = ChatSessionIndexReconciliationReport()
             let rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
             let knownIDs = Set(rows.compactMap { row -> String? in
                 guard case .string(let raw)? = row["id"],
@@ -122,7 +119,6 @@ public actor ChatSessionIndexReconciler {
 
             let fileLimit = 256
             let boundedCandidates = candidates.prefix(fileLimit)
-            report.skippedForBounds += max(0, candidates.count - boundedCandidates.count)
 
             var transcriptsByID: [String: (url: URL, modified: Date)] = [:]
             for entry in directoryEntries {
@@ -154,12 +150,11 @@ public actor ChatSessionIndexReconciler {
                     stamp: row[Self.transcriptStampKey],
                     version: row[ChatSessionIndexFile.acknowledgedTranscriptKey]
                 )
-                if staleCandidates.count < 50 { staleCandidates.append(candidate) }
-                else { report.skippedForBounds += 1 }
+                staleCandidates.append(candidate)
+                if staleCandidates.count == 50 { break }
             }
 
             return SelectionPass(
-                report: report,
                 candidates: staleCandidates,
                 orphans: Array(boundedCandidates)
             )
@@ -169,7 +164,7 @@ public actor ChatSessionIndexReconciler {
     private func readOrphanRepairs(
         _ selection: SelectionPass, maximumBytes: Int64
     ) async throws -> (recovered: [[String: JSONValue]], report: ChatSessionIndexReconciliationReport, consumedBytes: Int64) {
-        var report = selection.report
+        var report = ChatSessionIndexReconciliationReport()
 
         // Release the index lock for transcript reads; a busy transcript cannot block its siblings' recovery.
         var consumedBytes: Int64 = 0
@@ -190,7 +185,6 @@ public actor ChatSessionIndexReconciler {
             guard maximumBytes >= 0, fileBytes >= 0,
                   consumedBytes <= maximumBytes,
                   fileBytes <= maximumBytes - consumedBytes else {
-                report.skippedForBounds += 1
                 continue
             }
             let rawID = transcript.deletingPathExtension().lastPathComponent
@@ -202,7 +196,6 @@ public actor ChatSessionIndexReconciler {
             let remainingBytes = maximumBytes - consumedBytes
             guard let read = try await Self.readTranscript(transcript, sessionID: sessionID,
                                                           maximumBytes: remainingBytes) else {
-                report.skippedForBounds += 1
                 continue
             }
             consumedBytes += read.bytes
@@ -246,7 +239,7 @@ public actor ChatSessionIndexReconciler {
             recoveredRow[TranscriptRowStamp.previewKey] = read.preview?.stamp.json ?? .null
             // Stamp the pre-read mtime so a concurrent change remains eligible for repair.
             if let modified = values.contentModificationDate {
-                recoveredRow[Self.transcriptStampKey] = .string(Self.iso8601(modified))
+                recoveredRow[Self.transcriptStampKey] = .string(NativeTimestampFormat.fractionalZulu(modified))
             }
             recoveredRow[ChatSessionIndexFile.acknowledgedTranscriptKey] = read.version
             recoveredRow[ChatSessionIndexFile.transcriptGenerationKey] = .int(1)
@@ -267,14 +260,12 @@ public actor ChatSessionIndexReconciler {
             try Task.checkCancellation()
             report.transcriptsExamined += 1
             guard maximumBytes >= 0, consumedBytes <= maximumBytes else {
-                report.skippedForBounds += 1
                 continue
             }
             let remainingBytes = maximumBytes - consumedBytes
             // Measure transcript bytes under the read's lock so the charged size matches the evidence.
             guard let read = try await Self.readTranscript(candidate.url, sessionID: candidate.sessionID,
                                                           maximumBytes: remainingBytes) else {
-                report.skippedForBounds += 1
                 continue
             }
             consumedBytes += read.bytes
@@ -327,7 +318,7 @@ public actor ChatSessionIndexReconciler {
                         row["messageCount"] = indexedCount
                         disagreed = true
                     }
-                    row[Self.transcriptStampKey] = .string(Self.iso8601(repair.candidate.modified))
+                    row[Self.transcriptStampKey] = .string(NativeTimestampFormat.fractionalZulu(repair.candidate.modified))
                     row[ChatSessionIndexFile.acknowledgedTranscriptKey] = read.version
                 }
                 // No preview can quote a missing or provenance-damaged row.
@@ -340,8 +331,8 @@ public actor ChatSessionIndexReconciler {
                 }
                 // Advance updatedAt only: an older appended row must not lower sidebar ordering.
                 if let lastStamp = read.lastSpokenStamp,
-                   let lastDate = Self.date(lastStamp),
-                   let rowDate = Self.date((row["updatedAt"])?.trimmedString),
+                   let lastDate = NativeTimestampFormat.parseOptionalISO8601FractionalFirst(lastStamp),
+                   let rowDate = NativeTimestampFormat.parseOptionalISO8601FractionalFirst(row["updatedAt"]?.trimmedString),
                    lastDate > rowDate {
                     row["updatedAt"] = .string(lastStamp)
                     disagreed = true
@@ -397,7 +388,7 @@ public actor ChatSessionIndexReconciler {
             let spoken = rows.filter { ["user", "assistant"].contains($0["role"]?.trimmedString?.lowercased() ?? "") }
             return StaleRead(bytes: bytes, rows: valid ? rows : nil,
                              version: ChatSessionIndexFile.transcriptVersion(at: transcript),
-                             preview: spoken.last.flatMap(readableSpeech).map { (bounded($0.text, to: 160), $0.stamp) },
+                             preview: spoken.last.flatMap(readableSpeech).map { (SwiftNativeChatOrchestrationClient.previewText($0.text), $0.stamp) },
                              firstSpokenStamp: spoken.first?["createdAt"]?.trimmedString,
                              lastSpokenStamp: spoken.last?["createdAt"]?.trimmedString)
         } ?? nil
@@ -440,15 +431,6 @@ public actor ChatSessionIndexReconciler {
     private nonisolated static func readableSpeech(_ row: [String: JSONValue]) -> ContactThread.Line? {
         let line = ContactThread.Line(row)
         return !line.id.isEmpty && line.provenanceFailure == nil ? line : nil
-    }
-
-    private nonisolated static func date(_ raw: String?) -> Date? {
-        guard let raw, !raw.isEmpty else { return nil }
-        return NativeTimestampFormat.parseISO8601FractionalFirst(raw)
-    }
-
-    private nonisolated static func iso8601(_ date: Date) -> String {
-        return NativeTimestampFormat.fractionalZulu(date)
     }
 
     private nonisolated static func bounded(_ raw: String, to limit: Int) -> String {

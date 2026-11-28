@@ -52,15 +52,20 @@ public enum ChatToolOutcome {
         exactResultClass(output).isFailure
     }
 
-    /// The start boundary handed unstarted work back for the person's words; completed siblings retain their own receipts.
-    public static func isPersonArrivalHandBack(_ output: JSONValue) -> Bool {
+    public static func isToolHandBack(_ output: JSONValue) -> Bool {
         let reply = ToolResult(output)
-        guard let status = reply.status else { return false }
+        guard let fields = output.objectValue, let status = reply.status, !reply.carriesFailureEvidence else { return false }
         // A step that really failed keeps the provider's error bit, whatever the hand-back says about the rest.
-        if case .array(let receipts)? = output.objectValue?["receipts"],
+        if case .array(let receipts)? = fields["receipts"],
            receipts.contains(where: { exactResultClass($0, inspectWrappedResult: true).isFailure }) { return false }
-        return output.objectValue?["reason"] == .string("person_arrival")
-            && ["skipped", "partial"].contains(status) && !reply.carriesFailureEvidence
+        switch fields["reason"] {
+        case .string("person_arrival"):
+            return status == "skipped" || status == "partial"
+        case .string("owner_withdrawal"):
+            if status == "partial", case .array(let unrun)? = fields["unrun"] { return !unrun.isEmpty }
+            return status == "skipped" && fields["execution"] == .string("not_run") && fields["effects"] == .string("none")
+        default: return false
+        }
     }
 
     /// Read values may be unwrapped data; incomplete evidence cannot establish a complete snapshot.
@@ -103,7 +108,7 @@ public enum ChatToolOutcome {
         interactionState: String? = nil
     ) -> (status: FoldStatus, outcome: DisplayOutcome) {
         guard kind == InlineInteractionWire.transcriptKind else {
-            if let result, isPersonArrivalHandBack(result) {
+            if let result, isToolHandBack(result) {
                 return (.plain, displayOutcome(result: result, ok: ok, hasResult: hasResult))
             }
             return (ok == false ? .failed : .plain,
@@ -167,50 +172,8 @@ public enum ChatToolOutcome {
         }
     }
 
-    public static func displaySummary(outcome: DisplayOutcome, input: JSONValue?, result: JSONValue?) -> String {
-        let value = result
-        let fields: [String: JSONValue] = { if case .object(let fields) = value { return fields }; return [:] }()
-        let reason = value.flatMap(ChatToolOutcome.explanation)
-        let macOutcome = value.flatMap { MacControlReceiptOutcome.projecting(envelope: $0) }
-        switch outcome {
-        case .pending: return "No result yet"
-        case .asked: return "Asked you first"
-        // The envelope's reason explains why the question card exists.
-        case .needsYou:
-            return fields["detail"]?.stringValue ?? "Waiting on your answer"
-        case .unknown:
-            if let macOutcome, macOutcome == .effectUnconfirmed || macOutcome == .timedOut {
-                return MacControlReceiptOutcome.effectUnconfirmed.sentence
-            }
-            return "Response received · completion not confirmed"
-        case .connectionFailed: return "Connection lost · completion unknown"
-        case .refused:
-            if reason == "tool denied: fileAccess=read_only blocks write_file" {
-                return "Reading only is allowed; file not written."
-            }
-            return reason ?? "The request was refused."
-        case .partial:
-            var count = "Partially completed"
-            if case .array(let created)? = fields["created"], case .object(let args)? = input,
-               case .array(let children)? = args["children"] {
-                count = "\(created.count) of \(children.count) tasks created"
-            }
-            // Keep the raw failure reason in Details while naming the failed child in the summary.
-            var why = reason
-            if let reason, reason.hasPrefix("creating child "),
-               let open = reason.firstIndex(of: "'"),
-               let close = reason[reason.index(after: open)...].firstIndex(of: "'") {
-                let title = reason[reason.index(after: open)..<close]
-                let rest = reason[close...].dropFirst()
-                let error = rest.hasPrefix(": ") ? rest.dropFirst(2) : rest
-                why = "\(title) not created: \(error)"
-            }
-            return count + (why.map { " · \($0)" } ?? "")
-        case .failed: return reason ?? "The request failed."
-        case .succeeded:
-            if case .string(let text) = value { return text }
-            return fields["summary"]?.stringValue ?? fields["message"]?.stringValue ?? "Completed"
-        }
+    public static func displaySummary(result: JSONValue) -> String {
+        explanation(result) ?? "The request failed."
     }
 
     public static func explanation(_ output: JSONValue) -> String? {

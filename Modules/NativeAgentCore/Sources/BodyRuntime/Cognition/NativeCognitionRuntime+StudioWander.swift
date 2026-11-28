@@ -11,6 +11,7 @@ import DeskCore
 /// Material held by one thought; the care owner checks its generation when keeping a returned question.
 public struct HourOpportunity: Sendable {
     public let words: String
+    let encounter: String
     let cares: [UUID]
     let generation: UInt64
 }
@@ -50,11 +51,13 @@ extension NativeCognitionRuntime {
                   let current = PersonPresence.read(dataRoot: dataRoot, now: now()).transition,
                   !current.here, current.since == presence.since else { return }
             await Attention.post(Happening(.`self`, subject: "hour", door: "sense:hour", who: "self",
-                words: "The person stepped away during his active hours. This time is mine, with nothing asked of it.",
+                words: "The person stepped away during their active hours. This time is mine, with nothing asked of it.",
                 once: once, shows: shows), dataRoot: dataRoot).value
             if try await ExperienceStore.at(dataRoot).experience("happening:" + once) != nil {
                 RepairOwed.settle(dataRoot, operation: "attention.hour", evidence: .init(source: "happening", id: "happening:" + once))
             }
+        } catch is CancellationError {
+            return
         } catch {
             RepairOwed.owe(dataRoot, id: "hour", kind: .act, operation: "attention.hour", owner: "hour",
                 words: error.localizedDescription, lever: "Repair the named hour evidence; no opportunity was inferred from its absence.")
@@ -79,14 +82,17 @@ extension NativeCognitionRuntime {
         let (material, failures, cares, generation) = await composeStudioWanderMaterial()
         var words = try StudioWanderLane.prompt(material)
         if !failures.isEmpty { words += "\n\nUnread sources:\n" + failures.map { "- " + $0 }.joined(separator: "\n") }
-        return HourOpportunity(words: words, cares: cares, generation: generation)
+        let encounter = material.invitations.prefix(StudioWanderLane.Material.bulletLimit)
+            .map { String($0.prefix(StudioWanderLane.Material.bulletCharacterLimit)) }
+            .joined(separator: "\n")
+        return HourOpportunity(words: words, encounter: encounter, cares: cares, generation: generation)
     }
 
     /// True only when this thought's returned question is durable in a new or continued care; no question supplies no care effect.
     public func keepHourWondering(_ output: String, opportunity: HourOpportunity, thought: String) async throws -> Bool {
         guard let question = Self.studioWanderQuestion(output) else { return false }
         let (asked, continuing) = Self.studioWanderContinuing(question, offered: opportunity.cares)
-        guard try await substrate.noteHourWondering(asked, topic: nil, continuing: continuing,
+        guard try await substrate.noteHourWondering(asked, continuing: continuing,
             generation: opportunity.generation, source: thought) else {
             throw CognitiveCareNotSaved(detail: "the hour's care generation is no longer current")
         }

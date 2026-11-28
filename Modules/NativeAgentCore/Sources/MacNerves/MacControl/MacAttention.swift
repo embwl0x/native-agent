@@ -6,6 +6,7 @@ import PersistenceCore
 import DeskCore
 import AppKit
 import CoreGraphics
+import SenseCore
 // Blueprint: | `MacAttention.swift` | `MacAttentionSessionStore`, `MacDriverBinding`: Driver takeover, view continuity and held-input settlement |
 
 public struct MacAttentionSnapshot: Sendable, Equatable {
@@ -19,7 +20,6 @@ public struct MacAttentionSnapshot: Sendable, Equatable {
     public let counts: [MacAttentionActivityKind: Int]
     public let lastActivity: MacAttentionActivity?
     public let latestViewId: String?
-    public let timedOutWaiting: Bool
     public let driverAllowed: Bool
     public let driverGeneration: UInt64
 
@@ -44,7 +44,7 @@ public struct MacAttentionSnapshot: Sendable, Equatable {
             "refresh_required": .bool(refreshRequired),
             "counts": .object(countObject),
             "view": latestViewId.map { .string($0) } ?? .null,
-            "wait_timed_out": .bool(timedOutWaiting),
+            "wait_timed_out": .bool(false),
             "driver": .string(driverAllowed ? "agent" : "user"),
             "driver_generation": .int(Int64(clamping: driverGeneration)),
         ]
@@ -107,7 +107,9 @@ public final class MacDriverBinding: Sendable {
         self.handback = handback
     }
 
-    private func stopped(context: MacOperationContext) -> Bool { state.withLock { $0.cancelled } || Task.isCancelled || context.expired }
+    private func stopped(context: MacOperationContext) -> Bool {
+        state.withLock { $0.cancelled } || Task.isCancelled || context.expired || ChatCancelFlag.isRaised(context.textDeedStop)
+    }
 
     /// Physical input ends foreground driver authority before the next event.
     public func allowsEmission(context: MacOperationContext) -> Bool {
@@ -187,7 +189,6 @@ public actor MacAttentionSessionStore {
     public static let defaultDurationSeconds = 300
     public static let minimumDurationSeconds = 15
     public static let maximumDurationSeconds = 1_800
-    public static let maximumWaitMilliseconds = 15_000
 
     private struct Session {
         let id: String
@@ -202,19 +203,12 @@ public actor MacAttentionSessionStore {
         var latestViewId: String?
     }
 
-    private struct Waiter {
-        let after: Int64
-        let done: ScopedWaiter
-        let timeoutTask: Task<Void, Never>
-    }
-
     private let screenViewStore: MacScreenViewStore
     private var session: Session?
     private var sessionGeneration: UInt64 = 0
     private var observation: (any MacAXEffectObservation)?
     private var expiryTask: Task<Void, Never>?
     private var isShutDown = false
-    private var waiters: [UUID: Waiter] = [:]
     private struct DriverState {
         var agentDriving = false
         var driverOpen = true
@@ -352,10 +346,6 @@ public actor MacAttentionSessionStore {
         observation?.stop()
         expiryTask?.cancel()
         driverObservers.values.forEach { $0.finish() }
-        for waiter in waiters.values {
-            waiter.timeoutTask.cancel()
-            waiter.done.resume()
-        }
     }
 
     /// Terminal domain retirement, distinct from stopping a bounded view session. The engine drain owns calling this; no later bind/start reopens admission.
@@ -400,12 +390,12 @@ public actor MacAttentionSessionStore {
             guard !Task.isCancelled else { return }
             await self?.expire(sessionId: id)
         }
-        return snapshot(timedOutWaiting: false, context: context)
+        return snapshot(context: context)
     }
 
     public func status(now: Date, context: MacOperationContext) async -> MacAttentionSnapshot? {
         await expireIfNeeded(now: now)
-        return snapshot(timedOutWaiting: false, context: context)
+        return snapshot(context: context)
     }
 
     @discardableResult
@@ -426,25 +416,6 @@ public actor MacAttentionSessionStore {
         await screenViewStore.invalidate()
     }
 
-    public func waitForActivity(
-        sessionId: String,
-        after sequence: Int64,
-        timeoutMilliseconds: Int,
-        now: Date,
-        context: MacOperationContext
-    ) async -> MacAttentionSnapshot? {
-        await expireIfNeeded(now: now)
-        guard session?.id == sessionId else { return nil }
-        let waitMs = max(0, min(timeoutMilliseconds, Self.maximumWaitMilliseconds))
-        var timedOut = false
-        if session?.sequence ?? 0 <= sequence, waitMs > 0 {
-            timedOut = await suspendUntilActivity(after: sequence, timeoutMilliseconds: waitMs, context: context)
-        }
-        await expireIfNeeded(now: Date())
-        guard session?.id == sessionId else { return nil }
-        return snapshot(timedOutWaiting: timedOut, context: context)
-    }
-
     /// A capture acknowledges only activity through userSequence so later input still invalidates it.
     public func observed(
         sessionId: String,
@@ -460,7 +431,7 @@ public actor MacAttentionSessionStore {
         current.observedSequence = min(current.sequence, max(0, sequence))
         current.observedUserSequence = min(current.userSequence, max(0, userSequence))
         session = current
-        return snapshot(timedOutWaiting: false, context: context)
+        return snapshot(context: context)
     }
 
     /// Rechecked before every emitted motor event. This is the effect-time human-takeover boundary, not merely a tool-entry check.
@@ -472,14 +443,14 @@ public actor MacAttentionSessionStore {
     ) async -> MacAttentionActionPermission {
         await expireIfNeeded(now: now)
         guard let binding = context.driver, binding.allowsAction(context: context) else {
-            return .refused(reason: Self.driverRefusal(context: context), current: snapshot(timedOutWaiting: false, context: context))
+            return .refused(reason: Self.driverRefusal(context: context), current: snapshot(context: context))
         }
         guard let current = session else { return .allowed }
         guard sessionId == current.id else {
             return .refused(
                 reason: "attention_session_required: an explicit Mac attention session is active; "
                     + "act with its session and latest observed user sequence, or stop it",
-                current: snapshot(timedOutWaiting: false, context: context)!
+                current: snapshot(context: context)!
             )
         }
         // Background work never waits for physical input because it uses none of the person's input resources.
@@ -489,15 +460,15 @@ public actor MacAttentionSessionStore {
             return .refused(
                 reason: "human_takeover: physical user input occurred after the agent's last fused view; "
                     + "yield until the person explicitly returns Mac control",
-                current: snapshot(timedOutWaiting: false, context: context)!
+                current: snapshot(context: context)!
             )
         }
         guard current.observedSequence == current.sequence,
               current.latestViewId != nil else {
             return .refused(
                 reason: "scene_changed: the active app or screen changed after the agent's last fused view; "
-                    + "call mac_attention next before acting again",
-                current: snapshot(timedOutWaiting: false, context: context)!
+                    + "take a fresh mac.look before acting again",
+                current: snapshot(context: context)!
             )
         }
         return .allowed
@@ -519,11 +490,9 @@ public actor MacAttentionSessionStore {
         session = current
 
         await screenViewStore.invalidate(for: activity)
-        guard session?.id == current.id else { return }
-        resumeReadyWaiters(sequence: current.sequence)
     }
 
-    private func snapshot(timedOutWaiting: Bool, context: MacOperationContext) -> MacAttentionSnapshot? {
+    private func snapshot(context: MacOperationContext) -> MacAttentionSnapshot? {
         guard let current = session else { return nil }
         let driver = makeDriverBinding()
         return MacAttentionSnapshot(
@@ -537,38 +506,9 @@ public actor MacAttentionSessionStore {
             counts: current.counts,
             lastActivity: current.lastActivity,
             latestViewId: current.latestViewId,
-            timedOutWaiting: timedOutWaiting,
             driverAllowed: driver.allowsEmission(context: context),
             driverGeneration: driver.generation
         )
-    }
-
-    private func suspendUntilActivity(after sequence: Int64, timeoutMilliseconds: Int, context: MacOperationContext) async -> Bool {
-        let id = UUID()
-        let before = session?.sequence ?? sequence
-        if session != nil, (session?.sequence ?? 0) <= sequence {
-            let done = ScopedWaiter()
-            let timeoutTask = Task { [weak self] in
-                do { try await Task.sleep(for: .milliseconds(timeoutMilliseconds)) }
-                catch { return }
-                await self?.resumeWaiter(id: id)
-            }
-            waiters[id] = Waiter(after: sequence, done: done, timeoutTask: timeoutTask)
-            await done.park(budget: context.waitBudget)
-            resumeWaiter(id: id)
-        }
-        return (session?.sequence ?? before) <= sequence
-    }
-
-    private func resumeWaiter(id: UUID) {
-        guard let waiter = waiters.removeValue(forKey: id) else { return }
-        waiter.timeoutTask.cancel()
-        waiter.done.resume()
-    }
-
-    private func resumeReadyWaiters(sequence: Int64) {
-        let ids = waiters.compactMap { id, waiter in waiter.after < sequence ? id : nil }
-        for id in ids { resumeWaiter(id: id) }
     }
 
     private func expire(sessionId: String) async {
@@ -589,12 +529,6 @@ public actor MacAttentionSessionStore {
         expiryTask?.cancel()
         expiryTask = nil
         session = nil
-        let pending = Array(waiters.values)
-        waiters.removeAll()
-        for waiter in pending {
-            waiter.timeoutTask.cancel()
-            waiter.done.resume()
-        }
     }
 
     public static let personUsingMac = "human_takeover: The person is using the Mac, so I held off. Nothing was sent."

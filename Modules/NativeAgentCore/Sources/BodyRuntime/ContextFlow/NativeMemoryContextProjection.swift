@@ -72,11 +72,11 @@ struct MemoryContext: ContextCompiledProjectionProvider, Sendable {
 
     init(
         memory: SwiftNativeMemoryV2 = SwiftNativeMemoryV2.shared,
-        provenanceIndex: MemoryAtomRecordIndex? = nil,
+        provenanceIndex: MemoryAtomRecordIndex,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) {
         self.memory = memory
-        self.provenanceIndex = provenanceIndex ?? MemoryAtomRecordIndex()
+        self.provenanceIndex = provenanceIndex
         self.dataRoot = dataRoot
         self.invalidationSourceURL = dataRoot.appendingPathComponent("memory/memory.sqlite")
             .standardizedFileURL
@@ -134,8 +134,8 @@ struct MemoryContext: ContextCompiledProjectionProvider, Sendable {
         }
         guard !atoms.isEmpty else { return ContextTurnExclusion() }
         do {
-            let records = try await memory.memoryRecords(ids: atoms.compactMap(\.1))
-            let byID = Dictionary(records.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            let ids = atoms.compactMap(\.1)
+            let byID = try await memory.uniqueContextRecords(ids: ids)
             // A queued invalidation may not have published yet. Never deliver an atom whose attribution differs from its roots under live Trust.
             // One live trust read for this whole pass; every record's roots see the same picture.
             let trust = MemoryDataProvenance.reading(dataRoot: dataRoot, atoms.compactMap { $0.1.flatMap { byID[$0] }?.extras })
@@ -175,7 +175,7 @@ struct MemoryContext: ContextCompiledProjectionProvider, Sendable {
         }
     }
 
-    private static func provenanceMatches(_ record: MindCore.MemoryRecord, atom: ContextStoredAtom,
+    static func provenanceMatches(_ record: MindCore.MemoryRecord, atom: ContextStoredAtom,
                                           trust: MemoryDataProvenance.TrustRead) -> Bool {
         guard case .held(let roots) = MemoryRoot.reading(record.extras) else { return false }
         let presented = MemoryRoot.ordered(roots.map { MemoryDataProvenance.presented($0, trust: trust) })
@@ -185,10 +185,12 @@ struct MemoryContext: ContextCompiledProjectionProvider, Sendable {
     }
 
     static func speakable(_ record: MindCore.MemoryRecord?, compiledAt: Date, on surface: ContextSurface) -> Bool {
-        guard let record, NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(record.createdAt) != nil, isActive(record), !pendingAdmission(record), MemoryLifecycle.isRecallEligible(record.lifecycle),
+        let now = Date()
+        guard let record, MemoryRecallScoring.hasStarted(validFrom: record.validFrom, at: now),
+              NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(record.createdAt) != nil, isActive(record), !pendingAdmission(record), MemoryLifecycle.isRecallEligible(record.lifecycle),
               let version = NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(record.updatedAt),
               version.timeIntervalSince(compiledAt) <= 0.001,
-              MemoryRecordDisclosurePolicy.classify(record)?.permits(surface: surface.rawValue, personaID: nil) == true
+              MemoryRecordDisclosurePolicy.classify(record, at: now)?.permits(surface: surface.rawValue, personaID: nil) == true
         else { return false }
         return true
     }
@@ -381,7 +383,7 @@ private extension MemoryContext {
             canonicalJSONString(record.extras?.objectValue?["context_topics"]) ?? "",
             entities.filter { $0.kind == ContextCorrectionScope.entityKind }.map(\.label).joined(separator: "\u{1f}"),
             canonicalJSONString(.object(MemoryDataProvenance.fields(in: record.extras, trust: trust))) ?? "",
-        ] + (body == embeddingText ? [] : [embeddingText]))
+        ] + (body == embeddingText ? [] : [embeddingText]) + (record.validFrom == nil ? [] : ["validity-start"]))
 
         // Canonical saves and epoch convergence own the vector; metadata changes can republish an atom without predicting its words again.
         let embedding: ContextEmbedding?
@@ -401,9 +403,8 @@ private extension MemoryContext {
             body: body,
             authority: authority,
             confidence: confidence,
-            // A closed truth interval expires the atom from automatic context.
             freshness: ContextFreshness(updatedAt: updatedAt, expiresAt: NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(record.validTo),
-                createdAt: createdAt, recallSeedAt: recallSeedAt),
+                createdAt: createdAt, recallSeedAt: recallSeedAt, startsAt: record.validFrom.flatMap(MemoryRecallScoring.parseTimestamp)),
             privacy: descriptor.privacy,
             permittedSurfaces: descriptor.permittedSurfaces,
             injectionPolicy: .adaptive,
@@ -462,8 +463,6 @@ private extension MemoryContext {
         return Array(Set(valid).sorted().prefix(NativeMemoryContextProjectionLimits.maximumTagsPerRecord))
     }
 
-    /// Dates are presentation evidence, not vector input; valid_to also expires atoms. Prefix dates inside the body cap so bounded expansion retains them
-    /// without adding bytes above the budget.
     static func presentationBody(
         _ text: String, record: MindCore.MemoryRecord, maximumUTF8Bytes: Int
     ) -> String {

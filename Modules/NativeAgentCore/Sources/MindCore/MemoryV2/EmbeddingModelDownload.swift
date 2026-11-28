@@ -70,7 +70,7 @@ public final class EmbeddingModelDownloadController {
                     activating = true
                     // Once the verified directory has committed, a late Pause must not cancel corpus convergence and strand two vector spaces.
                     let converged = await Task.detached(priority: .utility) {
-                        _ = await SwiftNativeMemoryV2.shared.releaseEmbeddingMemory(reason: "verified model installed")
+                        await SwiftNativeMemoryV2.shared.releaseEmbeddingMemory()
                         return await SwiftNativeMemoryV2.shared.reconcileEmbeddingEpochAtLaunch()
                     }.value
                     activating = false
@@ -90,6 +90,7 @@ public final class EmbeddingModelDownloadController {
             if !installCommitted {
                 do { try await downloader.pauseByUser() }
                 catch { await downloader.reportFailure(error) }
+                status = await downloader.currentStatus()
             }
             pauseTask = nil
         }
@@ -365,7 +366,8 @@ public actor EmbeddingModelDownload {
 
     private func removeObserver(_ id: UUID) { observers.removeValue(forKey: id) }
     func reportFailure(_ error: Error) {
-        publish(error is CancellationError ? "Download paused" : "Download failed: \(error.localizedDescription)")
+        let paused = error is CancellationError || (Task.isCancelled && (error as? URLError)?.code == .cancelled)
+        publish(paused ? "Download paused" : "Download failed: \(error.localizedDescription)")
     }
     private func publish(_ phase: String? = nil, bytes: Int64 = 0) {
         if let phase { status.phase = phase }

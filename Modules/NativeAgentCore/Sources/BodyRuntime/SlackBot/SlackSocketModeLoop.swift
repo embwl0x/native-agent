@@ -52,6 +52,7 @@ public struct SlackSocketModeLoop: LoopRunner {
         guard config.enabled else { return .off("Socket Mode off") }
         // Recovery only hands each saved accepted message its own lifetime, as a new one gets; the socket session never waits on or cancels it.
         do { try await reconcileSavedReplies() }
+        catch is CancellationError {}
         catch { await recordError(context: "inbound_recovery", error: error) }
         guard !Task.isCancelled else { return .skipped(reason: "Slack socket mode canceled") }
         return await socketTickOutcome()

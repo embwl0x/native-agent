@@ -50,11 +50,11 @@ final class NativeAgentHotkeyBootstrap {
                 },
                 reportUnavailable: { message in
                     appModel.statusText = "Voice input unavailable: \(message)"
-                    NativeAgentNotifications.post(title: "Voice input unavailable", body: message, deadline: nil)
+                    NativeAgentNotifications.post(title: "Voice input unavailable", body: message)
                 },
                 reportRejectedTurn: { message in
                     appModel.statusText = "Voice message was not sent: \(message)"
-                    NativeAgentNotifications.post(title: "Voice message was not sent", body: message, deadline: nil)
+                    NativeAgentNotifications.post(title: "Voice message was not sent", body: message)
                 }
             )
             self.voiceTurn = voiceTurn
@@ -244,7 +244,7 @@ struct NativeAgentApp: App {
                 Task {
                     guard let appModel = coordinator.appModel else { return }
                     await appModel.runDoctor(repair: false)
-                    NativeAgentNotifications.post(title: "NativeAgent health checks", body: appModel.statusText, deadline: nil)
+                    NativeAgentNotifications.post(title: "NativeAgent health checks", body: appModel.statusText)
                 }
             }
             .disabled(coordinator.appModel == nil)
@@ -264,6 +264,11 @@ struct NativeAgentApp: App {
             if let appModel = coordinator.appModel {
                 Text(MenuBarStatusPresentation.line(statusText: appModel.statusText,
                     health: appModel.face.slot(.counts).select("health", as: CountsFace.self) { $0?.statuses.health }))
+                let waiting = appModel.face.slot(.counts).select("deskWaiting.menuBar", as: CountsFace.self) { face -> Int? in
+                    guard let count = face?.deskWaiting, count.isAvailable else { return nil }
+                    return count.value
+                }
+                if let waiting, waiting > 0 { Text("\(waiting) waiting on you") }
             }
         }
 

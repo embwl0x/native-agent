@@ -58,8 +58,6 @@ extension AppModel {
             canonicalSessionIDs: face.slot(.sessions).select("allIDs", as: SessionListFace.self) { $0?.allIDs ?? [] }
         )
     }
-
-    // Key drafts and attachments by session so tab changes preserve unsent work.
 }
 
 @MainActor

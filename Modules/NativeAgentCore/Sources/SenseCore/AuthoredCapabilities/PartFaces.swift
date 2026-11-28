@@ -73,8 +73,11 @@ public actor PartFaces {
         public let levers: [PartFace.Section]
         public let keyLevers: [PartFace.Section]
         public let owed: Bool
-        public init(facts: JSONValue, epoch: UInt64, levers: [PartFace.Section] = [], keyLevers: [PartFace.Section] = [], owed: Bool = false) {
+        public let readingSources: [String: [String]]
+        public init(facts: JSONValue, epoch: UInt64, levers: [PartFace.Section] = [], keyLevers: [PartFace.Section] = [], owed: Bool = false,
+                    readingSources: [String: [String]] = [:]) {
             self.facts = facts; self.epoch = epoch; self.levers = levers; self.keyLevers = keyLevers; self.owed = owed
+            self.readingSources = readingSources
         }
     }
     public typealias PacketRead = @Sendable () async throws -> Packet
@@ -91,7 +94,11 @@ public actor PartFaces {
     public private(set) var snapshots: [String: PartFaceSnapshot] = [:]
     private let dataRoot: URL
     private let call: Call
-    private var reads: [String: LatestRead] = [:]
+    private struct PageRead {
+        let gate = LatestRead()
+        var transient: PartFaceSnapshot?
+    }
+    private var reads: [String: PageRead] = [:]
     /// The input each page's ready face was drawn from: a face is a pure reading of its input, so the same selected version over the same
     /// input reuses it whatever epoch carried it, and different input always draws again.
     private var drawnFrom: [String: JSONValue] = [:]
@@ -100,11 +107,14 @@ public actor PartFaces {
     private struct Source: Sendable {
         let part: String; let epoch: UInt64; let input: JSONValue; let unavailable: String?; let owed: Bool
         var levers: [PartFace.Section]? = nil; var keyLevers: [PartFace.Section]? = nil; var bound = false; var native = false
+        var readingSources: [String: [String]] = [:]
 
         nonisolated func snapshot(_ version: String?, _ status: PartFaceSnapshot.Status, _ face: PartFace?,
                                   _ error: PartCallError?) -> PartFaceSnapshot {
-            .init(part: part, version: version, sourceEpoch: epoch, status: status, face: face, error: error, owed: owed, levers: levers,
-                  keyLevers: keyLevers)
+            var snapshot = PartFaceSnapshot(part: part, version: version, sourceEpoch: epoch, status: status, face: face, error: error,
+                                            owed: owed, levers: levers, keyLevers: keyLevers)
+            snapshot.readingSources = readingSources
+            return snapshot
         }
     }
     private var sources: [String: Source] = [:]
@@ -118,6 +128,7 @@ public actor PartFaces {
 
     private enum Publication: Sendable {
         case snapshot(String, PartFaceSnapshot)
+        case transient(String, PartFaceSnapshot?)
         case observe(String, PartFaceSnapshot?, UUID, UUID, Bool)
         case release(UUID)
         case releaseRenderer(UUID)
@@ -144,6 +155,9 @@ public actor PartFaces {
                         await feed.post(PageTitleFace(title: snapshot.face?.title), at: .pageTitle(id))
                     }
                     NotificationCenter.default.post(PageFacePublished(page: id), subject: id as NSString)
+                case .transient(let id, let snapshot):
+                    if let snapshot { await feed?.post(snapshot, at: key(id)) }
+                    else { await feed?.remove(key(id)) }
                 case .observe(let id, let snapshot, let reader, let renderer, let titleOnly):
                     let slot: FaceKey = titleOnly ? .pageTitle(id) : key(id)
                     readers[reader, default: (renderer: renderer, slots: [])].slots.insert(slot)
@@ -240,8 +254,8 @@ public actor PartFaces {
     }
 
     private func gate(_ id: String) -> LatestRead {
-        if let gate = reads[id] { return gate }
-        let gate = LatestRead(); reads[id] = gate; return gate
+        if let read = reads[id] { return read.gate }
+        let read = PageRead(); reads[id] = read; return read.gate
     }
 
     /// Frozen packet changes advance the source epoch; missing packets stay explicit. Each read returns its result; LatestRead alone publishes.
@@ -271,7 +285,7 @@ public actor PartFaces {
     private func projectSource(_ source: Source, page id: String) async throws -> PartFaceSnapshot {
         if Task.isCancelled || stopped { throw PartCallError(code: "cancelled", message: "The projection owner was stopped.") }
         let root = dataRoot, run = call, cached = snapshots[id], previousInput = drawnFrom[id]
-        let snapshot = await Task.detached(priority: .userInitiated) {
+        let work = Task.detached(priority: .userInitiated) {
             let version: String
             do {
                 guard let file = try AbilityStore(dataRoot: root).read(id: source.part),
@@ -306,7 +320,8 @@ public actor PartFaces {
             case .failure(let error):
                 return source.snapshot(version, .failed, nil, error)
             }
-        }.value
+        }
+        let snapshot = await withTaskCancellationHandler { await work.value } onCancel: { work.cancel() }
         try Task.checkCancellation()
         if let error = snapshot.error, error.code == "cancelled" { throw error }
         if let current = sources[id], source.epoch < current.epoch { throw Superseded(reading: snapshot) }
@@ -322,7 +337,10 @@ public actor PartFaces {
         let last = snapshots[id]
         guard last?.part != snapshot.part || last?.version != snapshot.version || last?.face != snapshot.face || last?.status != snapshot.status
             || last?.owed != snapshot.owed || last?.levers != snapshot.levers
-            || last?.keyLevers != snapshot.keyLevers || last?.error != snapshot.error else { return }
+            || last?.keyLevers != snapshot.keyLevers || last?.error != snapshot.error
+            || last?.readingSources != snapshot.readingSources else { return }
+        var snapshot = snapshot
+        snapshot.pageRevision = UUID().uuidString
         snapshots[id] = snapshot
         publication.yield(.snapshot(id, snapshot))
     }
@@ -345,6 +363,22 @@ public actor PartFaces {
         stemPages.insert(id)
     }
 
+    public func publishTransient(page id: String, subject: String, face: PartFace, levers: [PartFace.Section]) {
+        guard !stopped, !Task.isCancelled else { return }
+        gate(id).write {
+            let snapshot = PartFaceSnapshot(part: subject, version: nil, sourceEpoch: 0,
+                status: .ready, face: face, error: nil, owed: false, levers: levers, pageRevision: UUID().uuidString)
+            reads[id]?.transient = snapshot
+            publication.yield(.transient(id, snapshot))
+        }
+    }
+
+    public func retireTransient(page id: String) async {
+        guard let read = reads.removeValue(forKey: id) else { return }
+        read.gate.write { publication.yield(.transient(id, nil)) }
+        await flush()
+    }
+
     /// Who draws a page: a part (the agent's), or the stem's own read in Swift.
     public enum Drawer: Sendable, Equatable { case part(String), stem }
 
@@ -363,9 +397,11 @@ public actor PartFaces {
         if let demand = itemDemands[id] {
             let owner = currentSnapshot(demand.page) ?? demand.snapshot
             do {
-                let face = try await presentation(page: demand.page, item: demand.item, request: demand.request)
-                return .init(part: owner.part, version: owner.version, sourceEpoch: owner.sourceEpoch,
-                             status: .ready, face: face, error: nil, owed: owner.owed)
+                return try await readPresentation(page: demand.page, item: demand.item, request: demand.request,
+                                                  stampRevision: demand.parentRevision != nil)
+            } catch is CancellationError {
+                return .init(part: owner.part, version: owner.version, sourceEpoch: owner.sourceEpoch, status: .failed, face: nil,
+                             error: .init(code: "cancelled", message: "The page read was cancelled."), owed: owner.owed)
             } catch {
                 return .init(part: owner.part, version: owner.version, sourceEpoch: owner.sourceEpoch,
                     status: .failed, face: nil, error: (error as? PartCallError) ?? .init(code: "read_failed", message: error.localizedDescription),
@@ -400,7 +436,8 @@ public actor PartFaces {
                     return (failed, nil)
                 }
                 let source = Source(part: reader.part, epoch: packet.epoch, input: packet.facts, unavailable: nil, owed: packet.owed,
-                    levers: packet.levers.isEmpty ? nil : packet.levers, keyLevers: packet.keyLevers.isEmpty ? nil : packet.keyLevers, bound: true)
+                    levers: packet.levers.isEmpty ? nil : packet.levers, keyLevers: packet.keyLevers.isEmpty ? nil : packet.keyLevers,
+                    bound: true, readingSources: packet.readingSources)
                 return (try await projectSource(source, page: id), source)
             }, publish: { snapshot, source in
                 self.publish(snapshot, page: id, source: source)
@@ -490,7 +527,7 @@ public actor PartFaces {
                 packets[page] = (part, { [weak self] in
                     guard let self else { throw PartCallError(code: "cancelled", message: "The projection owner was stopped.") }
                     let epoch = try await self.nextOwnEpoch(page)
-                    return try await Self.notebookPacket(dataRoot: root, part: part, page: page, epoch: epoch)
+                    return try await Self.notebookPacket(dataRoot: root, part: part, epoch: epoch)
                 })
             }
             if claimed[page] == nil, !stemPages.contains(page) { publishRemoval(page) }
@@ -508,14 +545,12 @@ public actor PartFaces {
         return epoch
     }
 
-    @concurrent nonisolated private static func notebookPacket(dataRoot: URL, part: String, page: String, epoch: UInt64) async throws -> Packet {
-        let facts = try AbilityStore.notebook(dataRoot: dataRoot, id: part, setting: false, value: .null) { code, message in
-            PartCallError(code: code, message: message)
-        }
-        switch facts {
-        case .object: return Packet(facts: facts, epoch: epoch)
-        case .null: return Packet(facts: .object([:]), epoch: epoch)
-        default: throw PartCallError(code: "bad_notebook", message: "Page \(page) draws from \(part)'s notebook, which holds no object.")
+    @concurrent nonisolated private static func notebookPacket(dataRoot: URL, part: String, epoch: UInt64) async throws -> Packet {
+        do {
+            let facts = try AbilityStore.notebook(dataRoot: dataRoot, id: part, call: .page)
+            return Packet(facts: facts, epoch: epoch)
+        } catch let failure as SenseFailure {
+            throw PartCallError(code: failure.code, message: failure.message)
         }
     }
 
@@ -581,12 +616,15 @@ public actor PartFaces {
     }
 
     public typealias Item = @Sendable (_ item: String, _ request: FaceReadRequest) async throws -> PartFace
-    private var items: [String: Item] = [:]
+    package typealias SourcedItem = @Sendable (_ item: String, _ request: FaceReadRequest) async throws
+        -> (face: PartFace, sources: [String: [String]])
+    private var items: [String: SourcedItem] = [:]
     private var itemClaims: [String: @Sendable (String) async throws -> Bool] = [:]
     private struct ItemDemand: Sendable {
         let page: String
         let item: String
         let request: FaceReadRequest
+        let parentRevision: String?
         let snapshot: PartFaceSnapshot
     }
     /// Request-scoped answers belong to held demands, outside the top-level pages exported to the phone.
@@ -594,7 +632,12 @@ public actor PartFaces {
     private var itemDemands: [String: ItemDemand] = [:]
 
     public func register(page id: String, contains: (@Sendable (String) async throws -> Bool)? = nil, item: @escaping Item) {
-        items[id] = item
+        register(page: id, contains: contains, readingItem: { key, request in (try await item(key, request), [:]) })
+    }
+
+    package func register(page id: String, contains: (@Sendable (String) async throws -> Bool)? = nil,
+                          readingItem: @escaping SourcedItem) {
+        items[id] = readingItem
         itemClaims[id] = contains
     }
 
@@ -636,8 +679,9 @@ public actor PartFaces {
     /// The whole door reading of the section (or, with `rows`, the row) the page shows with this id, read as an open section reads (detail
     /// and footer included); a row reads with the rows beneath it, under its section's title. A section that holds a document is read by
     /// its document's reader, never here. Nil when the page shows neither.
-    public func shownText(page id: String, item: String, rows: Bool) -> String? {
-        let sections = (currentSnapshot(id)?.drawnFace?.sections ?? []) + (currentSnapshot(id)?.levers ?? [])
+    public func shownText(page id: String, item: String, rows: Bool, reading: (@Sendable ([String]) -> Void)? = nil) -> String? {
+        let snapshot = currentSnapshot(id)
+        let sections = (snapshot?.drawnFace?.sections ?? []) + (snapshot?.levers ?? [])
         var shown: PartFace.Section
         if let section = sections.first(where: { $0.id == item && $0.block == nil }) {
             shown = section
@@ -648,6 +692,7 @@ public actor PartFaces {
             shown.more = nil
         } else { return nil }
         shown.folded = nil
+        if let snapshot { reading?(snapshot.sources(in: [shown])) }
         return PartFace(sections: [shown]).text(door: true, page: id)
     }
 
@@ -662,18 +707,37 @@ public actor PartFaces {
         guard let demand = itemDemands[id + "/" + request.scope], demand.request == request, let face = demand.snapshot.face else {
             throw PartCallError(code: "page_read_released", message: "This page demand is no longer held. Open it again to read it.")
         }
-        return face
+        return face.stampingPageRevision(demand.snapshot.pageRevision)
     }
 
     private func currentSnapshot(_ id: String) -> PartFaceSnapshot? { itemDemands[id]?.snapshot ?? snapshots[id] }
+    private func publishedRevision(_ id: String) -> String? {
+        guard let demand = itemDemands[id] else { return snapshots[id]?.pageRevision }
+        guard let parent = publishedRevision(demand.page), parent == demand.parentRevision else { return nil }
+        return demand.snapshot.pageRevision
+    }
+
     private func rootPage(_ id: String) -> String {
         guard let parent = itemDemands[id]?.page else { return id }
         return rootPage(parent)
     }
     private func currentSource(_ id: String) -> Source? { sources[rootPage(id)] }
 
+    public func presentation(page id: String, item: String, request: FaceReadRequest, reading: (@Sendable ([String]) -> Void)? = nil,
+                             readUsing: DemandRead? = nil,
+                             stampRevision: Bool = false) async throws -> PartFace {
+        let snapshot = try await readPresentation(page: id, item: item, request: request, readUsing: readUsing, stampRevision: stampRevision)
+        guard let face = snapshot.face else {
+            throw PartCallError(code: "page_unavailable", message: "This item has no face to draw.")
+        }
+        reading?(snapshot.sources(in: face.sections))
+        return stampRevision ? face.stampingPageRevision(snapshot.pageRevision) : face
+    }
+
     /// The item or collection reader freezes its evidence before the selected pure projection runs.
-    public func presentation(page id: String, item: String, request: FaceReadRequest, readUsing: DemandRead? = nil) async throws -> PartFace {
+    private func readPresentation(page id: String, item: String, request: FaceReadRequest, readUsing: DemandRead? = nil,
+                                  stampRevision: Bool) async throws
+        -> PartFaceSnapshot {
         guard !stopped else { throw CancellationError() }
         guard request.key == item else {
             throw PartCallError(code: "invalid_page_read", message: "The demand's key must name the item its owner is reading.")
@@ -681,9 +745,32 @@ public actor PartFaces {
         let namespace = id + "/" + request.scope
         let source = currentSource(id)
         let snapshot = currentSnapshot(id)
+        let parentRevision = stampRevision ? publishedRevision(id) : nil
         let root = rootPage(id)
         let native = items[root]
-        let result = try await gate(namespace).read({ () async throws -> PartFace in
+        func reading(_ face: PartFace, sources: [String: [String]] = [:]) throws -> PartFaceSnapshot {
+            try Task.checkCancellation()
+            if stampRevision {
+                guard let parentRevision, parentRevision == publishedRevision(id),
+                      native != nil || currentSource(id)?.input == source?.input else {
+                    throw PartCallError(code: "stale_read", message: "The page changed while this item was being read. Open its current page.")
+                }
+            }
+            var revision: String?
+            if stampRevision {
+                if let held = itemDemands[namespace], held.request == request,
+                   held.snapshot.face == face, let previous = held.snapshot.pageRevision {
+                    revision = previous
+                } else {
+                    revision = UUID().uuidString
+                }
+            }
+            var read = PartFaceSnapshot(part: snapshot?.part ?? id, version: snapshot?.version, sourceEpoch: snapshot?.sourceEpoch ?? 0,
+                                        status: .ready, face: face, error: nil, owed: snapshot?.owed ?? false, pageRevision: revision)
+            read.readingSources = sources
+            return read
+        }
+        return try await gate(namespace).read({
             if let native {
                 if let contains = itemClaims[root], (try await contains(item)) == false {
                     throw PartCallError(code: "item_unavailable", message: "The page owner does not supply that item.")
@@ -696,9 +783,8 @@ public actor PartFaces {
                         throw PartCallError(code: "stale_read", message: "This native read changed. Open its current page before reading it.")
                     }
                 }
-                let face = try await Self.readOffMain { try await native(item, request) }
-                try Task.checkCancellation()
-                return face
+                let read = try await Self.readOffMain { try await native(item, request) }
+                return try reading(read.face, sources: read.sources)
             }
             guard let snapshot, let source, snapshot.status == .ready, let version = snapshot.version else {
                 if let error = snapshot?.error { throw error }
@@ -732,15 +818,12 @@ public actor PartFaces {
                 guard currentSource(id)?.epoch == source.epoch, currentSnapshot(id)?.version == version else {
                     throw PartCallError(code: "stale_read", message: "The page changed while this item was being read. Open its current page.")
                 }
-                return try face.bound(to: PartFace.Keys(packet: source.input), levers: source.levers ?? [],
-                    keyLevers: source.keyLevers ?? []).readingSecretStatus(page: namespace)
+                return try reading(face.bound(to: PartFace.Keys(packet: source.input), levers: source.levers ?? [],
+                    keyLevers: source.keyLevers ?? []).readingSecretStatus(page: namespace))
             }
-        }, publish: { face in
-            let held = PartFaceSnapshot(part: snapshot?.part ?? id, version: snapshot?.version, sourceEpoch: snapshot?.sourceEpoch ?? 0,
-                                        status: .ready, face: face, error: nil, owed: snapshot?.owed ?? false)
-            itemDemands[namespace] = ItemDemand(page: id, item: item, request: request, snapshot: held)
+        }, publish: { snapshot in
+            itemDemands[namespace] = ItemDemand(page: id, item: item, request: request, parentRevision: parentRevision, snapshot: snapshot)
         })
-        return result
     }
 
     public func hasBody(page id: String, item: String) async throws -> Bool {
@@ -768,9 +851,12 @@ public actor PartFaces {
         return try PartFace.Keys(packet: source.input).rows[item]?.read != nil
     }
 
-    public func body(page id: String, item: String, expecting: PartFace.Call? = nil, readUsing: DemandRead? = nil) async throws -> String {
+    public func body(page id: String, item: String, expecting: PartFace.Call? = nil, reading: (@Sendable ([String]) -> Void)? = nil,
+                     readUsing: DemandRead? = nil) async throws -> String {
         if let body = bodies[rootPage(id)] { return try await body(item) }
-        if let block = currentSnapshot(id)?.drawnFace?.sections.compactMap(\.block).first(where: { $0.key == item }), let text = block.text {
+        if let snapshot = currentSnapshot(id), let section = snapshot.drawnFace?.sections.first(where: { $0.block?.key == item }),
+           let text = section.block?.text {
+            reading?(snapshot.sources(in: [section]))
             return text
         }
         guard let snapshot = currentSnapshot(id) else {
@@ -866,10 +952,12 @@ public actor PartFaces {
     /// the person's door; the page reads again after it.
     public func act(page id: String, row: String, action: String, value: String? = nil, values: [String: PartFace.Value]? = nil,
                     formRevision: String? = nil, door: String, device: String? = nil,
-                    chat: String? = nil, expecting: PartFace.Call? = nil, renderer: UUID? = nil) async throws -> String? {
+                    chat: String? = nil, expecting: PartFace.Call? = nil, renderer: UUID? = nil,
+                    expectedPageRevision: String? = nil) async throws -> String? {
         let outcome = try await actOutcome(page: id, row: row, action: action, value: value, values: values,
                                           formRevision: formRevision, door: door,
-                                          device: device, chat: chat, expecting: expecting, renderer: renderer)
+                                          device: device, chat: chat, expecting: expecting, renderer: renderer,
+                                          expectedPageRevision: expectedPageRevision)
         if let failure = outcome.failure { throw failure }
         if outcome.effects == .unknown {
             throw WireFailure(code: "page_effects_unknown", message: outcome.words ?? "This action's effects are unknown. Read its current state.",
@@ -881,7 +969,25 @@ public actor PartFaces {
     public func actOutcome(page id: String, row: String, action: String, value: String? = nil, values: [String: PartFace.Value]? = nil,
                            formRevision: String? = nil, door: String, device: String? = nil,
                            chat: String? = nil, expecting: PartFace.Call? = nil, renderer: UUID? = nil,
-                           operation: UUID? = nil, undoOf: UUID? = nil) async throws -> FaceActOutcome {
+                           operation: UUID? = nil, undoOf: UUID? = nil, expectedPageRevision: String? = nil) async throws -> FaceActOutcome {
+        let refreshed: PartFaceSnapshot?
+        if itemDemands[id] != nil, door == "mac" || expectedPageRevision != nil || undoOf == nil { refreshed = await refresh(page: id) }
+        else { refreshed = nil }
+        let transient = door == "mac" && !stopped ? reads[id]?.transient : nil
+        let snapshot: PartFaceSnapshot?
+        if door == "mac" || (door == "phone" && expectedPageRevision != nil) {
+            try Task.checkCancellation()
+            guard let expectedPageRevision, refreshed?.error == nil,
+                  (transient?.pageRevision ?? publishedRevision(id)) == expectedPageRevision else {
+                throw PartCallError(code: "stale_row", message: "This page changed after it was shown. Read the page again before acting.")
+            }
+            guard expecting != nil else {
+                throw PartCallError(code: "drawn_call_missing", message: "Read the page again before acting.")
+            }
+            snapshot = transient ?? currentSnapshot(id)
+        } else {
+            snapshot = refreshed ?? snapshots[id]
+        }
         guard let run else { throw PartCallError(code: "no_action", message: "Nothing runs a row's call here.") }
         let undoKey = UndoKey(page: id, row: row, door: door, device: device, renderer: renderer)
         if let undoOf {
@@ -894,9 +1000,6 @@ public actor PartFaces {
                           decided: inverse.tap.decided, renderer: renderer)
             return await perform(inverse.call, tap: tap, operation: operation, undoKey: undoKey, run: run)
         }
-        let snapshot: PartFaceSnapshot?
-        if itemDemands[id] != nil { snapshot = await refresh(page: id) }
-        else { snapshot = snapshots[id] }
         if let error = snapshot?.error { throw error }
         // Where each matching row came from decides who decides its call: the stem's own rows (the page's levers, the key levers, every row
         // of a page the stem registered) are the person's; a row of any other page (the agent's own) is the agent's, so the tap only asks.
@@ -983,6 +1086,7 @@ public actor PartFaces {
             $0.key.page != id || $0.key.door != door || $0.key.device != device || $0.key.renderer != renderer
         }
         let tap = Tap(page: id, row: row, action: action, door: door, device: device, chat: chat, decided: decided, renderer: renderer)
+        if transient != nil { return try await run(call, tap) }
         return await perform(call, tap: tap, operation: operation, undoKey: undoKey, run: run)
     }
 

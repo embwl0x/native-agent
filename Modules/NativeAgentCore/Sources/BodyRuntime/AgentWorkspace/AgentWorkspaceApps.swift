@@ -19,7 +19,7 @@ enum AgentWorkspaceApps {
 
     static func quickAction(tool: String) -> AgentWorkspaceButton? {
         if tool == "browser.chrome_snapshot" {
-            return readButton("Read my current tab", tool: tool, input: [:])
+            return AgentWorkspaceActivity.read("Read my current tab", tool: tool, input: [:])
         }
         switch tool {
         case "commit_memory":
@@ -116,17 +116,17 @@ enum AgentWorkspaceApps {
         if let appName { readInput["app"] = .string(appName) }
         if let part = input["part"] { readInput["part"] = part }
         var actions: [AgentWorkspaceButton] = [
-            readButton("Look again", tool: "screen", input: readInput),
+            AgentWorkspaceActivity.read("Look again", tool: "screen", input: readInput),
             .init(label: "Go to an app or location", action: .perform(tool: "go", input: [:], title: "Go to an app or location", textField: "name",
                 isEffect: true), needsText: true),
-            readButton("Read app menu", tool: "menu", input: appName.map { ["app": .string($0)] } ?? [:]),
+            AgentWorkspaceActivity.read("Read app menu", tool: "menu", input: appName.map { ["app": .string($0)] } ?? [:]),
             .init(label: "Act by name or on a visual region", action: .open(.record(tool: "app", input: ["find": .string("act"), "args": .object([:])], title: "Act on the screen"))),
-            readButton("Look at desktop pixels", tool: "screen", input: ["pixels": .bool(true)]),
+            AgentWorkspaceActivity.read("Look at desktop pixels", tool: "screen", input: ["pixels": .bool(true)]),
         ]
         if let appName {
             actions.insert(.init(label: "Bring this app forward", action: .perform(tool: "go",
                 input: ["name": .string(appName)], title: "Open " + (boundedString(app["name"]) ?? appName), textField: nil, isEffect: true)), at: 1)
-            actions.append(readButton("Look at frontmost app", tool: "screen", input: ["structured": .bool(true)]))
+            actions.append(AgentWorkspaceActivity.read("Look at frontmost app", tool: "screen", input: ["structured": .bool(true)]))
         }
         return .init(title: boundedString(app["name"]) ?? boundedString(input["app"]) ?? "Computer", content: .object(row), items: items, actions: actions)
     }
@@ -138,7 +138,7 @@ enum AgentWorkspaceApps {
         guard envelope["ok"] == .bool(true), output["available"] == .bool(true),
               let appName = boundedString(app["bundle_id"]) ?? boundedString(app["name"]),
               case .array(let paths)? = output["paths"] else {
-            return .init(title: "Computer menu", content: result, items: [], actions: [readButton("Look again", tool: "screen", input: ["structured": .bool(
+            return .init(title: "Computer menu", content: result, items: [], actions: [AgentWorkspaceActivity.read("Look again", tool: "screen", input: ["structured": .bool(
                 true)])])
         }
         let items: [AgentWorkspaceItem] = paths.prefix(80).compactMap { value in
@@ -151,8 +151,8 @@ enum AgentWorkspaceApps {
         output["paths"] = .array(paths.filter { !projected.contains(boundedString(JSONValue.objectOrEmpty($0)["path"]) ?? "") })
         var content = envelope; content["output"] = .object(output)
         return .init(title: "Computer menu", content: .object(content), items: items, actions: [
-            readButton("Read this app menu again", tool: "menu", input: ["app": .string(appName)]),
-            readButton("Return to screen", tool: "screen", input: ["structured": .bool(true)]),
+            AgentWorkspaceActivity.read("Read this app menu again", tool: "menu", input: ["app": .string(appName)]),
+            AgentWorkspaceActivity.read("Return to screen", tool: "screen", input: ["structured": .bool(true)]),
         ])
     }
 
@@ -174,7 +174,7 @@ enum AgentWorkspaceApps {
             let arguments: [String: JSONValue] = isDirectory
                 ? ["path": .string(child), "max_entries": .int(12)]
                 : ["path": .string(child), "max_bytes": .int(12000)]
-            items.append(.init(title: name, content: .object(["path": .string(child), "kind": .string(isDirectory ? "folder" : "file")]), actions: [readButton(
+            items.append(.init(title: name, content: .object(["path": .string(child), "kind": .string(isDirectory ? "folder" : "file")]), actions: [AgentWorkspaceActivity.read(
                 isDirectory ? "Open folder" : "Open file", tool: tool, input: arguments, title: (isDirectory ? "Folder: " : "File: ") + name)]))
         }
         var actions: [AgentWorkspaceButton] = [
@@ -190,7 +190,7 @@ enum AgentWorkspaceApps {
            boundedString(next["snapshot"]) != nil,
            let offset = next["offset"]?.strictInt64, let current = row["offset"]?.strictInt64, offset > current,
            let count = next["max_entries"]?.strictInt64, count > 0, count <= 200 {
-            actions.insert(readButton("Next files", tool: "list_dir", input: next), at: 0)
+            actions.insert(AgentWorkspaceActivity.read("Next files", tool: "list_dir", input: next), at: 0)
         }
         var metadata = row
         metadata.removeValue(forKey: "entries")
@@ -207,7 +207,7 @@ enum AgentWorkspaceApps {
             let retry: [AgentWorkspaceButton] = input["tab_id"]?.strictInt64.map { tab in
                 var arguments: [String: JSONValue] = ["tab_id": .int(tab)]
                 if input["scope"] == .string("main_content") { arguments["scope"] = .string("main_content") }
-                return [readButton("Read this page again", tool: "browser.chrome_snapshot", input: arguments)]
+                return [AgentWorkspaceActivity.read("Read this page again", tool: "browser.chrome_snapshot", input: arguments)]
             } ?? []
             return .init(title: "Browser page", content: result, items: [], actions: retry)
         }
@@ -248,19 +248,19 @@ enum AgentWorkspaceApps {
         var readingActions: [AgentWorkspaceButton] = []
         if mainContent {
             var whole = current; whole["scope"] = .string("page")
-            readingActions.append(readButton("Read whole page", tool: "browser.chrome_snapshot", input: whole))
+            readingActions.append(AgentWorkspaceActivity.read("Read whole page", tool: "browser.chrome_snapshot", input: whole))
             metadata["workspace_reading"] = .string(reading["mainContentAvailable"] == .bool(true)
                 ? "Reading the visible main content. Page down continues through the rendered article; this is not a claim that offscreen content was read."
                 : "No main region declared: reading the page without its navigation (Read whole page adds it).")
         } else if reading["mainContentAvailable"] == .bool(true) {
             var main = current; main["scope"] = .string("main_content")
-            readingActions.append(readButton("Read main content", tool: "browser.chrome_snapshot", input: main))
+            readingActions.append(AgentWorkspaceActivity.read("Read main content", tool: "browser.chrome_snapshot", input: main))
         }
         let navigation: [String: JSONValue] = ["tab_id": .int(tab), "expected_user_sequence": .int(sequence)]
         let pageDown = navigation.merging(["delta_x": .int(0), "delta_y": .int(700)]) { _, new in new }
         let pageUp = navigation.merging(["delta_x": .int(0), "delta_y": .int(-700)]) { _, new in new }
         return .init(title: boundedString(row["title"]) ?? "Browser page", content: .object(metadata), items: items, actions: readingActions + [
-            readButton("Read page again", tool: "browser.chrome_snapshot", input: current),
+            AgentWorkspaceActivity.read("Read page again", tool: "browser.chrome_snapshot", input: current),
             .init(label: "Go to a website", action: .perform(tool: "browser.chrome_navigate", input: navigation, title: "Go to a website", textField: "url",
                 isEffect: true), needsText: true),
             .init(label: "Page down", action: .perform(tool: "browser.chrome_scroll", input: pageDown, title: "Page down", textField: nil, isEffect: true)),
@@ -269,9 +269,6 @@ enum AgentWorkspaceApps {
         ])
     }
 
-    private static func readButton(_ label: String, tool: String, input: [String: JSONValue], title: String? = nil) -> AgentWorkspaceButton {
-        .init(label: label, action: .open(.record(tool: tool, input: input, title: title ?? label)))
-    }
     static func boundedString(_ value: JSONValue?) -> String? {
         guard let text = value?.nonemptyString, text.count <= 8192 else { return nil }
         return text

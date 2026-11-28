@@ -9,13 +9,12 @@ extension SwiftNativeKnowledgeGraphIndexer {
 
     /// Bound each memory's entity payload and keep freshest names first when truncated. Unknown or unindexed memories have no result.
     public func relatedEntityNames(
-        forMemoryIDs memoryIDs: [String],
-        perMemoryLimit: Int = 8
+        forMemoryIDs memoryIDs: [String]
     ) async throws -> [String: [String]] {
         let seeds = memoryIDs
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
-        guard !seeds.isEmpty, perMemoryLimit > 0 else { return [:] }
+        guard !seeds.isEmpty else { return [:] }
         // The memory→node mapping is a one-way hash, so build the forward map once and use it to attribute each edge back to its memory.
         let factIDToMemoryID: [String: String] = {
             var map: [String: String] = [:]
@@ -48,7 +47,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
             for row in entityRows {
                 let factID: String = row["fact_id"]
                 guard let memoryID = factIDToMemoryID[factID],
-                      result[memoryID, default: []].count < perMemoryLimit else { continue }
+                      result[memoryID, default: []].count < 8 else { continue }
                 let name: String = row["name"]
                 result[memoryID, default: []].append(name.trimmingCharacters(in: .whitespacesAndNewlines))
             }

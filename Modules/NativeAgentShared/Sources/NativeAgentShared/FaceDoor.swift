@@ -8,15 +8,18 @@ public struct FaceActSubmission: Sendable {
     public let value: String?
     public let values: [String: PartFace.Value]?
     public let formRevision: String?
+    public let expectedPageRevision: String?
     public let expectedCall: PartFace.Call
     public let undoOf: UUID?
     public let checking: Bool
     public init(id: UUID, row: String, action: String, value: String?, expectedCall: PartFace.Call, undoOf: UUID? = nil,
-                checking: Bool = false, values: [String: PartFace.Value]? = nil, formRevision: String? = nil) {
+                checking: Bool = false, values: [String: PartFace.Value]? = nil, formRevision: String? = nil,
+                expectedPageRevision: String? = nil) {
         self.id = id; self.row = row; self.action = action; self.value = value; self.expectedCall = expectedCall
         self.undoOf = undoOf
         self.checking = checking
         self.values = values; self.formRevision = formRevision
+        self.expectedPageRevision = expectedPageRevision
     }
 }
 

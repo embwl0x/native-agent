@@ -5,9 +5,9 @@ import ProviderRouting
 import NativeAgentCore
 import PersistenceCore
 import Darwin
+import UniformTypeIdentifiers
 import CoreFoundation
 import SQLite3
-import UniformTypeIdentifiers
 // Blueprint: | `AgentContactTaskValues.swift` | Execution and payload debt remain distinct. |
 public enum AgentContactTaskState: String, Codable, Sendable {
     case submitted, working, inputRequired = "input-required", completed, failed, canceled, stopped

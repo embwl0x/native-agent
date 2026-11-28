@@ -5,8 +5,8 @@ import ProviderRouting
 import NativeAgentCore
 import PersistenceCore
 import Darwin
-import CoreFoundation
 import SQLite3
+import CoreFoundation
 // Blueprint: | `AgentContactTaskReceipts.swift` | SQLite owns checked task receipts and payload debt. |
 extension AgentContactTasks {
     private func taskKey(id: String, owner: String) -> String {
@@ -155,8 +155,6 @@ extension AgentContactTasks {
         }
     }
     static func completionDigest(_ part: AgentContactPart) throws -> String {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        return SHA256Hex.of(try encoder.encode(part))
+        try StableHash.sortedJSONSHA256(part)
     }
 }

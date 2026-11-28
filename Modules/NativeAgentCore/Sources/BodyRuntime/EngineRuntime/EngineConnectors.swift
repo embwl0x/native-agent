@@ -9,9 +9,9 @@ import MindCore
 extension NativeAgentEngine {
     public func runConnectorAction(id: String, dryRun: Bool, input: [String: JSONValue] = [:],
         origin: String, platform: any ConnectorActionPlatform) async throws -> ConnectorActionReceipt {
-        try await withPartDoor(envelope: .personOnMac(origin)) { door in
+        try await withPartDoor(envelope: .personOnMac(origin)) { _ in
             try await ConnectorActions(platform: platform).runConnectorAction(
-                id: id, dryRun: dryRun, input: input, dataRoot: self.dataRoot, turn: door.turn)
+                id: id, dryRun: dryRun, input: input, dataRoot: self.dataRoot)
         }
     }
 }

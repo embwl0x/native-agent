@@ -16,9 +16,7 @@ public struct ChatSessionsCheck: DoctorCheck {
     }
 
     public func run() async -> CheckResult {
-        let sessionsPath = root
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("sessions.json")
+        let sessionsPath = DataRootPaths.chatSessionIndex(in: root)
         let count: Int
         do {
             let rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
@@ -92,8 +90,7 @@ public struct ChatMessagesIntegrityCheck: DoctorCheck {
     }
 
     public func run() async -> CheckResult {
-        let dir = root
-            .appendingPathComponent("chat", isDirectory: true)
+        let dir = DataRootPaths.chatDirectory(in: root)
             .appendingPathComponent("messages", isDirectory: true)
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: dir.path, isDirectory: &isDir), isDir.boolValue else {

@@ -88,16 +88,6 @@ final class ICloudPhoneCall: Sendable {
     }
 }
 
-/// Terminal turns consume their signed input even if reply publication fails, preventing duplicate execution.
-enum ICloudIncomingTurnConsumptionPolicy {
-    static func shouldConsume(
-        turnReachedTerminalState: Bool,
-        replyPublished: Bool
-    ) -> Bool {
-        turnReachedTerminalState || replyPublished
-    }
-}
-
 public struct ICloudIncomingTurnForwarder: Sendable {
     private let sync: DeviceSync
     private let port: any ICloudIncomingTurnPort
@@ -317,10 +307,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
             if turnReachedTerminalState {
                 port.completed(sessionID: sessionID)
             }
-            return ICloudIncomingTurnConsumptionPolicy.shouldConsume(
-                turnReachedTerminalState: turnReachedTerminalState,
-                replyPublished: false
-            )
+            return turnReachedTerminalState
         }
     }
 

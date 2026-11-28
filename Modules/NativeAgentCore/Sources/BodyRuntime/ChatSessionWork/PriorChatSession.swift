@@ -109,7 +109,7 @@ package enum PriorChatSession {
             let source = row["source"]?.stringValue
             let scope = row["continuityScope"]?.stringValue
             guard try SessionHistoryReader.continuityMessages(
-                forSessionId: id, dataRoot: dataRoot, limit: 1, maximumBytes: 64 * 1024,
+                forSessionId: id, dataRoot: dataRoot,
                 matching: { Resolved.admits($0, participant: participant, source: source, scope: scope) }
             ) != nil else { return false }
         }

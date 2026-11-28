@@ -3,6 +3,8 @@ import Observation
 import SwiftUI
 #if os(macOS)
 import AppKit
+import Combine
+import CoreGraphics
 #else
 import UIKit
 #endif
@@ -190,6 +192,10 @@ public struct FaceLongText: View {
     public let text: String
     public let format: String?
     public let copy: Bool
+    #if os(macOS)
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @State private var textScale = BoardGeometry.macTextScale
+    #endif
     @State private var find = UUID()
     @State private var markdown: AttributedString?
     @State private var formattingIssue: String?
@@ -215,7 +221,11 @@ public struct FaceLongText: View {
             }.buttonStyle(.borderless).font(.caption)
             Group {
                 if format != "markdown" || markdown != nil {
+                    #if os(macOS)
+                    FaceTextKit(text: text, code: format == "code", markdown: markdown, find: find, textScale: textScale)
+                    #else
                     FaceTextKit(text: text, code: format == "code", markdown: markdown, find: find)
+                    #endif
                 } else if let formattingIssue { Text(formattingIssue).foregroundStyle(.red).textSelection(.enabled) }
                 else if formattingCancelled { Text("Document formatting cancelled.").foregroundStyle(.secondary) }
                 else {
@@ -228,6 +238,12 @@ public struct FaceLongText: View {
                 .frame(minHeight: 180, idealHeight: 360, maxHeight: 480)
                 .accessibilityLabel("Document")
         }
+        #if os(macOS)
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.AccessibilityDisplayOptionsDidChangeMessage.name)) { _ in
+            textScale = BoardGeometry.macTextScale
+        }
+        .onChange(of: dynamicTypeSize, initial: true) { _, _ in textScale = BoardGeometry.macTextScale }
+        #endif
         .task(id: format == "markdown" ? text : nil) {
             guard format == "markdown" else { markdown = nil; return }
             markdown = nil
@@ -260,6 +276,7 @@ private struct FaceTextKit: NSViewRepresentable {
     let code: Bool
     let markdown: AttributedString?
     let find: UUID
+    let textScale: CGFloat
     final class Coordinator {
         var find: UUID
         init(_ find: UUID) { self.find = find }
@@ -290,11 +307,13 @@ private struct FaceTextKit: NSViewRepresentable {
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         guard let view = scroll.documentView as? NSTextView else { return }
         if let markdown {
-            let value = Self.attributed(markdown)
+            let value = Self.attributed(markdown, textScale: textScale)
             if view.attributedString() != value { view.textStorage?.setAttributedString(value) }
         } else {
             if view.string != text { view.string = text }
-            view.font = code ? .monospacedSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular) : .systemFont(ofSize: NSFont.systemFontSize)
+            view.font = code
+                ? .monospacedSystemFont(ofSize: (NSFont.smallSystemFontSize * textScale).rounded(), weight: .regular)
+                : .systemFont(ofSize: (NSFont.systemFontSize * textScale).rounded())
             view.textColor = .labelColor
         }
         if context.coordinator.find != find {
@@ -305,15 +324,15 @@ private struct FaceTextKit: NSViewRepresentable {
             view.performTextFinderAction(command)
         }
     }
-    private static func attributed(_ markdown: AttributedString) -> NSAttributedString {
+    private static func attributed(_ markdown: AttributedString, textScale: CGFloat) -> NSAttributedString {
         var styled = AttributedString()
-        let base = NSFont.systemFont(ofSize: NSFont.systemFontSize)
+        let base = NSFont.systemFont(ofSize: (NSFont.systemFontSize * textScale).rounded())
         for run in markdown.runs {
             var segment = AttributedString(markdown[run.range])
             if segment.appKit.font == nil {
                 let intent = run.inlinePresentationIntent ?? []
                 var font = intent.contains(.code)
-                    ? NSFont.monospacedSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
+                    ? NSFont.monospacedSystemFont(ofSize: (NSFont.smallSystemFontSize * textScale).rounded(), weight: .regular)
                     : base
                 if intent.contains(.stronglyEmphasized) { font = NSFontManager.shared.convert(font, toHaveTrait: .boldFontMask) }
                 if intent.contains(.emphasized) { font = NSFontManager.shared.convert(font, toHaveTrait: .italicFontMask) }

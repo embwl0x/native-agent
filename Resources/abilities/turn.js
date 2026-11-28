@@ -62,13 +62,6 @@ function step(state, event) {
 
 // Practice met again: keep the route as she works, so next time she runs it instead of working it out.
 function kept(practice) {
-  var have = practice.ability;
-  if (have && have.worked) return "You have worked this out by hand before (" + practice.route + "), and an ability of yours already " +
-    "makes these calls: authored." + have.id + " (" + have.description + "). What you did here stands; if this is that work, use authored." +
-    have.id + " the next time you do it instead of working it out by hand.";
-  if (have) return "You have worked this out by hand before (" + practice.route + "). An ability of yours makes these calls, authored." +
-    have.id + " (" + have.description + "), but its last run of them failed: " + have.failed + ". What you did here stands; if this is that work, " +
-    "repair it so the next time it does this: app ability.save under id " + have.id + " with code that makes the calls that worked here, in order.";
   var words = practice.hand ? "You have worked this out by hand before (" + practice.route + "). " +
     "Keep the route that works as one of your own abilities as part of this work, so next time you run it instead of working it out again: " +
     "app ability.save {id, description, code, params}, whose run(input) makes the calls that work, in order, " +
@@ -94,12 +87,21 @@ function next(state, effects) { return {state: state, do: effects}; }
 function where(body) {
   function quoted(text) { return text ? "\u201c" + String(text).slice(0, 80) + "\u201d" : ""; }
   var j = body[body.changed] || {}, line;
-  if (body.changed === "front") line = "I'm in " + (j.app_name || "an app") + (j.title ? ", " + quoted(j.title) : "");
-  else if (body.changed === "browser") line = j.active_tab && j.active_tab.title ? "The browser tab in front is " + quoted(j.active_tab.title) : "No browser tab is in front";
-  else if (body.changed === "files") line = j.document_path ? "The open document is " + quoted(String(j.document_path).split("/").pop()) : "No document is open in front";
+  if (body.changed === "front") {
+    var title = j.title_observed_at ? (j.title ? quoted(j.title) : "untitled") + " (title observed " + j.title_observed_at + ")" : "window title unknown";
+    line = "Last reported in front: " + (j.app_name || "an app") + ", " + title;
+  } else if (body.changed === "browser") {
+    if (!j.active_tab) line = "No front browser tab was reported";
+    else {
+      var tabTitle = j.active_tab.title;
+      if (typeof tabTitle !== "string") line = "Last reported browser tab: title not reported";
+      else line = "Last reported browser tab: " + (tabTitle === "" ? "untitled" : quoted(tabTitle));
+    }
+  } else if (body.changed === "files") line = j.document_path ? "Last reported open document: " + quoted(String(j.document_path).split("/").pop()) : "No open document was reported in front";
   else if (body.changed === "threads") line = "My working places changed";
   else line = "My Mac's state changed";
-  return line + " (body:" + body.changed + ").";
+  var observed = body.changed === "somatic" && body.observed_at ? " (observed " + body.observed_at + ")" : "";
+  return line + observed + " (body:" + body.changed + ").";
 }
 
 function hear(h, felt) {
@@ -168,7 +170,7 @@ function dynamic(context, recall, bodyAnchor, expression) {
 var BASELINE = [
   "Relevant context comes from canonical local sources. These records preserve evidence from when they were written; they are not automatically live readings. Recheck changing status, counts, health, availability, and claims labeled current/latest/live/present with their canonical owner before repeating them as current.",
   "Operating agreements apply only to their stated subject and scope. Follow the current explicit decision; keep older incidents as history. Age, similarity and a memory's confidence do not expand authority. When a decision explicitly replaces a remembered rule, use memory.commit with supersedes or corrects so the old rule leaves automatic context without being erased.",
-  'For deeper context, use app {action:"context.expand", args:{atom_id}} with one of the listed atom ids only when the deeper section is needed.',
+  'Where context shows a [context.expand <id>] marker or a # Deeper context line, app {action:"context.expand", args:{atom_id}} opens that id; use it only when the deeper section is needed.',
   "Home glance covers Desk, inbox, approvals, exchanges, helper status, phone-place records and reviews; no live calendar, reminders, mail, front app, full Doctor check or complete activity log.",
   "[CognitiveSubstrate] carries selected inner cues; no external-state reads, full Doctor check or complete activity log.",
   "If asked what model or provider you are using, answer from Current runtime; do not guess.",

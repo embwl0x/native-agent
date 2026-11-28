@@ -64,10 +64,10 @@ extension SwiftNativeProviderRouting {
         guard case .object(let obj) = value, !surfaces.isEmpty else { return value }
         return .object(obj.filter { !surfaces.contains($0.key) })
     }
-    nonisolated static func normalizeModelIdStatic(_ raw: String, fallback: String) -> String {
+    nonisolated static func normalizeModelIdStatic(_ raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { return fallback }
-        if trimmed.count > 100 { return fallback }
+        if trimmed.isEmpty { return "" }
+        if trimmed.count > 100 { return "" }
         // Model syntax admits only [A-Za-z0-9._:/+-], at most 100 characters.
         let allowed: Set<Character> = {
             var s: Set<Character> = []
@@ -77,7 +77,7 @@ extension SwiftNativeProviderRouting {
             return s
         }()
         for ch in trimmed {
-            if !allowed.contains(ch) { return fallback }
+            if !allowed.contains(ch) { return "" }
         }
         // Normalization checks syntax only; catalog admission belongs to routing reads.
         return trimmed
@@ -88,7 +88,7 @@ extension SwiftNativeProviderRouting {
         providerID: String? = nil,
         supportedReasoningEfforts: [String]? = nil
     ) throws -> String {
-        let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let normalized = TextNormalization.trimmedLowercased(raw)
         guard let model, !model.isEmpty else { return normalized }
         let supported = supportedReasoningEfforts
             ?? FirstPartyModelCatalog.routeSupportedEfforts(model, providerID: providerID ?? "")
@@ -103,9 +103,6 @@ extension SwiftNativeProviderRouting {
                 "Think level '\(raw)' is unsupported for \(model). Choose one of \(supported.joined(separator: ", ")) in Providers.")
         }
         return normalized
-    }
-    nonisolated static func normalizeServiceTierStatic(_ raw: String) -> String {
-        TextNormalization.trimmedLowercased(raw)
     }
     /// Scalar reads consume already checked state.
     nonisolated static func stringFrom(_ node: JSONValue, key: String) -> String? {

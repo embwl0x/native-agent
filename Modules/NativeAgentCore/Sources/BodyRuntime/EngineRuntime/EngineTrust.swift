@@ -132,8 +132,6 @@ public final class TrustFacade {
     /// Effects follow committed policy changes, never a checked read.
     @ObservationIgnored public var policyDidChange: (@MainActor () -> Void)?
 
-    public private(set) var securityStatus: SecurityCenterStatus?
-    public private(set) var securityRefreshError: String?
     @ObservationIgnored private lazy var policyRead = LatestRead()
     @ObservationIgnored private var settingsFeed: SettingsFeedProjection?
 
@@ -148,7 +146,6 @@ public final class TrustFacade {
         policyRead.write {
             policy = saved
             policyReadError = nil
-            securityStatus = nil
             publishSettings()
         }
         policyDidChange?()
@@ -161,17 +158,11 @@ public final class TrustFacade {
             let checked: Result<[String: JSONValue], Error>
             do { checked = .success(try await center.loadTrustPolicyChecked()) }
             catch { checked = .failure(error) }
-            let status: Result<SecurityCenterStatus, Error>
-            do {
-                status = .success(try await SwiftNativeSecurityCenter(dataRoot: dataRoot).status(policy: checked, limit: 10))
-            } catch {
-                status = .failure(error)
-            }
             let typed: Result<TrustPolicy, Error> = await Task.detached(priority: .userInitiated) {
                 Result { try TrustPolicy(policyObject: checked.get()) }
             }.value
-            return (checked, typed, status)
-        }, publish: { _, typed, status in
+            return (raw: checked, typed: typed)
+        }, publish: { _, typed in
             switch typed {
             case .success(let value):
                 if policy != value { policy = value; changed = true }
@@ -182,19 +173,10 @@ public final class TrustFacade {
                 policy = nil
                 policyReadError = error.localizedDescription
             }
-            switch status {
-            case .success(let value):
-                if securityStatus != value { securityStatus = value; changed = true }
-                if securityRefreshError != nil { changed = true }
-                securityRefreshError = nil
-            case .failure(let error):
-                let issue = UserFacingError.cause(error, action: "read security status")
-                if securityRefreshError != issue { securityRefreshError = issue; changed = true }
-            }
             publishSettings()
         })
         if changed { await capabilitiesDidChange?() }
-        return (result.0, result.1)
+        return result
     }
 
     public private(set) var capabilityCatalogSources: [CapabilityCatalogSource] = []
@@ -281,11 +263,6 @@ public final class TrustFacade {
         }
     }
 
-    nonisolated static func capabilityNeedsReview(_ status: String?) -> Bool {
-        guard let status else { return false }
-        return ["review", "proposal", "draft", "drafted", "needs_setup"].contains(status.lowercased())
-    }
-
     public func checkCapabilityTrust(id: String) async throws -> CapabilityTrustEvaluation {
         let evaluation = try await capabilityEvaluationRead.read({ try await evaluateCapability(id: id) }, publish: {
             latestCapabilityTrustEvaluation = $0
@@ -327,10 +304,7 @@ public final class TrustFacade {
             connectorActionStatuses: connectorActionStatuses
         )
         let records = try rows.map { try CapabilityRecord(catalogRow: $0) }
-        var byKind: [String: Int] = [:]
         var active = 0
-        var review = 0
-        var autoloaded = 0
         let activeStatuses: Set<String> = ["active", "installed", "ready", "configured"]
         var identities: Set<String> = []
         for record in records {
@@ -341,17 +315,12 @@ public final class TrustFacade {
             guard identities.insert(record.id).inserted else {
                 throw RuntimeReadError.unreadableFeed("The capability list does not add up (the list contains duplicate ids). Refresh before relying on it.")
             }
-            byKind[record.kind ?? "", default: 0] += 1
             let status = (record.status ?? "").lowercased()
             if activeStatuses.contains(status) { active += 1 }
-            if Self.capabilityNeedsReview(record.status) { review += 1 }
-            if record.autoload == true { autoloaded += 1 }
         }
         return CapabilitySummaryResponse(
             records: records,
-            summary: CapabilityCounts(total: records.count, active: active, review: review,
-                                      autoloaded: autoloaded, byKind: byKind),
-            createdAt: nowISO
+            summary: CapabilityCounts(total: records.count, active: active)
         )
     }
 
@@ -442,8 +411,6 @@ extension TrustFacade {
             status: enabled ? "ok" : "off",
             mode: mode,
             enabled: enabled,
-            processEnabled: true,
-            trustEnabled: trustEnabled,
             disabledReason: disabledReason,
             guardrails: [
                 KernelGuardrail(
@@ -461,8 +428,7 @@ extension TrustFacade {
                     title: "Write backup requirement",
                     status: backupRequired ? "ok" : "warn"
                 ),
-            ],
-            createdAt: SwiftNativeManifestSigner.isoTimestamp(Date())
+            ]
         )
     }
 

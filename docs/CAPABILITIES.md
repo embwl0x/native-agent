@@ -60,8 +60,8 @@ Source: [NativeAgentEngine.swift](../Modules/NativeAgentCore/Sources/BodyRuntime
 ## Conversation surfaces
 
 - **Mac:** streaming chat, sessions and queued follow-ups; Simple, Advanced
-  and Agent views. Agent Home draws their shared face with row actions; the
-  other Agent rooms remain read-only.
+  and Agent views. Agent view shows a read-only Home face with links and
+  rooms with selectable text.
 - **iPhone/iPad:** a companion using signed iCloud transport to the Mac.
   The Mac must remain awake with NativeAgent open to answer.
   Optional phone senses and their setup evidence share one bounded owner;
@@ -204,7 +204,8 @@ filesystem API; it cannot call every action merely because the action exists.
   spec](skill_manifest_spec.md). Abilities grant no new authority. The retired
   `skill.*` and `tool.*` compatibility aliases are removed and answer as unknown
   actions; `skill.build` remains separately registered as a person-owned Mac
-  action that starts a skill build in the Mac's message box.
+  action that prepares a draft in the Mac's message box when the NativeAgent
+  window is connected. A disconnected window returns `composer_unavailable`.
 - NativeAgent runs no MCP client of its own: an MCP server they wants is an
   ability they grows, a resident one holding the server's program or connection.
   Servers a data root kept from before are raised to their once on home as theirs
@@ -237,8 +238,7 @@ connectors and agent communication under the saved policy.
   instead defaults to the app's verified source checkout when no repository
   is named, or the workspace when no checkout exists, and returns `cwd`.
   `git.status` returns parsed branch/tracking/change fields without a raw
-  duplicate. `git.run` takes only an exact argv array, preserving empty
-  arguments. SwiftPM actions read `configuration`, `package_path` and
+  duplicate. SwiftPM actions read `configuration`, `package_path` and
   `disable_swiftpm_sandbox`; retired alternate spellings are not read.
   Every command launch checks required workspace preparation; a writable confined
   launch also checks its required SwiftPM shim before starting. Preparation
@@ -581,9 +581,13 @@ connectors and agent communication under the saved policy.
   for cleanup.
   Every four-verb physical hand carries the observed foreground PID, including
   keys in an app with no window. A cross-app drag retains the source PID, or the
-  destination PID after an authorized raise. An unknown foreground identity sends
-  no input. Popup cleanup also carries the burst attention fields and the open
-  popup's captured native window identity; every event checks that identity.
+  destination PID after an authorized raise. An uncertain raise stops the drag
+  and preserves the operation's effect evidence. Takeover after a confirmed
+  raise records that raise and stops before the drag. An unknown foreground
+  identity sends no input. A thrown popup-open call reports the opening click's
+  effect status and inspection guidance, and says the option click was never
+  sent. Popup cleanup carries the burst attention fields and the open popup's
+  captured native window identity; every event checks that identity.
   Its failure is retained in `popup_cleanup`. Exact per-event window-number
   checks remain watch-specific. PID-directed field typing rechecks the intended
   window and focused field at every key-down.
@@ -781,15 +785,6 @@ connectors and agent communication under the saved policy.
   from the current app declarations, and inactive watch recipes name
   `schedule.create` for explicit creation with `kind`, `schedule` and `payload`
   arguments; recipe titles stay outside those arguments.
-  System media `toggle` sends the play/pause key. Idempotent `play`, `resume`
-  and `pause` report that the Now Playing owner/state cannot be established;
-  they emit no toggle.
-  Target discovery uses one bounded Now Playing process recipe. Both preflight
-  admission and execution retain typed discovery failures, process output and
-  capture/exit evidence in `target_discovery`; no media key is sent after a
-  discovery failure. A successful read with no Now Playing path/client or a zero
-  player PID returns `no_player` with no effect; Stop propagates cancellation,
-  rather than a discovery failure. The player's Write switch still decides admission.
   `mac.apps` consumes the resident Spotlight snapshot. A readable bundle with no
   declared platform is a Mac app. Ancestor package exclusion uses the filesystem's
   package flag, so a dotted folder name alone leaves the app eligible. Missing
@@ -808,6 +803,11 @@ connectors and agent communication under the saved policy.
   no cold-gather timer. Resident arrival
   observation ends with its consumer lifetime; the engine shuts down the query
   only after producers, admitted turns and resident consumers have settled.
+  `app.anatomy` resolves a name, bundle ID or indexed path in that same snapshot.
+  If it matches multiple installed copies, choose the exact path. It reads
+  six selectable probes without launching the target, including static bundle
+  and extension metadata, the saved app map and passive permission status.
+  See [Senses](SENSES.md#the-native-world).
   Mac location reads return a held CoreLocation fix with its age, or await a
   CoreLocation callback when no fix is held. The location owner adds no answer
   timer. An empty callback is unknown; an error reports its own cause without
@@ -826,6 +826,7 @@ connectors and agent communication under the saved policy.
   The built-in browser's [operation contract](INTERNAL_WORKINGS.md#built-in-browser-operation-ownership)
   owns pure previews, settlement, bounded WebKit waits and checked IPC readiness.
 - **Web search:** `web.search` searches SearXNG and returns its results (with the engines' direct `answers` and up to three `infoboxes` knowledge panels, each a title, summary and page, when SearXNG has them) or an explicit failure with setup or repair guidance. A malformed result or `unresponsive_engines` entry is skipped with a named `gaps` entry; valid siblings still return, and an empty result with gaps cannot establish no matches. Required response/envelope failures still fail the search. Research's results view and Lab evidence retain these gaps. Without configured SearXNG, search is unavailable; it does not select a browser route. The requested time range travels with the SearXNG search.
+  Cancelling an in-flight Research search reports the act as cancelled.
 - **Web reads:** `web.read` (`read_page`) extracts the retained HTTP HTML as
   paragraphs, list items and table rows, with each content link inline as
   `title → url` (a URL label appears once). HN stories keep their points and
@@ -917,8 +918,10 @@ read before each independently committed card. It is not a multi-card
 transaction. A damaged saved card blocks only proposals for its own work;
 unrelated or unidentifiable damaged cards leave named gaps, and other works
 continue. These per-work failures and gaps travel in the pass result and
-cognition receipt. An inbox-read or card-write failure stops staging and returns
-already-staged approval IDs with the exact cause; an unconfirmed card write must
+cognition receipt. Cancellation ends staging with the approval IDs already
+collected, and the pass remembers the interruption if admission reopens. An
+inbox-read or card-write failure stops staging and returns already-staged
+approval IDs with the exact cause; an unconfirmed card write must
 be inspected before repetition. Audit read and persistence failures travel
 separately in the pass result and journal append's derived-failure list. They do not undo a
 committed card, journal entry or graph projection. An unavailable graph has no

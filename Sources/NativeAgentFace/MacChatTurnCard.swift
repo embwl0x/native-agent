@@ -43,7 +43,7 @@ struct MacChatTurnCard: View {
     }
 
     var body: some View {
-        GlassCard(tint: model.tone == .working ? nil : tint) {
+        TurnCardSurface(tint: model.tone == .working ? nil : tint) {
             HStack(alignment: .center, spacing: NativeAgentSpacing.md) {
             MacChatTurnStepAge(since: model.clock.stepStartedAt) { long in
             VStack(alignment: .leading, spacing: 3) {
@@ -409,14 +409,17 @@ struct MacChatTurnCardHost: View {
     let sessionId: String
     var onStop: (() -> Void)?
     var onOpenScreen: (() -> Void)? = nil
+    var coveredTurnID: String? = nil
+    var coveredStepIDs: Set<String> = []
 
     var body: some View {
         let face = appModel.turnFace(for: sessionId)
         if let model = face?.card {
+            let covered = face?.turnID == coveredTurnID ? coveredStepIDs : []
+            let done = (face?.steps ?? []).filter { !$0.isRunning && $0.text != model.detail }.prefix(3)
             VStack(alignment: .leading, spacing: 3) {
                 MacChatTurnCard(model: model, onStop: onStop, preview: face?.preview, onOpenScreen: onOpenScreen,
-                                // A step whose words the box is already showing as its current line is not listed again above it.
-                                done: Array((face?.steps ?? []).filter { !$0.isRunning && $0.text != model.detail }.prefix(3).reversed()))
+                                done: Array(done.filter { !covered.contains($0.id) }.reversed()))
                 if let status = face?.approvalStatus {
                     Text(status).font(NativeAgentFont.tag).foregroundStyle(.secondary)
                 }

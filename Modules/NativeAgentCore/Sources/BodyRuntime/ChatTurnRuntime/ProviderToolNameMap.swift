@@ -20,19 +20,20 @@ struct ProviderToolNameMap: Sendable {
             let providerName = Self.uniqueProviderName(for: schema.name, used: &used)
             aliases[providerName] = schema.name
             if reverse[schema.name] == nil { reverse[schema.name] = providerName }
-            let description: String
-            if providerName == schema.name {
-                description = schema.description
-            } else {
-                description = "\(schema.description) NativeAgent dispatch name: \(schema.name)."
+            guard providerName != schema.name else {
+                publicSchemas.append(schema)
+                continue
             }
-            publicSchemas.append(LLMToolSchema(
+            var aliased = LLMToolSchema(
                 name: providerName,
                 toolClass: schema.toolClass, reach: schema.reach, capabilities: schema.capabilities,
                 effectInputPolicy: schema.effectInputPolicy,
-                description: description,
+                macIntegration: schema.macIntegration, makes: schema.makes, removes: schema.removes,
+                description: "\(schema.description) NativeAgent dispatch name: \(schema.name).",
                 parametersJSON: schema.parametersJSON
-            ))
+            )
+            aliased.volatileCatalogAppendix = schema.volatileCatalogAppendix
+            publicSchemas.append(aliased)
         }
 
         self.schemas = publicSchemas

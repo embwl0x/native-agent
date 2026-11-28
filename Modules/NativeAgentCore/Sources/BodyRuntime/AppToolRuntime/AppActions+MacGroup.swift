@@ -1,7 +1,7 @@
+import PersistenceCore
 import MacNerves
 import NativeAgentCore
 import NativeAgentShared
-import PersistenceCore
 import DeskCore
 import SenseCore
 import Foundation
@@ -38,10 +38,18 @@ extension AppActions {
             List installed apps or check one by name; returns name, bundle ID, path, version and scriptability
             """, [.optional("name"), .optional("all", .boolean)],
                  tool: "mac_apps", read: true, scope: "installed apps applications what apps do I have; name: optional substring filter"),
+        AppAction("app.anatomy", "mac", """
+            Inspect one installed Mac app without launching it. Read its bundle, URL declarations, static scripting dictionary,
+            App Intents metadata, learned app map and passive permission status.
+            """, [.required("app"), .optional("sections", .strings), .optional("include_sdef_xml", .boolean)],
+                 tool: "app_anatomy", read: true,
+                 scope: """
+                    Supply an exact bundle ID, app name, or installed .app path. Omit sections to read all six.
+                    Choose from \(MacAppAnatomy.Section.allCases.map(\.rawValue).joined(separator: ", ")). Set include_sdef_xml for a clipped XML excerpt.
+                    """),
         .fold("mac_screenshot_save", "mac"),
         .fold("mac_location", "mac", "Where this Mac is", read: true),
         .fold("mac_volume", "mac", "Read or change volume; no args reads only", readWhen: ["level": .null, "adjust": .null, "muted": .null]),
-        .fold("mac_media", "mac", "Control Now Playing across Music, Spotify, browsers and podcasts: play/pause toggle, next or previous", screen: true),
         .fold("activity_query", "mac", read: true),
         .fold("context_lookup", "capabilities", read: true),
         .fold("request_interaction", "chat"),

@@ -152,7 +152,6 @@ public actor SlackInboundDeliveryJournal {
     private let encoder: JSONEncoder
     private struct Handlers: Sendable {
         var active: Set<String> = []
-        var tasks: [String: Task<Void, Never>] = [:]
     }
     /// One handler owns each accepted event across loop replacements.
     private static let handlers = Mutex(Handlers())
@@ -222,7 +221,7 @@ public actor SlackInboundDeliveryJournal {
         let key = path.path + "\u{0}" + eventId
         Self.handlers.withLock { handlers in
             guard handlers.active.insert(key).inserted else { return }
-            handlers.tasks[key] = Task(priority: .userInitiated) {
+            Task(priority: .userInitiated) {
                 await operation()
                 await self.releaseHandler(eventId: eventId)
             }
@@ -277,7 +276,6 @@ public actor SlackInboundDeliveryJournal {
     func releaseHandler(eventId: String) {
         Self.handlers.withLock { handlers in
             let key = path.path + "\u{0}" + eventId
-            handlers.tasks.removeValue(forKey: key)
             handlers.active.remove(key)
         }
     }
@@ -446,9 +444,9 @@ public actor SlackInboundDeliveryJournal {
         }
     }
 
-    func settleUnconfirmed(eventId: String, failedBeforeAnswer: Bool = false) throws -> SlackInboundDeliveryRecord {
+    func settleUnconfirmed(eventId: String) throws -> SlackInboundDeliveryRecord {
         try mutate(eventId: eventId) {
-            $0.phase = failedBeforeAnswer || $0.failedBeforeAnswer == true ? .failedBeforeAnswer : .sentUnconfirmed
+            $0.phase = $0.failedBeforeAnswer == true ? .failedBeforeAnswer : .sentUnconfirmed
             $0.updatedAt = Date()
         }
     }

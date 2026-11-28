@@ -27,6 +27,15 @@ public actor ChatTurnSteering {
         var saved = false
         /// Its admission already took it as read while a round carried it, so close drops it.
         var settled = false
+
+        var blocksUnstarted: Bool {
+            turn.originPrincipal == "person" && turn.peerSteering?.isTainted(dataRoot: turn.dataRoot) != true
+        }
+
+        var arrivalKind: WaitingArrival {
+            if arrival.cardAnswer { return .cardAnswer }
+            return turn.originPrincipal == "person" && arrival.row != .hidden ? .personMessage : .message
+        }
     }
 
     /// Who answers a waiting arrival, decided once on this actor.
@@ -40,37 +49,49 @@ public actor ChatTurnSteering {
             input = try SwiftNativeChatOrchestrationClient.turnAttachmentInput(
                 message: arrival.words, attachments: arrival.attachments, dataRoot: dataRoot, runId: turn.run)
         } catch { return nil }
-        let text = arrival.row == .hidden ? input.userMessage : deliveryText(input.userMessage, turn: turn)
+        let text = arrival.row == .hidden || arrival.cardAnswer ? input.userMessage : deliveryText(input.userMessage, turn: turn)
         return Offer(arrival: arrival, turn: turn, reading: [.text(text)] + input.imageBlocks)
     }
 
     private var pending: [String: [Offer]] = [:]
+    enum WaitingArrival: Sendable {
+        case personMessage, cardAnswer, message
+
+        var subject: String {
+            switch self {
+            case .personMessage: "message from the person"
+            case .cardAnswer: "card answer"
+            case .message: "message"
+            }
+        }
+    }
+
     private struct Pending: Sendable {
         let boundary: Bool
-        let person: Bool
+        let arrival: WaitingArrival?
     }
     nonisolated private static let pendingSessions = Mutex<[String: Pending]>([:])
     nonisolated public static func hasPending(_ sessionId: String) -> Bool {
         pendingSessions.withLock { $0[sessionId]?.boundary == true }
     }
-    /// Only the person's readable, untainted words withdraw a proposal that has not started.
     nonisolated public static func hasPersonWaiting(_ sessionId: String) -> Bool {
-        pendingSessions.withLock { $0[sessionId]?.person == true }
+        waitingArrival(sessionId) != nil
+    }
+    nonisolated static func waitingArrival(_ sessionId: String) -> WaitingArrival? {
+        pendingSessions.withLock { $0[sessionId]?.arrival }
     }
     /// Async callers read the owner without taking the dispatch snapshot's lock on their actor.
-    public func personWaiting(in sessionId: String) -> Bool {
-        guard let turn = open[sessionId] else { return false }
-        return pending[sessionId]?.contains {
-            turn.takes($0) && $0.turn.originPrincipal == "person" && $0.turn.peerSteering?.isTainted(dataRoot: $0.turn.dataRoot) != true
-        } == true
+    func waitingArrival(in sessionId: String) -> WaitingArrival? {
+        guard let turn = open[sessionId] else { return nil }
+        return pending[sessionId]?.first { turn.takes($0) && $0.blocksUnstarted }?.arrivalKind
     }
     /// Only an offer the open turn can read asks a running ability to hand back at its next step; reserved arrivals await their answer.
     private func syncPendingFlag(_ sessionId: String) {
         let readable = open[sessionId].map { turn in pending[sessionId]?.filter(turn.takes) ?? [] } ?? []
-        let person = personWaiting(in: sessionId)
         let boundary = !readable.isEmpty
+        let arrival = readable.first(where: \.blocksUnstarted)?.arrivalKind
         Self.pendingSessions.withLock {
-            if boundary || person { $0[sessionId] = Pending(boundary: boundary, person: person) }
+            if boundary { $0[sessionId] = Pending(boundary: boundary, arrival: arrival) }
             else { $0.removeValue(forKey: sessionId) }
         }
     }
@@ -81,6 +102,7 @@ public actor ChatTurnSteering {
     func restoreReadings(_ runs: Set<String>, sessionId: String) {
         guard !runs.isEmpty else { return }
         replayed[sessionId] = runs
+        open[sessionId]?.turn.peerSteering?.sealTaskElevations()
         open[sessionId]?.hasJoinedMessage = true
         let waiting = pending[sessionId] ?? []
         reserved[sessionId, default: []] += waiting.filter { runs.contains($0.turn.run) }
@@ -132,6 +154,11 @@ public actor ChatTurnSteering {
     }
     public typealias Persister = @Sendable (String, Offer) async -> Bool
 
+    enum OwnerAct: String, Sendable {
+        case withdrawUnstarted = "turn.withdraw_unstarted"
+        case stop = "turn.stop"
+    }
+
     struct OpenTurn {
         let token: UUID
         let turnId: String
@@ -141,10 +168,8 @@ public actor ChatTurnSteering {
         /// This turn's persister cannot be replaced by another door.
         let persist: Persister?
         let helper: Bool
-        /// Who started this turn and the peers already steering it.
-        let principal: String
-        let sources: Set<String>
-        let fileAccess: ICloudChatFileAccessPolicy.Ceiling
+        let turn: Turn
+        var withdrawalWriter: TurnCheckpointWriter?
         /// A joined arrival keeps its own row and door; the opener cannot stand for its authority.
         var hasJoinedMessage = false
         /// Arrivals whose row this turn could not save run alone, so they are not offered to its later rounds.
@@ -155,19 +180,17 @@ public actor ChatTurnSteering {
             TurnAdmission.Steered(sessionID: sessionId, turnID: turnId, runID: run, requestID: door?.correlationId)
         }
 
-        /// Except Mac intents, the person's and the agent's own untainted words join any turn of the agent's. Anything an agent or peer said
-        /// joins only a turn that same sender started under the same steering, so it never rides past the floor its own turn would meet;
-        /// refused, it runs alone under that floor.
         func takes(_ offer: Offer) -> Bool {
             guard persist != nil, !helper, !unsaved.contains(offer.turn.run) else { return false }
             guard ChatTurnSteering.rootKey(offer.turn.dataRoot) == ChatTurnSteering.rootKey(dataRoot) else { return false }
-            let from = offer.turn, carried = Set(from.peerSteering?.checkpointSources ?? [])
+            let from = offer.turn
             // Mac intents wait for their own turn; joining would inherit the opener's ask.
             guard from.envelope?.workIdentity != "intent:chat" else { return false }
             // Every arrival keeps its file ceiling, regardless of who sent it.
-            guard fileAccess.holds(from.fileAccessCeiling) else { return false }
-            if ["person", "self"].contains(from.originPrincipal), from.peerSteering?.isTainted(dataRoot: from.dataRoot) != true { return true }
-            return from.originPrincipal == principal && carried.isSubset(of: sources)
+            guard turn.fileAccessCeiling.holds(from.fileAccessCeiling), from.originPrincipal == turn.originPrincipal else { return false }
+            let held = PeerDataTaint.carried(turn: turn), incoming = PeerDataTaint.carried(turn: from)
+            return held.elevated.isEmpty && incoming.elevated.isEmpty
+                && Set(incoming.sources).isSubset(of: Set(held.sources))
         }
     }
 
@@ -181,7 +204,7 @@ public actor ChatTurnSteering {
     private struct IdleListener: Sendable { let root: String; let edge: AsyncStream<Void>.Continuation }
     private init() {}
 
-    nonisolated private static func rootKey(_ dataRoot: URL) -> String {
+    nonisolated static func rootKey(_ dataRoot: URL) -> String {
         dataRoot.standardizedFileURL.resolvingSymlinksInPath().path
     }
 
@@ -206,10 +229,10 @@ public actor ChatTurnSteering {
         let helper = try SessionConversation.checkedIsHelper(sessionId, dataRoot: dataRoot)
         let token = turn.admissionToken ?? UUID()
         var opened = OpenTurn(token: token, turnId: turnId, run: turn.run, dataRoot: dataRoot, door: door, persist: persist,
-                                   helper: helper, principal: turn.originPrincipal, sources: Set(turn.peerSteering?.checkpointSources ?? []),
-                                   fileAccess: turn.fileAccessCeiling)
+                                   helper: helper, turn: turn)
         if let held = open[sessionId], held.turnId == turnId, held.run == turn.run, Self.rootKey(held.dataRoot) == Self.rootKey(dataRoot) {
             opened.hasJoinedMessage = held.hasJoinedMessage
+            opened.withdrawalWriter = held.withdrawalWriter
         }
         open[sessionId] = opened
         Self.openRoots.withLock { $0[sessionId] = OpenRoot(root: Self.rootKey(dataRoot), helper: helper) }
@@ -247,6 +270,34 @@ public actor ChatTurnSteering {
     /// A card can hand back only to the exact act that raised it.
     public func isTurnOpen(sessionId: String, turnID: String) -> Bool {
         open[sessionId]?.turnId == turnID
+    }
+
+    func bindWithdrawalWriter(_ writer: TurnCheckpointWriter, in sessionId: String, turn: Turn) {
+        guard withdrawalOwner(in: .init(sessionId: sessionId, turnId: turn.id), run: turn.run, dataRoot: turn.dataRoot) != nil else { return }
+        open[sessionId]?.withdrawalWriter = writer
+    }
+
+    private func withdrawalOwner(in identity: MacChatTurnIdentity, run: String, dataRoot: URL) -> OpenTurn? {
+        guard let held = open[identity.sessionId], !held.helper, held.turnId == identity.turnId, held.run == run,
+              Self.rootKey(held.dataRoot) == Self.rootKey(dataRoot) else { return nil }
+        return held
+    }
+
+    func canWithdrawUnstarted(in identity: MacChatTurnIdentity, run: String, dataRoot: URL) async -> Bool {
+        guard let writer = withdrawalOwner(in: identity, run: run, dataRoot: dataRoot)?.withdrawalWriter else { return false }
+        return await writer.admitsWithdrawal
+    }
+
+    func withdrawUnstarted(in identity: MacChatTurnIdentity, run: String, dataRoot: URL) async throws -> Bool {
+        try Task.checkCancellation()
+        guard let writer = withdrawalOwner(in: identity, run: run, dataRoot: dataRoot)?.withdrawalWriter else { return false }
+        return try await writer.withdrawUnstarted()
+    }
+
+    func withdrawsUnstarted(in sessionId: String, turn: Turn) async -> Bool {
+        guard let writer = withdrawalOwner(in: .init(sessionId: sessionId, turnId: turn.id),
+                                           run: turn.run, dataRoot: turn.dataRoot)?.withdrawalWriter else { return false }
+        return await writer.withdrawsUnstarted
     }
 
     /// The run identifies the opener only while this exact open turn has read no other arrival.
@@ -318,8 +369,8 @@ public actor ChatTurnSteering {
             return []
         }
         let taken = waiting.filter(turn.takes)
-        guard !taken.isEmpty else { return [] }
-        let requiresPersistence = personWaiting(in: sessionId)
+        guard !taken.isEmpty, turn.turn.peerSteering?.sealTaskElevations(onlyIfUnelevated: true) == true else { return [] }
+        let requiresPersistence = waitingArrival(in: sessionId) != nil
         let runs = Set(taken.map(\.turn.run))
         pending[sessionId] = waiting.filter { !runs.contains($0.turn.run) }
         // Reserve before saving so a withdrawal and the write cannot race.

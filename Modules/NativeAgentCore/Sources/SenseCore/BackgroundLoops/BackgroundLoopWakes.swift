@@ -66,7 +66,7 @@ extension BackgroundLoopLifetimes {
         guard started, physiologyGenerations[loopId] == generation else { return }
         var health = physiologyListenerHealth[loopId] ?? LoopEventListenerHealth()
         health.active = false
-        health.lastEndedAt = clock()
+        health.lastEndedAt = Date()
         health.consecutiveEnds += 1
         let delay = backoffDelay(forEndCount: health.consecutiveEnds)
         health.lastError = "event stream ended (\(health.consecutiveEnds) consecutive); restarting in \(formatTimeout(delay))"
@@ -96,7 +96,7 @@ extension BackgroundLoopLifetimes {
     private func physiologyEventArrived(loopId: String, generation: UUID) {
         guard !Task.isCancelled, started,
               physiologyGenerations[loopId] == generation,
-              let runner = physiologyRunners[loopId]
+              physiologyRunners[loopId] != nil
         else { return }
         // Only a delivered event proves listener recovery; repeated immediate ends must keep raising the health count.
         if var health = physiologyListenerHealth[loopId], health.consecutiveEnds != 0 || !health.active {
@@ -114,13 +114,10 @@ extension BackgroundLoopLifetimes {
             physiologyPendingEvents.insert(loopId)
             return
         }
-        let delay = max(0, min(runner.eventCoalescingDelay, 60))
         let token = UUID()
         physiologyDebounceTokens[loopId] = token
         physiologyDebounceTasks[loopId] = Task { [weak self] in
-            if delay > 0 {
-                try? await Task.sleep(for: .seconds(delay))
-            }
+            try? await Task.sleep(for: .seconds(0.25))
             guard !Task.isCancelled else { return }
             await self?.fireDebouncedPhysiology(loopId: loopId, generation: generation, token: token)
         }
@@ -152,7 +149,7 @@ extension BackgroundLoopLifetimes {
               physiologyGenerations[loopId] == generation,
               let runner = managedRunner(loopId: loopId) else { return }
         let outcome = await executeRegisteredTick(
-            loopId: loopId, runner: runner, lifecycle: lifecycle, requiresDue: false
+            loopId: loopId, runner: runner, lifecycle: lifecycle
         )
         // Join active work, then reconcile once: it may have read before this event or left capped work pending.
         if outcome.isCoalescedSkip,
@@ -171,7 +168,7 @@ extension BackgroundLoopLifetimes {
         else { return }
         let token = UUID()
         physiologyDeadlineTokens[loopId] = token
-        let current = clock()
+        let current = Date()
         guard let deadline = await runner.nextMeaningfulDeadline(after: current),
               started, lifecycleGeneration == lifecycle,
               physiologyGenerations[loopId] == generation,
@@ -219,10 +216,10 @@ extension BackgroundLoopLifetimes {
         while automaticLifecycleIsCurrent(lifecycle), physiologyGenerations[loopId] == generation {
             guard let eligibleAt = await scheduler.nextPhysiologyEligibleAt(
                 loopId: loopId,
-                at: clock()
+                at: Date()
             ), automaticLifecycleIsCurrent(lifecycle),
                physiologyGenerations[loopId] == generation else { return false }
-            let delay = max(0, eligibleAt.timeIntervalSince(clock()))
+            let delay = max(0, eligibleAt.timeIntervalSince(Date()))
             guard delay > 0 else { return true }
             do {
                 try await Task.sleep(for: .seconds(delay))

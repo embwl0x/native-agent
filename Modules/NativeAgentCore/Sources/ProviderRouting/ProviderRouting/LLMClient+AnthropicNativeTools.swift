@@ -288,7 +288,8 @@ extension AnthropicTransport {
             let input = try checkedProviderJSONObject(inputJSON, owner: "Recorded tool call \(name) (\(id))")
             return ["type": "tool_use", "id": id, "name": name, "input": input]
         case .toolResult(let id, let content, let isError):
-            var result: [String: Any] = ["type": "tool_result", "tool_use_id": id, "content": content]
+            var result: [String: Any] = ["type": "tool_result", "tool_use_id": id,
+                "content": providerToolResultContent(content, isError: isError)]
             if isError { result["is_error"] = true }
             return result
         }
@@ -323,7 +324,7 @@ extension AnthropicTransport {
         system: String?,
         model: String,
         tools: [LLMToolSchema],
-        stream: Bool, call: LLMCall
+        call: LLMCall
     ) async throws -> (body: [String: Any], conversation: Data) {
         // Omit empty tool declarations because their presence can select tool mode; native call/result encoding still applies.
         let wireTools = tools.isEmpty ? [] : try Self.nativeToolsArray(
@@ -374,7 +375,7 @@ extension AnthropicTransport {
             "max_tokens": try requestOutputTokens(model: model, call: call),
             "messages": encoded.map { $0.1 },
         ]
-        if stream { body["stream"] = true }
+        body["stream"] = true
         if !wireTools.isEmpty { body["tools"] = wireTools }
         if let systemBlocks { body["system"] = systemBlocks }
         if firstPartyAnthropicToolContract {
@@ -417,9 +418,11 @@ extension AnthropicTransport {
         let model = input.model
         let tools = input.tools
         let call = input.call
-        let (body, conversation) = try await makeNativeToolsBody(
-            messages: messages, system: system, model: model, tools: tools ?? [], stream: true, call: call
+        let (made, conversation) = try await makeNativeToolsBody(
+            messages: messages, system: system, model: model, tools: tools ?? [], call: call
         )
+        var body = made
+        if firstPartyAnthropicToolContract { AnthropicOAuthTransport.markStandingMemories(&body, call: call) }
         var req = try self.request(body: body)
         req.setValue("text/event-stream", forHTTPHeaderField: "accept")
 
@@ -429,6 +432,22 @@ extension AnthropicTransport {
 }
 
 extension AnthropicMessagesWire {
+    private static func equivalentToolInput(_ lhs: JSONValue, _ rhs: JSONValue) -> Bool {
+        switch (lhs, rhs) {
+        case (.int(let integer), .double(let number)), (.double(let number), .int(let integer)):
+            return Int64(exactly: number) == integer
+        case (.array(let left), .array(let right)):
+            return left.count == right.count && zip(left, right).allSatisfy { equivalentToolInput($0.0, $0.1) }
+        case (.object(let left), .object(let right)):
+            return left.count == right.count && left.allSatisfy { key, value in
+                guard let other = right[key] else { return false }
+                return equivalentToolInput(value, other)
+            }
+        default:
+            return lhs == rhs
+        }
+    }
+
     func consume(_ events: ProviderEvents, _ continuation: ReplyStream.Continuation, started requestStartNs: UInt64) async throws {
         let providerId = profile.providerId
         let substitutedFrom: String?
@@ -456,6 +475,7 @@ extension AnthropicMessagesWire {
         // The open tool name distinguishes a tool block from text/thinking so their stop events cannot close a call.
         var openToolId: String?
         var openToolName: String?
+        var openToolInput: Data?
         var openToolJSON = ""
         var pendingToolCalls: [LLMStreamToolCall] = []
         // Thinking text and signatures are valid only together; accumulate them per block and bind completed replay to every confirmed sibling call.
@@ -518,13 +538,25 @@ extension AnthropicMessagesWire {
                         } else if type == "tool_use" {
                             openToolId = block["id"] as? String ?? ""
                             openToolName = block["name"] as? String ?? ""
+                            openToolInput = nil
+                            if let value = block["input"] {
+                                guard let input = value as? [String: Any] else {
+                                    throw LLMError.providerError(message: "\(label): tool input at block start is not an object")
+                                }
+                                if !input.isEmpty {
+                                    openToolInput = try JSONSerialization.data(withJSONObject: input, options: [.sortedKeys])
+                                }
+                            }
                             openToolJSON = ""
                         }
                     case "content_block_delta":
                         guard let delta = obj["delta"] as? [String: Any] else { return false }
                         switch delta["type"] as? String {
                         case "input_json_delta":
-                            openToolJSON += delta["partial_json"] as? String ?? ""
+                            guard let fragment = delta["partial_json"] as? String else {
+                                throw LLMError.providerError(message: "\(label): tool argument fragment is not a string")
+                            }
+                            openToolJSON += fragment
                             // A named call's input says what is being written and how much.
                             let input = openToolName.map { LLMStreamCallInput(name: $0, input: openToolJSON.utf8) }
                             continuation.yield(input.map(LLMMessageStreamEvent.callInput) ?? .keepAlive)
@@ -547,11 +579,19 @@ extension AnthropicMessagesWire {
                             openThinkingData = nil
                         } else if let name = openToolName {
                             // Empty candidates hold later calls in wire order until the terminal verdict.
-                            let json = openToolJSON.trimmingCharacters(in: .whitespacesAndNewlines)
+                            let streamed = Data(openToolJSON.trimmingCharacters(in: .whitespacesAndNewlines).utf8)
+                            if let openToolInput, !streamed.isEmpty {
+                                guard let initial = try? JSONValue.parse(openToolInput),
+                                      let received = try? JSONValue.parse(streamed),
+                                      Self.equivalentToolInput(initial, received) else {
+                                    throw LLMError.providerError(message: "\(label): streamed tool arguments contradict the block's input object")
+                                }
+                            }
                             pendingToolCalls.append(LLMStreamToolCall(
-                                id: openToolId ?? "", name: name, inputJSON: Data(json.utf8)))
+                                id: openToolId ?? "", name: name, inputJSON: openToolInput ?? streamed))
                             openToolId = nil
                             openToolName = nil
+                            openToolInput = nil
                             openToolJSON = ""
                             return try await commitToolCalls(terminal: false, stopReason: stopReason)
                         }

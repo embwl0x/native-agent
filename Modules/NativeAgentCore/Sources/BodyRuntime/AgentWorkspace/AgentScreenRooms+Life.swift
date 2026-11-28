@@ -1,7 +1,7 @@
 import Foundation
 import MacNerves
 import PersistenceCore
-// Blueprint: | `AgentScreenRooms+Life.swift` | `workspace-readout.js`, `lifeRoom`, `opening`, `AgentItemPages`: named owner actions and readback |
+// Blueprint: | `AgentScreenRooms+Life.swift` | `workspace-readout.js`, `lifeRoom`, `opening`, `itemPages`: named owner actions and readback |
 
 enum AgentWorkspaceLife {
     static let destinations: [AgentWorkspaceDestination] = [
@@ -20,7 +20,7 @@ enum AgentWorkspaceLife {
     }
 
     static func project(workspace: WorkspaceOperation, tool: String, input: [String: JSONValue], result: JSONValue, dataRoot: URL) async -> WorkspacePage {
-        let row = object(result)
+        let row = JSONValue.objectOrEmpty(result)
         var native: [String: JSONValue] = ["status": row["status"] ?? (row["ok"] == .bool(false) ? .string("failed") : .string("ok"))]
         for key in ["connected", "detail", "fix", "reason", "failure_code", "error_code", "effects", "remedy", "hint", "next_call", "tap"] {
             native[key] = row[key] }
@@ -48,27 +48,27 @@ enum AgentWorkspaceLife {
             }
         }
         var items: [String: AgentWorkspaceItem] = [:], actions: [String: AgentWorkspaceButton] = [:]
-        let tracks = array(row["results"]) + array(row["tracks"])
+        let tracks = (row["results"]?.arrayValue ?? []) + (row["tracks"]?.arrayValue ?? [])
         for (index,value) in tracks.enumerated() {
-            let track = object(value), key = "track:" + String(index)
+            let track = JSONValue.objectOrEmpty(value), key = "track:" + String(index)
             if let name = track["name"]?.trimmedString {
                 items[key] = .init(title:name,content:.object(["who":track["artist"] ?? .null,"summary":track["album"] ?? .null]),actions:[])
-                actions[key+":play"] = effect("play",tool:"music.control",input:["action":.string("play"),"track":.string(name),"artist":track["artist"]
+                actions[key+":play"] = AgentWorkspaceActivity.effect("play",tool:"music.control",input:["action":.string("play"),"track":.string(name),"artist":track["artist"]
                     ?? .string("")])
             }
         }
-        for (index,value) in array(row["playlists"]).enumerated() {
-            let list = object(value), key = "playlist:" + String(index)
+        for (index,value) in (row["playlists"]?.arrayValue ?? []).enumerated() {
+            let list = JSONValue.objectOrEmpty(value), key = "playlist:" + String(index)
             if let name = list["name"]?.trimmedString {
                 items[key] = .init(title:name,content:value,actions:[])
-                actions[key+":play"] = effect("play",tool:"music.control",input:["action":.string("play"),"playlist":.string(name)])
+                actions[key+":play"] = AgentWorkspaceActivity.effect("play",tool:"music.control",input:["action":.string("play"),"playlist":.string(name)])
             }
         }
-        for verb in ["play","pause","stop","next","previous"] { actions[verb] = effect(verb,tool:"music.control",input:["action":.string(verb)]) }
+        for verb in ["play","pause","stop","next","previous"] { actions[verb] = AgentWorkspaceActivity.effect(verb,tool:"music.control",input:["action":.string(verb)]) }
         actions["playlist"] = typed("playlist",tool:"music.control",input:["action":.string("play")],field:"playlist",effect:true)
         actions["track"] = typed("track",tool:"music.control",input:["action":.string("play")],field:"track",effect:true)
         actions["find"] = typed("find",tool:"music.search",field:"query")
-        actions["playlists"] = read("playlists",tool:"music.playlists",input:["limit":.int(24)])
+        actions["playlists"] = AgentWorkspaceActivity.read("playlists",tool:"music.playlists",input:["limit":.int(24)])
         let failed = problem(native) != nil || native["error"] != nil
         return await WorkspaceReadout.project(workspace: workspace, input:.object(["mode":.string("music"),"tool":.string(tool),"state":.string(
             failed ? "unavailable" : "available"),
@@ -81,25 +81,14 @@ enum AgentWorkspaceLife {
         return AgentScreen.failureFace(.object(row))
     }
 
-    private static func read(_ label: String, tool: String, input: [String: JSONValue] = [:], title: String? = nil) -> AgentWorkspaceButton {
-        .init(label: label, action: .open(.record(tool: tool, input: input, title: title ?? label)))
-    }
-
     private static func typed(_ label: String, tool: String, input: [String: JSONValue] = [:], field: String?, effect: Bool = false) -> AgentWorkspaceButton {
         .init(label: label, action: .perform(tool: tool, input: input, title: label, textField: field, isEffect: effect), needsText: field != nil)
     }
-
-    private static func effect(_ label: String, tool: String, input: [String: JSONValue]) -> AgentWorkspaceButton {
-        .init(label: label, action: .perform(tool: tool, input: input, title: label, textField: nil, isEffect: true))
-    }
-
-    static func object(_ value: JSONValue) -> [String: JSONValue] { value.objectValue ?? [:] }
-    private static func array(_ value: JSONValue?) -> [JSONValue] { value?.arrayValue ?? [] }
 }
 
 extension AgentScreen {
     package static func notedLifeRead(_ name: String, _ result: JSONValue, dataRoot: URL) -> JSONValue {
-        let row = AgentWorkspaceLife.object(result)
+        let row = JSONValue.objectOrEmpty(result)
         guard row["status"] == .string("completed"), case .int(let count)? = row["count"] else { return result }
         if name == "calendar", row["day"] == .string("today"), case .string(let start)? = row["rangeStart"] {
             AgentReadBadges.shared.note(name, "\(count) in day beginning " + start, dataRoot: dataRoot)
@@ -120,7 +109,7 @@ extension AgentScreen {
         switch place {
         case .record(let name, _, _):
             tool = name
-            receipt = AgentWorkspaceLife.object(projection.content)["action_receipt"]
+            receipt = JSONValue.objectOrEmpty(projection.content)["action_receipt"]
         case .receipt(let name, _, let value, _):
             tool = name; receipt = value
             if AgentWorkspaceLife.room(for: name) == "music" { shown = await AgentWorkspaceLife.project(workspace: workspace, tool: name, input: [:],
@@ -132,11 +121,11 @@ extension AgentScreen {
         }
         guard let room = AgentWorkspaceLife.room(for: tool) else { return nil }
         if case .receipt = place, tool.hasPrefix("mac_") { return nil }
-        let readStatus = tool == "music.control" ? (AgentWorkspaceLife.object(shown.content)["status"] ?? status) : status
+        let readStatus = tool == "music.control" ? (JSONValue.objectOrEmpty(shown.content)["status"] ?? status) : status
         var lines = textRoom(workspace: workspace, room, place: place, projection: shown, status: readStatus, dataRoot: dataRoot, scope: scope).components(
             separatedBy: "\n")
         if let receipt {
-            let row = AgentWorkspaceLife.object(receipt)
+            let row = JSONValue.objectOrEmpty(receipt)
             let what = ["title", "action_performed", "playlist", "track"].lazy.compactMap { key -> String? in
                 if case .string(let text)? = row[key], !text.isEmpty { return text } else { return nil }
             }.first
@@ -165,6 +154,8 @@ extension AgentScreen {
 }
 
 extension AgentScreen {
+    static let itemPages = AgentRoomCache<String>(lasting: true)
+
     static func opening(_ action: AgentWorkspaceAction) -> Bool {
         switch action {
         case .open(.record("app", let input, _)) where input["find"] != nil: return false
@@ -173,19 +164,4 @@ extension AgentScreen {
         default: return false
         }
     }
-}
-
-final class AgentItemPages: Sendable {
-    static let shared = AgentItemPages()
-    private let cache = AgentRoomCache<String>(lasting: true)
-
-    func keep(_ root: URL, _ pages: [String: String], room: String? = nil, scope: String? = nil) {
-        cache.keep(root, pages, room: room, scope: scope)
-    }
-
-    func page(_ root: URL, _ name: String) -> String? {
-        cache.value(root, name)
-    }
-
-    func removeSession(_ key: String) { cache.removeSession(key) }
 }

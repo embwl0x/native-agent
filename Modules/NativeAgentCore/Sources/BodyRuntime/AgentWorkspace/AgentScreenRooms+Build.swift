@@ -114,9 +114,15 @@ extension AgentScreen {
                 header = ["TELEGRAM", on ? "on" : "off", broken ? "error now" : "ok"]; label = "LINK"; body = nil
             default:
                 guard let body else { break }
+                if tool == "recall_memory", input["memory_id"]?.stringValue != nil {
+                    let temporal = object["temporal"]?.objectValue
+                    rows = [text(object["temporal_note"]),
+                            text(temporal?["valid_from"]).map { "Valid from " + $0 },
+                            text(temporal?["valid_to"]).map { "Valid to " + $0 }].compactMap { $0 }.flatMap { wrap($0) }
+                }
                 let cap = tool == "screen" ? 60 : tool == "read_page" ? 120 : 40
                 let lines = body.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-                rows = lines.prefix(cap).flatMap { wrap($0) }
+                rows += lines.prefix(cap).flatMap { wrap($0) }
                 let saved: String? = if case .object(let receipt)? = object["source_receipt"] { text(receipt["path"]) } else { nil }
                 if lines.count > cap {
                     rows.append("+\(lines.count - cap) more lines" + (tool == "read_file" ? " · app files.read with offset reads on"

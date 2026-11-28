@@ -5,6 +5,13 @@ import SwiftUI
 // Blueprint: | `ShellFaceCalls.swift` | Scene, Desk, Work pane and clipboard reverse presentations |
 
 @MainActor enum ShellFaceCalls {
+    static func showTable(_ appModel: AppModel, elements: [String]? = nil, version: String? = nil) {
+        appModel.tableFocus = version.map { (id: UUID(), elements: elements, version: $0) }
+        TrustFaceWindows.show("table", title: "The table", frame: ("TableWindow", TableBoardTools.windowMinimumSize),
+            content: FacePageView(page: "desk", only: "piece:" + BoardDocument.tableRef)
+                .environment(appModel).macFaceStyle())
+    }
+
     static func install(on router: FaceCallRouter, appModel: AppModel) {
         router.register({ call in
             switch call {
@@ -21,9 +28,7 @@ import SwiftUI
                 return .acknowledged
             case .showWorkPane(let name, let reference, let turn):
                 if name == "table" {
-                    TrustFaceWindows.show("table", title: "The table", frame: ("TableWindow", TableBoardTools.windowMinimumSize),
-                        content: FacePageView(page: "desk", only: "piece:" + BoardDocument.tableRef)
-                            .environment(appModel).macFaceStyle())
+                    showTable(appModel)
                     return .acknowledged
                 }
                 let tab: WorkPaneTab

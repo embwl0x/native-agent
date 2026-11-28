@@ -22,7 +22,7 @@ extension SwiftNativeMacControl {
               !viewId.isEmpty else {
             return .refused(injectionRefusal(
                 action: action,
-                error: "missing required field: view (the view id mac_view returned with this mark)",
+                error: "missing required field: view (set by mac.act from its own look; not an agent argument)",
                 status: 400,
                 extra: ["mark": .int(Int64(mark))]
             ))
@@ -148,23 +148,13 @@ extension SwiftNativeMacControl {
     /// Point clicks and two-point drags share the same physical input owner and gates.
     func handleClick(_ body: [String: JSONValue], turn: Turn, context: MacOperationContext) async -> MacControlResult {
         let started = now()
-        // Marks retain the captured window; live geometry is resolved at injection.
-        var markedTarget: MacScreenViewMark?
-        var markedSnapshot: MacScreenViewSnapshot?
-        switch await resolveMarkReference(action: "click", body: body) {
-        case .refused(let refusal): return refusal
-        case .resolved(let hit, let snapshot):
-            markedTarget = hit
-            markedSnapshot = snapshot
-        case .absent: break
-        }
-        switch planClick(body, markedTarget: markedTarget) {
+        switch planClick(body) {
         case .refused(let refusal): return refusal
         case .ready(let plan, let button, let describe):
-            let pid = markedSnapshot?.windowIdentity?.pid ?? handTargetPID(plan, context: context)
-            let held = await MacBodyNerve.holding(markedSnapshot?.windowIdentity, pid: pid, turn: turn, context: context, expect: .hidInput) {
+            let pid = handTargetPID(plan, context: context)
+            let held = await MacBodyNerve.holding(nil, pid: pid, turn: turn, context: context, expect: .hidInput) {
                 await executeClick(plan, button: button, description: describe, body: body,
-                    markedTarget: markedTarget, markedSnapshot: markedSnapshot, started: started, turn: turn, context: context)
+                    started: started, turn: turn, context: context)
             }
             return held.value.recording(held.receipt)
         }
@@ -176,7 +166,7 @@ extension SwiftNativeMacControl {
     }
 
     /// Validate the requested target and prepare the click or drag.
-    private func planClick(_ body: [String: JSONValue], markedTarget: MacScreenViewMark?) -> ClickPlan {
+    private func planClick(_ body: [String: JSONValue]) -> ClickPlan {
         let button: MacMouseButton
         if let supplied = body["button"] {
             guard let raw = supplied.stringValue?.lowercased(), let parsed = MacMouseButton(rawValue: raw) else {
@@ -208,55 +198,9 @@ extension SwiftNativeMacControl {
             return nil
         }
 
-        // Approval and execution must name the same single target.
-        if let markedTarget {
-            let coordinateKeys = ["x", "y", "from", "to", "from_x", "from_y", "to_x", "to_y"]
-            let conflicting = coordinateKeys.filter { body[$0] != nil && body[$0] != .null }
-            if !conflicting.isEmpty {
-                return .refused(injectionRefusal(
-                    action: "click",
-                    error: "ambiguous_target: this call names both mark \(markedTarget.mark) "
-                        + "and coordinates (\(conflicting.sorted().joined(separator: ", "))); "
-                        + "send one or the other",
-                    status: 400,
-                    extra: [
-                        "mark": .int(Int64(markedTarget.mark)),
-                        "conflicting_fields": .array(conflicting.sorted().map { .string($0) }),
-                    ]
-                ))
-            }
-        }
-
         let plan: [MacHandStep]
-        var describe: [String: JSONValue]
-        if let markedTarget {
-            let x = markedTarget.frame.x + markedTarget.frame.w / 2.0
-            let y = markedTarget.frame.y + markedTarget.frame.h / 2.0
-            var count = body["count"]?.integerValue.flatMap(Int.init(exactly:)) ?? 1
-            if case .bool(true)? = body["double"] { count = max(count, 2) }
-            count = max(1, min(count, 3))
-            plan = MacHandRepertoire.click(button: button, at: CGPoint(x: x, y: y), count: count)
-            describe = [
-                "gesture": .string("click"),
-                "targeted_by": .string("mark"),
-                "mark": .int(Int64(markedTarget.mark)),
-                // Stored labels are raw; receipt serialization must redact them.
-                "element": .object([
-                    "role": .string(markedTarget.role),
-                    "label": markedTarget.label.map {
-                        MacScreenViewTextRedaction.redactedLegendString(
-                            $0,
-                            valueChars: MacAXLimits.hardValueChars,
-                            enclosing: markedTarget.enclosingCaption
-                        )
-                    } ?? .null,
-                    "path": .array(markedTarget.path.map { .int(Int64($0)) }),
-                ]),
-                "x": .double(x),
-                "y": .double(y),
-                "count": .int(Int64(count)),
-            ]
-        } else if let from = point("from"), let to = point("to") {
+        let describe: [String: JSONValue]
+        if let from = point("from"), let to = point("to") {
             let steps = max(4, min(60, durationMs / 16))
             let start = CGPoint(x: from.0, y: from.1)
             let end = CGPoint(x: to.0, y: to.1)
@@ -303,55 +247,18 @@ extension SwiftNativeMacControl {
         return .ready(plan, button, describe)
     }
 
-    /// Inject the gesture with live mark resolution and report what was emitted.
     private func executeClick(
         _ plan: [MacHandStep], button: MacMouseButton, description: [String: JSONValue], body: [String: JSONValue],
-        markedTarget: MacScreenViewMark?, markedSnapshot: MacScreenViewSnapshot?, started: Date,
-        turn: Turn, context: MacOperationContext
+        started: Date, turn: Turn, context: MacOperationContext
     ) async -> MacControlResult {
         if let refusal = injectionPreconditions(action: "click", requiresSink: true, context: context) {
             return refusal
         }
-        var describe = description
-        var pressed = false
-        var lastPosted: MacMouseEvent?
-        let execution = await executeHand(plan, action: "click", body: body, turn: turn, context: context) { step in
-            guard case .mouse(var event) = step else { return nil }
-            if let markedTarget, let markedSnapshot {
-                let x: Double
-                let y: Double
-                if event.phase == .up, pressed, let lastPosted {
-                    // Mouse-down may itself change the label or remove the target. Finish that click at its accepted position.
-                    x = lastPosted.x
-                    y = lastPosted.y
-                } else {
-                    let live: MacAXActTarget?
-                    do { live = try liveMarkedTarget(markedTarget, snapshot: markedSnapshot, context: context) }
-                    catch { return injectionRefusal(action: "click", error: "ax_evidence_unavailable", status: 409,
-                        extra: ["guidance": .string(error.localizedDescription)]) }
-                    guard let target = live,
-                          let centre = target.centre else {
-                        return injectionRefusal(action: "click", error: "mark_drifted: take a fresh view", status: 409)
-                    }
-                    x = centre.x
-                    y = centre.y
-                }
-                event = MacMouseEvent(
-                    phase: event.phase, button: event.button, x: x, y: y,
-                    clickCount: event.clickCount, modifiers: event.modifiers
-                )
-                describe["x"] = .double(x)
-                describe["y"] = .double(y)
-            }
-            step = .mouse(event)
-            lastPosted = event
-            if event.phase == .down { pressed = true }
-            if event.phase == .up { pressed = false }
-            return nil
-        }
+        let execution = await executeHand(plan, action: "click", body: body, turn: turn, context: context)
         await screenViewStore.invalidate()
         if let refusal = execution.refusal { return refusal }
 
+        var describe = description
         describe["ok"] = .bool(true)
         describe["status"] = .string("clicked")
         describe["button"] = .string(button.rawValue)
@@ -382,7 +289,7 @@ extension SwiftNativeMacControl {
         guard let mark = markedTarget, let snapshot = markedSnapshot else {
             return injectionRefusal(
                 action: "ax_act",
-                error: "missing required field: mark+view (from mac_view)",
+                error: "missing required field: mark+view (set by mac.act from its own look; not an agent argument)",
                 status: 400
             )
         }

@@ -282,7 +282,7 @@ public enum QuietChatSessionCommands {
         }
         // Agent regeneration cannot answer the owner's real-action replay confirmation.
         if let gate = ChatTurnFailure.retryNeedsConfirmation(for: last, in: messages) {
-            return failure("needs_confirmation", gate.line(model: nil) + " "
+            return failure("needs_confirmation", gate.line() + " "
                 + "Ask the person before starting it over, or send a message that continues from where it stopped.",
                 session)
         }

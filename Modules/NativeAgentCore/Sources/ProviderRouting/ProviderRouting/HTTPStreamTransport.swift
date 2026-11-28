@@ -87,11 +87,10 @@ struct HTTPStreamTransport<Wire: ProviderWireCodec>: LLMTransport {
     let profile: any HTTPProviderProfile
     let prepare: @Sendable (ProviderStreamInput) async throws -> Wire
     var reject: @Sendable (Int, String) throws -> Void = { _, _ in }
-    var diagnostic: @Sendable (Int, Data, String) throws -> Void = { _, _, _ in }
+    var diagnostic: @Sendable (Int, Data, ProviderStreamInput) throws -> Void = { _, _, _ in }
     var filter: (@Sendable (ReplyStream, ProviderStreamInput) -> ReplyStream)? = nil
 
     var providerId: String { profile.providerId }
-    var telemetry: LLMCallTraceRecorder { profile.telemetry }
     func requestOutputTokens(model: String, call: LLMCall) throws -> Int {
         try profile.requestOutputTokens(model: model, call: call)
     }
@@ -117,7 +116,7 @@ struct HTTPStreamTransport<Wire: ProviderWireCodec>: LLMTransport {
                     if !(200..<300).contains(http.statusCode) {
                         try reject(http.statusCode, model)
                         let body = try await ProviderErrorBodyDrain.read(bytes, maxBytes: 4096)
-                        try diagnostic(http.statusCode, body, model)
+                        try diagnostic(http.statusCode, body, input)
                         try throwIfChatCompletionsError(status: http.statusCode, data: body, response: http)
                     }
                     try await wire.consume(ProviderEvents(bytes, lifetime: call.lifetime), continuation, started: started)

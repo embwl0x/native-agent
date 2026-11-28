@@ -250,8 +250,7 @@ public final class ChatShellOpeningLine {
         guard let safeID = NativeAgentChatSessionID.normalizedPathComponent(sessionID) else {
             throw CocoaError(.fileReadInvalidFileName)
         }
-        let url = dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
+        let url = DataRootPaths.chatDirectory(in: dataRoot)
             .appendingPathComponent("messages", isDirectory: true)
             .appendingPathComponent("\(safeID).jsonl")
         let handle: FileHandle
@@ -314,8 +313,7 @@ public final class ChatShellOpeningLine {
     }
     nonisolated static func readLastTurn(sessionID: String, dataRoot: URL) throws -> String? {
         guard let safeID = NativeAgentChatSessionID.normalizedPathComponent(sessionID) else { throw CocoaError(.fileReadInvalidFileName) }
-        let url = dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
+        let url = DataRootPaths.chatDirectory(in: dataRoot)
             .appendingPathComponent("messages", isDirectory: true)
             .appendingPathComponent("\(safeID).jsonl")
         guard let read = try SwiftNativePersistenceCore.tailPhysicalLines(url, limit: .max, maxBytes: tailBytes)

@@ -5,6 +5,7 @@ import MacNerves
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
+import DeskCore
 // Blueprint: | `NativeCognitionRuntime+Attention.swift` | Serial committed intake, checked weighing, retained claims and sleep |
 
 /// Where a thought opens: the agent's mind stream, installed at launch above cognition.
@@ -31,12 +32,15 @@ public struct Attended: Sendable {
     public let unread: String?
     /// The night's reading of the agent's parts when the thought is the sleep thought's continuation.
     public let night: JSONValue?
+    let hour: (happening: String, opportunity: HourOpportunity)?
 
     public init(node: AttentionNode?, drive: Double?, happenings: [Experience], readings: JSONValue?, mode: String, unread: String? = nil,
-                night: JSONValue? = nil, earlierDrive: Attention.EarlierDrive? = nil, crossedByHappening: [String: JSONValue] = [:]) {
+                night: JSONValue? = nil, earlierDrive: Attention.EarlierDrive? = nil, crossedByHappening: [String: JSONValue] = [:],
+                hour: (happening: String, opportunity: HourOpportunity)? = nil) {
         self.node = node; self.drive = drive; self.happenings = happenings; self.readings = readings; self.mode = mode; self.unread = unread
         self.night = night; self.earlierDrive = earlierDrive
         self.crossedByHappening = crossedByHappening
+        self.hour = hour
     }
 
     /// The record retains earlier ids even when their happening bodies are no longer available.
@@ -78,6 +82,7 @@ struct AttentionCrossing {
     /// The final drive at the batch's clock reading, before any record await.
     let drive: Double
     let readings: JSONValue?
+    let hour: (happening: String, opportunity: HourOpportunity)?
     let once = "attention.ignite:" + UUID().uuidString
     var claimed: Attended?
 }
@@ -91,6 +96,8 @@ struct AttentionReturn {
 }
 
 extension NativeCognitionRuntime: AttentionIntake {
+    private static let hourAppetiteMaximumLift = 0.15
+
     /// The mind stream opens admission: what is owed is attended, nodes already at one ignite, and what waited is weighed, once.
     public func installStream(_ stream: any AttentionStream) async {
         guard !isAdmissionClosed else { return }
@@ -98,6 +105,8 @@ extension NativeCognitionRuntime: AttentionIntake {
         guard !attention.opened, !attention.opening else { return }
         attention.opening = true
         defer { attention.opening = false }
+        await matchCommittedCausalHappenings()
+        guard !isAdmissionClosed else { return }
         var owed: [Experience]
         do { owed = try await Attention.owed(dataRoot: dataRoot) }
         catch { attentionFailed("opening", subject: "owed", error: error); return }
@@ -114,8 +123,28 @@ extension NativeCognitionRuntime: AttentionIntake {
         await weighWaiting(mode: "awake")
     }
 
+    private func matchCommittedCausalHappenings() async {
+        do {
+            let items = try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState().items
+            let at = now()
+            let waits = items.compactMap(MyQueue.causalEntry).compactMap { entry -> (kind: Happening.Kind, subject: String, since: String)? in
+                guard !MyQueue.isOver(entry, at: at), let wait = entry.step.causalWait,
+                      case let .happening(kind, subject) = wait.trigger, let since = DeskClock.parseISO(wait.since) else { return nil }
+                return (kind, subject, NativeTimestampFormat.fractionalZulu(since))
+            }
+            let committed = try await ExperienceStore.at(dataRoot).committedHappenings(matching: waits)
+            for experience in committed where !MyQueue.isCausalMoment(experience.happening) {
+                guard !isAdmissionClosed, !Task.isCancelled else { return }
+                await releaseCausalMoments(.happening(experience))
+            }
+        } catch {
+            attentionFailed("opening", subject: "declared happenings", error: error)
+        }
+    }
+
     public func took(_ experience: Experience) async {
         guard !isAdmissionClosed, let happening = experience.happening else { return }
+        if !MyQueue.isCausalMoment(happening) { await releaseCausalMoments(.happening(experience)) }
         if happening.signal == "person.away", happening.door == "presence" { await senseHour(experience) }
         guard !isAdmissionClosed else { return }
         // A world line releases the agent's `on_news` steps it touches: those are moments the agent set, owed even through sleep or before opening.
@@ -176,6 +205,11 @@ extension NativeCognitionRuntime: AttentionIntake {
         var routes: [String: [Experience]] = [:]
         var mine: [Experience] = []
         for experience in owed {
+            if MyQueue.isCausalMoment(experience.happening) {
+                let attended = Attended(node: nil, drive: nil, happenings: [experience], readings: nil, mode: attention.asleep ? "waking" : "awake")
+                handoff { await stream.think(attended) }
+                continue
+            }
             if experience.happening?.subject == "night", experience.happening?.door == "sense:night" {
                 let attended = Attended(node: nil, drive: nil, happenings: [experience], readings: nil, mode: "night")
                 handoff { await stream.rest(attended) }
@@ -191,12 +225,11 @@ extension NativeCognitionRuntime: AttentionIntake {
         handoff { await stream.think(attended) }
     }
 
-    /// A Desk change re-offers its still-owed moments, including returns to conversations; the stream reads their current Desk evidence.
     func reofferQueueMoments() async {
         guard attention.opened, !isAdmissionClosed else { return }
         do {
             let owed = try await Attention.owed(dataRoot: dataRoot).filter {
-                $0.happening?.kind == .moment && $0.happening?.subject.hasPrefix("queue:") == true
+                $0.happening?.kind == .moment && $0.happening?.subject.hasPrefix("queue:") == true && !MyQueue.isCausalMoment($0.happening)
             }
             guard !isAdmissionClosed else { return }
             attentionSucceeded("queue", subject: "owed")
@@ -215,7 +248,7 @@ extension NativeCognitionRuntime: AttentionIntake {
         defer { leaveAttention() }
         guard !isAdmissionClosed, await finishAttention(), backgroundThinkingEnabled, !attention.asleep, let stream = attention.stream else { return }
         let feltAt = now()
-        var weighed: [(experience: Experience, happening: Happening, care: UUID?, worth: Double, felt: JSONValue, said: JSONValue?)] = []
+        var weighed: [(experience: Experience, happening: Happening, care: UUID?, worth: Double, felt: JSONValue, said: JSONValue?, hour: HourOpportunity?)] = []
         weighing: for experience in experiences {
             guard !isAdmissionClosed else { return }
             guard let happening = experience.happening, !happening.owed else { continue }
@@ -247,6 +280,7 @@ extension NativeCognitionRuntime: AttentionIntake {
             }
             let felt: JSONValue
             let given: JSONValue
+            var hourOpportunityRead: HourOpportunity?
             do {
                 let node = try await substrate.attentionNode(care: care, subject: happening.subject, words: happening.words)
                 let feeling = try await feltReading(touch: touch, node: node.key, door: happening.door, mode: mode, at: feltAt)
@@ -263,6 +297,17 @@ extension NativeCognitionRuntime: AttentionIntake {
                     }
                     reading["rest"] = rest
                     reading["curiosity"] = curiosity
+                    reading["epistemicAppetite"] = .string("unavailable")
+                    if let base = curiosity.numberValue(coercingStrings: false, finiteOnly: true) {
+                        let opportunity = try await hourOpportunity()
+                        hourOpportunityRead = opportunity
+                        if let appetite = try await substrate.hourAppetite(meeting: opportunity.encounter, at: feltAt) {
+                            let lift = Self.hourAppetiteMaximumLift * appetite.unfamiliarity * appetite.closureRate
+                            reading["curiosity"] = .double(min(1, base + lift))
+                            reading["epistemicAppetite"] = .object(["unfamiliarity": .double(appetite.unfamiliarity),
+                                "closureRate": .double(appetite.closureRate)])
+                        }
+                    }
                 }
                 felt = .object(reading)
                 given = try JSONValue.parse(JSONEncoder().encode(happening))
@@ -303,7 +348,7 @@ extension NativeCognitionRuntime: AttentionIntake {
                         }
                     } catch { attentionFailed("weighed", subject: experience.id, error: error); continue }
                 }
-                weighed.append((experience, happening, care, firstWatchNews ? max(worth, 1) : worth, felt, said))
+                weighed.append((experience, happening, care, firstWatchNews ? max(worth, 1) : worth, felt, said, hourOpportunityRead))
             }
         }
         guard !weighed.isEmpty else { return }
@@ -330,7 +375,8 @@ extension NativeCognitionRuntime: AttentionIntake {
         var ready: [String: AttentionCrossing] = [:]
         for (weight, landed) in zip(weighed, landings) {
             if landed.drive >= 1 {
-                ready[landed.node.key] = AttentionCrossing(node: landed.node, drive: landed.drive, readings: weight.felt)
+                ready[landed.node.key] = AttentionCrossing(node: landed.node, drive: landed.drive, readings: weight.felt,
+                    hour: weight.hour.map { (happening: weight.experience.id, opportunity: $0) })
             }
         }
         attention.batch = AttentionBatch(at: at, mode: mode, stream: stream,
@@ -425,7 +471,8 @@ extension NativeCognitionRuntime: AttentionIntake {
                             continue
                         }
                         crossing.claimed = Attended(node: crossing.node, drive: crossing.drive, happenings: landed.happenings,
-                            readings: crossing.readings, mode: batch.mode, earlierDrive: landed.earlierDrive, crossedByHappening: crossedByHappening)
+                            readings: crossing.readings, mode: batch.mode, earlierDrive: landed.earlierDrive,
+                            crossedByHappening: crossedByHappening, hour: crossing.hour)
                         batch.crossings[0] = crossing
                         scheduleDirtyMicrocycle(reason: "attention.ignite")
                     }
@@ -518,7 +565,7 @@ extension NativeCognitionRuntime: AttentionIntake {
         defer { leaveAttention() }
         guard !isAdmissionClosed, await finishAttention(), backgroundThinkingEnabled, !attention.asleep, let stream = attention.stream else { return }
         let ready = await substrate.igniting()
-        let crossings = ready.nodes.map { AttentionCrossing(node: $0.node, drive: $0.drive, readings: nil) }
+        let crossings = ready.nodes.map { AttentionCrossing(node: $0.node, drive: $0.drive, readings: nil, hour: nil) }
         attention.batch = AttentionBatch(at: ready.at, mode: mode, stream: stream, crossings: crossings)
         _ = await finishAttention()
     }

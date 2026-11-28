@@ -110,10 +110,7 @@ extension ContextSQLiteStore {
         }
     }
 
-    public func prune(
-        retainingLatest generationLimit: Int = 8,
-        protectedGenerationIDs: Set<Int64> = []
-    ) async throws -> ContextStorePruneResult {
+    public func prune() async throws -> ContextStorePruneResult {
         try await dbPool.write { db in
             let latest = try Int64.fetchAll(
                 db,
@@ -122,9 +119,9 @@ extension ContextSQLiteStore {
                 WHERE status = 'completed'
                 ORDER BY id DESC LIMIT ?
                 """,
-                arguments: [max(1, generationLimit)]
+                arguments: [8]
             )
-            let kept = Set(latest).union(protectedGenerationIDs).sorted()
+            let kept = Set(latest).sorted()
             let keptRows = kept.isEmpty ? "SELECT NULL WHERE 0" : "VALUES " + kept.map { _ in "(?)" }.joined(separator: ",")
             let arguments = StatementArguments(kept)
             let deletedVersions = try [

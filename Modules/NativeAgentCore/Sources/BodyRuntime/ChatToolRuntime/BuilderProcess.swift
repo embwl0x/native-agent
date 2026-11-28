@@ -53,11 +53,11 @@ extension SwiftToolDispatcher {
     }
     /// Shim preparation failures refuse launch at their cause. Executable staging stays in OS temp, outside backup/export/phone sync and the data-root
     /// PrivacyMap.
-    static func builderSwiftPMShimDirectory(baseDirectory: URL? = nil) throws -> URL {
+    static func builderSwiftPMShimDirectory() throws -> URL {
         let realSwift = try builderRealSwiftPath()
         let fm = FileManager.default
         // Per-user private temp (/var/folders/<hash>/T, mode 700) — not the world-writable /tmp, so the shim cannot be pre-planted by another user.
-        let dir = (baseDirectory ?? fm.temporaryDirectory)
+        let dir = fm.temporaryDirectory
             .appendingPathComponent(InstallPaths.current.name("nativeagent-swiftpm-shim"), isDirectory: true)
         let shim = dir.appendingPathComponent("swift", isDirectory: false)
         let script = builderSwiftPMShimScript(realSwiftPath: realSwift)

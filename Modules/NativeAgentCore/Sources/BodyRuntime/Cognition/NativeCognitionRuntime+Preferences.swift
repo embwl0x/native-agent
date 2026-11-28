@@ -35,7 +35,7 @@ extension NativeCognitionRuntime {
                let provider = try? await routing.getProvider(id: providerID),
                provider.configured == true {
                 Self.initializeMissingInnerLifePreferences(
-                    dataRoot: dataRoot, providerReady: true, defaults: preferenceDefaults
+                    dataRoot: dataRoot, defaults: preferenceDefaults
                 )
                 if usesLiveAppBody {
                     await contextFlow.reloadConfiguration()
@@ -79,7 +79,7 @@ extension NativeCognitionRuntime {
                 tendernessAfter: await self.organismKernel.snapshot().chemicalState.tenderness
             )
         }
-        let organismConfiguration = Self.loadOrganismConfiguration(
+        let organismConfiguration = Self.organismConfigurationForLaunch(
             dataRoot: dataRoot,
             defaults: preferenceDefaults
         )
@@ -194,10 +194,9 @@ extension NativeCognitionRuntime {
 
     /// Automatic setup shares the explicit preference transaction but cannot replace saved choice; the hour preference remains independent.
     nonisolated static func initializeMissingInnerLifePreferences(
-        dataRoot: URL, providerReady: Bool, defaults: UserDefaults
+        dataRoot: URL, defaults: UserDefaults
     ) {
-        guard providerReady,
-              NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot),
+        guard NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot),
               defaults.object(forKey: enabledKey) == nil else { return }
         NativeContextFlowConfiguration.initializeMissingInnerLifeMode(defaults: defaults)
         writeInnerLifePreferences(
@@ -273,16 +272,6 @@ extension NativeCognitionRuntime {
             || environment["NATIVE_AGENT_ORGANISM_KERNEL_ENABLED"] == "1"
         return OrganismConfiguration(enabled: enabled)
     }
-
-    static func loadOrganismConfiguration(
-        dataRoot: URL,
-        defaults: UserDefaults = .standard
-    ) -> OrganismConfiguration {
-        organismConfigurationForLaunch(dataRoot: dataRoot, defaults: defaults)
-    }
-
-
-
 
     private static let enabledKey = "cognitiveSubstrateEnabled"
     private static let capsuleKey = "cognitiveSubstrateCapsuleEnabled"

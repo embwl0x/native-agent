@@ -50,9 +50,6 @@ public protocol QuietSettingsHost: AnyObject {
     func dreamEnabled() async throws -> Bool
     func setDreamCycleEnabled(_ enabled: Bool) async -> Bool
     func setRemCycleEnabled(_ enabled: Bool) async -> Bool
-    func savePersonalityChecked(_ profile: PersonalityProfile) async throws
-    func patchMemoryPolicy(knowledgeGraphEnabled: Bool?, adaptivePromotion: Bool?) async -> Bool
-    func saveMemoryPolicy(crossSessionRecall: Bool) async
 
     // Live switches must both persist the key and notify the running app through their page-owned setters.
     /// Report the effective inner life with a reason when the requested state did not take effect.

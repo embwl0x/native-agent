@@ -1,7 +1,7 @@
-import SenseCore
 import Foundation
-import NativeAgentShared
 import PersistenceCore
+import SenseCore
+import NativeAgentShared
 import NativeAgentCore
 // Blueprint: | `MacAppleScriptBridge+Runtime.swift` | `MacAppleScriptBridge.clampedInt`: shared integer argument bounds |
 

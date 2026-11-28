@@ -146,14 +146,16 @@ matter-face change leaves transcript generations and change/completion
 notifications untouched. The former capability-wide filing cache and
 cross-conversation reuse are removed; transcript state is the one owner.
 A raised request requires both its transcript filing and its matter filing to
-succeed. A matter failure preserves the transcript and continuation, returns
-filing failure without success publication, and retains the redacted cause and
-repair lever in `interaction.raise:<id>` debt. Raising that same request after
-repair reuses its transcript row and settles that debt only after matter filing.
+succeed. A cancelled transcript filing returns without opening a filing repair
+debt. A matter failure preserves the transcript and continuation, returns filing
+failure without success publication, and retains the redacted cause and repair
+lever in `interaction.raise:<id>` debt. Raising that same request after repair
+reuses its transcript row and settles that debt only after matter filing.
 Provider asks coordinate across conversations: the replacement is durably filed
-or reused before older asks are superseded. An unreadable or damaged sibling
-stays byte-preserved with an owed repair; it cannot prevent the new ask from
-being filed, and no clean-feed replacement is attempted against damaged rows.
+or reused before older asks are superseded. Supersession runs through `settle`
+under the provider-ask lock, even if the filing task was cancelled. An unreadable
+or damaged sibling stays byte-preserved with an owed repair. The new ask can
+still be filed, and clean-feed replacement requires readable rows.
 Transcript and mirror-ownership read errors refuse the operation with their
 cause. They never prove a card completed or that the agent may answer User's card.
 Provider requests verify exactly their canonical target account; a ready ChatGPT
@@ -259,8 +261,11 @@ and `elevated` arrays of nonempty principal strings. A peer trusted on arrival
 remains in `sources`. Only an explicit task approval puts a peer in `elevated`.
 Valid empty arrays record
 an unsteered run; absent or malformed records refuse restoration. Both peer-card answers save `decision: "approved"`.
-**Just this** runs one call; **For this task** saves `scope: "task"`, elevating only untrusted, unelevated carried peers when restored. Absent scope means Just this;
-Approve alone means Just this; after-card peers keep their floor. Inline
+**Just this** runs one call. **For this task** saves `scope: "task"` and elevates
+the card's untrusted peers on its exact live Ask if that Ask has reserved no
+joined arrival. Absent scope and Approve alone mean Just this. A saved
+elevation contributes peer provenance to card continuations, after-card work
+and resumed abilities. Inline
 continuations likewise require recorded `peerSources` and
 `elevatedPeerSources`. A refusal preserves the saved work and its unresolved
 obligations, reports the unavailable provenance, and runs no continuation;

@@ -132,10 +132,7 @@ public enum VisionTextLayer {
     }
 
     private static func geometryPrecedes(_ lhs: VisionTextBox, _ rhs: VisionTextBox) -> Bool {
-        if lhs.rect.y != rhs.rect.y { return lhs.rect.y < rhs.rect.y }
-        if lhs.rect.x != rhs.rect.x { return lhs.rect.x < rhs.rect.x }
-        if lhs.rect.w != rhs.rect.w { return lhs.rect.w < rhs.rect.w }
-        if lhs.rect.h != rhs.rect.h { return lhs.rect.h < rhs.rect.h }
+        if lhs.rect != rhs.rect { return lhs.rect.geometryPrecedes(rhs.rect) }
         if lhs.text != rhs.text { return lhs.text < rhs.text }
         return lhs.source < rhs.source
     }

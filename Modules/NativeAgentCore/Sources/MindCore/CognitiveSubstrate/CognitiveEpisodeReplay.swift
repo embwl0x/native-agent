@@ -191,18 +191,15 @@ public struct CognitiveReplayIntegrationInput: Sendable, Equatable {
 public struct CognitiveReplayIntegrationResult: Sendable, Equatable {
     public var episodeIds: [UUID]
     public var schemaProposalIds: [UUID]
-    public var skippedEvidenceIds: [String]
     public var timelineEventIds: [UUID]
 
     public init(
         episodeIds: [UUID] = [],
         schemaProposalIds: [UUID] = [],
-        skippedEvidenceIds: [String] = [],
         timelineEventIds: [UUID] = []
     ) {
         self.episodeIds = episodeIds
         self.schemaProposalIds = schemaProposalIds
-        self.skippedEvidenceIds = skippedEvidenceIds
         self.timelineEventIds = timelineEventIds
     }
 }

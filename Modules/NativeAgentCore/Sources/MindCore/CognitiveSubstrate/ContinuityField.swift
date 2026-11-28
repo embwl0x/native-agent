@@ -635,7 +635,8 @@ struct ContinuityField: Sendable {
     }
 
     private func associationTokens(for node: CognitiveNode) -> Set<String> {
-        significantTokens(in: [
+        if node.subjectReference.isChatTurn { return significantTokens(in: node.summary) }
+        return significantTokens(in: [
             node.summary,
             node.subjectReference.label ?? node.subjectReference.id,
         ].joined(separator: " "))

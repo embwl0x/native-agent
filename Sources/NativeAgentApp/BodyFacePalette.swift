@@ -69,7 +69,7 @@ final class BodyFacePalette {
                     for await _ in changes.stream { wake.yield(()) }
                     if !Task.isCancelled { wake.yield(()) }
                 }
-                group.addTask { await self.observeLayout(wake) }
+                group.addTask { await self.observeSources(wake) }
                 wake.yield(())
                 for await _ in events {
                     guard !Task.isCancelled else { break }
@@ -82,10 +82,13 @@ final class BodyFacePalette {
         changes.cancel()
     }
 
-    private func observeLayout(_ wake: AsyncStream<Void>.Continuation) async {
+    private func observeSources(_ wake: AsyncStream<Void>.Continuation) async {
+        let catalog = model?.face.slot(PageFaceKey.catalog)
         let changes = Observations { [engine] in
             _ = engine.layout.availability
             _ = engine.activityWatch.removableExclusions
+            _ = engine.persona.displayName
+            _ = catalog?.value(as: PartFaceCatalog.self)
         }
         for await _ in changes {
             guard !Task.isCancelled else { return }
@@ -128,7 +131,14 @@ final class BodyFacePalette {
                 }
             }
         } catch { failures["conversations"] = Self.failure("Saved conversations could not be searched.", cause: error.localizedDescription) }
-        let pool = CommandPalettePresentation.itemPool(layout: layout, settings: settings, saved: CommandPaletteSavedThings.shared(engine: engine))
+        let ownPages: [QuietToolPage]
+        do { ownPages = try await QuietPages.ownerPages(model).map(\.value) }
+        catch {
+            ownPages = []
+            failures["pages"] = Self.failure("The agent's pages could not be searched.", cause: error.localizedDescription)
+        }
+        let pool = CommandPalettePresentation.itemPool(layout: layout, agentName: engine.persona.displayName,
+            ownPages: ownPages, settings: settings, saved: CommandPaletteSavedThings.shared(engine: engine))
         let rail = CommandPalettePresentation.railItems(layout)
         let inputSessions = sessions
         let confirmed = hits
@@ -165,6 +175,7 @@ final class BodyFacePalette {
     private static func target(_ item: PaletteItem) throws -> FacePaletteTarget {
         switch item.kind {
         case .tab(let page): return .page(page.rawValue)
+        case .ownPage(let id): return .page(SurfaceLayout.pagePrefix + id)
         case .railTab(let page, let tab): return .tab(page: page.rawValue, tab: tab)
         case .setting(let page, let tab): return .setting(page: page, tab: tab)
         case .chatSession(let session): return .conversation(session)

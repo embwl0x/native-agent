@@ -42,19 +42,18 @@ enum ToolCallCodec: Sendable, Equatable {
     }
 
     /// Marker results share one closed carrier; pixels follow it in their original order.
-    static func resultBlocks(_ blocks: [LLMContentBlock], toolNames: [String],
-                             markerCodec: TextMarkerCodec?) -> [LLMContentBlock] {
-        guard let markerCodec else { return blocks }
+    private static func resultBlocks(_ blocks: [LLMContentBlock], toolNames: [String],
+                                     markerCodec: TextMarkerCodec) throws -> [LLMContentBlock] {
         var carrier = ""
         var images: [LLMContentBlock] = []
         var index = 0
         for block in blocks {
-            guard case .toolResult(_, let content, let isError) = block else {
+            guard case .toolResult(let id, let content, let isError) = block else {
                 images.append(block)
                 continue
             }
-            markerCodec.appendResult(index: index, toolName: toolNames[index], ok: !isError,
-                                     content: content, to: &carrier)
+            try markerCodec.appendResult(index: index, id: id, toolName: toolNames[index], isError: isError,
+                                         content: content, to: &carrier)
             index += 1
         }
         if index > 0 { markerCodec.closeRound(&carrier) }
@@ -75,7 +74,7 @@ enum ToolCallCodec: Sendable, Equatable {
                 return record.name
             }
             guard !names.isEmpty else { return message }
-            return LLMMessage(role: message.role, content: Self.resultBlocks(message.content, toolNames: names, markerCodec: marker))
+            return LLMMessage(role: message.role, content: try Self.resultBlocks(message.content, toolNames: names, markerCodec: marker))
         }
     }
 

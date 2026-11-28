@@ -27,11 +27,6 @@ public var defaultReasoningEffortOptions: [ReasoningEffortOption] {
     ]
 }
 
-public func reasoningOptions<Option>(available: [Option], supported: [String]?, id: (Option) -> String) -> [Option] {
-    guard let supported else { return [] }
-    return available.filter { supported.contains(id($0)) }
-}
-
 public struct ProviderModelInfo: Codable, Hashable, Identifiable, Sendable {
     public var id: String
     public var name: String
@@ -267,14 +262,6 @@ public enum ProviderSurfaceGroups {
     public static let all: [ProviderSurfaceGroup] = [chat, work, mind]
 
     /// Every label, keyed by surface — the page reads its row names from here so a name can never drift from the group that owns it.
-    public static func rows(visible: [String]) -> [ProviderSurfaceGroup] {
-        all.compactMap { group in
-            let members = group.members.filter { visible.contains($0.surface) }
-            guard !members.isEmpty else { return nil }
-            return ProviderSurfaceGroup(id: group.id, title: group.title, members: members)
-        }
-    }
-
     public static let labels: [String: String] = Dictionary(
         uniqueKeysWithValues: all.flatMap(\.members).map { ($0.surface, $0.label) }
     )

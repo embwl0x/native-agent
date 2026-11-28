@@ -31,6 +31,7 @@ struct DreamPendingWork: Codable, Sendable {
     struct Completion: Codable, Sendable {
         let occurredAt: Date
         let feltSummary: String?
+        let droppedOptionalItems: Int?
     }
 
     mutating func finish(_ step: String, result: String = "done") {
@@ -48,6 +49,8 @@ struct DreamPendingWork: Codable, Sendable {
         let entry: Data
         let previousDiary: Data?
         let consumedThrough: Date
+        /// When the dream began reading what is not conversation; absent in journals written before it existed.
+        var materialThrough: Date? = nil
     }
 
     var isSettled: Bool {
@@ -157,8 +160,9 @@ extension FileBackedDreamDiary {
 extension DreamCycleRunner {
     /// Keep item payloads owed on failure while independent items and nights proceed through the same section journal.
     func retryPendingWork(delivery: DreamEffectSink?) async
-        -> (settled: Int, lessonsSaved: Int, errors: [String], pendingPaths: Set<String>, discoveryUnavailable: Bool, busy: [String]) {
-        guard !Task.isCancelled else { return (0, 0, ["dream delivery remains pending after Stop"], [], false, []) }
+        -> (settled: Int, lessonsSaved: Int, errors: [(journal: URL?, words: String)],
+            discoveryUnavailable: Bool, busy: [String], revisited: Set<URL?>) {
+        guard !Task.isCancelled else { return (0, 0, [(nil, Self.stopPendingWords)], false, [], []) }
         let directory = DreamPendingWork.directory(dataRoot)
         let files: [URL]
         do {
@@ -167,36 +171,37 @@ extension DreamCycleRunner {
         } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
             files = []
         } catch {
-            return (0, 0, ["dream work discovery failed: \(error)"], [], true, [])
+            return (0, 0, [(nil, "dream work discovery failed: \(error)")], true, [], [])
         }
         let progress = DreamRetryProgress()
         let records = readPendingDreams(files, progress: progress)
+        var revisited: Set<URL?> = [nil]
         for (file, saved) in records.sorted(by: {
             $0.1.date == $1.1.date ? $0.0.path < $1.0.path : $0.1.date < $1.1.date
         }) {
-            if Task.isCancelled { progress.errors.append("dream delivery remains pending after Stop"); break }
+            if Task.isCancelled { progress.errors.append((nil, Self.stopPendingWords)); break }
             var work = saved
             guard !work.isSettled else { continue }
-            let path = dataRoot.appendingPathComponent("dream_diary/\(work.date).md")
             do {
                 do { try publishPendingDream(&work) }
                 catch { progress.publicationUnavailable = true; throw error }
                 work = try await retryDreamLessonsAndReflection(work, file: file, delivery: delivery, progress: progress)
                 work = try await retryRemainingDreamEffects(work, file: file, delivery: delivery, progress: progress)
                 if work.isSettled { progress.settled += 1 }
-                else { progress.pendingPaths.insert(path.path) }
+            } catch is CancellationError {
+                progress.errors.append((nil, Self.stopPendingWords))
+                break
             } catch {
-                progress.pendingPaths.insert(path.path)
-                progress.errors.append("\(file.path) settlement unavailable: \(error)")
+                progress.errors.append((file, "\(file.path) settlement unavailable: \(error)"))
             }
+            revisited.insert(file)
         }
-        return (progress.settled, progress.lessonsSaved, progress.errors, progress.pendingPaths, progress.publicationUnavailable, progress.busy)
+        return (progress.settled, progress.lessonsSaved, progress.errors, progress.publicationUnavailable, progress.busy, revisited)
     }
 
     private final class DreamRetryProgress {
-        var errors: [String] = []
+        var errors: [(journal: URL?, words: String)] = []
         var busy: [String] = []
-        var pendingPaths: Set<String> = []
         var settled = 0
         var lessonsSaved = 0
         var publicationUnavailable = false
@@ -220,7 +225,7 @@ extension DreamCycleRunner {
                 }
                 records.append((file, work))
             } catch {
-                progress.errors.append("\(file.path) settlement unavailable: \(error)")
+                progress.errors.append((nil, "\(file.path) settlement unavailable: \(error)"))
                 // An unreadable journal may still owe publication.
                 progress.publicationUnavailable = true
             }
@@ -241,13 +246,12 @@ extension DreamCycleRunner {
                         }
                     }
                 } catch {
-                    progress.pendingPaths.insert(dataRoot.appendingPathComponent("dream_diary/\(file.day ?? file.stem).md").path)
-                    progress.errors.append("\(file.url.path) saved work unavailable: \(error)")
+                    progress.errors.append((nil, "\(file.url.path) saved work unavailable: \(error)"))
                 }
             }
         } catch {
             progress.publicationUnavailable = true
-            progress.errors.append("dream diary discovery failed: \(error)")
+            progress.errors.append((nil, "dream diary discovery failed: \(error)"))
         }
         return records
     }
@@ -263,30 +267,34 @@ extension DreamCycleRunner {
             do {
                 try await commitLesson(lesson, dateKey: work.date, sourcePeerIds: work.sourcePeerIds)
                 saved += 1
+                progress.lessonsSaved += 1
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 let failure = (error as? ToolFailureError) ?? (error as? MemoryStorageError)?.failure
                 guard let failure, failure.status == .refused, failure.effects == .none, failure.recovery == .terminal else {
                     work.note("lessons", error: error)
-                    progress.errors.append("\(file.path) lesson \(lesson.from): \(error)")
+                    progress.errors.append((file, "\(file.path) lesson \(lesson.from): \(error)"))
                     continue
                 }
                 let input = JSONValue.array([.string(lesson.lesson), .string(lesson.from), .string(lesson.kind)])
                 work.finish("lesson:" + (try input.serialize(pretty: false)), result: "refused: \(failure.message)")
-                progress.errors.append("\(file.path) lesson \(lesson.from) refused: \(failure.message)")
+                progress.errors.append((file, "\(file.path) lesson \(lesson.from) refused: \(failure.message)"))
             }
             work.lessons.remove(at: index)
             if work.lessons.isEmpty { work.finish("lessons") }
             try work.save(in: dataRoot)
         }
         if offered > 0 { try work.save(in: dataRoot) }
-        progress.lessonsSaved += saved
         if offered > 0 {
             do {
                 try await receiptSink("dream.lessons", .object([
                     "date": .string(work.date), "dreamId": .string(work.id.uuidString),
                     "offered": .int(Int64(offered)), "saved": .int(Int64(saved)),
                     "failed": .int(Int64(offered - saved))]))
-            } catch { progress.errors.append("\(file.path) lesson receipt failed: \(error)") }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch { progress.errors.append((file, "\(file.path) lesson receipt failed: \(error)")) }
         }
         // Failure notes cannot block another attempt; only Stop or shared-journal failure prevents sibling steps.
         if let material = work.reflection {
@@ -312,9 +320,11 @@ extension DreamCycleRunner {
                 // Busy keeps the judgment owed for the next run without failing this one.
                 work.note("reflection.judgment", error: held)
                 progress.busy.append("reflection for \(work.date): \(held.words)")
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 work.note("reflection.judgment", error: error)
-                progress.errors.append("\(file.path) reflection judgment owed: \(error)")
+                progress.errors.append((file, "\(file.path) reflection judgment owed: \(error)"))
             }
             // Checkpoint judgment before integration so no effect precedes its durable cause.
             try work.save(in: dataRoot)
@@ -326,9 +336,11 @@ extension DreamCycleRunner {
                 try finishDelivery(result, step: "reflection.integration", work: &work)
                 work.reflectionAcknowledgment = receipt.id
                 work.reflectionReceipt = nil
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 work.note("reflection.integration", error: error)
-                progress.errors.append("\(file.path) reflection integration owed: \(error)")
+                progress.errors.append((file, "\(file.path) reflection integration owed: \(error)"))
             }
             try work.save(in: dataRoot)
         }
@@ -338,9 +350,11 @@ extension DreamCycleRunner {
                 let result = try await deliver(.reflectionAcknowledgment(id), work: work, sink: delivery)
                 try finishDelivery(result, step: "reflection.acknowledgment", work: &work)
                 work.reflectionAcknowledgment = nil
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 work.note("reflection.acknowledgment", error: error)
-                progress.errors.append("\(file.path) reflection acknowledgment owed: \(error)")
+                progress.errors.append((file, "\(file.path) reflection acknowledgment owed: \(error)"))
             }
             try work.save(in: dataRoot)
         }
@@ -356,21 +370,25 @@ extension DreamCycleRunner {
                 let result = try await deliver(.care(care.night), work: work, sink: delivery)
                 try finishDelivery(result, step: "care", work: &work)
                 work.care = nil
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 work.note("care", error: error)
-                progress.errors.append("\(file.path) care delivery owed: \(error)")
+                progress.errors.append((file, "\(file.path) care delivery owed: \(error)"))
             }
             try work.save(in: dataRoot)
         }
         if let affect = work.affect {
             try Task.checkCancellation()
             do {
-                let skipped = try await integrateMood(affect: affect, dateKey: work.date)
+                let skipped = try await integrateMood(affect: affect, dateKey: work.date, dreamId: work.id)
                 work.affect = nil
                 work.finish("mood", result: skipped.map { "skipped: " + $0 } ?? "done")
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 work.note("mood", error: error)
-                progress.errors.append("\(file.path) mood delivery owed: \(error)")
+                progress.errors.append((file, "\(file.path) mood delivery owed: \(error)"))
             }
             try work.save(in: dataRoot)
         }
@@ -382,9 +400,11 @@ extension DreamCycleRunner {
                     "entries": .array(work.studioEntries.map(JSONValue.string))]))
                 work.studioEntries = []
                 work.finish("studio.citations")
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 work.note("studio.citations", error: error)
-                progress.errors.append("\(file.path) studio citation owed: \(error)")
+                progress.errors.append((file, "\(file.path) studio citation owed: \(error)"))
             }
             try work.save(in: dataRoot)
         }
@@ -392,11 +412,14 @@ extension DreamCycleRunner {
             try Task.checkCancellation()
             do {
                 let result = try await deliver(.completion(occurredAt: completion.occurredAt,
-                    feltSummary: completion.feltSummary), work: work, sink: delivery)
+                    feltSummary: completion.feltSummary, droppedOptionalItems: completion.droppedOptionalItems),
+                    work: work, sink: delivery)
                 try finishDelivery(result, step: "dreamCompleted", work: &work)
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 work.note("dreamCompleted", error: error)
-                progress.errors.append("\(file.path) dream completion owed: \(error)")
+                progress.errors.append((file, "\(file.path) dream completion owed: \(error)"))
             }
             try work.save(in: dataRoot)
         }
@@ -435,7 +458,7 @@ extension DreamCycleRunner {
             }
             try SwiftNativePersistenceCore.writeDataAtomicDurable(publication.entry, to: path)
         }
-        try advanceDreamMark(to: publication.consumedThrough)
+        try advanceDreamMark(to: publication.consumedThrough, materialThrough: publication.materialThrough)
         work.publication = nil
         work.finish("publication")
         try work.save(in: dataRoot)

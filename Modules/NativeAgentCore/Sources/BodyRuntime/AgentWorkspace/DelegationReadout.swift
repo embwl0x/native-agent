@@ -3,10 +3,10 @@ import NativeAgentShared
 import PersistenceCore
 import NativeAgentCore
 import Darwin
-import AppKit
 import MacNerves
 import DeskCore
 import SenseCore
+import AppKit
 // Blueprint: | `DelegationReadout.swift` | retain source availability and distinct delivery/execution times |
 
 // MARK: - Delegation status projection
@@ -70,7 +70,7 @@ public struct DelegationReadout: Sendable, Equatable {
 
     var recencyKey: Date?
 
-    public func toJSON(includeReplyText: Bool = false) -> JSONValue {
+    public func toJSON() -> JSONValue {
         var obj: [String: JSONValue] = [
             "id": .string(id),
             "source": .string(source),
@@ -94,10 +94,6 @@ public struct DelegationReadout: Sendable, Equatable {
         put("completion_text_head", completionTextHead)
         put("request_text_head", requestTextHead)
         put("agent_reply_text_head", agentReplyTextHead)
-        if includeReplyText {
-            put("agent_reply_text", agentReplyText)
-            if agentReplyText != nil { obj["agent_reply_truncated"] = .bool(agentReplyTruncated) }
-        }
         put("execution_error", executionError)
         put("record_kind", recordKind)
         put("recovery_note", recoveryNote)
@@ -117,7 +113,7 @@ public struct DelegationReadout: Sendable, Equatable {
             "state", "status", "run_status", "last_liveness", "completed_at", "completion_text_head", "execution_error", "record_kind",
             "conversation_id", "delivery_outcome", "elapsed_seconds",
         ]
-        guard case .object(let full) = toJSON(includeReplyText: false) else { preconditionFailure("Delegation projection must be an object") }
+        guard case .object(let full) = toJSON() else { preconditionFailure("Delegation projection must be an object") }
         return .object(full.filter { fields.contains($0.key) })
     }
 }

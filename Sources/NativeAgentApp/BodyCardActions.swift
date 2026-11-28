@@ -48,7 +48,7 @@ final class BodyCardActions {
                 throw PartCallError(code: "card_restart_unavailable", message: "This request does not need an app restart.")
             }
             try await restart()
-            return .card(.init(identity: identity, effects: .known, presentationOperation: nil, failure: nil))
+            return .card(.init(identity: identity, effects: .known, failure: nil))
         }
         // A walking permission card stays answerable: Continue starts the one walk over from the first grant still off. The grant watch
         // already carries a running card (its census), and a wake of its own here would read as the person's return from the pane just opened.
@@ -157,7 +157,7 @@ final class BodyCardActions {
         }
         if !watched { pending[identity.card] = nil }
         if pending.isEmpty { observation?.cancel(); observation = nil }
-        return .card(.init(identity: identity, effects: .known, presentationOperation: nil, failure: failure,
+        return .card(.init(identity: identity, effects: .known, failure: failure,
             controlIdentity: watched ? controlIdentity : nil, verified: verified))
     }
 

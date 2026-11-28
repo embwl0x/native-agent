@@ -7,13 +7,6 @@ import PersistenceCore
 
 public actor CountsFeedProjection {
     struct Input: Sendable {
-        let proposals: [ProposalRecord]
-        let proposalsLoaded: Bool
-        let proposalsIssue: String?
-        let helpers: [BotsShelfRecord]
-        let runningHelpers: Set<UUID>
-        let helpersLoaded: Bool
-        let helpersIssue: String?
         let desk: WorkOverview?
         let deskIssue: String?
     }
@@ -45,18 +38,7 @@ public actor CountsFeedProjection {
         await publish()
     }
 
-    func updateUnreadSessionIDs(_ ids: Set<String>) async {
-        value.unreadSessionIDs = ids
-        await publish()
-    }
-
     func updateOwner(_ input: Input) async {
-        value.memoryProposals = .init(value: input.proposalsLoaded ? input.proposals.filter { $0.status == "pending" }.count : nil,
-                                     issue: input.proposalsIssue.map(NativeAppSecretRedactor.redactText))
-        value.helpers = .init(value: input.helpersLoaded ? input.helpers.count : nil,
-                              issue: input.helpersIssue.map(NativeAppSecretRedactor.redactText))
-        value.runningHelpers = .init(value: input.helpersLoaded ? input.runningHelpers.count : nil,
-                                     issue: input.helpersIssue.map(NativeAppSecretRedactor.redactText))
         let gaps = input.desk?.unavailable ?? []
         let deskIssue = input.deskIssue ?? (gaps.isEmpty ? nil : gaps.joined(separator: "\n"))
         value.deskWaiting = .init(value: input.desk?.needsYouCount, issue: deskIssue.map(NativeAppSecretRedactor.redactText))
@@ -84,39 +66,24 @@ public actor CountsFeedProjection {
 /// Capture existing owner values briefly; counting and comparing belong to the projection actor.
 @MainActor
 final class CountSources {
-    private enum Change: Sendable {
-        case owners(CountsFeedProjection.Input)
-        case unread(Set<String>)
-    }
     private weak var engine: NativeAgentEngine?
     private var pending: CountsFeedProjection.Input?
-    private var pendingUnread: Set<String>?
     private var drain: Task<Void, Never>?
     private var ownerChanges: Task<Void, Never>?
-    private var unreadObserver: NSObjectProtocol?
 
     init(engine: NativeAgentEngine) {
         self.engine = engine
-        unreadObserver = NotificationCenter.default.observeSynchronously(for: MacChatUnreadSessions.DidChange.self) { [weak self] in
-            Task { @MainActor in self?.captureUnread() }
-        }
-        captureUnread()
         observe(engine)
     }
 
     isolated deinit {
         ownerChanges?.cancel()
         drain?.cancel()
-        if let unreadObserver { NotificationCenter.default.removeObserver(unreadObserver) }
     }
 
     private func observe(_ engine: NativeAgentEngine) {
-        let changes = Observations { [memory = engine.memory, threads = engine.contactThreads, desk = engine.desk] in
+        let changes = Observations { [desk = engine.desk] in
             CountsFeedProjection.Input(
-                proposals: memory.proposals, proposalsLoaded: memory.hasLoadedProposals,
-                proposalsIssue: memory.proposalsReadError,
-                helpers: threads.helpers, runningHelpers: threads.running,
-                helpersLoaded: threads.helpersLoaded, helpersIssue: threads.helpersRefreshError,
                 desk: desk.page.overview, deskIssue: desk.liveUpdateError ?? desk.page.deskUnavailable)
         }
         ownerChanges = Task { [weak self] in
@@ -133,28 +100,16 @@ final class CountSources {
         guard drain == nil else { return }
         let projection = engine.countsFeed
         drain = Task.detached { [weak self] in
-            while let change = await self?.take() {
-                switch change {
-                case .owners(let input): await projection.updateOwner(input)
-                case .unread(let ids): await projection.updateUnreadSessionIDs(ids)
-                }
+            while let input = await self?.take() {
+                await projection.updateOwner(input)
             }
         }
     }
 
-    private func captureUnread() {
-        pendingUnread = MacChatUnreadSessions.shared.ids
-        startDrain()
-    }
-
-    private func take() -> Change? {
+    private func take() -> CountsFeedProjection.Input? {
         if let pending {
             self.pending = nil
-            return .owners(pending)
-        }
-        if let pendingUnread {
-            self.pendingUnread = nil
-            return .unread(pendingUnread)
+            return pending
         }
         drain = nil
         return nil

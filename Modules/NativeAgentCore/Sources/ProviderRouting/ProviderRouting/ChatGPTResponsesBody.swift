@@ -59,12 +59,12 @@ extension ChatGPTTransport {
                         "arguments": argsStr,
                         "call_id": id,
                     ])
-                case .toolResult(let toolUseId, let content, _):
+                case .toolResult(let toolUseId, let content, let isError):
                     flushContent()
                     inputItems.append([
                         "type": "function_call_output",
                         "call_id": toolUseId,
-                        "output": content,
+                        "output": providerToolResultContent(content, isError: isError),
                     ])
                 case .image(let mediaType, let base64, _, _):
                     content.append([

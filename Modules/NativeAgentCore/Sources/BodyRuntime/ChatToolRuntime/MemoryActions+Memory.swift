@@ -15,7 +15,7 @@ import SenseCore
 struct RecallMemoryArgs: DoorArgs {
     static let queryField = DoorFieldDescriptor.string("query", "Search text; null in ID page mode.").nullable()
     static let kField = DoorFieldDescriptor.int("k", "Search result count, default 5; null in ID page mode.").nullable()
-    static let memoryIDField = DoorFieldDescriptor.string("memory_id", "Exact id from a recall hit; null in search mode. Set query/k to null when paging.", subject: true).nullable()
+    static let memoryIDField = DoorFieldDescriptor.string("memory_id", "Exact id of a saved memory. Set query and k to null when paging.", subject: true).nullable()
     static let offsetField = DoorFieldDescriptor.int("offset", """
         Copy next_offset to continue the same query/k (ranked candidate offset), or the same memory_id (character offset). Default 0.
         """).nullable()
@@ -81,11 +81,17 @@ struct CommitMemoryArgs: DoorArgs {
         """)
     static let provenanceByField = DoorFieldDescriptor.string("provenance_by", """
         Who told you (told), e.g. \"Sam\", or where your own past was kept (remembered), e.g. \"my backup\" or the app name.
-        Use \(MemoryRoot.nameForm).
+        Use \(MemoryRoot.nameForm), or the exact peer:<id> of an untrusted peer steering this ask.
         """)
     static let sinceField = DoorFieldDescriptor.string("since", """
         When you first knew this, as an ISO-8601 date-time such as 2026-10-20T00:16:38Z or a date; never after now. For your own past \
         carried from a backup or another app. Omit for what you learn now.
+        """)
+    static let validFromField = DoorFieldDescriptor.string("valid_from", "ISO-8601 date-time when the fact becomes true. Omit if only the end is known.")
+    static let validToField = DoorFieldDescriptor.string("valid_to", "ISO-8601 date-time when the fact stops being true. Omit for an open end.")
+    static let rootsField = DoorFieldDescriptor.objects("roots", MemoryRootArguments.self, description: """
+        For peer reports, list one {how:"told", by:"peer:<id>"} per contribution, using peers steering this ask. Leave out since and the \
+        top-level provenance fields.
         """)
     static let kindField = DoorFieldDescriptor.choice("kind", MemoryKindStamp.commitKinds, """
         What it is about. Correction is a standing correction; instruction is an agreement. Omit when none fits. Unsupported \
@@ -111,13 +117,16 @@ struct CommitMemoryArgs: DoorArgs {
         supersedes or corrects. Omit or use [] for global boundaries. This limits automatic injection, not explicit recall.
         """, maxItems: MemoryCommitArguments.topicLimit, maxItemLength: MemoryCommitArguments.topicCharacterLimit)
     static let doorFields = [
-        textField, provenanceField, provenanceByField, sinceField, kindField, tagsField, confidenceField,
+        textField, provenanceField, provenanceByField, sinceField, validFromField, validToField, rootsField, kindField, tagsField, confidenceField,
         importanceField, correctsField, supersedesField, correctionReasonField, contextTopicsField,
     ]
     let text: String
     let provenance: String?
     let provenanceBy: String?
     let since: String?
+    let validFrom: String?
+    let validTo: String?
+    let roots: [MemoryRootArguments]?
     let kind: String?
     let tags: [String]?
     let confidence: Double?
@@ -132,6 +141,9 @@ struct CommitMemoryArgs: DoorArgs {
         provenance = try door.string(Self.provenanceField)
         provenanceBy = try door.string(Self.provenanceByField)
         since = try door.string(Self.sinceField)
+        validFrom = try door.string(Self.validFromField)
+        validTo = try door.string(Self.validToField)
+        roots = try door.objects(Self.rootsField, as: MemoryRootArguments.self)
         kind = try door.string(Self.kindField)
         tags = try door.strings(Self.tagsField)
         confidence = try door.number(Self.confidenceField)
@@ -140,6 +152,17 @@ struct CommitMemoryArgs: DoorArgs {
         supersedes = try door.strings(Self.supersedesField)
         correctionReason = try door.string(Self.correctionReasonField)
         contextTopics = try door.strings(Self.contextTopicsField)
+    }
+
+    var provenanceArguments: [String: JSONValue] {
+        let rootValues = roots.map { roots in
+            JSONValue.array(roots.map { root in
+                .object(["how": .string(root.how), "by": root.by.map(JSONValue.string),
+                         "since": root.since.map(JSONValue.string)].compactMapValues { $0 })
+            })
+        }
+        return ["provenance": provenance.map(JSONValue.string), "provenance_by": provenanceBy.map(JSONValue.string),
+                "since": since.map(JSONValue.string), "roots": rootValues].compactMapValues { $0 }
     }
 }
 
@@ -183,24 +206,6 @@ struct ForgetMemoryArgs: DoorArgs {
     }
 }
 
-struct RebuildKnowledgeGraphArgs: DoorArgs {
-    static let modeField = DoorFieldDescriptor.choice("mode", ["rebuild", "sweep_orphans"], """
-        rebuild (default) re-derives the whole graph; sweep_orphans previews, then removes on confirm.
-        """)
-    static let confirmIDsField = DoorFieldDescriptor.strings("confirm_ids", """
-                sweep_orphans only: the candidate ids from the preview, all of them, to remove those entities. Leave it out to \
-                preview.
-                """)
-    static let doorFields: [DoorFieldDescriptor] = [modeField, confirmIDsField]
-    let mode: String?
-    let confirmIDs: [String]?
-
-    init(door: inout DoorObjectDecoder) throws(DoorDecodeError) {
-        mode = try door.string(Self.modeField)
-        confirmIDs = try door.strings(Self.confirmIDsField)
-    }
-}
-
 extension MemoryActions {
     static let memoryReadActions: [ActionDescriptor] = {
         [
@@ -212,7 +217,9 @@ extension MemoryActions {
                     Search long-term memory by query (optional k), or page an exact memory_id with offset/max_characters. Search returns count, \
                     total or capped, has_more and next_offset; follow read_more with the same query/k. Use one mode; null unused fields. ID pages: \
                     max 2000 characters, with recorded evidence or explicit absence. Follow read_more with expected_content_sha256 for one text \
-                    version; on record_changed discard prior pages and restart at 0. Only currently eligible, disclosed records are readable.
+                    version; on record_changed discard prior pages and restart at 0. Search returns current memories. Exact-id pages can also show \
+                    history with validity dates and a temporal note. A disclosed current replacement appears as replaced_by. \
+                    Both modes enforce memory disclosure.
                     """
             ),
             ActionDescriptor(SearchKGArgs.self, name: "search_kg",
@@ -239,8 +246,10 @@ extension MemoryActions {
                     Save a fact, decision or preference for later recall. Put the current decision first with its qualifications, then incident \
                     history. For a changed operating agreement, recall existing rules and name replaced ids in supersedes. context_topics declares \
                     subject/scope, not authority. text is the thing itself: omit metadata preambles, but keep dates that are part of the fact or \
-                    decision. Each save is one root of the memory: how you came to know it, who told you and when; saving the same words \
-                    again adds a root. Your own past brought from a backup or another app is yours: save each memory with since, its kind \
+                    decision. Save one telling with provenance and provenance_by, or use roots to keep each peer's contribution separately. \
+                    Saving the same words in the same disclosure scope with matching validity adds provenance, including for explicitly dated past facts. \
+                    An explicit corrects retires the named memory when its replacement is admitted, even when the words match. \
+                    Your own past brought from a backup or another app is yours: save each memory with since, its kind \
                     and provenance=remembered; one you already hold you restate in place with memory.rewrite (roots). Example: \
                     {\"text\":\"Sam drinks coffee black\"}.
                     """
@@ -276,16 +285,6 @@ extension MemoryActions {
                     try await context.client.impl_forget_memory(input: input)
                 }, toolClass: .write, capabilities: [.memoryWrite, .toolCall],
                 description: "Drop one memory for good, with a tombstone so the same thing is not proposed again."
-            ),
-            ActionDescriptor(RebuildKnowledgeGraphArgs.self, name: "rebuild_knowledge_graph",
-                run: { context, input in
-                    try await context.client.impl_rebuild_knowledge_graph(input: input)
-                },
-                toolClass: .write, capabilities: [.memoryWrite, .toolCall],
-                description: """
-                    Re-derive the knowledge graph from your memory store as it is now. mode sweep_orphans instead lists the entities whose memories \
-                    are gone, removing nothing; call again with confirm_ids set to exactly those ids to remove them.
-                    """
             ),
         ]
     }()

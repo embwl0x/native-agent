@@ -28,7 +28,7 @@ enum NativeContextMemoryProvenance {
             }
         }
         // The why receipt includes all scored candidates; only selected records count as use.
-        let requested = Set(memoryAtomIDs + packet.receipt.candidateScores.map(\.atomID))
+        let requested = Set(memoryAtomIDs + packet.receipt.candidateScores.map(\.atomID) + packet.associationPointers.map(\.atomID))
         let records = Dictionary(prepared.generation.sources.compactMap { source -> (ContextSourceID, String)? in
             guard source.descriptor.owner == MemoryContext.owner,
                   let recordID = MemoryContext.recordID(inLocator: source.descriptor.canonicalLocator) else { return nil }

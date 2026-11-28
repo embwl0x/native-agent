@@ -27,15 +27,15 @@ function face(input) {
 
     // My mind: whether I am awake, what I last thought about, and what is owed to me.
     const ATTENTION = {
-        awake: {title: "Awake", tone: "plain"},
-        asleep: {title: "Asleep", detail: "The world waits until I wake; what is owed still reaches me.", tone: "quiet"},
+        awake: {title: "Awake", detail: "Last read", tone: "plain"},
+        asleep: {title: "Asleep", detail: "Last read", tone: "quiet"},
         unavailable: {title: "Attention unreadable", detail: "No cognition runs, so whether I am awake is not known.", tone: "failed"}
     };
     const OUTCOME = {hit: ["Did something", "done"], empty: ["Let it be", "quiet"], failed: ["Failed", "failed"]};
     const KIND = {returned: "Work returned", moment: "A moment I set", body: "My body", world: "The world", self: "A care of mine"};
     const said = h => h.words + (h.quoted ? " (from an agent's turn)" : "");
     const attention = ATTENTION[input.attention.state] || {title: "Attention: " + input.attention.state, tone: "attention"};
-    const mind = [row({id: "attention", title: attention.title, detail: attention.detail, tone: attention.tone})];
+    const mind = [row({id: "attention", title: attention.title, detail: attention.detail, tone: attention.tone, at: input.attention.at})];
     for (const t of input.thoughts) {
         const first = t.attended[0];
         const outcome = OUTCOME[t.outcome] || [t.outcome || "Open", "attention"];
@@ -110,7 +110,7 @@ function face(input) {
         }),
         senses: () => input.senses.map(s => s.failure
             ? row({id: s.key, title: "Sense source unavailable", detail: s.failure, tone: "failed", open: open(s.key)})
-            : row({id: s.key, title: s.words, open: open(s.key)})),
+            : row({id: s.key, title: s.words, at: s.at, open: open(s.key)})),
         elsewhere: () => input.elsewhere.map(e => row({id: e.key, title: e.door, detail: e.who, at: e.at, open: open(e.key)})),
         places: () => input.places.map(p => row({id: p.key, title: p.name, detail: p.detail, at: p.at, open: open(p.key)})),
         mac: () => input.mac.map(m => row({id: m.key, title: m.app, detail: m.about, value: m.readout, at: m.at, open: open(m.key)}))
@@ -128,23 +128,25 @@ function face(input) {
         queue: "Queued Desk steps, reviews and handoffs; not all of my own activity.",
         working: "Jobs and lines at work; agent.jobs lists them all.",
         people: "Contacts, exchanges, discovery offers and local health; no full Doctor check.",
-        helpers: "Definitions, latest shelf results and run queue; not full run history.", senses: "Retained abilities, senses and watches.",
+        helpers: "Definitions, latest shelf results and run queue; not full run history.", senses: "Abilities, senses and watches at the last read.",
         elsewhere: "Latest speakers across recent transcripts; not a complete activity log.",
         places: "Navigation, Chrome connection and prior read badges; browser tabs stay with their conversation.",
         mac: "Recorded reads/actions retained at their last write; no fresh window content."
     };
-    // A part never read is a gap on the page; a part that failed names its failure.
     function gaps(name) {
         return (input.gaps[name] || []).map(g => g.failure
             ? {id: name + ":failed:" + g.source, title: g.source + " unavailable", detail: g.failure, tone: "failed"}
+            : g.at ? {id: name + ":stale:" + g.source, title: g.source + " is refreshing",
+                detail: "Showing its last reading.", at: g.at, tone: "attention"}
             : {id: name + ":unread:" + g.source, title: g.source + " not read yet",
                 detail: "This section is incomplete until its first reading lands.", tone: "attention"});
     }
     for (const name of input.order) {
         if (!draw[name]) continue;
-        let body = draw[name]().concat(gaps(name));
-        if (name === "notable" && input.layoutFailure) body.push({id: "layout.failed", title: "Layout unavailable", detail: input.layoutFailure,
+        const warnings = gaps(name);
+        if (name === "notable" && input.layoutFailure) warnings.push({id: "layout.failed", title: "Layout unavailable", detail: input.layoutFailure,
             tone: "failed"});
+        let body = draw[name]().slice(0, Math.max(0, 256 - warnings.length)).concat(warnings);
         if (name === "notable" && !body.length) continue;
         if (!body.length) body = [{id: name + ":empty", title: EMPTY[name] || "Nothing here yet.", tone: "quiet"}];
         sections.push({id: name, title: TITLE[name], style: "list", footer: COVERAGE[name], rows: body.slice(0, 256)});

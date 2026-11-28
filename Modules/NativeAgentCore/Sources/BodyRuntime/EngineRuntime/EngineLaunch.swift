@@ -468,7 +468,7 @@ extension NativeAgentEngine {
         }
         retainLaunchWork {
             await configureMemoryPromotionAtLaunch(dataRoot: dataRoot,
-                makeLLMClient: { makeSharedLLMClient(dataRoot: dataRoot, assembly: $0) })
+                makeLLMClient: { makeSharedLLMClient(dataRoot: dataRoot) })
         }
         retainLaunchWork {
             do {
@@ -479,6 +479,9 @@ extension NativeAgentEngine {
                 await RepairOwed.settle(dataRoot, operation: "approval.reconcile",
                     evidence: .init(source: "workflows/approvals/requests.json", id: "checked reconciliation scan")).value
                 OrganPulse.record("launch.approval_executions", found: executions, note: "\(executions) re-run")
+            } catch is CancellationError {
+                // Quit cancelled a lock wait: a stop, not a broken approval store.
+                return
             } catch {
                 await RepairOwed.owe(dataRoot, id: "approval.reconcile", kind: .run,
                     operation: "approval.reconcile", owner: "Approval reconciliation",
@@ -487,7 +490,7 @@ extension NativeAgentEngine {
             }
             await retainLaunchWork {
                 await MemoryApprovalTransactions.stageKindBackfillIfNeeded(dataRoot: dataRoot,
-                    makeLLMClient: { makeSharedLLMClient(dataRoot: dataRoot, assembly: $0) })
+                    makeLLMClient: { makeSharedLLMClient(dataRoot: dataRoot) })
             }
             await retainLaunchWork {
                 let remStaged = await stagePendingREMProposalsAtLaunch()
@@ -598,7 +601,7 @@ extension NativeAgentEngine {
 
     public static func configureMemoryPromotionAtLaunch(
         dataRoot: URL,
-        makeLLMClient: @escaping @Sendable (PrivateWorkContextAssembly) -> any LLMClient
+        makeLLMClient: @escaping @Sendable () -> any LLMClient
     ) async {
         await AdaptiveMemoryPromoter.shared.configure(
             memory: SwiftNativeMemoryV2.shared,

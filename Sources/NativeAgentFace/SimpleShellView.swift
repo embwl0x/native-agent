@@ -1,3 +1,4 @@
+import CoreGraphics
 import SwiftUI
 import NativeAgentShared
 // Blueprint: | `SimpleShellView.swift` | Simple's local selection draws contact and helper slots beside chat; every other page shows in place |
@@ -7,7 +8,7 @@ import NativeAgentShared
 struct SimpleShellView: View {
     enum Pane: Hashable { case agent, contact(String), helper(String) }
     @Environment(AppModel.self) private var appModel
-    @State private var pane: Pane = .agent
+    @Binding var pane: Pane
     /// The page the window shows.
     let shown: ShellRailRow
     /// Choosing a place, with the pages the layout shows of it.
@@ -22,13 +23,15 @@ struct SimpleShellView: View {
         } detail: {
             let showingChat = inChat && pane == .agent
             ZStack {
-                ChatView()
-                    .environment(\.chatPageIsVisible, showingChat)
-                    .opacity(showingChat ? 1 : 0)
-                    .allowsHitTesting(showingChat)
-                    .disabled(!showingChat)
-                    .accessibilityHidden(!showingChat)
-                    .accessibilityElement(children: showingChat ? .contain : .ignore)
+                SimpleChatLayout(visible: showingChat) {
+                    ChatView()
+                        .environment(\.chatPageIsVisible, showingChat)
+                        .opacity(showingChat ? 1 : 0)
+                        .allowsHitTesting(showingChat)
+                        .disabled(!showingChat)
+                        .accessibilityHidden(!showingChat)
+                        .accessibilityElement(children: showingChat ? .contain : .ignore)
+                }
                 if inChat {
                     switch pane {
                     case .agent: EmptyView()
@@ -38,11 +41,31 @@ struct SimpleShellView: View {
                 }
                 ShellPlacePage(shown: shown, select: select)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .faceObservation(.key(.contacts))
         .faceObservation(.key(.helpers))
         .environment(\.layoutProfile, SimpleViewMode.simple)
         // A conversation the window is sent to is shown itself, not hidden under an agent's or helper's thread left open.
         .onChange(of: appModel.activeChatSessionId) { _, _ in pane = .agent }
+        .onDisappear { pane = .agent }
+    }
+}
+
+private struct SimpleChatLayout: Layout {
+    let visible: Bool
+
+    func makeCache(subviews: Subviews) -> CGSize? { nil }
+    func updateCache(_ cache: inout CGSize?, subviews: Subviews) {}
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout CGSize?) -> CGSize {
+        if visible, let chat = subviews.first { return chat.sizeThatFits(proposal) }
+        return CGSize(width: proposal.width.flatMap { $0.isFinite ? $0 : nil } ?? 0,
+                      height: proposal.height.flatMap { $0.isFinite ? $0 : nil } ?? 0)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout CGSize?) {
+        if visible { cache = bounds.size }
+        subviews.first?.place(at: bounds.origin, proposal: ProposedViewSize(cache ?? .zero))
     }
 }

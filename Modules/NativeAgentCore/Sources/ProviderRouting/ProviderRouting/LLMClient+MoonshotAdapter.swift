@@ -16,9 +16,8 @@ public final class MoonshotTransport: HTTPProviderProfile {
 
     public static let defaultEndpoint = URL(string: "https://api.moonshot.ai/v1/chat/completions")
 
-    let session: URLSession
-    private let endpoint: URL?
-    private let apiKeyOverride: String?
+    let session = ProviderHTTP.session
+    private let endpoint = MoonshotTransport.defaultEndpoint
     private let dataRootOverride: URL?
     public let telemetry: LLMCallTraceRecorder
     private let reasoningLedger = ToolCallReplayLedger<String>()
@@ -26,15 +25,9 @@ public final class MoonshotTransport: HTTPProviderProfile {
     private var credentialRoot: URL { dataRootOverride ?? PersistenceCore.defaultDataRoot() }
 
     public init(
-        session: URLSession = ProviderHTTP.session,
-        endpoint: URL? = MoonshotTransport.defaultEndpoint,
-        apiKeyOverride: String? = nil,
         dataRootOverride: URL? = nil,
         telemetryDataRootOverride: URL? = nil
     ) {
-        self.session = session
-        self.endpoint = endpoint
-        self.apiKeyOverride = apiKeyOverride
         self.dataRootOverride = dataRootOverride
         self.telemetry = LLMCallTraceRecorder(
             dataRootOverride: telemetryDataRootOverride ?? dataRootOverride
@@ -58,7 +51,7 @@ public final class MoonshotTransport: HTTPProviderProfile {
         request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         applyStreamingLLMHeaders(to: &request)
         request.httpBody = try JSONSerialization.data(withJSONObject: await self.buildBody(
-            model: model, messages: messages, system: system, tools: tools, stream: true, call: call
+            model: model, messages: messages, system: system, tools: tools, call: call
         ), options: [.sortedKeys])
         return ChatCompletionsWire(request: request, label: "Moonshot", model: model, profile: self, call: call, reasoning: reasoningLedger)
     }
@@ -68,15 +61,15 @@ public final class MoonshotTransport: HTTPProviderProfile {
         messages: [LLMMessage],
         system: String?,
         tools: [LLMToolSchema]?,
-        stream: Bool, call: LLMCall
+        call: LLMCall
     ) async throws -> [String: Any] {
         var apiMessages: [[String: Any]] = []
         if let system, !system.isEmpty { apiMessages.append(["role": "system", "content": system]) }
         for message in messages {
             apiMessages.append(contentsOf: try await chatMessages(from: message))
         }
-        var body: [String: Any] = ["model": model, "messages": apiMessages, "stream": stream]
-        if stream { body["stream_options"] = ["include_usage": true] }
+        var body: [String: Any] = ["model": model, "messages": apiMessages, "stream": true]
+        body["stream_options"] = ["include_usage": true]
         try OpenAITransport.applyTools(to: &body, tools: tools)
         try applyReasoningControls(to: &body, model: model, call: call)
         // No allowance, no field: a cap of zero would refuse the request.
@@ -120,7 +113,7 @@ public final class MoonshotTransport: HTTPProviderProfile {
     }
 
     private func apiKey() throws -> String {
-        guard let key = try apiKeyOverride ?? LLMCredentialResolver.checkedAPIKey(
+        guard let key = try LLMCredentialResolver.checkedAPIKey(
             providerConfigFile: "moonshot.json",
             dataRoot: credentialRoot
         ), !key.isEmpty else {

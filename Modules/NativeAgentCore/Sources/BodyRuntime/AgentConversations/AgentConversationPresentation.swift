@@ -3,10 +3,36 @@ import MindCore
 import SenseCore
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 
 // Blueprint: | `AgentConversationPresentation.swift` | Canonical receipt interpretation and retained-history reads through AgentConversationView |
 extension AgentConversationSession {
+    static func staleSendReceipt(_ stale: AgentConversationStore.StaleSend, turn: Turn, conversation: AgentConversationContext,
+                                 dataRoot: URL) -> JSONValue {
+        let exchange = stale.exchange
+        let seconds = Int(max(0, Date().timeIntervalSince(exchange.sentAt)))
+        let age = seconds == 1 ? "1 second" : "\(seconds) seconds"
+        let showHistory = conversation.returnsHistory && !SwiftNativeTurnEngine.peerContinuityTurn(turn)
+        let detail = "Nothing was sent by this call. You already started sending a message in this conversation \(age) ago from another chat. "
+            + (showHistory ? "Check the conversation before deciding. " : "") + "Send again only if you still mean to."
+        let unseen = [exchange] + stale.later
+        let times = unseen.map { NativeTimestampFormat.flooredOptionalMicrosecondUTCOffset($0.sentAt) }
+        var fields: [String: JSONValue] = ["status": .string("refused"), "reason": .string("conversation_advanced"),
+            "execution": .string("not_run"), "effects": .string("none"), "sent": .bool(false), "terminal": .bool(true),
+            "automatic_resend": .bool(false), "detail": .string(detail), "prior_sent_at": .string(times[0])]
+        if !stale.later.isEmpty {
+            fields["later_sent_at"] = .array(times.dropFirst().map(JSONValue.string))
+        }
+        let receipt = JSONValue.object(fields)
+        if showHistory {
+            return AgentConversationHistoryView.adding(to: receipt, agent: stale.agent, name: stale.name,
+                dataRoot: dataRoot, startingWith: unseen)
+        }
+        turn.rememberAgentExchangeTiming(times, ids: unseen.map(\.id))
+        return receipt
+    }
+
     /// Routine replies belong to the asking chats; correlate their run IDs with the send record’s asks.
     static func routineRead(turn: Turn, mac: MacOperationContext, conversation: AgentConversationContext, workspace: WorkspaceOperation, agent: String,
         name: String, peer: AgentPeerContact?, row: AgentConversationRecord?,
@@ -18,7 +44,8 @@ extension AgentConversationSession {
             let current: AgentConversationRecord
             if row.readInput == nil { current = row }
             else { current = try await refresh(turn: turn, mac: mac, conversation: conversation, row, store: store, input: args, perform: perform) }
-            result = AgentConversationView.view(current, details: false, read: true, dataRoot: dataRoot, includeHistory: conversation.returnsHistory)
+            result = AgentConversationView.view(current, details: false, read: true, dataRoot: dataRoot,
+                includeHistory: conversation.returnsHistory)
             consumeRead(result, turn: turn, peer: peer, message: current.readInput?["message_id"]?.nonblankString, scope: scope, conversation: conversation,
                             dataRoot: dataRoot)
         }

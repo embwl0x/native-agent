@@ -67,6 +67,7 @@ public enum SignedPeerEvidenceStore {
                 try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: url)
             }
         } catch {
+            if error is CancellationError { throw error }
             RepairOwed.owe(dataRoot, id: "signed-peer:" + cleanID, kind: .run,
                 operation: "mobile.signed_peer_evidence", owner: url.path,
                 words: "The authenticated phone contact could not be saved: " + error.localizedDescription,

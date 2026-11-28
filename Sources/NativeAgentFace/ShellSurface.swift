@@ -1,39 +1,9 @@
 import SwiftUI
 import NativeAgentShared
 
-// Blueprint: | `ShellSurface.swift` | `ShellSurface`: the window's five places; `ShellSurfaceTabs`: a place's tabs; `ShellPlacePage`: tabs over the page, the ask bar under it |
+// Blueprint: | `ShellSurface.swift` | Mac place layout and last tab; `ShellSurfaceTabs` and `ShellPlacePage` draw the tabs, page and ask bar |
 
-/// One of the window's places: Advanced's rail draws all five, Simple's sidebar all but Diagnostics. A surface is a fixed grouping of the pages
-/// the layout's `rail` block shows in the window's view, in that block's order; the pages, their ids and the layout stay as they are, and a
-/// surface showing more than one page shows them as tabs.
-enum ShellSurface: String, CaseIterable, Identifiable, Sendable {
-    case chat, desk, agent, control, diagnostics
-
-    var id: String { rawValue }
-
-    /// The surface a page belongs to. A tab item (Knowledge graph, Dreams, Cognition, Inspector) belongs with the page that holds it
-    /// (`SidebarItem.shellHome`).
-    init(_ item: SidebarItem) {
-        switch item {
-        case .chat: self = .chat
-        case .desk, .activity, .inboxPolicy, .bots: self = .desk
-        case .memories, .knowledge, .personality, .dreams, .capabilities, .ownPage: self = .agent
-        case .trust, .providers, .connectors, .settings: self = .control
-        case .diagnostics, .cognition, .inspector: self = .diagnostics
-        }
-    }
-
-    /// The page the surface opens on the first time it is chosen in a window.
-    var firstPage: SidebarItem {
-        switch self {
-        case .chat: .chat
-        case .desk: .desk
-        case .agent: .memories
-        case .control: .trust
-        case .diagnostics: .diagnostics
-        }
-    }
-
+extension ShellSurface {
     /// The surfaces, in rail order, each with the pages the layout shows of it in the view `profile` names; a surface with none is absent.
     static func shown(_ layout: SurfaceLayoutAvailability, profile: String) -> [ShellSurfacePages] {
         let rows = SidebarItem.railRows(layout, profile: profile)
@@ -56,27 +26,8 @@ enum ShellSurface: String, CaseIterable, Identifiable, Sendable {
         return pages.first
     }
 
-    /// The surface a rail word names. The rail's fixed words win: a surface's id, or the word drawn for a place other than the agent's. The
-    /// agent's name as it is now names the agent's place only when no fixed place has that word.
     @MainActor static func named(_ word: String, appModel: AppModel) -> ShellSurface? {
-        let word = word.trimmingCharacters(in: .whitespacesAndNewlines)
-        func names(_ fixed: String) -> Bool { fixed.caseInsensitiveCompare(word) == .orderedSame }
-        if let fixed = allCases.first(where: { names($0.rawValue) || ($0 != .agent && names($0.title(appModel))) }) { return fixed }
-        return names(ShellSurface.agent.title(appModel)) ? .agent : nil
-    }
-
-    /// The place's word. The agent's place carries the name the shell writes everywhere else (`agentDisplayName`); while
-    /// that name is unread or unreadable the place is called Agent.
-    @MainActor func title(_ appModel: AppModel) -> String {
-        switch self {
-        case .chat: return "Chat"
-        case .desk: return "Desk"
-        case .agent:
-            let name = appModel.agentDisplayName
-            return name.isEmpty ? "Agent" : name
-        case .control: return "Control"
-        case .diagnostics: return "Diagnostics"
-        }
+        named(word, agentName: appModel.agentDisplayName)
     }
 }
 

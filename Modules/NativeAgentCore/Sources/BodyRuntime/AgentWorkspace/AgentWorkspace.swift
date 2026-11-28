@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import MacNerves
 import PersistenceCore
 import NativeAgentCore
@@ -47,8 +48,7 @@ package enum AgentWorkspace {
     private static func text(_ value: JSONValue?) throws -> String? {
         guard let value, value != .null else { return nil }
         guard case .string(let raw) = value else { throw AgentWorkspaceFailure(message: "Item arguments must be text or null.") }
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
+        return raw.trimmedNonEmpty
     }
 
     private static func run(workspace: WorkspaceOperation, input: [String: JSONValue], key: String, scope: String, dataRoot: URL,
@@ -386,7 +386,7 @@ package enum AgentWorkspace {
         if case .record("agent_read", let args, _) = location, case .string(let agent)? = args["agent"],
            ["details", "history_before", "history_exchange"].allSatisfy({ args[$0] == nil }) {
             do {
-                let sessions = try AgentWorkSession.sessions(workspace: workspace, with: agent, dataRoot: dataRoot)
+                let sessions = try AgentWorkSession.sessions(with: agent, dataRoot: dataRoot)
                 recoveredProjection.items += sessions.prefix(4).map(\.item)
                 if sessions.count > 4, case .object(var content) = recoveredProjection.content {
                     content["work_sessions"] = .string("4 newest of \(sessions.count) shown; all of them are in Your conversations (open \"conversations\")")

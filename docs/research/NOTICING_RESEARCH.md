@@ -1834,16 +1834,13 @@ are current concerns: the relevance check of mechanism 2 and the standing
 sensitivity behind it. The subconscious that runs between turns without the
 model is where mechanisms 1 to 3 belong, since none of them needs the model
 to run. The sense of the person's presence (here or away, and the gap since
-they were last here) is mechanism 4's presence, and the opening after a long
-gap, one of the three moments at which a pressing care may be brought up,
-is the conversational opening the science describes; the other two, a topic
-winding down and a step from what is being said, are the breakpoints of
-conversation. Senses are the sources of mechanism 1, each needing its own
+they were last here) is mechanism 4's presence. A long gap, the end of a topic
+and a transition between topics are the conversational openings the science
+describes. Senses are the sources of mechanism 1, each needing its own
 baseline. The Desk holds intentions, and the science says they should carry
 their cues and be switched off when done. Outreach, with its gates, quiet
 hours and once-per-care cadence unless something moved, is mechanism 5's
-threshold, and the person silencing one care's cue is the dismissal that
-should raise the criterion for that kind. App-arrival notice is built:
+threshold. App-arrival notice is built:
 `AgentDiscoverySession` records the first scan silently, then emits `app.installed`
 for a newly seen bundle/version except the running app's own bundle id; the shipped resident `notice.js` part filters
 nonscriptable apps and offers once per bundle/version. This is novelty against

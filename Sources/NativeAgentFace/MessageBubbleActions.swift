@@ -54,7 +54,6 @@ private struct BubbleAction: View {
     }
 }
 
-/// Canonical message detail is prepared by the body and drawn from its document slot.
 struct MessageJSONSheet: View {
     let message: TranscriptMessageReference
     @Environment(AppModel.self) private var appModel

@@ -10,7 +10,7 @@ import UserNotifications
 
 extension SwiftNativeMacControl {
     /// Parse the act's fields; a malformed field is refused before anything is read.
-    func parseActRequest(_ body: [String: JSONValue]) -> MacActGate<MacActRequest> {
+    func parseActRequest(_ body: [String: JSONValue], restoringText: Bool) -> MacActGate<MacActRequest> {
         // Refuse malformed fields rather than inventing a target.
         guard let rawVerb = body["verb"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
               !rawVerb.isEmpty else {
@@ -55,7 +55,7 @@ extension SwiftNativeMacControl {
         } else {
             typeMode = .replace
         }
-        if verb == .type, (text ?? "").isEmpty {
+        if verb == .type, text == nil || (text == "" && !restoringText) {
             return .refused(injectionRefusal(
                 action: "act",
                 error: "missing required field: text (verb \"type\" needs the characters to type)",
@@ -80,11 +80,40 @@ extension SwiftNativeMacControl {
             }
             scrollAmount = value
         } else { scrollAmount = 0 }
-        let waitMs = MacActClosedLoop.clampedWaitMs(body["wait_ms"]?.integerValue.flatMap(Int.init(exactly:)))
+        let afterFields = body["after"]?.objectValue
+        let cleanupFields = body["cleanup"]?.objectValue
+        let after = afterFields?["value"]?.stringValue
+        let withinMs = afterFields?["within_ms"]?.exactIntegerValue
+        let waitMs = MacActClosedLoop.clampedWaitMs(withinMs ?? body["wait_ms"]?.integerValue.flatMap(Int.init(exactly:)))
+        let restoreText = cleanupFields != nil
+        let hasAfter = body["after"] != nil && body["after"] != .null
+        let hasCleanup = body["cleanup"] != nil && body["cleanup"] != .null
+        if hasAfter || hasCleanup {
+            guard verb == .type, typeMode == .replace, body["keystrokes"] != .bool(true), let afterFields,
+                  afterFields["expect"] == .string("text"),
+                  afterFields.keys.allSatisfy({ ["expect", "value", "target", "within_ms"].contains($0) }),
+                  afterFields["target"] == nil || afterFields["target"] == .string(handle),
+                  afterFields["within_ms"] == nil || withinMs.map({ (0...MacActClosedLoop.maxWaitMs).contains($0) }) == true,
+                  let after, after.utf8.count == 64, after.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
+                return .refused(injectionRefusal(action: "act", error: "invalid_reversible_deed", status: 400,
+                    extra: ["effects": .string("none"), "guidance": .string("Use exact type/replace with after.expect text and after.value a lowercase UTF-8 SHA-256. surface, state, selected, focus, dismissed, window_title and ax_path_exists are unavailable.")]))
+            }
+            if hasCleanup {
+                guard let cleanupFields, cleanupFields["verb"] == .string("restore_text"),
+                      cleanupFields["when"] == .string("mismatch"),
+                      cleanupFields.keys.allSatisfy({ ["verb", "when", "reversible_only", "target"].contains($0) }),
+                      cleanupFields["target"] == nil || cleanupFields["target"] == .string(handle),
+                      cleanupFields["reversible_only"] == nil || cleanupFields["reversible_only"] == .bool(true),
+                      !restoringText else {
+                    return .refused(injectionRefusal(action: "act", error: "unsupported_deed_cleanup", status: 400,
+                        extra: ["effects": .string("none"), "guidance": .string("cleanup requires verb restore_text and when mismatch. press, key, dismiss and unobserved are unavailable.")]))
+                }
+            }
+        }
         // Anchored background AX actions stay in their app; work needing foreground input returns `needs_front` without raising.
         let background = body["background"] == .bool(true)
         return .admitted(MacActRequest(verb: verb, handle: handle, frameId: frameId, text: text, typeMode: typeMode, direction: direction,
-            scrollAmount: scrollAmount, waitMs: waitMs, background: background))
+            scrollAmount: scrollAmount, waitMs: waitMs, background: background, after: after, restoreText: restoreText))
     }
 
     /// Resolve the handle in its recorded frame and admit the act on the frame's own process.

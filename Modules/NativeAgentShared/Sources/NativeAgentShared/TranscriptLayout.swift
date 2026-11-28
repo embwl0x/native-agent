@@ -10,7 +10,7 @@ public typealias TranscriptColor = UIColor
 public typealias TranscriptFont = UIFont
 #endif
 
-// Blueprint: | `TranscriptLayout.swift` | `TranscriptParagraph`, `TranscriptFragment`, `TranscriptFoldFragment`, `TranscriptLayoutDelegate`, `TranscriptAttachment`, `TranscriptShapes`: paragraph kinds and gaps, fragment geometry, the fold chevron, fold hiding, attachment room and decoration shapes for Mac and phone |
+// Blueprint: | `TranscriptLayout.swift` | `TranscriptParagraph`, `TranscriptFragment`, `TranscriptFoldFragment`, `TranscriptLayoutDelegate`, `TranscriptAttachment`, `TranscriptShapes`: paragraph kinds and gaps, fragment and bubble geometry, the fold chevron, fold hiding, attachment room and decoration shapes for Mac and phone |
 
 public enum TranscriptParagraph: String {
     case user, reply, heading, quote, listItem, code, foldHeadline, foldDetail, gap, attachment
@@ -68,6 +68,12 @@ open class TranscriptFragment: NSTextLayoutFragment {
                                      height: line.typographicBounds.height))
         }
         return rect
+    }
+
+    public final func paddedInkRect(horizontal: CGFloat, vertical: CGFloat) -> CGRect {
+        let ink = inkRect
+        guard !ink.isNull else { return .zero }
+        return ink.insetBy(dx: -horizontal, dy: -vertical)
     }
 
     /// The x where the first line's text starts, in fragment space.

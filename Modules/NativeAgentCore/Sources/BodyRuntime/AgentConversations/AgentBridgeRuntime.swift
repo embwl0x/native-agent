@@ -1,11 +1,11 @@
 import Foundation
 import DeskCore
 import NativeAgentCore
-import CryptoKit
 import PersistenceCore
 import MacNerves
 import Darwin
 import NativeAgentShared
+import CryptoKit
 // Blueprint: | `AgentBridgeRuntime.swift` | `AgentBridgeRuntime` |
 
 /// Helper discovery and execution grant no authority; a subprocess result alone cannot verify work.
@@ -13,14 +13,13 @@ public enum AgentBridgeRuntime {
     /// Unreadable helpers remain absent; the caller names `expectedHelperPath` in its refusal.
     public static func helperURL(
         named name: String,
-        override: URL? = nil,
         dataRoot: URL,
         bundleResourceRoot: URL = Bundle.main.bundleURL
             .appendingPathComponent("Contents/Resources", isDirectory: true),
         fileManager: FileManager = .default
     ) -> URL? {
         let path = expectedHelperPath(
-            named: name, override: override, dataRoot: dataRoot, bundleResourceRoot: bundleResourceRoot)
+            named: name, dataRoot: dataRoot, bundleResourceRoot: bundleResourceRoot)
         var isDirectory: ObjCBool = false
         guard fileManager.fileExists(atPath: path.path, isDirectory: &isDirectory),
               !isDirectory.boolValue,
@@ -34,12 +33,10 @@ public enum AgentBridgeRuntime {
     /// Checkout installs use local scripts so edits apply without rebuilding; packaged installs use bundled resources.
     public static func expectedHelperPath(
         named name: String,
-        override: URL? = nil,
         dataRoot: URL,
         bundleResourceRoot: URL = Bundle.main.bundleURL
             .appendingPathComponent("Contents/Resources", isDirectory: true)
     ) -> URL {
-        if let override { return override.standardizedFileURL }
         if let checkout = resolveSandboxRepoRoot(dataRoot: dataRoot) {
             return checkout.appendingPathComponent("script/\(name)").standardizedFileURL
         }
@@ -57,19 +54,11 @@ public enum AgentBridgeRuntime {
     }
 
     public static func executableURL(
-        named name: String,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
         fileManager: FileManager = .default
     ) -> URL? {
-        let override: String? = switch name {
-        case "codex": environment["NATIVE_AGENT_CODEX_BIN"] ?? environment["CODEX_BIN"]
-        case "claude": environment["NATIVE_AGENT_CLAUDE_WAKE_CLAUDE_BIN"]
-        case "omp": environment["NATIVE_AGENT_OMP_WAKE_BIN"] ?? environment["OMP_BIN"]
-        case "node": environment["NATIVE_AGENT_BRIDGE_NODE_BIN"]
-        default: nil
-        }
-        if let override {
+        if let override = environment["NATIVE_AGENT_BRIDGE_NODE_BIN"] {
             return firstExecutable([URL(fileURLWithPath: override)], fileManager: fileManager)
         }
 
@@ -77,23 +66,14 @@ public enum AgentBridgeRuntime {
             .split(separator: ":")
             .map { URL(fileURLWithPath: String($0), isDirectory: true) }
 
-        var candidates: [URL] = []
-        if name == "codex" {
-            candidates.append(homeDirectory.appendingPathComponent(".codex/packages/standalone/current/bin/codex"))
-            candidates.append(homeDirectory.appendingPathComponent("Desktop/Codex.app/Contents/Resources/codex"))
-            candidates.append(URL(fileURLWithPath: "/Applications/Codex.app/Contents/Resources/codex"))
-        }
-        candidates.append(contentsOf: unique(directories).map { $0.appendingPathComponent(name) })
-
-        if name == "node" {
-            let nvmVersions = homeDirectory.appendingPathComponent(".nvm/versions/node", isDirectory: true)
-            let versionDirectories = ((try? fileManager.contentsOfDirectory(
-                at: nvmVersions,
-                includingPropertiesForKeys: nil,
-                options: [.skipsHiddenFiles]
-            )) ?? []).sorted { $0.lastPathComponent > $1.lastPathComponent }
-            candidates.append(contentsOf: versionDirectories.map { $0.appendingPathComponent("bin/node") })
-        }
+        var candidates = unique(directories).map { $0.appendingPathComponent("node") }
+        let nvmVersions = homeDirectory.appendingPathComponent(".nvm/versions/node", isDirectory: true)
+        let versionDirectories = ((try? fileManager.contentsOfDirectory(
+            at: nvmVersions,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        )) ?? []).sorted { $0.lastPathComponent > $1.lastPathComponent }
+        candidates.append(contentsOf: versionDirectories.map { $0.appendingPathComponent("bin/node") })
         return firstExecutable(candidates, fileManager: fileManager)
     }
 

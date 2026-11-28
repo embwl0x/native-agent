@@ -1,11 +1,11 @@
-import CommonCrypto
-import AppKit
 import Foundation
 import PersistenceCore
 import Darwin
 import NativeAgentShared
 import NativeAgentCore
 import MindCore
+import CommonCrypto
+import AppKit
 // Blueprint: | `MacSyncEngine+Storage.swift` | `MacSyncEngine`, `DeviceSyncStorage`; Checked replay/digest and ledger storage. |
 
 extension MacSyncEngine {
@@ -187,31 +187,22 @@ extension MacSyncEngine {
         }
     }
 
-    struct CompletionCommit: Sendable, Equatable {
-        /// Both the processed-id save and pending-file archive must land before completion is clean.
+    struct CompletionCommit: Sendable {
         var clean: Bool
-        /// A durable marker also forbids redispatch after incomplete bookkeeping.
-        var markerWritten: Bool
         var syncError: String?
-        /// Clean completion needs no ledger update because the caller already recorded the terminal state.
-        var transactionState: String?
     }
 
     /// After a response lands, bookkeeping or its durable marker must forbid redispatch; failure of both exposes replay risk.
     nonisolated static func commitCompletionBookkeeping(
         dataRoot: URL,
         msgId: String,
-        processedSaved: Bool,
-        archiveError: String?
+        processedSaved: Bool
     ) -> CompletionCommit {
-        guard !processedSaved || archiveError != nil else {
+        guard !processedSaved else {
             clearCompletedUnarchivedMarker(dataRoot: dataRoot, msgId: msgId)
-            return CompletionCommit(clean: true, markerWritten: false, syncError: nil, transactionState: nil)
+            return CompletionCommit(clean: true, syncError: nil)
         }
-        var reasons: [String] = []
-        if !processedSaved { reasons.append("processed-id list could not be saved") }
-        if let archiveError { reasons.append("pending file could not be archived: \(archiveError)") }
-        let reason = reasons.joined(separator: "; ")
+        let reason = "processed-id list could not be saved"
         let marked = writeCompletedUnarchivedMarker(dataRoot: dataRoot, msgId: msgId, reason: reason)
         let message = marked
             ? "Command \(msgId) finished but its completion record could not be filed (\(reason)). It is marked completed and will not run again."
@@ -220,12 +211,7 @@ extension MacSyncEngine {
                 restart — free disk space and check iCloud permissions.
                 """
         nativeLog("MacSyncEngine.commitCompletionBookkeeping: %@", message)
-        return CompletionCommit(
-            clean: false,
-            markerWritten: marked,
-            syncError: message,
-            transactionState: "completed_unarchived"
-        )
+        return CompletionCommit(clean: false, syncError: message)
     }
 
     nonisolated static func clearCompletedUnarchivedMarker(dataRoot: URL, msgId: String) {

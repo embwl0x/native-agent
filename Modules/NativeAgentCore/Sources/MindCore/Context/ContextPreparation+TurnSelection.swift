@@ -150,6 +150,34 @@ extension ContextPreparation {
     }
 
     public func prepareTurn(_ request: ContextTurnRequest) async throws -> ContextPreparedTurn {
+        try await prepareTurn(request, associationReader: nil)
+    }
+
+    package typealias AssociationReader = @Sendable ([String: ContextAtomID], ContextStoredGeneration, NeedSignal) async throws -> (verified: Set<ContextAtomID>, studioAllowed: Bool)
+
+    private func associate(_ direct: ContextPacket, seeds: [ContextAtomID], rowLimit: Int?, need: NeedSignal, generation: ContextStoredGeneration,
+                           graph: Result<ContextAssociationGraph, any Error>?, reader: AssociationReader?) async throws -> ContextPacket {
+        guard let reader, let graph, !seeds.isEmpty, selector.hasAssociationRoom(in: direct, rowLimit: rowLimit) else { return direct }
+        do {
+            let graph = try graph.get()
+            guard !graph.edges.isEmpty else { return direct }
+            let eligible = Set(direct.receipt.eligibility.filter(\.eligible).map(\.atomID))
+            let (verified, studioAllowed) = try await reader(graph.records.filter { eligible.contains($0.value) }, generation, need)
+            try Task.checkCancellation()
+            return selector.addingAssociations(to: direct, seeds: seeds, rowLimit: rowLimit, graph: graph, verified: verified, studioAllowed: studioAllowed,
+                                               need: need, generation: generation)
+        } catch is CancellationError { throw CancellationError() }
+        catch {
+            diagnostics("[context-flow] Memory associations unavailable: \(error.localizedDescription)")
+            let notice = ContextDegradedSourceNotice(
+                sourceID: ContextStableID.source(owner: "nativeagent.knowledge-graph", locator: "knowledge-graph"),
+                reason: "Memory associations unavailable.")
+            return Self.withholding(.init(unverified: [notice]), from: direct)
+        }
+    }
+
+    package func prepareTurn(_ request: ContextTurnRequest,
+                             associationReader: AssociationReader?) async throws -> ContextPreparedTurn {
         guard started, mode != .off else {
             throw ContextTurnPreparationError.coordinatorNotStarted
         }
@@ -215,90 +243,16 @@ extension ContextPreparation {
                     state.temporaryActivation
                 )
             }
-            let makeNeed: (Int) -> NeedSignal = { characterBudget in
-                NeedSignal(
-                    message: request.userMessage,
-                    surface: request.surface,
-                    origin: request.origin,
-                    authorization: ContextSelectionAuthorization(
-                        allowedOrigins: [request.origin],
-                        allowedPrivacy: request.allowedPrivacy,
-                        allowedSourceIDs: generationDerived.allowedSourceIDs,
-                        permissionLabels: request.permissionLabels
-                    ),
-                    sessionID: request.sessionID,
-                    recentTurns: request.recentTurns,
-                    activeTask: request.activeTask,
-                    unresolvedQuestion: request.unresolvedQuestion,
-                    goal: request.goal,
-                    cognitiveActivation: activation,
-                    feedbackUtilityOverrides: feedbackByAtom.mapValues(\.utility),
-                    feedbackDecayOverrides: feedbackByAtom.mapValues(\.decay),
-                    memoryReachability: feedbackByAtom.mapValues(\.reachability),
-                    servedTurnsAgo: self.servedTurnsAgo(sessionID: request.sessionID, recentExchanges: request.recentExchanges),
-                    precoveredSourceIDs: generationDerived.precoveredSourceIDs,
-                    mandatoryAtomIDs: Set(generation.atoms.lazy.filter {
-                        generationDerived.protectedCorrectionAtomIDs.contains($0.draft.id)
-                            && ContextCorrectionScope.applies(
-                                $0.draft, message: request.userMessage, recentTurns: request.recentTurns
-                            )
-                    }.map(\.draft.id)),
-                    deletedAtomIDs: request.suppressedAtomIDs,
-                    queryEmbedding: request.queryEmbedding?.values,
-                    alternateQueryEmbedding: request.queryEmbedding?.alternateValues,
-                    ownWordsQueryEmbeddings: request.queryEmbedding?.ownWordsValues,
-                    queryEmbeddingModelFingerprint: request.queryEmbedding?.modelFingerprint,
-                    queryEmbeddingModelID: request.queryEmbedding?.modelID,
-                    availableGenerationID: generation.generation.id,
-                    characterBudget: characterBudget,
-                    packetAtomExpandThresholdChars: request.packetAtomExpandThresholdChars,
-                    memoryAtomRowLimit: request.memoryAtomRowLimit,
-                    cacheState: .hit
-                )
-            }
-            var need = makeNeed(request.characterBudget)
-            var budgetExpansion: ContextFlowBudgetExpansion?
-            var packet: ContextPacket
-            do {
-                packet = try selector.select(
-                    need,
-                    from: generation,
-                    pinnedTo: lease.snapshot,
-                    sourceReadFailures: readFailures
-                )
-            } catch ContextSelectionError.mandatoryBudgetExceeded(let required, _)
-                where request.maximumCharacterBudget > request.characterBudget
-            {
-                let expandedBudget = min(
-                    request.maximumCharacterBudget,
-                    max(
-                        request.characterBudget,
-                        required + request.postMandatoryCharacterReserve
-                    )
-                )
-                guard expandedBudget >= required else {
-                    throw ContextSelectionError.mandatoryBudgetExceeded(
-                        required: required,
-                        limit: request.maximumCharacterBudget
-                    )
-                }
-                need = makeNeed(expandedBudget)
-                budgetExpansion = ContextFlowBudgetExpansion(
-                    requestedCharacterBudget: request.characterBudget,
-                    effectiveCharacterBudget: expandedBudget,
-                    maximumCharacterBudget: request.maximumCharacterBudget,
-                    mandatoryCharacterBudget: required,
-                    grantedPostMandatoryReserve: max(0, expandedBudget - required)
-                )
-                packet = try selector.select(
-                    need,
-                    from: generation,
-                    pinnedTo: lease.snapshot,
-                    sourceReadFailures: readFailures
-                )
-            }
+            let selection = try Self.selectTurnPacket(
+                selector: selector, request: request, generation: generation, snapshot: lease.snapshot,
+                derived: generationDerived, readFailures: readFailures, activation: activation,
+                utility: feedbackByAtom.mapValues(\.utility), decay: feedbackByAtom.mapValues(\.decay),
+                reachability: feedbackByAtom.mapValues(\.reachability),
+                servedTurnsAgo: servedTurnsAgo(sessionID: request.sessionID, recentExchanges: request.recentExchanges))
             let verifier = Self.verifier(compiledProjectionProviders, generation: generation, surface: request.surface)
-            packet = await Self.verified(packet, by: verifier, in: generation)
+            let associated = try await associate(selection.packet, seeds: selection.seeds, rowLimit: selection.rowLimit, need: selection.need, generation: generation,
+                                                 graph: associationGraph, reader: request.memoryRecallEnabled ? associationReader : nil)
+            let packet = await Self.verified(associated, by: verifier, in: generation, seeds: selection.seeds)
             let recordsFeedback = !Self.isTestSession(request.sessionID)
             let feedbackHandler: (@Sendable (
                 ContextFeedbackSignal,
@@ -332,9 +286,9 @@ extension ContextPreparation {
                 packet: packet,
                 lease: lease,
                 generation: generation,
-                need: need,
+                need: selection.need,
                 turnTime: request.turnTime,
-                budgetExpansion: budgetExpansion,
+                budgetExpansion: selection.expansion,
                 deliveryHandler: deliveryHandler,
                 feedbackHandler: feedbackHandler,
                 verifier: verifier
@@ -342,6 +296,55 @@ extension ContextPreparation {
         } catch {
             lease.release()
             throw error
+        }
+    }
+
+    private static func selectTurnPacket(
+        selector: ContextSelector, request: ContextTurnRequest, generation: ContextStoredGeneration,
+        snapshot: ContextGenerationSnapshot, derived: GenerationDerivedTurnState, readFailures: [ContextDegradedSourceNotice],
+        activation: [ContextAtomID: Double], utility: [ContextAtomID: Double], decay: [ContextAtomID: Double],
+        reachability: [ContextAtomID: Double], servedTurnsAgo: [ContextAtomID: Int]
+    ) throws -> (packet: ContextPacket, seeds: [ContextAtomID], rowLimit: Int?, need: NeedSignal, expansion: ContextFlowBudgetExpansion?) {
+        let mandatory = Set(generation.atoms.lazy.filter {
+            derived.protectedCorrectionAtomIDs.contains($0.draft.id)
+                && ContextCorrectionScope.applies($0.draft, message: request.userMessage, recentTurns: request.recentTurns)
+        }.map(\.draft.id))
+        func makeNeed(_ characterBudget: Int) -> NeedSignal {
+            NeedSignal(
+                message: request.userMessage, surface: request.surface, origin: request.origin,
+                authorization: ContextSelectionAuthorization(allowedOrigins: [request.origin],
+                    allowedPrivacy: request.allowedPrivacy, allowedSourceIDs: derived.allowedSourceIDs,
+                    permissionLabels: request.permissionLabels),
+                sessionID: request.sessionID, recentTurns: request.recentTurns, activeTask: request.activeTask,
+                unresolvedQuestion: request.unresolvedQuestion, goal: request.goal, cognitiveActivation: activation,
+                feedbackUtilityOverrides: utility, feedbackDecayOverrides: decay, memoryReachability: reachability,
+                servedTurnsAgo: servedTurnsAgo, precoveredSourceIDs: derived.precoveredSourceIDs,
+                mandatoryAtomIDs: mandatory, deletedAtomIDs: request.suppressedAtomIDs,
+                queryEmbedding: request.queryEmbedding?.values, alternateQueryEmbedding: request.queryEmbedding?.alternateValues,
+                ownWordsQueryEmbeddings: request.queryEmbedding?.ownWordsValues,
+                queryEmbeddingModelFingerprint: request.queryEmbedding?.modelFingerprint,
+                queryEmbeddingModelID: request.queryEmbedding?.modelID, availableGenerationID: generation.generation.id,
+                characterBudget: characterBudget, packetAtomExpandThresholdChars: request.packetAtomExpandThresholdChars,
+                memoryAtomRowLimit: request.memoryAtomRowLimit, now: Date(), cacheState: .hit)
+        }
+        let need = makeNeed(request.characterBudget)
+        do {
+            let selection = try selector.selectForTurn(need, from: generation, pinnedTo: snapshot, sourceReadFailures: readFailures)
+            return (selection.packet, selection.seeds, selection.rowLimit, need, nil)
+        } catch ContextSelectionError.mandatoryBudgetExceeded(let required, _)
+            where request.maximumCharacterBudget > request.characterBudget
+        {
+            let expanded = min(request.maximumCharacterBudget,
+                max(request.characterBudget, required + request.postMandatoryCharacterReserve))
+            guard expanded >= required else {
+                throw ContextSelectionError.mandatoryBudgetExceeded(required: required, limit: request.maximumCharacterBudget)
+            }
+            let expandedNeed = makeNeed(expanded)
+            let selection = try selector.selectForTurn(expandedNeed, from: generation, pinnedTo: snapshot, sourceReadFailures: readFailures)
+            return (selection.packet, selection.seeds, selection.rowLimit, expandedNeed, ContextFlowBudgetExpansion(
+                requestedCharacterBudget: request.characterBudget, effectiveCharacterBudget: expanded,
+                maximumCharacterBudget: request.maximumCharacterBudget, mandatoryCharacterBudget: required,
+                grantedPostMandatoryReserve: max(0, expanded - required)))
         }
     }
 
@@ -363,7 +366,7 @@ extension ContextPreparation {
     /// Verification changes delivered items and pointers, never selection accounting; outcome feedback retains the original IDs.
     @concurrent private static func verified(
         _ packet: ContextPacket, by verifier: @Sendable ([ContextStoredAtom]) async -> ContextTurnExclusion,
-        in generation: ContextStoredGeneration
+        in generation: ContextStoredGeneration, seeds: [ContextAtomID]
     ) async -> ContextPacket {
         let chosenIDs = Set(packet.selectedItems.map(\.pointer.atomID) + packet.expandablePointers.map(\.atomID))
         let found: [ContextStoredAtom] = chosenIDs.flatMap { generation.atoms(id: $0) }
@@ -372,13 +375,21 @@ extension ContextPreparation {
             return a.draft.id < b.draft.id
         }
         let check = await verifier(chosen)
+        return withholding(check, from: packet, seeds: seeds)
+    }
+
+    private static func withholding(_ check: ContextTurnExclusion, from packet: ContextPacket, seeds: [ContextAtomID] = []) -> ContextPacket {
         guard !check.atomIDs.isEmpty || !check.unverified.isEmpty else { return packet }
+        var withheld = check.atomIDs
+        if !check.atomIDs.isDisjoint(with: seeds) {
+            withheld.formUnion(packet.associationPointers.map(\.atomID))
+        }
         return ContextPacket(
             generationID: packet.generationID, sourceFingerprint: packet.sourceFingerprint,
             selectedItems: packet.selectedItems.filter { !check.atomIDs.contains($0.pointer.atomID) },
-            expandablePointers: packet.expandablePointers.filter { !check.atomIDs.contains($0.atomID) },
+            expandablePointers: packet.expandablePointers.filter { !withheld.contains($0.atomID) },
             degradedSources: packet.degradedSources + check.unverified,
-            budget: packet.budget, receipt: packet.receipt)
+            budget: packet.budget, receipt: packet.receipt, associationWalkMicroseconds: packet.associationWalkMicroseconds)
     }
 
 }

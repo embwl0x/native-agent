@@ -39,51 +39,40 @@ extension EngineFaceActs {
         case .saveAnthropicSetupToken(let secret): secrets = [secret]
         case .answerCard(let answer): secrets = Array(answer.secrets.values)
         case .saveConnectorCredentials(let request): secrets = Array(request.fields.values)
-        case .configureTelegram(let request): secrets = request.token.map { [$0] } ?? []
         case .importGrokCredentials(let request): secrets = [request.secret]
         // These open value maps can carry submitted text; their owners decide its meaning.
         case .pageAct(let request):
             secrets = request.value.map(secretText) ?? []
         case .inboxAction(_, _, let value): secrets = value.map(secretText) ?? []
-        case .saveMemoryPolicy(let request): secrets = request.fields.values.flatMap(secretText)
-        case .saveMultimodalPolicy(let request): secrets = request.fields.values.flatMap(secretText)
         case .runMacControl(let request): secrets = request.arguments.values.flatMap(secretText)
-        case .setActivityPolicy(let request): secrets = request.fields.values.flatMap(secretText)
         case .deskCommand(let request): secrets = request.arguments.values.flatMap(secretText)
         case .senseViewEvent(_, _, let value): secrets = secretText(value)
         // Protocol, observation, navigation and transcript receipts carry identities, queries and geometry.
         case .attach, .observe, .unobserve, .refresh, .frameApplied, .cancelRequest,
-             .restoreConversation, .createConversation, .selectConversation, .markConversationRead,
+             .restoreConversation, .createConversation, .selectConversation,
              .archiveConversation, .clearConversation, .pinConversation, .unpinConversation,
-             .stop, .regenerate, .prepareRetryDraft, .exportConversation, .appendSlashHelp,
-             .requestDocument, .readRun, .requestCopy, .setSurfaceExpanded, .openTranscriptReader,
+             .stop, .regenerate, .exportConversation, .appendSlashHelp,
+             .requestDocument, .readRun, .setSurfaceExpanded, .openTranscriptReader,
              .resizeTranscriptReader, .releaseTranscriptReader, .transcriptReceipt, .setTranscriptFold,
-             .firstVisibleReply, .declarePreferences:
+             .firstVisibleReply:
             secrets = []
         // Account operations carry ids, consent or choices; credentials use the typed cases above.
         case .readProviderAccount, .saveChatChoice, .disconnectProvider, .beginOAuth, .signOutProvider, .decideCodexCLIConsent,
-             .repairCodexCLIConsent, .verifyCardOnReturn, .openCard, .setConnectorEnabled, .disconnectConnector,
-             .testTelegram, .clearTelegramLogs, .removePhonePairing, .setUpChrome:
+             .repairCodexCLIConsent, .verifyCardOnReturn, .openCard:
             secrets = []
         // Named app preferences, policy and maintenance carry decisions, identifiers, counts and declared modes.
-        case .setPreference, .resolveApproval, .applyTrustPreset, .setAutonomyEnabled, .setChromeControlEnabled, .setKillSwitchEnabled,
-             .saveMacIntegrationPreset, .saveMacControlPolicy, .refreshPrivacyInventory,
-             .checkMail, .requestMacOSAccess, .openMacOSSettings, .excludeActivityApp, .removeActivityExclusion,
-             .wipeActivity, .createBackup, .restoreBackup, .createProductionExport, .runDoctor,
-             .requestSupportSnapshot, .setEmbeddingDownload, .setEmbeddingsEnabled, .reindexSpotlight,
-             .requestUpdate, .updateInteraction, .pinMemory, .forgetMemory, .resolveMemoryProposal,
-             .cognition, .runDream, .runREM,
-             .setDreamCycleEnabled, .setREMCycleEnabled, .setInnerLifeEnabled, .setContextFlowMode:
+        case .setPreference, .applyTrustPreset, .setEmbeddingDownload, .reindexSpotlight,
+             .requestUpdate, .updateInteraction, .forgetMemory, .cognition:
             secrets = []
         // Authored conversation, memory, persona and work content has no credential field.
-        case .renameConversation, .send, .revise, .notify, .remember, .commitNote, .writeScratch, .searchMemories,
-             .readPersona, .savePersonaProfile, .savePersonaName, .savePersonaDocument, .onboarding,
+        case .renameConversation, .send, .revise, .remember, .commitNote, .writeScratch, .searchMemories,
+             .readPersona, .savePersonaName, .savePersonaDocument, .onboarding,
              .createDeskTask, .addDeskNote, .research, .exportMake, .sendContactMessage, .stopContactMessage,
-             .resendContactMessage, .withdrawContactMessage, .ingestAttachment, .captureScreen, .openBrowser, .voice:
+             .resendContactMessage, .ingestAttachment, .captureScreen, .openBrowser, .voice:
             secrets = []
         // Renderer reports and notification responses carry presentation facts and ordinary message text.
         case .handBackMacControl, .reportScene, .followSettled, .reportProtectedWindows, .reportOverlayWindow, .reportInspector,
-             .reportRendererDiagnostic, .notificationResponse, .quitBody, .restartBody:
+             .notificationResponse, .quitBody:
             secrets = []
         }
         func scrub(_ value: String) -> String {

@@ -83,7 +83,8 @@ and the asking chat's session (where the answer returns). Receipts and the
 webhook body name the one Grok conversation, `GrokBotRoute.conversation(peer:)`
 (the contact's thread), never the asking chat. HTTP 200 means accepted and waiting; a network
 failure means an unknown outcome. Acceptance waits at most 45 seconds, the bound every HTTP send
-to a contact carries; past it the outcome is unknown. The webhook is not automatically retried.
+to a contact carries; past it the outcome is unknown. A task-cancelled webhook
+reports `stopped` and retains the unknown acceptance outcome. The webhook is not automatically retried.
 A read after ten minutes without an answer reports `no answer in time`;
 silence cannot establish whether Grok is waiting for local approval.
 

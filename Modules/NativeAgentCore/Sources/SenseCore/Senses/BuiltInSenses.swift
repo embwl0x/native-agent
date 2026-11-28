@@ -27,11 +27,11 @@ public enum BuiltInSenses {
     }
 
     /// Install after the registry; missing or malformed kit resources must fail launch rather than masquerade as an empty kit.
-    public static func registerAll(resources: URL? = nil) async throws {
+    public static func registerAll() async throws {
         guard let registry = SensesHub.shared.registry else {
             throw SenseFailure(code: "source_unavailable", message: "The senses registry is not installed.")
         }
-        let defaults = try defaults(resources: resources)
+        let defaults = try defaults()
         let existing = try await registry.all()
         for version in defaults {
             let record = version.record
@@ -42,9 +42,9 @@ public enum BuiltInSenses {
         }
     }
 
-    static func defaults(resources: URL? = nil) throws -> [FileSenseRegistry.Version] {
+    static func defaults() throws -> [FileSenseRegistry.Version] {
         try defaultsByRoot.withLock { defaultsByRoot in
-            let root = (resources ?? resourceRoot()).standardizedFileURL
+            let root = resourceRoot().standardizedFileURL
             if let known = defaultsByRoot[root.path] { return known }
             let versions = try readDefaults(root)
             defaultsByRoot[root.path] = versions

@@ -428,7 +428,8 @@ package enum MacAXAttributeRead {
 
     static let labelAttributes = [kAXSubroleAttribute, kAXTitleAttribute, kAXDescriptionAttribute, "AXLabel",
                                   kAXHelpAttribute, kAXPlaceholderValueAttribute, kAXRoleDescriptionAttribute, kAXPositionAttribute, kAXSizeAttribute]
-    typealias Label = (identity: String?, display: String?, subrole: String?, help: String?, placeholder: String?, frame: MacAXFrame?, unreadable: Bool)
+    typealias Label = (identity: String?, display: String?, subrole: String?, help: String?, placeholder: String?, frame: MacAXFrame?,
+                       unreadable: Bool, caption: String?)
 
     static func copyLabel(_ element: AXUIElement, role: String, context: MacOperationContext) -> Label {
         let owner = context.attributeGaps
@@ -439,13 +440,14 @@ package enum MacAXAttributeRead {
                 return try readLabel(element, role: role, values: values, context: context, prepare: { $0 })
             } catch {
                 failed(error, context: context)
-                return (nil, nil, nil, nil, nil, nil, true)
+                return (nil, nil, nil, nil, nil, nil, true, nil)
             }
         }
     }
 
     static func readLabel(_ element: AXUIElement, role: String, values: Values, context: MacOperationContext,
-                          prepare: (AXUIElement) -> AXUIElement) throws -> Label {
+                          prepare: (AXUIElement) -> AXUIElement,
+                          checkRelated: ((AXUIElement, MacOperationContext) throws -> Void)? = nil) throws -> Label {
         let subrole = try string(values[kAXSubroleAttribute], attribute: kAXSubroleAttribute)
         let help = try string(values[kAXHelpAttribute], attribute: kAXHelpAttribute)
         let placeholder = try string(values[kAXPlaceholderValueAttribute], attribute: kAXPlaceholderValueAttribute)
@@ -455,7 +457,7 @@ package enum MacAXAttributeRead {
             text != role && text != MacScreenRender.kindName(role: role)
                 && text != roleDescription
         }
-        var identity: String?, display: String?
+        var identity: String?, display: String?, relatedCaption: String?
         if role == kAXButtonRole, let subrole,
            [kAXCloseButtonSubrole, kAXMinimizeButtonSubrole, kAXZoomButtonSubrole].contains(subrole) {
             identity = MacScreenRender.kindName(role: String(subrole.dropLast("Button".count)))
@@ -464,7 +466,7 @@ package enum MacAXAttributeRead {
             for attribute in [kAXTitleAttribute, kAXDescriptionAttribute, "AXLabel"] {
                 let own = try string(values[attribute], attribute: attribute)
                 if context.attributeGaps?.contains(attribute: attribute) == true {
-                    return (nil, nil, subrole, help, placeholder, frame, true)
+                    return (nil, nil, subrole, help, placeholder, frame, true, nil)
                 }
                 guard let own, isName(own) else { continue }
                 if identity == nil, attribute != kAXDescriptionAttribute || own != help { identity = own }
@@ -472,11 +474,12 @@ package enum MacAXAttributeRead {
                 if identity != nil, display != nil { break }
             }
             if identity == nil || display == nil {
-                let caption = copyCaption(element, role: role, frame: frame, context: context, prepare: prepare)
+                let caption = copyCaption(element, role: role, frame: frame, context: context, prepare: prepare, checkRelated: checkRelated)
                 if caption.unreadable {
                     // No hint or nearby text may stand in for a failed name.
-                    return (nil, nil, subrole, help, placeholder, frame, true)
+                    return (nil, nil, subrole, help, placeholder, frame, true, nil)
                 }
+                relatedCaption = caption.text
                 identity = identity ?? caption.text
                 display = display ?? caption.text
             }
@@ -487,7 +490,7 @@ package enum MacAXAttributeRead {
                 }
             }
         }
-        return (identity, display, subrole, help, placeholder, frame, false)
+        return (identity, display, subrole, help, placeholder, frame, false, relatedCaption)
     }
 
     static func valueState(_ raw: CFTypeRef?, role: String) -> String? {
@@ -521,17 +524,19 @@ package enum MacAXAttributeRead {
     ]
 
     private static func copyCaption(
-        _ element: AXUIElement, role: String, frame: MacAXFrame?, context: MacOperationContext, prepare: (AXUIElement) -> AXUIElement) -> (text: String?,
-            unreadable: Bool) {
+        _ element: AXUIElement, role: String, frame: MacAXFrame?, context: MacOperationContext, prepare: (AXUIElement) -> AXUIElement,
+        checkRelated: ((AXUIElement, MacOperationContext) throws -> Void)?) -> (text: String?, unreadable: Bool) {
         // These reads establish a label source, not attributes of the control. Keep foreign element errors in their own scope, then publish ONE caption gap on
         // the control. Checked reads stop at the first failure.
         do {
             let text = try collectingAttributeGaps(context: context) { _, context in
-                let text = try readCaption(element, role: role, frame: frame, context: context, prepare: prepare)
+                let text = try readCaption(element, role: role, frame: frame, context: context, prepare: prepare, checkRelated: checkRelated)
                 try context.evidence?.check()
                 return text
             }
             return (text, false)
+        } catch is MacAccessibilityReader.StrictReadCut {
+            return (nil, true)
         } catch let error as ElementAttributeFailure {
             context.attributeGaps?.record("caption read: \(error.localizedDescription)")
             return (nil, true)
@@ -542,7 +547,8 @@ package enum MacAXAttributeRead {
     }
 
     private static func readCaption(
-        _ element: AXUIElement, role: String, frame: MacAXFrame?, context: MacOperationContext, prepare: (AXUIElement) -> AXUIElement) throws -> String? {
+        _ element: AXUIElement, role: String, frame: MacAXFrame?, context: MacOperationContext, prepare: (AXUIElement) -> AXUIElement,
+        checkRelated: ((AXUIElement, MacOperationContext) throws -> Void)?) throws -> String? {
         func relatedElement(_ element: AXUIElement, _ attribute: String) throws -> AXUIElement? {
             guard let raw = try checkedRaw(element, attribute, context: context) else { return nil }
             guard CFGetTypeID(raw) == AXUIElementGetTypeID() else {
@@ -551,6 +557,7 @@ package enum MacAXAttributeRead {
             return raw as! AXUIElement
         }
         func captionText(_ element: AXUIElement) throws -> String? {
+            try checkRelated?(element, context)
             let value = try checkedText(element, kAXValueAttribute, context: context)
             let text: String
             if value.isEmpty { text = try checkedText(element, kAXTitleAttribute, context: context) }
@@ -566,6 +573,7 @@ package enum MacAXAttributeRead {
         // directly above, one line tall. Anything else and the field has no label; its placeholder still names it.
         guard let field = frame,
               let parent = try relatedElement(element, kAXParentAttribute).map(prepare) else { return nil }
+        try checkRelated?(parent, context)
         let list = try childList(parent, context: context)
         let siblings = try checkedElementArray(parent, list.attribute, count: list.count, context: context)
         guard let index = siblings.firstIndex(where: { CFEqual($0, element) }) else { return nil }

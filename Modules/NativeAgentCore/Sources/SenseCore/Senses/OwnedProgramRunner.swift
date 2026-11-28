@@ -658,7 +658,9 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                 }
             } onCancel: { actions.cancel(); process.stop() }
         } catch {
-            journal.fail((error as? SenseFailure) ?? SenseFailure(code: "crashed", message: error.localizedDescription))
+            journal.fail((error as? SenseFailure) ?? (error is CancellationError
+                ? SenseFailure(code: "cancelled", message: "Program cancelled.")
+                : SenseFailure(code: "crashed", message: error.localizedDescription)))
             return journal.receipt()
         }
     }

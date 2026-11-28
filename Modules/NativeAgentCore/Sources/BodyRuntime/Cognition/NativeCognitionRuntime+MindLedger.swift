@@ -187,7 +187,7 @@ extension NativeCognitionRuntime {
         let memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
         for source in evidence.sources where source.hasPrefix("memory:") {
             let id = String(source.dropFirst(7))
-            guard (try? await memory.readMemoryRecord(id: id, persona: nil, surface: surface)) != nil else {
+            guard (try? await memory.readMemoryRecord(id: id, surface: surface)) != nil else {
                 return nil
             }
         }

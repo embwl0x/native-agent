@@ -1,6 +1,6 @@
-import Foundation
 import NativeAgentCore
 import Synchronization
+import Foundation
 // Blueprint: | `ProviderReplyWork.swift` | stop joins transport exit and drain |
 
 /// One reply owns its cancellable caller wait and its independent producer settlement.

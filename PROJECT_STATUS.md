@@ -1,6 +1,6 @@
 # NativeAgent Project Status
 
-Source status: 2026-10-20. This describes the checkout, not a release or
+Source status: 2026-11-27. This describes the checkout, not a release or
 installed-app verification. Release history lives in [CHANGELOG.md](CHANGELOG.md)
 and [release notes](docs/release-notes/).
 
@@ -12,34 +12,36 @@ execution. StandingBots owns helpers' model/tool loops over their own transcript
 Mac, iPhone, Telegram, Slack and local agent bridges reach that
 shared engine.
 
-The Mac has Simple, Advanced and Agent views. Simple presents chat, the
-places Chat, Desk, the agent's own and Control, and folded contacts and
-helpers; Advanced adds Diagnostics, the conversation list and the Work pane;
-Agent draws their Home face with row actions and keeps the other rooms as
-read-only text.
+The Mac has Simple, Advanced and Agent views. Simple presents Together,
+Table, the agent's named place and Control, with folded contacts and helpers.
+Advanced uses Chat and Desk and adds Diagnostics, the conversation list and
+the Work pane. Agent draws a read-only Home face with links and shows the other
+rooms as read-only text. The iPhone uses the same four everyday places and puts
+Diagnostics under Control → Advanced.
 
 ## Where things stand
 
 | Area | Current source contract |
 |---|---|
-| Releases | Mac v0.6.20 is the current public release as of 2026-11-19 (Developer ID signed, notarized, Sparkle). The iPhone companion ships through the App Store and TestFlight. The [Releases page](https://github.com/embwl0x/native-agent/releases) is authoritative for what has shipped. |
+| Releases | Mac v0.6.23 is the current public release as of 2026-11-24 (Developer ID signed, notarized, Sparkle). The iPhone companion ships through the App Store and TestFlight. The [Releases page](https://github.com/embwl0x/native-agent/releases) is authoritative for what has shipped. |
 | iPhone link | Signed CloudKit records. Each side rings its bell (`chat.bell`, its newest sent record names) and the reader fetches bell and records by ID, so a message lands in seconds without waiting on CloudKit's query index; the query stays the backstop. See [the bell](docs/mobile_companion.md). |
 | Agent interface | The agent's one door, `app`, is always on. `app {}` is home; `page`, `item`, `find`, `action` and JavaScriptCore `script` reach capabilities through `AppActionRegistry`. |
 | Discovery | Pages and actions arrive in tool results. Argument binding and refused-call advice follow [the one-door contract](docs/ONE_DOOR.md). |
+| Mac deeds | An exact, non-secret AX text replacement can declare its expected value digest and a guarded prior-value restore on observed mismatch. The restore re-enters act admission and has its own receipt. Stop before emission leaves the field as it stands and records the skip. See [Senses](docs/SENSES.md). |
 | macOS grants | Owned permission remedies automatically file `permissions.request` through the composed tool return; already-allowed access skips the card and an open card for the capability is reused. Results retain the original outcome and name the card for the person. Only the person's foreground Allow tap invokes macOS acquisition. Card and Settings acquisition await activation or cancellation, release observation on every exit, and request no grant while inactive or cancelled; Settings retains acquisition problems as failures. See [the one-door contract](docs/ONE_DOOR.md). |
 | Growth and MCP | Authored executable tools and legacy executable skills migrated into `data/abilities/` alongside senses and turns: one current file, optional previous/proposed files and independent run state, with exact admission/proof and explicit lifecycle actions. Built-in skill guidance remains in the persona's `skills/bodies/`, read and never run; the [manifest spec](docs/skill_manifest_spec.md) owns that distinction. An MCP server they wants is an ability they grows; NativeAgent keeps no MCP client. |
 | Web search | `web.search` uses the configured SearXNG endpoint; without one it returns `searxng_not_configured`. Discovery/selection is explicit Research setup, never search or Doctor recovery through another endpoint. Checked discovery distinguishes refused listeners from failed probes/inventory: a candidate's failure is a named gap while other candidates proceed, including when a reachable endpoint is selected; required configuration/inventory failures stop discovery. Responses validate current result fields and engine-failure evidence before admission: malformed result and engine-failure rows become named gaps while valid siblings return; required envelope failures still fail the search. The Research view and tool result retain result gaps. Doctor answering/readiness checks stay unverified when no usable results remain and parse gaps prevent a conclusive empty response. Fetch receipt retention reports its own checked failure independently of completed reads. No browser search route or Codex search implementation remains. |
 | Web reads and maps | Chrome 0.4.78 waits for readable content. [Chrome](Extensions/NativeAgentChrome/README.md), [maps](docs/ONE_DOOR.md). |
 | Memory | MemoryV2 stores durable memories; Fluid Context prepares bounded context. [Recall unavailability](docs/ANATOMY_OF_A_TURN.md#recall-unavailability) names its cause. Conversation replay follows the [input-budget law](docs/conversation-context-history.md), without a stored cut pointer or summary. |
 | REM proposals | The [replacement-evidence contract](docs/COGNITION_WIRING.md#rem-proposal-replacement-evidence) owns displaced-content provenance, review and approval behavior. |
-| Work | Desk holds durable work. Helpers run their own model/tool loops with their names, personalities, jobs and transcripts; they follow Chat's Providers settings unless explicitly pinned and reach the resident through the contact path. Following helpers refuse conflicting settings at the submitted field and acknowledge inherited-value no-ops. See [helper settings](docs/USER_GUIDE.md#helpers-standing-bots). |
+| Work | Desk holds durable work and supplies the Ongoing work page. Helpers run their own model/tool loops with their names, personalities, jobs and transcripts; they follow Chat's Providers settings unless explicitly pinned and reach the resident through the contact path. Following helpers refuse conflicting settings at the submitted field and acknowledge inherited-value no-ops. See [helper settings](docs/USER_GUIDE.md#helpers-standing-bots). |
 | Providers | Chat, Work, and Memory and mind are the three routing groups; Work and Memory and mind inherit Chat's model/account unless configured. Think and Fast use effort-only and tier-only group transactions: each changes its field across every member without pinning the resolved model/account or the other control. The person's Add key / Sign in opens protected Mac entry directly; an agent's provider request points to that same entry and settles only from verified saved auth status. See [Providers](docs/USER_GUIDE.md). |
 | Mac face feed | Transcript paragraphs, page faces and native readouts use Shared slots; see [feed](Modules/NativeAgentCore/FACE_LINK.md). |
 | Shared page renderer | Stage 7 source uses image, preview and web leaves in shared Make/Sense pages and removes unused Alive parts and copied body drawing. The renderer owns the main window, detached chats, Shotgun, protected entry and page bitmaps; body settings, engine/tool hosts, permission guidance readings and paragraph preparation remain. Stage 5–7 installed acceptance and performance comparison are pending. [Contract](docs/skill_manifest_spec.md), [face boundary](Modules/NativeAgentCore/FACE_LINK.md). |
-| Trust | Full Mac grants autonomy without a timer. macOS privacy permission resets still ask the owner. An untrusted agent's card offers Just this for one call or For this task for the run; a read steers nothing. Agents enabled in Trust → Connected agents carry the owner's authority on authenticated turns; ordinary Trust and domain checks remain. |
+| Trust | Full Mac grants autonomy without a timer. macOS privacy permission resets still ask the owner. Just this approves one peer-steered call. For this task can also elevate the card's peers while the same unjoined Ask is live. Reading an untrusted job report adds its author to that Ask's steering sources. Agents enabled in Trust → Connected agents carry the owner's authority on authenticated turns. Ordinary Trust and domain checks remain. |
 | Arrivals | Doors submit typed arrivals through `TurnAdmission.run`. During generation the selected turn program's optional CPU `hear` may cut the round for an eligible arrival: prose stays, every proposed call is discarded, and the next request reads arrivals. Missing or failed hearing keeps the boundary read; failure owes repair. Reservations extend before first text, and joined readings are checkpointed for relaunch before their old checkpoints retire. Readable, untainted words from the person also withdraw unstarted proposals and slots, including batch steps. Running calls retain receipts; Stop cancels at once. One reply keeps prose in streamed order and answers joined arrivals; their doors post nothing. Unread arrivals run through their own doors. Contract: [Anatomy of a turn](docs/ANATOMY_OF_A_TURN.md#1-a-surface-admits-the-turn). Source implemented; installed proof and the agent's authored `hear` remain pending. |
 
-Meta's API-key route offers Standard Muse Wonder 1.0 and Muse Spark 1.3 through
+Meta's API-key route offers Standard Muse Wonder 1.0, Muse Ember 1.0 and Muse Spark 1.3, 1.2 and 1.1 through
 the shared Anthropic-format Messages adapter with Bearer auth and effort controls.
 Client-side text/tool history is retained; returned thinking blocks replay across
 tool rounds through the shared bounded in-memory ledger, without persistence.
@@ -165,11 +167,11 @@ failures. Retired tool names run nothing; there is nothing to load or unload.
   Reverse control closure preserves the correlated result without resurrecting
   the closed control.
   Body quit terminates and joins its face child independently of
-  the child's drawing thread. Doctor measures the original and copied Inspector
-  through the same platform port, preserving failed subscription admission as
-  an open view. Copied repair is bound to its connection/view/subscription and
-  confirms source observation independently. The shared trace observer gets one
-  repair attempt; later subscription failure retains each known effect's receipt.
+  the child's drawing thread. Doctor measures the renderer's Inspector through
+  the platform port, preserving failed subscription admission as an open view.
+  Repair is bound to its connection, view and subscription and confirms source
+  observation independently. The shared trace observer gets one repair attempt;
+  later subscription failure retains the source observation receipt.
   Context health holds its own subscription, fed by root-owned lifecycle,
   source, reconciliation, feedback, arena and lease events through the existing
   checked health owner. Coordinator replacement preserves that event source;
@@ -181,9 +183,11 @@ failures. Retired tool names run nothing; there is nothing to load or unload.
   duplicate body-window presenter and the original window's drawing are removed.
   Mac-control values follow driver and Trust events. Person-origin composer and
   Shotgun hand-back taps capture the delivered generation and acknowledge only a real
-  grant by the driver owner. Transcript resizing sends changed dimensions;
-  viewport membership has its own receipt. Link records identify readers, script
-  bases and mounted composer sessions, with fractional-second event timestamps.
+  grant by the driver owner. Transcript resizing sends changed width or scale
+  once the viewport has a finite, positive height. Viewport membership has its
+  own receipt and settles after a live resize.
+  Link records identify readers, script bases and mounted composer sessions,
+  with fractional-second event timestamps.
   Copied conversation switches reuse current rows, with one store watcher per
   visited session held for the connection. Opening sends the end viewport before
   Inbox and attachment work; acknowledged scripts leave the press's pending

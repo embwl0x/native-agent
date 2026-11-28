@@ -29,7 +29,7 @@ public struct DeskTimedBot: Identifiable, Equatable, Sendable {
     public static func load(root: URL, timing: BotRunnerScheduler.BotSchedule) throws -> [DeskTimedBot] {
         let bots = try BotDefinitionStore(dataRoot: root).list()
         return bots.filter { !$0.paused && $0.cadence != .manual }.map { bot in
-            DeskTimedBot(id: bot.id, name: bot.name, line: BotsShelfRecord.cadence(bot.cadence) + ".", nextRun: timing.dates[bot.id])
+            DeskTimedBot(id: bot.id, name: bot.name, line: StandingBotSchedule.words(bot.cadence) + ".", nextRun: timing.dates[bot.id])
         }
     }
 }
@@ -88,8 +88,7 @@ public struct BotsShelfRecord: Identifiable, Equatable, Sendable {
     public var latestEntry: ShelfEntry? { entries.max { $0.runAt < $1.runAt } }
     public var id: UUID { definition.id }
     public var needsModelChoice: Bool { definition.needsModelChoice || modelChoiceIssue != nil }
-    public static func shortDate(_ date: Date) -> String { metadataDate(date) }
-    private static func metadataDate(_ date: Date) -> String {
+    public static func shortDate(_ date: Date) -> String {
         let formatter = DateFormatter()
         formatter.setLocalizedDateFormatFromTemplate("MMMdjm")
         formatter.timeZone = TimeZone.autoupdatingCurrent
@@ -99,7 +98,7 @@ public struct BotsShelfRecord: Identifiable, Equatable, Sendable {
         guard let trigger = definition.eventTrigger else { return nil }
         var line = "Wakes on: " + trigger.label
         if let event = lastEvent {
-            let when = Self.metadataDate(event.at)
+            let when = Self.shortDate(event.at)
             switch event.outcome {
             case .queued: line += " · Last event \(when) · " + event.summary
             case .held: line += " · Last event \(when) held: " + (event.detail ?? "Autonomy is off")
@@ -123,11 +122,10 @@ public struct BotsShelfRecord: Identifiable, Equatable, Sendable {
         if !unattendedAllowed, !runsWithUnattendedOff { return BotsShelfUnattended.cardLine }
         if let wakeLine { return wakeLine }
         if case .manual = definition.cadence { return "Manual" }
-        if let nextRun { return "\(cadence) · Next \(Self.metadataDate(nextRun))" }
+        if let nextRun { return "\(cadence) · Next \(Self.shortDate(nextRun))" }
         return "\(cadence) · Not scheduled yet"
     }
-    public var cadence: String { Self.cadence(definition.cadence) }
-    public static func cadence(_ cadence: BotCadence) -> String { StandingBotSchedule.words(cadence) }
+    public var cadence: String { StandingBotSchedule.words(definition.cadence) }
     public static func health(_ health: ShelfRunHealth) -> String {
         switch health {
         case .ok: "Checked · findings available"

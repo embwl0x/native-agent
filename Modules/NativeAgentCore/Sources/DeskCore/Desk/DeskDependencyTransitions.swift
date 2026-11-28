@@ -188,14 +188,14 @@ extension SwiftNativeDeskStore {
     }
     /// Match updatedAt so stamping an old notification leaves newer content eligible.
     @discardableResult
-    public func markNotifiedIfUnchanged(_ handle: String, expectedUpdatedAt: String, at: String? = nil) async throws -> Bool {
+    public func markNotifiedIfUnchanged(_ handle: String, expectedUpdatedAt: String) async throws -> Bool {
         try await SwiftNativePersistenceCore.withFileLock(opsPath) {
             let feed = try await readFeedUnlocked()
             let state = Self.compact(base: feed.base, feed.ops)
             guard let item = state.items.first(where: { $0.handle == handle }),
                   item.updatedAt == expectedUpdatedAt else { return false }
             // Mint the stamp inside the flock so it cannot precede a mutation that wins the lock.
-            let stamp = at ?? DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
+            let stamp = DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
             try await commitUnlocked(
                 [DeskOp(handle: handle, body: .markNotified(at: stamp))],
                 feed: feed

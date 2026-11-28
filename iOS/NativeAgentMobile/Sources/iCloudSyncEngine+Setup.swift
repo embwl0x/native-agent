@@ -36,11 +36,11 @@ extension iCloudSyncEngine {
     static var ephemeralPruneStampKey: String { "NativeAgentMobile.ephemeralPrunedAt" }
 
     /// Prune off-main at most daily, using retained terminal consumption proof; keep unreadable/changed files and all nonterminal work.
-    func pruneEphemeralDirectoriesIfDue(force: Bool = false) {
+    func pruneEphemeralDirectoriesIfDue() {
         let defaults = UserDefaults.standard
         let now = Date().timeIntervalSince1970
         let last = defaults.double(forKey: Self.ephemeralPruneStampKey)
-        guard force || last <= 0 || now - last >= Self.ephemeralPruneIntervalSeconds else { return }
+        guard last <= 0 || now - last >= Self.ephemeralPruneIntervalSeconds else { return }
         let responses = responsesDir
         let transactions = transactionDir
         guard responses != nil || transactions != nil else { return }

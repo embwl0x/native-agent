@@ -8,16 +8,13 @@ extension SomaticSignalKind {
     var canonicalValence: Double {
         switch self {
         case .toolSucceeded, .deskItemClosed, .providerSucceeded, .providerRecovered,
-             .phoneDeliveryReceived, .memoryCommitted,
-             .dreamCompleted, .remIntegrated:
+             .phoneDeliveryReceived, .dreamCompleted, .remIntegrated:
             return 0.45
         case .toolFailed, .providerFailed, .phoneDeliveryFailed, .deskItemBlocked,
-             .memoryCorrected, .correctionReceived, .organDeviated:
+             .correctionReceived, .organDeviated:
             return -0.55
         case .appWake, .iPhoneReachable:
             return 0.15
-        case .resourcePressureChanged, .iPhoneStale:
-            return -0.5
         case .approvalResolved:
             return 0.4
         // No intrinsic valence (chat felt-meaning owned by the substrate; or a neutral lifecycle marker).

@@ -62,7 +62,7 @@ extension AppQuietToolHost {
             dreamEnabled: { try await dreamEnabled() },
             runDream: {
                 let run = await appModel.runDreamPassForDreams(parent: turn)
-                return (run.ok, appModel.statusForAgent, appModel.dreamError, run.busy)
+                return (run.ok, appModel.statusForAgent, appModel.dreamError, run.busy, run.stopped)
             }, previewDream: {
                 do {
                     let result = try await NativeAgentEngine.previewDream(dataRoot: appModel.engine.dataRoot)

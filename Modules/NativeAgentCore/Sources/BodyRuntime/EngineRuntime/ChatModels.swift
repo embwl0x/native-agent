@@ -1,12 +1,12 @@
 import MacNerves
 import SenseCore
 import Foundation
-import Observation
 import ImageIO
 import UniformTypeIdentifiers
 @_exported import NativeAgentShared
 import PersistenceCore
 import MindCore
+import Observation
 // Blueprint: | `ChatModels.swift` | `ChatMessage`; Checked transcript codec, attachment previews and export |
 
 public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
@@ -223,9 +223,11 @@ extension ChatMessage: MacChatRetryMessage {
             authored: recorded.authored.flatMap(ChatMessageAuthorship.init(rawValue:))
                 ?? (recorded.agent == nil ? nil : .agent))
         origin.peerSources = recorded.peerSources
-        origin.elevatedPeerSources = recorded.elevatedPeerSources
         if origin.peerSources == nil, origin.authored == .agent, recorded.agent != "self" {
             origin.peerSources = [recorded.agent ?? "an agent"]
+        }
+        if let elevated = recorded.elevatedPeerSources {
+            origin.peerSources = Array(Set((origin.peerSources ?? []) + elevated)).sorted()
         }
         return origin
     }

@@ -186,6 +186,7 @@ function programIndex(source) {
             }
         }
         const shapes = [{unknown:{}}], indices = new WeakMap();
+        const secretLines = Object.create(null);
         const unknown = 0;
         function shape(node) {
             if (!node) return unknown;
@@ -236,6 +237,12 @@ function programIndex(source) {
             return unknown;
         }
         for (const node of nodes) {
+            const text = node.type === "TemplateElement" ? string(node.value.cooked) : node.type === "Literal" ? literal(node) : null;
+            if (text?.includes("{{secret:")) {
+                for (const match of text.matchAll(/\{\{secret:([^{}]{1,64})\}\}/g)) {
+                    secretLines[match[1]] ??= node.loc.start.line;
+                }
+            }
             if (initializing.has(node) && (node.type === "VariableDeclarator" && node.init ||
                 node.type === "AssignmentExpression" || node.type === "UpdateExpression")) {
                 const target = node.id ?? node.left ?? node.argument;
@@ -265,7 +272,7 @@ function programIndex(source) {
             calls.push({...target, line:node.loc.start.line, first:literal(node.arguments[0]),
                 given:node.arguments.some(n => n.type === "SpreadElement") ? null : node.arguments.map(n => shape(n))});
         }
-        return JSON.stringify({entries:[...entries].sort(), functions, shapes, calls, callLines:locations()});
+        return JSON.stringify({entries:[...entries].sort(), functions, shapes, calls, callLines:locations(), secretLines});
     }
     return {locations, facts};
 }

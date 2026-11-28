@@ -355,15 +355,24 @@ extension ContextPreparation {
                 }
             }
 
+            let sourcesChanged = !changedBySource.isEmpty || !candidate.removedSourceIDs.isEmpty || candidate.baselineGenerationID == nil
+            let checkedTopology = ["nativeagent.memory-v2", "nativeagent.knowledge-graph", "nativeagent.studio"].contains {
+                candidate.projectionReadResults[$0] != nil
+            }
+            var checkedGraph: Result<ContextAssociationGraph, any Error>?
+            if checkedTopology, !sourcesChanged, let retained = activeStoredGeneration, retained.generation.id == candidate.baselineGenerationID {
+                checkedGraph = try await readAssociationGraph(in: retained)
+            }
+            let topologyChanged = checkedGraph != nil && (try? checkedGraph?.get().edges) != (try? associationGraph?.get().edges)
             var publication: ContextGenerationRecord?
-            if !changedBySource.isEmpty || !candidate.removedSourceIDs.isEmpty || candidate.baselineGenerationID == nil {
+            if sourcesChanged || topologyChanged {
                 publication = try await store.publish(ContextGenerationDraft(
                     reason: candidate.batch.reason,
                     changedSources: changedBySource.values.sorted {
                         $0.descriptor.id < $1.descriptor.id
                     },
                     removedSourceIDs: candidate.removedSourceIDs
-                ))
+                ), associationTopologyChanged: topologyChanged)
             }
 
             let stored: ContextStoredGeneration
@@ -386,7 +395,8 @@ extension ContextPreparation {
                 }
                 stored = loaded
             }
-            try await activate(stored, requestID: candidate.batch.requestID, readFailures: admittedReadFailures, patch: patch)
+            try await activate(stored, requestID: candidate.batch.requestID, readFailures: admittedReadFailures, patch: patch,
+                               refreshGraph: checkedTopology, checkedGraph: checkedGraph)
             lastReconciledAt = Date()
             acknowledge(candidate.batch)
             await pruneStoreIfDue()
@@ -406,9 +416,19 @@ extension ContextPreparation {
         let changed: [ContextStoredAtom]
     }
 
+    private func readAssociationGraph(in generation: ContextStoredGeneration) async throws -> Result<ContextAssociationGraph, any Error>? {
+        guard let provider = compiledProjectionProviders.compactMap({ $0 as? any ContextAssociationProjecting }).first else { return nil }
+        do { return .success(try await provider.associationGraph(in: generation)) }
+        catch is CancellationError { throw CancellationError() }
+        catch { return .failure(error) }
+    }
+
     /// Make `stored` the generation turns read: its mirrors, arena snapshot and projection identities publish together or not at all.
     func activate(_ stored: ContextStoredGeneration, requestID: UInt64,
-                  readFailures: [SourceReadOwner: [ContextSourceID: String]]? = nil, patch: GenerationPatch? = nil) async throws {
+                  readFailures: [SourceReadOwner: [ContextSourceID: String]]? = nil, patch: GenerationPatch? = nil,
+                  refreshGraph: Bool = true, checkedGraph: Result<ContextAssociationGraph, any Error>? = nil) async throws {
+        var graph = checkedGraph ?? associationGraph
+        if checkedGraph == nil, graph == nil || refreshGraph || patch == nil { graph = try await readAssociationGraph(in: stored) }
         let mirrors = try await mirrorProvider.requiredDocumentMirrors()
         guard !reconciliationClosed, requestID == nextReconciliationRequestID, !Task.isCancelled else { throw CancellationError() }
         let currentSnapshot = arena.currentSnapshot()
@@ -438,6 +458,7 @@ extension ContextPreparation {
         case nil, .published, .rehydrated:
             lastError = nil
             let previous = activeStoredGeneration
+            associationGraph = graph
             activateStoredGeneration(stored)
             if let readFailures { sourceReadFailures = readFailures }
             for provider in compiledProjectionProviders {

@@ -255,6 +255,7 @@ public actor SenseNewsBoard {
             items = previousItems
             histories = previousHistories
             fail(error)
+            return
         }
         await DerivedStateInvalidationCenter.shared.publish(DerivedSourceChange(
             namespace: "sense-news", stableID: "served", operation: .changed,

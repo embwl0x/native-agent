@@ -649,7 +649,6 @@ private struct MacRemindersListCreateArgs: PersonalIntegrationArgs {
 }
 
 private struct MacRemindersUpdateArgs: PersonalIntegrationArgs {
-    static let idField = DoorFieldDescriptor.string("id", "Exact reminder id from a reminder query, read or creation.", required: true)
     static let titleField = DoorFieldDescriptor.string("title", "New nonempty title; omitted leaves it unchanged.")
     static let notesField = DoorFieldDescriptor.string("notes", "New notes; omitted leaves them unchanged. Use clear_fields to remove them.")
     static let dueDateField = DoorFieldDescriptor("due_date", ActionDescriptor.stringOrIntSchema("""
@@ -657,7 +656,7 @@ private struct MacRemindersUpdateArgs: PersonalIntegrationArgs {
         """), required: false)
     static let clearFieldsField = DoorFieldDescriptor("clear_fields", ToolSchema.obj([("type", .string("array")), ("items", ToolSchema.enumStringSchema(["notes", "due_date"])),
         ("description", .string("Fields to clear: notes or due_date. Do not also supply a value for a cleared field."))]), required: false)
-    static let doorFields = [idField, titleField, notesField, dueDateField, clearFieldsField]
+    static let doorFields = [MacRemindersReadArgs.idField, titleField, notesField, dueDateField, clearFieldsField]
     let id: String
     let title: String?
     let notes: String?
@@ -665,7 +664,7 @@ private struct MacRemindersUpdateArgs: PersonalIntegrationArgs {
     let clearFields: [String]?
 
     init(door: inout DoorObjectDecoder) throws(DoorDecodeError) {
-        id = try door.requiredString(Self.idField)
+        id = try door.requiredString(MacRemindersReadArgs.idField)
         title = try door.string(Self.titleField)
         notes = try door.string(Self.notesField)
         dueDate = try door.stringOrInteger(Self.dueDateField)
@@ -674,7 +673,7 @@ private struct MacRemindersUpdateArgs: PersonalIntegrationArgs {
 
     var wire: [String: JSONValue] {
         [
-            Self.idField.name: .string(id),
+            MacRemindersReadArgs.idField.name: .string(id),
             Self.titleField.name: title.map(JSONValue.string),
             Self.notesField.name: notes.map(JSONValue.string),
             Self.dueDateField.name: dueDate?.wire,

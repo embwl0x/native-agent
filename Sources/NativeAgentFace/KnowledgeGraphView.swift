@@ -91,7 +91,7 @@ struct KnowledgeGraphView: View {
             }
             return drawn
         }
-        face.sections = [filters] + face.sections + (snapshot.levers ?? [])
+        face.sections = [filters] + face.sections + snapshot.drawnLevers
         if timeWindow != .all, entities.contains(where: { $0.lastSeen == nil }) {
             face.sections.insert(.init(id: "recency", style: .note, rows: [.init(id: "unknown", title:
                 "Entities without a last-seen timestamp are outside this time filter. Choose All time to include them.", tone: .quiet)]), at: 1)

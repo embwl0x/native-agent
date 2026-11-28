@@ -114,18 +114,18 @@ public enum MacScreenLock {
     }
 
     /// Focused-password evidence survives covered wakes; LatestRead orders publication.
-    public static var wakeFailed: Bool { passwordFocusedAfterWake.withLock { $0 == true } }
-    private static let passwordFocusedAfterWake = Mutex<Bool?>(nil)
+    package static var passwordPromptObservedAt: Date? { passwordPromptReading.withLock { $0 } }
+    private static let passwordPromptReading = Mutex<Date?>(nil)
     private typealias WakeResult = (before: MacSessionState, after: MacSessionState, mouseEvents: Int, keyEvents: Int)
     private actor WakeReads {
         private let latest = LatestRead()
         func read(_ load: @Sendable () async -> Result<WakeResult, Error>) async -> Result<WakeResult, Error> {
             await latest.read(load) { result in
-                passwordFocusedAfterWake.withLock { focused in
+                passwordPromptReading.withLock { observedAt in
                     if case .failure(let error) = result {
-                        focused = (error as? Covered)?.code == "mac_locked" ? true : nil
+                        observedAt = (error as? Covered)?.passwordPromptObservedAt
                     } else if case .success(let wake) = result, !wake.after.obstructed {
-                        focused = false
+                        observedAt = nil
                     }
                 }
             }
@@ -140,9 +140,16 @@ public enum MacScreenLock {
     public struct Covered: Error, Sendable {
         public let detail: String
         public let code: String
+        fileprivate let passwordPromptObservedAt: Date?
+
         public init(detail: String, code: String = "display_obstructed") {
+            self.init(detail: detail, code: code, passwordPromptObservedAt: nil)
+        }
+
+        fileprivate init(detail: String, code: String, passwordPromptObservedAt: Date?) {
             self.detail = detail
             self.code = code
+            self.passwordPromptObservedAt = passwordPromptObservedAt
         }
     }
 
@@ -191,7 +198,7 @@ public enum MacScreenLock {
                 || MacAXAttributeRead.copyString(field, kAXSubroleAttribute, context: context) == kAXSecureTextFieldSubrole
         }
         guard try covered() else { return (before, after, 0, 0) }
-        guard AXIsProcessTrusted() else {
+        guard SystemPermissionPreflight.status(.accessibility) == .granted else {
             throw Covered(detail: "Accessibility permission is required to wake the screensaver; no input was sent.")
         }
         let driver: MacDriverBinding
@@ -277,6 +284,7 @@ public enum MacScreenLock {
         let loginWindow = try loginWindowUp()
         // Focused secure fields prove authentication UI; loginwindow alone may be a passwordless saver.
         let locked = loginWindow && !after.displayAsleep && loginPasswordFocused()
+        let passwordPromptObservedAt = locked ? Date() : nil
         throw Covered(detail: after.displayAsleep
             ? "The display stayed asleep after two wake nudges."
             : locked
@@ -284,7 +292,7 @@ public enum MacScreenLock {
             : loginWindow
             ? "The loginwindow layer is still in front after two wake nudges; I couldn't confirm a password prompt."
             : "The screen is still covered after two wake nudges (macOS still reports the saver/login layer up, with no login window showing).",
-            code: locked ? "mac_locked" : "display_obstructed")
+            code: locked ? "mac_locked" : "display_obstructed", passwordPromptObservedAt: passwordPromptObservedAt)
     }
 }
 

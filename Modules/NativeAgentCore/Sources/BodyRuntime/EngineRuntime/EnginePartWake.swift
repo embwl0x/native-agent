@@ -42,7 +42,7 @@ actor EnginePartWake {
     /// Coalesce file news by part and watched path without dropping member changes.
     private var fileInputs: [UUID: [String: JSONValue]] = [:]
     /// Hold wakes across Autonomy or catalog unavailability without losing source helper generations.
-    private var heldBack: [String: (signal: String, part: String?, payload: [String: JSONValue])] = [:]
+    private var heldBack: [String: (signal: String, part: String?, payload: [String: JSONValue], origin: AbilityStore.WakeOrigin, delivery: UUID?)] = [:]
     /// Observe Trust only while wakes are held.
     private var autonomyWatch: Task<Void, Never>?
     private var retiringWatches: [UUID: Task<Void, Never>] = [:]
@@ -76,7 +76,7 @@ actor EnginePartWake {
         let center = NotificationCenter.default
         messageObservers.append(center.addObserver(for: AbilityStore.Signalled.self) { message in
             guard message.root == root.path else { return }
-            await Self.shared.signalled(message.signal, only: message.part, message.payload, dataRoot: root, epoch: epoch)
+            await Self.shared.signalled(message.signal, only: message.part, message.payload, dataRoot: root, epoch: epoch, origin: message.origin)
         })
         messageObservers.append(center.addObserver(for: TurnTracePersistLane.TerminalPersisted.self) { message in
             let row = message.row
@@ -237,16 +237,18 @@ actor EnginePartWake {
 
     /// Release intentions only at the original source edge; held delivery is not a second release.
     private func signalled(_ signal: String, only: String? = nil, except: String? = nil,
-                           _ payload: [String: JSONValue], dataRoot: URL, epoch: UUID, fileEdge: FileChangeEvents.Change? = nil) async {
+                           _ payload: [String: JSONValue], dataRoot: URL, epoch: UUID, fileEdge: FileChangeEvents.Change? = nil,
+                           origin: AbilityStore.WakeOrigin = .signal) async {
         guard lifecycle == epoch, !Task.isCancelled else { return }
         if let fileEdge, payload["available"] != .bool(true), await fileEdge.isSelfWrite { return }
         guard lifecycle == epoch, !Task.isCancelled else { return }
         await NativeAgentEngine.cognitionRuntime(for: dataRoot)?.carriedSignal(signal, payload: payload)
-        await deliver(signal, only: only, except: except, payload, dataRoot: dataRoot, epoch: epoch)
+        await deliver(signal, only: only, except: except, payload, dataRoot: dataRoot, epoch: epoch, origin: origin)
     }
 
     private func deliver(_ signal: String, only: String? = nil, except: String? = nil,
-                         _ payload: [String: JSONValue], dataRoot: URL, epoch: UUID) async {
+                         _ payload: [String: JSONValue], dataRoot: URL, epoch: UUID, origin: AbilityStore.WakeOrigin = .signal,
+                         delivery: UUID? = nil) async {
         guard lifecycle == epoch, !Task.isCancelled else { return }
         // Source subscriptions use the same admission owner even without a wake header.
         if signal == "sense.source.changed", let part = only,
@@ -268,11 +270,12 @@ actor EnginePartWake {
         let indexed = Self.indexedSignal(signal, dataRoot: dataRoot)
         let fileNews = signal.hasPrefix("file.changed:") && payload["changed"] != nil
         // Queue identity excludes member paths but retains provenance, including peer taint.
-        let identity = fileNews ? payload.filter { !["path", "changed", "changed_more"].contains($0.key) } : payload
+        var identity = fileNews ? payload.filter { !["path", "changed", "changed_more"].contains($0.key) } : payload
+        if signal == "body.changed" { identity["generation"] = nil }
         let news = (fileNews ? indexed : signal) + ((try? JSONValue.object(identity).serialize(pretty: false)) ?? "")
         guard let index else {
             // Keep unread wakes pending until the catalog reads again.
-            if ["held", "resumed"].contains(signal) { heldBack[(only ?? "") + "\u{0}" + news] = (signal, only, payload) }
+            if ["held", "resumed"].contains(signal) { heldBack[(only ?? "") + "\u{0}" + news] = (signal, only, payload, origin, delivery) }
             return
         }
         let parts = (index[indexed] ?? []).filter { (only == nil || $0.id == only) && $0.id != except }
@@ -284,6 +287,7 @@ actor EnginePartWake {
         for file in parts {
             let key = file.id + "\u{0}" + news
             let id = UUID()
+            let wakeDelivery = delivery ?? id
             if let pending = waiting[key] {
                 if fileNews, let earlier = fileInputs[pending] {
                     fileInputs[pending] = Self.mergeFileNews(earlier, input, watched: Self.watchedURL(signal, dataRoot: dataRoot).path)
@@ -306,14 +310,19 @@ actor EnginePartWake {
                     guard self.lifecycle == epoch, !Task.isCancelled else { return }
                     // Retain held and resumed wakes while the catalog is unavailable.
                     if self.index == nil, ["held", "resumed"].contains(signal) {
-                        return self.holdBack(key, signal, part: file.id, payload, dataRoot: dataRoot, epoch: epoch)
+                        return self.holdBack(key, signal, part: file.id, payload, dataRoot: dataRoot, epoch: epoch,
+                                             origin: origin, delivery: wakeDelivery)
                     }
                     guard let current = self.index?[indexed]?.first(where: { $0.id == file.id }) else { return }
                     if let refused = refusal {
-                        if ["held", "resumed"].contains(signal) { self.holdBack(key, signal, part: file.id, payload, dataRoot: dataRoot, epoch: epoch) }
+                        if ["held", "resumed"].contains(signal) {
+                            self.holdBack(key, signal, part: file.id, payload, dataRoot: dataRoot, epoch: epoch,
+                                          origin: origin, delivery: wakeDelivery)
+                        }
                         let wake = "wake-" + UUID().uuidString.lowercased()
                         let turn = Turn(dataRoot: dataRoot, id: wake, run: wake, session: Self.session)
                             .with(\.envelope, .native("wake:" + current.id)).with(\.verifiedSessionID, Self.session).with(\.partID, current.id)
+                            .with(\.abilityRunSource, .wake(part: current.id, origin: origin, delivery: wakeDelivery))
                         let result = if current.kind == .part {
                             await Self.receipt(refused, call: ["action": .string("authored." + current.id)], turn: turn, dataRoot: dataRoot)
                         } else { refused }
@@ -321,7 +330,7 @@ actor EnginePartWake {
                             payload: .object(["part": .string(current.id), "input": .object(input), "result": result]), turn: turn))
                         return nativeLog("[wake] %@ did not wake %@: unattended work refused (see part.wake)", signal, file.id)
                     }
-                    await Self.run(current, input: input, dataRoot: dataRoot)
+                    await Self.run(current, input: input, dataRoot: dataRoot, origin: origin, delivery: wakeDelivery)
                     guard self.lifecycle == epoch, !Task.isCancelled else { return }
                     // A source arrival has no caller deadline; lifecycle cancellation and slot release end this wait.
                     let waited = await OwnedProgramRunner.waitedForSlot(file.id, dataRoot: dataRoot, deadline: nil)
@@ -398,8 +407,9 @@ actor EnginePartWake {
     }
 
     /// Held arrivals stay unread; only `resumed` continues held work. Retain newest source material and recheck Trust both at policy changes and delivery.
-    private func holdBack(_ key: String, _ signal: String, part: String, _ payload: [String: JSONValue], dataRoot: URL, epoch: UUID) {
-        heldBack[key] = (signal, part, payload)
+    private func holdBack(_ key: String, _ signal: String, part: String, _ payload: [String: JSONValue], dataRoot: URL, epoch: UUID,
+                          origin: AbilityStore.WakeOrigin = .signal, delivery: UUID? = nil) {
+        heldBack[key] = (signal, part, payload, origin, delivery)
         guard autonomyWatch == nil else { return }
         let policy = dataRoot.appendingPathComponent("trust/policy.json")
         autonomyWatch = Task {
@@ -422,11 +432,13 @@ actor EnginePartWake {
         heldBack.removeAll()
         for wake in pending.values {
             guard lifecycle == epoch, !Task.isCancelled else { return }
-            await deliver(wake.signal, only: wake.part, wake.payload, dataRoot: dataRoot, epoch: epoch)
+            await deliver(wake.signal, only: wake.part, wake.payload, dataRoot: dataRoot, epoch: epoch,
+                          origin: wake.origin, delivery: wake.delivery)
         }
     }
 
-    private static func run(_ file: AbilityStore.File, input: [String: JSONValue], dataRoot: URL) async {
+    private static func run(_ file: AbilityStore.File, input: [String: JSONValue], dataRoot: URL, origin: AbilityStore.WakeOrigin,
+                            delivery: UUID) async {
         let wake = "wake-" + UUID().uuidString.lowercased()
         let taint = PeerDataTaint()
         if case .string(let agent)? = input["agent"] { taint.mark(dataRoot: dataRoot, peer: agent) }
@@ -434,6 +446,7 @@ actor EnginePartWake {
         let turn = Turn(dataRoot: dataRoot, id: wake, run: wake, session: Self.session)
             .with(\.envelope, .native(work)).with(\.verifiedSessionID, Self.session)
             .with(\.partID, file.id).with(\.peerSteering, taint)
+            .with(\.abilityRunSource, .wake(part: file.id, origin: origin, delivery: delivery))
         // Tainted signals may reach only read-only parts; effectful parts skip with a trace because a card itself is a decision.
         let readOnly: Bool
         do {
@@ -504,13 +517,14 @@ actor EnginePartWake {
         }
         let action = call["action"]?.stringValue ?? ""
         let part = action.hasPrefix("authored.") ? String(action.dropFirst(9)) : nil
-        let taint = PeerDataTaint(dataRoot: dataRoot, restoring: step.peers, elevated: step.elevated)
+        let taint = PeerDataTaint(dataRoot: dataRoot, restoring: step.peers + step.elevated)
         taint.keep(line: step.words)
         let run = "habit-" + UUID().uuidString.lowercased()
         let work = "carry." + handle
         let turn = Turn(dataRoot: dataRoot, id: run, run: run, session: Self.session)
             .with(\.envelope, .native(work)).with(\.verifiedSessionID, Self.session)
             .with(\.partID, part).with(\.peerSteering, taint)
+            .with(\.fileAccessCeiling, step.fileAccessCeiling ?? .init())
         guard await UnattendedWork.allowed(dataRoot: dataRoot) else {
             return await receipt(.object(["status": .string("refused"), "reason": .string("autonomy_off"),
                 "checker": .string("unattended_work"), "detail": .string("The habit did not run: Autonomy is off."), "effects": .string("none"),

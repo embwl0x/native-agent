@@ -1,5 +1,6 @@
 import Synchronization
 import Foundation
+import PersistenceCore
 import NativeAgentCore
 import NativeAgentShared
 
@@ -242,7 +243,6 @@ public final class ContextPreparedTurn: Sendable {
     public let lease: ContextGenerationLease
     public let generation: ContextStoredGeneration
     public let need: NeedSignal
-    /// The turn's frozen instant: memory ages read it, while selection and expiry keep `need.evaluationTime`.
     public let turnTime: Date
     public let budgetExpansion: ContextFlowBudgetExpansion?
     private let feedbackHandler: (@Sendable (
@@ -252,6 +252,8 @@ public final class ContextPreparedTurn: Sendable {
     ) async -> Void)?
     private struct Feedback {
         var deliveryRecorded = false
+        var associationPages: [String: (id: ContextAtomID, text: String)] = [:]
+        var deliveredAssociations: Set<ContextAtomID> = []
         var memoryRecordProvenance: [String]?
         var atomMemoryRecords: [ContextAtomID: String] = [:]
         var listedMemoryRecords: [ContextAtomID: String] = [:]
@@ -336,6 +338,48 @@ public final class ContextPreparedTurn: Sendable {
         }
         guard !atoms.isEmpty else { return }
         await feedbackHandler?(.correction(.contradicts), atoms, ["memory-correction:\(replacementID)"])
+    }
+
+    package func openedAssociation(_ page: ContextExpansionResult) {
+        guard !page.text.isEmpty, packet.associationPointers.contains(page.pointer) else { return }
+        feedback.withLock { state in
+            if !state.deliveredAssociations.contains(page.pointer.atomID) {
+                state.associationPages[page.receipt.id] = (page.pointer.atomID, page.text)
+            }
+        }
+    }
+
+    package func associationBodies(in messages: [LLMMessage]) -> Set<ContextAtomID> {
+        let pages = feedback.withLock { $0.associationPages }
+        guard !pages.isEmpty else { return [] }
+        var ids: Set<ContextAtomID> = []
+        func inspect(_ value: JSONValue) {
+            switch value {
+            case .object(let fields):
+                if let receipt = fields["receipt_id"]?.stringValue, let page = pages[receipt],
+                   fields["text"] == .string(page.text), fields["atom_id"] == .string(page.id.rawValue) {
+                    ids.insert(page.id)
+                } else { fields.values.forEach(inspect) }
+            case .array(let items): items.forEach(inspect)
+            default: break
+            }
+        }
+        for message in messages {
+            for case .toolResult(_, let content, false) in message.content where content.contains("receipt_id") {
+                if let value = try? JSONValue.parse(Data(content.utf8)) { inspect(value) }
+            }
+        }
+        return ids
+    }
+
+    package func recordAssociationDelivery(_ ids: Set<ContextAtomID>) async {
+        let first = feedback.withLock { state in
+            let first = ids.subtracting(state.deliveredAssociations)
+            state.deliveredAssociations.formUnion(first)
+            state.associationPages = state.associationPages.filter { !first.contains($0.value.id) }
+            return first
+        }
+        if !first.isEmpty { await feedbackHandler?(.selection, first.sorted(), [packet.receipt.id]) }
     }
 
     public func recordExpansion(atomID: ContextAtomID, receiptID: String) async {

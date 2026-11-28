@@ -3,20 +3,18 @@ import ApplicationServices
 import MacNerves
 import NativeAgentCore
 import NativeAgentShared
-import PersistenceCore
 import Synchronization
 // Blueprint: | `DesktopRouteObservation.swift` | Sendable observation owns locked wake state; AX and workspace events wake cancellable desktop waits. |
 /// Register before the first predicate read. An unavailable source reports its cause; every caller stops its observer. A desktop step's observation carries
 /// its own patience: when the condition has not come true within it, the caller reads once more and then the step ends with that one sentence, so no
 /// desktop operation (or its cleanup) can hold the desktop on silence.
 final class DesktopRouteObservation: Sendable {
-    enum Wake: String, Sendable {
-        case initialRead = "initial_read"
+    enum Wake: Sendable {
         // The AX stream includes its registration-race signal. A wake does not claim that a change notification or content change occurred.
-        case accessibility = "accessibility_subscription"
+        case accessibility
         case workspace
-        case unavailable = "observation_unavailable"
-        case expired = "patience_expired"
+        case unavailable
+        case expired
     }
     /// Seconds one observed desktop step (launch, activation, a control appearing, a panel closing) may wait before it ends its operation.
     static let stepPatience: Double = 20
@@ -44,7 +42,6 @@ final class DesktopRouteObservation: Sendable {
     private let life: TurnDeadline?
     private struct State: Sendable {
         var sourceFailure: Error?
-        var lastWake: Wake = .initialRead
         var stopped = false
         var reader: Task<Void, Never>?
         var expiry: Task<Void, Never>?
@@ -53,12 +50,11 @@ final class DesktopRouteObservation: Sendable {
     private let state: Mutex<State>
     private let workspace: Mutex<[NSObjectProtocol]>
 
-    /// `patience`: seconds this observed step may wait, capped by the operation's own deadline; nil only for reply watches, which Stop ends.
-    init(bundleID: String, context: MacOperationContext, accessibility: Bool = true, patience: Double? = nil) async throws {
+    init(bundleID: String, context: MacOperationContext) async throws {
         try Task.checkCancellation()
         life = context.life
         var initialFailure: Error?
-        do { source = accessibility ? try await MacAppSourceEvents.open(bundleID: bundleID, context: context) : nil }
+        do { source = try await MacAppSourceEvents.open(bundleID: bundleID, context: context) }
         catch is CancellationError { throw CancellationError() }
         catch {
             source = nil
@@ -99,28 +95,17 @@ final class DesktopRouteObservation: Sendable {
             }
             state.withLock { $0.reader = reader }
         }
-        if let patience {
-            // The operation's declared wait ceiling (TaskWaitDeadline) wakes this parker; nothing resumes it otherwise, and stop cancels it.
-            let budget = context.waitBudget.capped(seconds: patience)
-            let expiry = Task { [weak self] in
-                await ScopedWaiter().park(budget: budget)
-                guard !Task.isCancelled else { return }
-                self?.state.withLock { state in
-                    if state.sourceFailure == nil { state.sourceFailure = Expired(seconds: Int(patience)) }
-                }
-                pair.continuation.yield(.expired)
+        // The operation's declared wait ceiling (TaskWaitDeadline) wakes this parker; nothing resumes it otherwise, and stop cancels it.
+        let budget = context.waitBudget.capped(seconds: Self.stepPatience)
+        let expiry = Task { [weak self] in
+            await ScopedWaiter().park(budget: budget)
+            guard !Task.isCancelled else { return }
+            self?.state.withLock { state in
+                if state.sourceFailure == nil { state.sourceFailure = Expired(seconds: Int(Self.stepPatience)) }
             }
-            state.withLock { $0.expiry = expiry }
+            pair.continuation.yield(.expired)
         }
-    }
-    func receipt(readBy: String, replyComplete: Bool = false) async -> JSONValue {
-        let (sourceFailure, lastWake) = state.withLock { ($0.sourceFailure, $0.lastWake) }
-        var fields: [String: JSONValue] = ["read_by": .string(readBy), "wake": .string(lastWake.rawValue),
-            "mode": .string(sourceFailure != nil ? "unavailable" : "source_events")]
-        if let sourceFailure { fields["reason"] = .string(sourceFailure.localizedDescription) }
-        if let source { fields["ax_watch_coverage"] = await source.readCoverage() }
-        if replyComplete { fields["completion_signal"] = .string("correlated_reply_idle") }
-        return .object(fields)
+        state.withLock { $0.expiry = expiry }
     }
     func next() async throws {
         try Task.checkCancellation()
@@ -128,7 +113,6 @@ final class DesktopRouteObservation: Sendable {
         var iterator = stream.makeAsyncIterator()
         do {
             guard let wake = try await iterator.next() else { throw CancellationError() }
-            state.withLock { $0.lastWake = wake }
             // The app's own accessibility events are life; workspace news is about any app and proves nothing of this one.
             if wake == .accessibility { life?.moved() }
         } catch is CancellationError { throw CancellationError() }

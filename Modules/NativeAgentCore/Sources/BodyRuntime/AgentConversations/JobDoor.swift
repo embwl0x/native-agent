@@ -21,14 +21,16 @@ public enum JobDoors {
     }
 
     /// A command-line organ works in the job's folder; a job with no place works in its contact's own folder, where it may not write.
-    static func folder(_ job: JobStart, host: String, dataRoot: URL) throws -> URL {
-        if let folder = job.folder { return folder }
-        let own = job.contact.hostWorkspace.map { URL(fileURLWithPath: $0, isDirectory: true) }
+    static func folder(_ job: JobStart, host: String, dataRoot: URL) async throws -> URL {
+        let own = job.folder ?? job.contact.hostWorkspace.map { URL(fileURLWithPath: $0, isDirectory: true) }
             ?? AgentHostConnection.builderWorkspaceRoot(dataRoot: dataRoot).appendingPathComponent("agent-bridge-runs/" + host, isDirectory: true)
-        do { try FileManager.default.createDirectory(at: own, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]) }
-        catch { throw JobRefusal("\(job.contact.name)'s own folder \(own.path) could not be made: \(error.localizedDescription). Nothing ran.") }
-        _ = try AgentJobs.place(.string(own.path), dataRoot: dataRoot).get()
-        return own
+        if job.folder == nil {
+            do { try FileManager.default.createDirectory(at: own, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]) }
+            catch { throw JobRefusal("\(job.contact.name)'s own folder \(own.path) could not be made: \(error.localizedDescription). Nothing ran.") }
+        }
+        let checked = await AgentJobs.place(.string(own.path), dataRoot: dataRoot)
+        guard let place = try checked.get() else { throw JobRefusal("No job folder was checked. Nothing ran.") }
+        return URL(fileURLWithPath: place.path, isDirectory: true)
     }
 
     /// What a door says to an organ whose run this app lost when it restarted; the organ continues its own session from there.

@@ -66,11 +66,11 @@ public enum MacControlGate {
     public static func continuationCaptureRefusal(dataRoot: URL) async -> String? {
         do {
             let snapshot = try await SwiftNativeTrustCenter(dataRoot: dataRoot).loadAuthorizationSnapshotChecked()
-            let authority = SwiftNativeSecurityCenter.fullMacYoloAuthority(surface: "chat", originTrusted: true, snapshot: snapshot)
+            let authority = SwiftNativeSecurityCenter.fullMacYoloAuthority(snapshot: snapshot)
             let policy = policyForAdmittedFullMac(
                 MacControlPolicy.fromTrustPolicyObject(snapshot.policy, dataRoot: dataRoot), admitted: authority.state == .admitted)
-            guard PermissionLaw.posture(snapshot.policy) == .fullMac,
-                  gate(policy, category: "accessibility", trigger: "user").allowed else {
+            // Admitted, never merely saved: Pause everything refuses the capture even while Full Mac stays the saved posture.
+            guard policy.fullMacAdmitted, gate(policy, category: "accessibility", trigger: "user").allowed else {
                 return "accessibility_read_not_authorized"
             }
             return nil

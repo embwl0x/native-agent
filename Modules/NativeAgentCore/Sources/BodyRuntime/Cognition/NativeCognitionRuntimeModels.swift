@@ -22,8 +22,6 @@ public struct CognitiveObservatoryDetail: Sendable {
     public var organism: OrganismSnapshot
     public var capsulePreview: CognitiveCapsule?
     public var capsulePreviewInfo: CapsulePreviewInfo?
-    /// Absent or nondominant cognition has no fingerprint aboutness.
-    public var feltMode: CognitiveSubstrate.FeltMode?
 }
 
 /// Doctor reads mounted state without mutation or an Observatory refresh.
@@ -36,7 +34,6 @@ public struct CognitiveDoctorRead: Sendable {
     public let associationMissingEndpointCount: Int
     public let receiptRead: CognitiveReceiptRead
     public let organism: OrganismSnapshot
-    public let capsulePreviewInfo: CapsulePreviewInfo?
 }
 
 /// Distinguish the last delivered capsule from a cold synthetic inspection so Observatory can label its actual provenance.
@@ -44,7 +41,6 @@ public struct CapsulePreviewInfo: Sendable {
     public enum Source: Sendable { case liveInjected, synthetic }
     public var source: Source
     public var userMessage: String?
-    public var at: Date?
 }
 
 public struct CognitiveBridgeCapsuleSummary: Sendable {
@@ -57,13 +53,9 @@ public struct CognitiveBridgeCapsuleSummary: Sendable {
 }
 
 public struct NativeCognitionRuntimeChange: Sendable, Equatable {
-    public let revision: UInt64
-    public let occurredAt: Date
     public let reason: String
 
-    public init(revision: UInt64, occurredAt: Date, reason: String) {
-        self.revision = revision
-        self.occurredAt = occurredAt
+    public init(reason: String) {
         self.reason = reason
     }
 }
@@ -79,7 +71,6 @@ public struct NativeSubconsciousRuntimeState: Sendable, Equatable {
 
 public struct NativeReflectionRouteStatus: Sendable, Equatable {
     public let model: String
-    public let providerID: String
     public let providerReady: Bool
     public let modelKnown: Bool?
     public let detail: String
@@ -167,7 +158,7 @@ public struct CognitiveMicrocycleTelemetry: Sendable, Equatable {
 
 extension CognitiveAffectState {
     public var observatoryValuesAreValid: Bool {
-        [arousal, uncertainty, taskPressure, socialWarmth].allSatisfy {
+        (-1...1).contains(socialWarmth) && [arousal, uncertainty, taskPressure].allSatisfy {
             $0.isFinite && (0...1).contains($0)
         }
     }
@@ -182,8 +173,7 @@ extension OrganismSnapshot {
     }
 
     public var observatoryValuesAreValid: Bool {
-        [
-            chemicalState.warmth,
+        (-1...1).contains(chemicalState.warmth) && [
             chemicalState.vigilance,
             chemicalState.coherence,
             chemicalState.confidence,

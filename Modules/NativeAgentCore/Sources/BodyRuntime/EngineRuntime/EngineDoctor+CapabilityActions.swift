@@ -34,9 +34,7 @@ extension DoctorFacade {
             let export = support
                 ? try await ProductionExport.createSupportBundle(dataRoot: root, runProcess: runProcess,
                     diagnostics: { @Sendable in diagnostics }, health: { @Sendable in health })
-                : try await ProductionExport.createArchive(dataRoot: root, runProcess: runProcess) {
-                    @Sendable in try await DoctorReadout.getProductionHardening(dataRoot: root)
-                }
+                : try await ProductionExport.createArchive(dataRoot: root, runProcess: runProcess)
             let verification = try await export.verifyRegistry(dataRoot: root)
             if let failure = verification.failure {
                 throw PartCallError(code: "export_unverified", message: "The export was created but could not be verified: " + failure)
@@ -44,6 +42,9 @@ extension DoctorFacade {
             await recordProductionExports(verification.records)
             await settle { await self.finishProductionExport() }
             return export
+        } catch let stopped where stopped is CancellationError || stopped is ProcessRunCancellation {
+            await settle { await self.finishProductionExport() }
+            throw stopped
         } catch {
             productionExportFailure = (support, error.localizedDescription)
             await settle { await self.finishProductionExport() }

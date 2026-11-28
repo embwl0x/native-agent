@@ -87,9 +87,9 @@ iPhone and iPad updates are delivered by the App Store or TestFlight.
 
 - Keep NativeAgent running on the Mac.
 - Confirm iCloud is available on both devices.
-- Pull to refresh, or use **More → Settings → Check for Mac updates** when the
+- Pull to refresh, or use **Control → Check for Mac updates** when the
   iCloud connection is available. Otherwise follow **Connection setup help**.
-- For recovery, open **More → Settings → Connection → Repair connection**.
+- For recovery, open **Control → Connection → Repair connection**.
   This reconciles pending actions, removes the phone's local pairing key,
   clears connection delivery history, and opens pairing setup. It does not
   erase conversations or Mac data. Depending on connection state, **Pair with Mac**,
@@ -109,7 +109,7 @@ is still pending.
 - Confirm pairing is active and the Mac reports the phone as reachable.
 - Check Focus, notification summary, lock-screen preview, and time-sensitive
   notification settings.
-- **More → Settings → Recent pushes** shows the phone's recent push receipts.
+- **Control → Advanced → Power user → Diagnostics → Recent pushes** shows the phone's recent push receipts.
 - A push is only a wake/delivery signal; durable iCloud state still needs to
   reach the phone.
 

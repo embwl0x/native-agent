@@ -38,32 +38,17 @@ extension SwiftNativeMacControl {
     }
     /// Wait for the focused editor, not merely AXFocused on its outer control. Also serves as the acknowledgement for select-all and text delivery.
     func waitForTextInput(
-        pid: Int32, target: MacAXActTarget? = nil, clickPoint: CGPoint? = nil,
+        pid: Int32, target: MacAXActTarget? = nil,
         selectedAll: Bool = false, value: String? = nil,
         changedFrom before: MacAXTextInput? = nil,
         signals: MacWaitSignals, context: MacOperationContext
     ) async -> MacAXTextInput? {
-        func containsClick(_ element: MacAXActTarget, point: CGPoint) -> Bool {
-            guard let frame = element.frame, frame.w > 0, frame.h > 0 else { return false }
-            return CGRect(x: frame.x, y: frame.y, width: frame.w, height: frame.h).contains(point)
-        }
-        func matchesClick(_ focused: MacAXActTarget) -> Bool {
-            guard let clickPoint, let target else { return true }
-            if MacActClosedLoop.canType(role: target.role)
-                || ["AXStaticText", "AXText"].contains(target.role) { return true }
-            // A compact control can own an editor; a broad container cannot vouch for focus elsewhere inside it merely through ancestry.
-            if ["AXButton", "AXPopUpButton", "AXMenuButton"].contains(target.role),
-               let frame = target.frame, frame.w <= 320, frame.h <= 80,
-               containsClick(target, point: clickPoint) { return true }
-            return containsClick(focused, point: clickPoint)
-        }
         var observed: MacAXTextInput?
         let end = await macSettle("text_input", signals: signals, patience: 0.75) {
             guard !Task.isCancelled,
                   accessibilitySource(context: context).frontmostApp()?.processIdentifier == pid else { return false }
             if let focused = accessibilityActSource(context: context).focusedElement(pid: pid, context: context),
                target.map({ accessibilityActSource(context: context).matchesTextInputTarget(focused, target: $0, context: context) }) ?? true,
-               matchesClick(focused),
                let input = accessibilityActSource(context: context).textInput(focused, context: context),
                !selectedAll || input.selection == NSRange(location: 0, length: input.value.utf16.count),
                value == nil || input.value == value,
@@ -662,6 +647,8 @@ extension SwiftNativeMacControl {
                     } catch { return stopped(cancelled()) }
                     if let refusal = await attentionActionRefusal(action: action, body: body, turn: turn, context: context) { return stopped(refusal) }
                 }
+            } catch is CancellationError {
+                return stopped(cancelled())
             } catch {
                 // The sink records the post before restoring the windows, which can fail after input has left the hand.
                 if (context.driver?.inputCount ?? 0) > postedBefore { recordPost(step) }

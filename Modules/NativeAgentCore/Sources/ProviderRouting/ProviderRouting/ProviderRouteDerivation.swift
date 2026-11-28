@@ -71,9 +71,9 @@ extension SwiftNativeProviderRouting {
         }
         // Interpret saved picks without rewriting their authority.
         let accountCatalogs = CodexAccountModelCatalog.chatGPTOAuthCatalogs(dataRoot: dataRoot, preview: preview)
-        let openRouterCatalog = OpenRouterModelCatalog.readCache(dataRoot: dataRoot)
+        let openRouterCatalog = OpenRouterModelCatalog.cache.currentModels(dataRoot: dataRoot)
         var cachedModelIDs = accountCatalogs.mapValues { Set($0.map { $0.id.lowercased() }) }
-        if let moonshotModels = MoonshotModelCatalog.readCache(dataRoot: dataRoot) {
+        if let moonshotModels = MoonshotModelCatalog.cache.currentModels(dataRoot: dataRoot) {
             cachedModelIDs["moonshot"] = Set(moonshotModels.map { $0.id.lowercased() })
         }
         // A live route retires a pick only when no spelling of it is in its provider's complete list for this credential (`routeCarries`); its
@@ -177,7 +177,7 @@ extension SwiftNativeProviderRouting {
                 ? nil
                 : chatRoute.flatMap { defaultModelForProvider($0, offered: offeredModels[$0] ?? [], savedDefaults: savedDefaults) })
             ?? ""
-        let chatModel = Self.normalizeModelIdStatic(chatModelRaw, fallback: "")
+        let chatModel = Self.normalizeModelIdStatic(chatModelRaw)
         let chatEffortRaw = Self.stringFrom(surfaceEfforts, key: "chat")
             ?? (chatRoute == "openrouter" ? openRouterCatalog?.first { $0.id == chatModel }?.default_reasoning_effort : nil)
             ?? accountCatalogs[chatRoute ?? ""]?.first { $0.id == chatModel }?.defaultReasoningEffort
@@ -185,8 +185,8 @@ extension SwiftNativeProviderRouting {
             ?? chatRoute.flatMap { FirstPartyModelCatalog.descriptor(for: chatModel, providerID: $0, dataRoot: dataRoot)?.defaultReasoningEffort }
             ?? ""
         // Validate after group inheritance, so a failed Chat route cannot prevent an independent Work or Memory route from being resolved.
-        let chatEffort = chatEffortRaw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let chatServiceTier = Self.normalizeServiceTierStatic(
+        let chatEffort = TextNormalization.trimmedLowercased(chatEffortRaw)
+        let chatServiceTier = TextNormalization.trimmedLowercased(
             Self.stringFrom(surfaceServiceTiers, key: "chat") ?? "default"
         )
         let chatTuple = CanonicalTuple(
@@ -209,15 +209,13 @@ extension SwiftNativeProviderRouting {
             let provider = routes[surface] ?? chatRoute
             let model = Self.normalizeModelIdStatic(
                 saved ?? (routes[surface] == nil ? chatModel : provider.flatMap { defaultModelForProvider($0, offered: offeredModels[$0] ?? [],
-                    savedDefaults: savedDefaults) } ?? ""),
-                fallback: ""
+                    savedDefaults: savedDefaults) } ?? "")
             )
             // Keep a provider-only assignment even without a default: it needs a model selection, rather than silently inheriting Chat's account.
             return CanonicalTuple(
                 model: model,
-                effort: (Self.stringFrom(efforts, key: surface) ?? chatEffort)
-                    .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-                serviceTier: Self.normalizeServiceTierStatic(
+                effort: TextNormalization.trimmedLowercased(Self.stringFrom(efforts, key: surface) ?? chatEffort),
+                serviceTier: TextNormalization.trimmedLowercased(
                     Self.stringFrom(tiers, key: surface) ?? chatServiceTier
                 ),
                 provider: provider
@@ -295,8 +293,7 @@ extension SwiftNativeProviderRouting {
                 ? (unusableBlocksFallback
                     ? ""
                     : Self.normalizeModelIdStatic(
-                        route.flatMap { defaultModelForProvider($0, offered: offeredModels[$0] ?? [], savedDefaults: savedDefaults) } ?? "",
-                        fallback: ""
+                        route.flatMap { defaultModelForProvider($0, offered: offeredModels[$0] ?? [], savedDefaults: savedDefaults) } ?? ""
                     ))
                 : canonical.model
             // Refuse a model/account mismatch explicitly without substituting a model.
@@ -361,16 +358,11 @@ extension SwiftNativeProviderRouting {
             revision: revision
         )
     }
-    /// Unknown model surfaces must fail admission.
-    public func modelForSurface(_ surface: String) async throws -> SurfacePreference {
-        let surface = canonicalRoutingSurface(surface)
-        guard MODEL_SURFACES.contains(surface) else {
-            throw ProviderRoutingError.invalidRequest
-        }
+    public func modelForSurface() async throws -> SurfacePreference {
         let prefs = try await computeModelPreferences()
         // The complete surface inventory makes this lookup total.
-        guard let preference = prefs[surface] else {
-            throw ProviderRoutingError.configurationFailed("No resolved model preference for \(surface).")
+        guard let preference = prefs["chat"] else {
+            throw ProviderRoutingError.configurationFailed("No resolved model preference for chat.")
         }
         return preference
     }
@@ -383,11 +375,11 @@ extension SwiftNativeProviderRouting {
         Self.inferredProviderID(forModel: modelId, dataRoot: dataRoot)
     }
     /// Use the admitted route's catalog without rereading selection; retain discovery failure when no model row exists.
-    public func catalogContextLength(forModel modelID: String, providerID: String, preview: Bool = false) async
+    public func catalogContextLength(forModel modelID: String, providerID: String) async
         -> (contextLength: Int?, catalogFailure: String?) {
         let openRouter = providerID == "openrouter"
             ? await OpenRouterModelCatalog.modelsWithFreshness(dataRoot: dataRoot) : nil
-        let catalog = catalogRows(providerID, openRouterModels: openRouter?.models, preview: preview)
+        let catalog = catalogRows(providerID, openRouterModels: openRouter?.models)
         // The one "which row is this model" answer: a live route's listed spelling of the same model.
         let listed = FirstPartyModelCatalog.listedSpelling(modelID, providerID: providerID, dataRoot: dataRoot) ?? modelID
         let length = Self.contextLength(of: listed, in: catalog.rows)
@@ -404,8 +396,8 @@ extension SwiftNativeProviderRouting {
         }
         if let fault { return ([], fault) }
         let openRouter = providerID == "openrouter"
-            ? openRouterModels ?? OpenRouterModelCatalog.readCache(dataRoot: dataRoot) : nil
-        let moonshot = providerID == "moonshot" ? MoonshotModelCatalog.readCache(dataRoot: dataRoot) : nil
+            ? openRouterModels ?? OpenRouterModelCatalog.cache.currentModels(dataRoot: dataRoot) : nil
+        let moonshot = providerID == "moonshot" ? MoonshotModelCatalog.cache.currentModels(dataRoot: dataRoot) : nil
         return (modelsForProvider(providerID, openRouterModels: openRouter?.map { $0.providerJSON() },
                                   moonshotModels: moonshot?.map { $0.providerJSON() }, preview: preview), nil)
     }

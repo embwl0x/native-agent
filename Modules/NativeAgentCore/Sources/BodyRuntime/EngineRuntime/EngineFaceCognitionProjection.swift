@@ -57,14 +57,14 @@ public enum EngineFaceCognitionProjection {
         ])
         let timeline = PartFace.Section(id: "timeline", title: "Timeline", style: .timeline, rows: detail.developmentalTimeline.map { event in
             PartFace.Row(id: event.id.uuidString, title: safe(event.title), detail: safe(event.summary),
-                value: Self.kindWords(event.kind), at: ISO8601DateFormatter().string(from: event.occurredAt))
+                value: Self.kindWords(event.kind), at: NativeTimestampFormat.plainZulu(event.occurredAt))
         }, folded: true)
         let reflections = PartFace.Section(id: "reflections", title: "Reflections", style: .timeline, rows: detail.reflections.map { reflection in
             PartFace.Row(id: reflection.id.uuidString, title: safe(reflection.resultSummary),
                 detail: safe(reflection.request.reason),
                 value: reflection.careIntegrationPending == true || reflection.dispositionSaveFailed || reflection.journalPending == true
                     ? "Unfinished" : (reflection.cancelled ? "Cancelled" : "Recorded"),
-                at: ISO8601DateFormatter().string(from: reflection.createdAt))
+                at: NativeTimestampFormat.plainZulu(reflection.createdAt))
         }, folded: true)
         var sections = [PartFace(sections: [overview, workspace, associations, capacities, feeling, timeline, reflections])]
         let growth = detail.growthWeek.projection

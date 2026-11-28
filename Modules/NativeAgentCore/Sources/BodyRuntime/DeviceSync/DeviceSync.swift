@@ -129,7 +129,3 @@ actor DeviceSyncStorage {
 
     func perform<T: Sendable>(_ work: @Sendable () throws -> T) rethrows -> T { try work() }
 }
-
-extension DeviceSync {
-    struct InboxDidProcess: BodySignal {}
-}

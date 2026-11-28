@@ -46,7 +46,7 @@ struct ShellRoomHeader: View {
                 Group {
                     if status.opensTrust {
                         Button {
-                            NotificationCenter.default.post(OpenCommandRouteRequest(route: "trust"))
+                            SettingsLink.open(.trust)
                         } label: {
                             statusLabel.contentShape(Rectangle())
                         }

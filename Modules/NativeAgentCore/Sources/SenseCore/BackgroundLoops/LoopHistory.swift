@@ -42,9 +42,8 @@ extension SwiftNativeLoopScheduler {
 
     /// Retain surviving history and an explicit fault on damaged entries so startup proceeds without hiding corruption.
     package static func readLoopState(
-        _ path: URL?
+        _ path: URL
     ) async -> PersistedLoopState {
-        guard let path else { return ([:], [:], [:], nil) }
         let value: JSONValue
         do {
             value = try await SwiftNativePersistenceCore.readJSON(path, ifMissing: .object([:]))
@@ -96,8 +95,7 @@ extension SwiftNativeLoopScheduler {
 
     /// Keep history after unregister so hot replacement cannot reset a long-period loop’s due clock.
     internal func flushLoopState() async {
-        guard let loopStatePath else { return }
-        lastDurableFlushAt = clock()
+        lastDurableFlushAt = Date()
         let snapshot = JSONValue.object([
             "version": .string("1"),
             "loops": .object(persistedLastRun.mapValues { .string(NativeTimestampFormat.plainZulu($0)) }),
@@ -131,7 +129,7 @@ extension SwiftNativeLoopScheduler {
     /// Checkpoint sub-minute liveness on existing ticks; persist slow work immediately and flush stop without an extra wakeup.
     internal func recordDurableRun(loopId: String, at date: Date) async {
         persistedLastRun[loopId] = date
-        await flushLoopState(cadence: loops[loopId]?.loop.wake.period, at: clock())
+        await flushLoopState(cadence: loops[loopId]?.loop.wake.period, at: Date())
     }
 
     private func flushLoopState(cadence: TimeInterval?, at date: Date) async {
@@ -143,7 +141,7 @@ extension SwiftNativeLoopScheduler {
         await flushLoopState()
     }
 
-    /// Every beat feeds live liveness; only a changed outcome, note, yield or cadence belongs in the durable record.
+    /// Every beat feeds live liveness; a changed outcome, note, yield or cadence belongs in the durable record, and an unchanged one is restated hourly so a relaunch reads when it last worked.
     func recordPulse(_ pulse: OrganPulse) async {
         do {
             var row: [String: JSONValue] = ["outcome": .string(pulse.outcome.rawValue), "note": .string(pulse.note)]
@@ -167,7 +165,8 @@ extension SwiftNativeLoopScheduler {
                         do {
                             try await ExperienceStore.at(dataRoot).note(detail, unless: { existing in
                                 guard let latest = existing.last(where: { $0.kind == "beat" }) else { return false }
-                                return try JSONValue.parse(latest.row) == JSONValue.parse(detail.row)
+                                let since = detail.at.timeIntervalSince(latest.at)
+                                return try (0..<3_600).contains(since) && JSONValue.parse(latest.row) == JSONValue.parse(detail.row)
                             })
                         } catch {
                             nativeLog("BackgroundLoops: organ beat could not be recorded: %@", error.localizedDescription)
@@ -210,7 +209,7 @@ extension SwiftNativeLoopScheduler {
                 beatReading.loaded = true
             }
         }
-        let cutoff = clock().addingTimeInterval(-ExperienceStore.detailHorizon)
+        let cutoff = Date().addingTimeInterval(-ExperienceStore.detailHorizon)
         beatReading.rings = beatReading.rings.mapValues { $0.filter { $0.at >= cutoff } }
         beatReading.unreadable = beatReading.unreadable.filter { $0.value.at >= cutoff }
         let reading = beatReading

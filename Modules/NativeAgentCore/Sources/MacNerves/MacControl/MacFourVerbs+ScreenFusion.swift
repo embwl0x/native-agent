@@ -96,11 +96,7 @@ extension MacFourVerbs {
                 try await host.dispatch(action: "look", body: body, turn: turn, context: context)
             }
         } catch {
-            return .done(.blind(MacFourVerbsReply(
-                ok: false,
-                text: "I can't see the screen right now: \(error).",
-                detail: ["error": .string("\(error)")]
-            )))
+            return .done(.blind(Self.unknownActionReply(error, operation: "the look", app: app, readOnly: true)))
         }
         let output = Self.object(result.output)
         if result.ok, output["status"] == .string("ok"),
@@ -131,7 +127,8 @@ extension MacFourVerbs {
                     : Self.lookRefusalWords(result.error ?? Self.string(output["status"]) ?? "unknown"))
             return .done(.blind(MacFourVerbsReply(
                 ok: false,
-                text: Self.runningAppsLine(output) + "I can't see the screen right now. " + why,
+                // Her own window is never hers to look at; "right now" would promise a later that does not come.
+                text: Self.runningAppsLine(output) + (result.error == "self_inspection_refused" ? "" : "I can't see the screen right now. ") + why,
                 // Keep refusal wording unwrapped so callers can supply their own lead without parsing prose.
                 detail: Self.operationDetail(result).merging([
                     "error": .string(result.error ?? "look_failed"),

@@ -24,40 +24,6 @@ enum BackupCreationOutcome {
 extension AppModel {
 
     @MainActor
-    func saveMemoryPolicy(crossSessionRecall: Bool) async {
-        do {
-            let savedPolicy = try await TrustPolicyActions(dataRoot: engine.dataRoot).saveMemoryPolicy(
-                crossSessionRecall: crossSessionRecall
-            )
-            applySavedTrustPolicy(savedPolicy, status: "Memory policy saved")
-        } catch {
-            recordTrustActionFailure(UserFacingError.message(error, action: "save the memory policy"), cause: error)
-            systemToasts.push(error: "That memory setting could not be saved.")
-        }
-    }
-
-    @MainActor
-    @discardableResult
-    func patchMemoryPolicy(
-        knowledgeGraphEnabled: Bool? = nil,
-        adaptivePromotion: Bool? = nil
-    ) async -> Bool {
-        do {
-            let savedPolicy = try await TrustPolicyActions(dataRoot: engine.dataRoot).patchMemoryPolicy(
-                knowledgeGraphEnabled: knowledgeGraphEnabled,
-                adaptivePromotion: adaptivePromotion
-            )
-            applySavedTrustPolicy(savedPolicy, status: "Memory policy saved")
-            return true
-        } catch {
-            recordTrustActionFailure(UserFacingError.message(error, action: "save the memory policy"), cause: error)
-            systemToasts.push(error: "That memory setting could not be saved.")
-            return false
-        }
-    }
-
-
-    @MainActor
     func saveChromeControlEnabled(_ enabled: Bool) async {
         do {
             let savedPolicy = try await TrustPolicyActions(dataRoot: engine.dataRoot).saveChromeControlEnabled(enabled)
@@ -193,7 +159,7 @@ extension AppModel {
             envelope: TurnEnvelope.personOnMac("mac_ui:mac_control.notify", surface: "native_actions")).turn(dataRoot: engine.dataRoot)
         return try await engine.trust.notify(
             title: title, message: message,
-            notificationCenterAdapter: MacNotificationPosting(turn: turn, deadline: nil), turn: turn
+            notificationCenterAdapter: MacNotificationPosting(turn: turn), turn: turn
         )
     }
 

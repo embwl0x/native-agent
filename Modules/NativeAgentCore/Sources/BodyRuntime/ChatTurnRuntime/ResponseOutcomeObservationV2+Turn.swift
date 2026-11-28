@@ -87,8 +87,7 @@ extension ResponseOutcomeObservationV2 {
             turnElapsedMs: result.map { min(24 * 60 * 60 * 1_000, max(0, $0.elapsedMs)) },
             tools: toolReferences,
             motorActions: motorReferences,
-            dimensionStates: states,
-            interventionAssignment: nil
+            dimensionStates: states
         )
     }
 

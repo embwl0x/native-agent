@@ -7,6 +7,107 @@ import NativeAgentShared
 /// Desk steps carry readiness so waiting on the person or a card does not nag the agent.
 public enum MyQueue {
     public static let project = "my queue"
+    private static let causalMoment = "queue-cause:"
+
+    package static func isCausalMoment(_ happening: Happening?) -> Bool {
+        guard let happening else { return false }
+        return happening.kind == .moment && happening.once.hasPrefix(causalMoment)
+    }
+
+    package static func causalPrefix(_ handle: String, _ wait: DeskStep.CausalWait) -> String {
+        causalMoment + handle + ":" + SHA256Hex.of(utf8: wait.since) + ":"
+    }
+
+    package static func causalEntry(_ item: DeskItem) -> Entry? {
+        guard !item.status.isTerminal,
+              let step = item.step, step.causalWait != nil, step.status != "stopped",
+              item.isPursuit || entry(item) != nil else { return nil }
+        return Entry(item: item, step: step)
+    }
+
+    package static func deskResult(_ item: DeskItem) throws -> String {
+        if item.status.isTerminal { return deskTerminalResult(item.status.rawValue) }
+        var fields = JSONValue.objectOrEmpty(item.toJSON())
+        for key in ["updatedAt", "closedAt", "workAttempts", "pursuit", "notify", "cadence", "continuation"] {
+            fields[key] = nil
+        }
+        fields["refs"] = .array(item.refs.compactMap { ref in
+            if case .step = ref.kind { return nil }
+            var value = JSONValue.objectOrEmpty(ref.toJSON())
+            value["refId"] = nil
+            return .object(value)
+        })
+        fields["step"] = item.step.map { step in
+            var value = step.fields
+            value["filedAt"] = nil
+            return .object(value)
+        }
+        fields["notes"] = .array(item.notes.map { .object(["author": $0.author.map(JSONValue.string) ?? .null, "text": .string($0.text)]) })
+        return try JSONValue.object(fields).serializedSHA256()
+    }
+
+    package static func deskTerminalResult(_ status: String) -> String {
+        SHA256Hex.of(utf8: "terminal:" + status)
+    }
+
+    package static func setCausalWait(_ trigger: DeskStep.CausalWait.Trigger?, on id: String, peers: [String],
+                                      fileAccess: ICloudChatFileAccessPolicy.Ceiling, store: SwiftNativeDeskStore)
+        async throws -> (Entry, Change) {
+        try await SwiftNativePersistenceCore.withFileLock(store.opsPath) {
+            let feed = try await store.readFeedUnlocked()
+            let state = try store.inCurrentLife(SwiftNativeDeskStore.compact(base: feed.base, feed.ops))
+            func named(_ id: String) -> DeskItem? {
+                let alias = id.hasPrefix("desk.") ? String(id.dropFirst(5)) : id
+                return state.items.first { $0.handle == id || $0.alias == alias }
+            }
+            guard let item = named(id), !item.status.isTerminal,
+                  item.isPursuit || entry(item) != nil else {
+                throw ToolFailureError("Use the exact id of an open pursuit or carried step.", argumentPath: "$.id", effects: .none)
+            }
+            let previous = item.step
+            guard previous?.status != "stopped" else { throw Superseded() }
+            var step = previous ?? DeskStep(words: item.pursuit?.doneLooksLike ?? item.title, when: "own_turn", origin: "self")
+            var resolved = trigger
+            var baseline: String?
+            switch trigger {
+            case .desk(let key)?:
+                guard let target = named(key), target.handle != item.handle else {
+                    throw ToolFailureError("Name a different live Desk item by its exact id.", argumentPath: "$.wait_for.desk", effects: .none)
+                }
+                resolved = .desk(target.handle)
+                baseline = try deskResult(target)
+            default: break
+            }
+            if resolved != nil {
+                guard step.action == nil, step.say == nil, step.rhythm == nil else {
+                    throw ToolFailureError("Use a carried work step without a habit, fixed speech or repeating rhythm.", argumentPath: "$.wait_for", effects: .none)
+                }
+            }
+            if step.causalWait?.trigger == resolved, previous != nil {
+                return (Entry(item: item, step: step), .reused)
+            }
+            guard trigger != nil || previous != nil else {
+                throw ToolFailureError("This pursuit has no declared wait.", argumentPath: "$.wait_for", effects: .none)
+            }
+            if case .at(let date)? = resolved, date <= Date() {
+                throw ToolFailureError("Declare a future ISO 8601 instant.", argumentPath: "$.wait_for.at", effects: .none)
+            }
+            if let conflict = try await store.runHold(item.handle) { throw conflict }
+            let stamp = DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
+            step.causalWait = resolved.map { DeskStep.CausalWait(trigger: $0, since: stamp, baseline: baseline) }
+            if previous == nil || resolved == nil { step.filedAt = stamp }
+            step.lifeID = try DataRootLife.current(in: store.dataRoot)
+            step.peers = Array(Set(step.peers + peers)).sorted()
+            step.fileAccessCeiling = step.fileAccessCeiling.map { $0.intersecting(fileAccess) } ?? fileAccess
+            let op = DeskOp(handle: item.handle, body: .addRef(ref: DeskRef(kind: .step(step))))
+            try SwiftNativeDeskStore.validateHierarchyTransition(op, in: state)
+            try SwiftNativeDeskStore.validatePursuitInvariants(op, in: state, viaGenericPath: false)
+            let written = try await store.commitUnlocked([op], feed: feed)
+            guard let saved = written.state.items.first(where: { $0.handle == item.handle }),
+                  let savedStep = saved.step else { throw Superseded() }
+            return (Entry(item: saved, step: savedStep), .updated)
+        }
+    }
 
     /// The agent carries queue intentions and work assigned to her; pursuits have their own admission.
     public static func carries(_ item: DeskItem) -> Bool {
@@ -51,12 +152,15 @@ public enum MyQueue {
         // Said as the Desk says it: what is waited for may be a person or an event in her words, so no kind is claimed for it.
         if let waiting = entry.item.waitingOn { waits.append("waiting on " + waiting) }
         if entry.step.status == "stopped" { waits.append("stopped; reconcile before acting") }
-        if when(entry) == nil { waits.append("condition unavailable; repair " + entry.step.when) }
-        return .object([
+        if let wait = entry.step.causalWait { waits.append("waiting for " + wait.trigger.words) }
+        else if when(entry) == nil { waits.append("condition unavailable; repair " + entry.step.when) }
+        var fields: [String: JSONValue] = [
             "name": .string(entry.name), "words": .string(entry.step.words),
             "filed_at": .string(entry.step.filedAt ?? entry.item.openedAt),
             "when": .string(entry.step.when), "waits_on": .array(waits.map(JSONValue.string)),
-        ])
+        ]
+        if let wait = entry.step.causalWait { fields["wait_for"] = wait.trigger.json }
+        return .object(fields)
     }
 
     // MARK: - When
@@ -239,6 +343,7 @@ public enum MyQueue {
     }
 
     public static func when(_ entry: Entry) -> When? {
+        guard entry.step.causalWait == nil else { return nil }
         guard !entry.step.when.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         return When(entry.step.when, card: entry.step.card)
     }
@@ -316,6 +421,7 @@ public enum MyQueue {
     }
 
     public static func readiness(_ entry: Entry, _ context: Context) -> Readiness {
+        if entry.step.causalWait != nil { return .waiting }
         guard when(entry) != nil else {
             return .unavailable("The saved condition '\(entry.step.when)' is unavailable. Repair this step's condition before continuing it.")
         }
@@ -429,6 +535,7 @@ public enum MyQueue {
             let current = try await store.liveState().items.filter(carries)
             var results: [Result<PromiseLanding, Error>] = []
             for filing in filings {
+                guard !Task.isCancelled else { break }
                 do {
                     let landing: PromiseLanding
                     if let target = filing.target {
@@ -457,6 +564,8 @@ public enum MyQueue {
                         landing = PromiseLanding(id: queued.entry.name, change: queued.change)
                     }
                     results.append(.success(landing))
+                } catch is CancellationError {
+                    break
                 } catch { results.append(.failure(error)) }
             }
             return results

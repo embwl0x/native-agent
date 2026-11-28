@@ -25,7 +25,6 @@ public enum ProviderModelChoice {
         reasoningEffort: String?,
         accountModels: [CodexAccountModelCatalog.Model]? = nil,
         moonshotModels: [ProviderModelInfo]? = nil,
-        openRouterModels: [ProviderModelInfo]? = nil,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> String? {
         let route = provider?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -33,31 +32,17 @@ public enum ProviderModelChoice {
         let effort = reasoningEffort?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         guard !route.isEmpty else { return "Choose the account this runs on." }
         guard !id.isEmpty else { return "Choose a model on that account." }
-        if ProviderFamilyIdentity.normalize(route) == "openrouter" {
-            guard let row = openRouterModels?.first(where: { $0.id.caseInsensitiveCompare(id) == .orderedSame }),
-                  let supported = row.supported_reasoning_efforts else {
-                return "OpenRouter's reasoning capabilities for \(id) are unavailable. Refresh its model catalog in Providers before choosing a Think level."
-            }
-            if supported.isEmpty {
-                return effort.isEmpty || effort == "default" ? nil
-                    : "\(id) has no Think selector. Choose provider default in Providers."
-            }
-            return supported.contains(effort) ? nil
-                : "\(id) does not support Think \(effort); it supports " + supported.joined(separator: ", ") + "."
-        }
         guard !effort.isEmpty else { return "Choose a Think level for that model." }
         guard REASONING_EFFORT_OPTIONS.contains(effort) else {
             return "\(effort) is not a Think level."
         }
         let moonshot = ProviderFamilyIdentity.normalize(route) == "moonshot" ? moonshotModels : nil
-        let openRouter = ProviderFamilyIdentity.normalize(route) == "openrouter" ? openRouterModels : nil
         guard moonshot.map({ $0.contains { $0.id.lowercased() == id.lowercased() } })
             ?? accountModels.map({ $0.contains { $0.id.lowercased() == id.lowercased() } })
             ?? FirstPartyModelCatalog.routeCarries(id, providerID: route, dataRoot: dataRoot) else {
             return "\(route) does not serve \(id). Pick a model that account offers."
         }
-        guard let supported = openRouter?.first(where: { $0.id == id })?.supported_reasoning_efforts
-            ?? moonshot.flatMap({ _ in MoonshotModelCatalog.supportedReasoningEfforts(for: id) })
+        guard let supported = moonshot.flatMap({ _ in MoonshotModelCatalog.supportedReasoningEfforts(for: id) })
             ?? accountModels?.first(where: { $0.id.lowercased() == id.lowercased() })?.supportedReasoningEfforts
             ?? FirstPartyModelCatalog.routeSupportedEfforts(id, providerID: route, dataRoot: dataRoot), !supported.isEmpty else {
             return "Think controls for \(id) on \(route) are unknown. Refresh its model catalog in Providers."
@@ -78,38 +63,29 @@ public enum ProviderModelChoice {
 public struct Provider: Sendable, Codable, Equatable {
     public var id: String
     public var displayName: String?
-    public var kind: String?
     public var configured: Bool?
     public var active: Bool?
-    public var surface: String?
     public var modelCatalog: JSONValue?
     public var oauthStatus: JSONValue?
-    public var lastTestedAt: String?
     public var lastError: String?
     public var extras: JSONValue?
 
     public init(
         id: String,
         displayName: String? = nil,
-        kind: String? = nil,
         configured: Bool? = nil,
         active: Bool? = nil,
-        surface: String? = nil,
         modelCatalog: JSONValue? = nil,
         oauthStatus: JSONValue? = nil,
-        lastTestedAt: String? = nil,
         lastError: String? = nil,
         extras: JSONValue? = nil
     ) {
         self.id = id
         self.displayName = displayName
-        self.kind = kind
         self.configured = configured
         self.active = active
-        self.surface = surface
         self.modelCatalog = modelCatalog
         self.oauthStatus = oauthStatus
-        self.lastTestedAt = lastTestedAt
         self.lastError = lastError
         self.extras = extras
     }
@@ -117,13 +93,10 @@ public struct Provider: Sendable, Codable, Equatable {
     private static let knownKeys: Set<String> = [
         "id",
         "displayName",
-        "kind",
         "configured",
         "active",
-        "surface",
         "modelCatalog",
         "oauthStatus",
-        "lastTestedAt",
         "lastError",
         "extras",
     ]
@@ -160,14 +133,12 @@ public struct Provider: Sendable, Codable, Equatable {
         let idVal = try c.decode(String.self, forKey: JSONKey("id"))
         self.id = idVal
         self.displayName = try str("displayName")
-        self.kind = try str("kind")
         self.configured = try bool("configured")
         self.active = try bool("active")
-        self.surface = try str("surface")
         self.modelCatalog = try jv("modelCatalog")
         self.oauthStatus = try jv("oauthStatus")
-        self.lastTestedAt = try str("lastTestedAt")
         self.lastError = try str("lastError")
+        _ = try str("kind", "surface", "lastTestedAt")
 
         var unknown = c.unknownFields(excluding: Self.knownKeys)
         if let explicit = try jv("extras"), case .object(let obj) = explicit {
@@ -180,39 +151,12 @@ public struct Provider: Sendable, Codable, Equatable {
         var c = encoder.container(keyedBy: JSONKey.self)
         try c.encode(id, forKey: JSONKey("id"))
         try c.encodeIfPresent(displayName, forKey: JSONKey("displayName"))
-        try c.encodeIfPresent(kind, forKey: JSONKey("kind"))
         try c.encodeIfPresent(configured, forKey: JSONKey("configured"))
         try c.encodeIfPresent(active, forKey: JSONKey("active"))
-        try c.encodeIfPresent(surface, forKey: JSONKey("surface"))
         try c.encodeIfPresent(modelCatalog, forKey: JSONKey("modelCatalog"))
         try c.encodeIfPresent(oauthStatus, forKey: JSONKey("oauthStatus"))
-        try c.encodeIfPresent(lastTestedAt, forKey: JSONKey("lastTestedAt"))
         try c.encodeIfPresent(lastError, forKey: JSONKey("lastError"))
         try c.encodeUnknownFields(extras, excluding: Self.knownKeys)
-    }
-}
-
-// MARK: - ModelPreferences
-
-public struct ModelPreferences: Sendable, Codable, Equatable {
-    public var surfaceModels: JSONValue?
-    public var defaultModel: String?
-    public var extras: JSONValue?
-
-    public init(
-        surfaceModels: JSONValue? = nil,
-        defaultModel: String? = nil,
-        extras: JSONValue? = nil
-    ) {
-        self.surfaceModels = surfaceModels
-        self.defaultModel = defaultModel
-        self.extras = extras
-    }
-
-    enum CodingKeys: String, CodingKey {
-        case surfaceModels = "surface_models"
-        case defaultModel = "default_model"
-        case extras
     }
 }
 

@@ -1,6 +1,3 @@
-import CommonCrypto
-import CryptoKit
-import AppKit
 import Foundation
 import PersistenceCore
 import NativeAgentShared
@@ -10,6 +7,9 @@ import MacNerves
 import DeskCore
 import SenseCore
 import ProviderRouting
+import CommonCrypto
+import CryptoKit
+import AppKit
 // Blueprint: | `MacSyncEngine+SnapshotFreshness.swift` | Manifest-derived stale-page accounting and group build outcomes; cancelled reads remain unavailable |
 
 extension MacSyncEngine {

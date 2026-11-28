@@ -148,6 +148,7 @@ public final class MacChatTurnRuntime {
     @discardableResult
     public func requestStop(
         sessionId: String,
+        runID: String? = nil,
         revokeDriverControl: (@MainActor @Sendable () async -> Void)? = nil,
         didWrite: (@MainActor @Sendable (Result<Void, Error>) -> Void)? = nil
     ) -> Task<Void, Never> {
@@ -158,9 +159,14 @@ public final class MacChatTurnRuntime {
             _ = finishRuntime(sessionId: sessionId, generation: reserved)
         }
         // Stop names the runs active at the click, so a run that registers while the marker waits (a phone send) is not stopped by it.
-        let clickedRuns = NativeAgentChatSessionID.normalizedPathComponent(sessionId).map {
-            ChatCancelFlag.stopContent(forFlagAt: ChatCancelFlag.path(dataRoot: dataRoot, sessionId: $0)).split(separator: "\n").map(String.init)
-        } ?? []
+        let clickedRuns: [String]
+        if let runID {
+            clickedRuns = [runID]
+        } else {
+            clickedRuns = NativeAgentChatSessionID.normalizedPathComponent(sessionId).map {
+                ChatCancelFlag.stopContent(forFlagAt: ChatCancelFlag.path(dataRoot: dataRoot, sessionId: $0)).split(separator: "\n").map(String.init)
+            } ?? []
+        }
         let generation = (pendingStopWriteGenerations[sessionId] ?? 0) + 1
         pendingStopWriteGenerations[sessionId] = generation
         let previousWrite = pendingStopWrites[sessionId]

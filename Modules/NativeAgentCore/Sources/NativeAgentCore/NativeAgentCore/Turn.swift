@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentShared
+import Synchronization
 // Blueprint: | `Turn.swift` | `Turn`: one identity handed to everything serving it; `TurnPart` keys each owner's state |
 
 /// One turn: which act it is, which run and session are its own, and each
@@ -15,6 +16,7 @@ public struct Turn: Sendable {
     /// The resolved session; nil until one exists.
     public var session: String?
     public let dataRoot: URL
+    package let startedAt: Date
     private var parts: [ObjectIdentifier: any Sendable] = [:]
 
     public init(root: URL, id: String = Turn.mintID(), run: String = UUID().uuidString, session: String? = nil) {
@@ -22,6 +24,8 @@ public struct Turn: Sendable {
         self.id = id
         self.run = run
         self.session = session
+        self.startedAt = Date()
+        self[SeenAgentExchanges.self] = SeenAgentExchanges()
     }
 
     /// Lowercased UUID, the row-id convention every trace writer shares.
@@ -40,11 +44,10 @@ public struct Turn: Sendable {
         return turn
     }
 
-    /// A new act inside this turn (a part's thought, a helper): its own id,
-    /// this turn's run and session unless given, every part carried.
     public func derived(id: String = Turn.mintID(), run: String? = nil) -> Turn {
+        if id == self.id { return with(\.run, run ?? self.run) }
         var turn = Turn(root: dataRoot, id: id, run: run ?? self.run, session: session)
-        turn.parts = parts
+        turn.parts.merge(parts) { current, _ in current }
         return turn
     }
 }
@@ -55,6 +58,36 @@ public struct Turn: Sendable {
 public protocol TurnPart {
     associatedtype Value: Sendable
     static var unset: Value { get }
+}
+
+private final class SeenAgentExchanges: TurnPart, Sendable {
+    static let unset: SeenAgentExchanges? = nil
+    struct Evidence {
+        var seen: Set<String> = []
+        var timing: [String: Set<String>] = [:]
+    }
+    let evidence = Mutex(Evidence())
+}
+
+extension Turn {
+    package var seenAgentExchanges: Set<String> {
+        self[SeenAgentExchanges.self]?.evidence.withLock { $0.seen } ?? []
+    }
+
+    package func rememberAgentExchangeTiming(_ times: [String], ids: [String]) {
+        self[SeenAgentExchanges.self]?.evidence.withLock { evidence in
+            for (time, id) in zip(times, ids) { evidence.timing[time, default: []].insert(id) }
+        }
+    }
+
+    package func seeAgentExchanges(_ ids: [String], timing: [String]) {
+        self[SeenAgentExchanges.self]?.evidence.withLock { evidence in
+            evidence.seen.formUnion(ids)
+            for time in timing {
+                if let ids = evidence.timing[time], ids.count == 1 { evidence.seen.formUnion(ids) }
+            }
+        }
+    }
 }
 
 package enum DoorPreview: TurnPart, Sendable {

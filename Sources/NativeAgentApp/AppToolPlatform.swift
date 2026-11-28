@@ -36,10 +36,9 @@ extension AppToolExecutor {
             note, userInfo, turn in
             try await AppToolExecutor.defaultMobileNotificationSender(note, userInfo: userInfo, router: AttentionRouter.shared, turn: turn)
         },
-        macNotificationSender: @escaping @Sendable (NativeAgentNotificationDefaults.Note, Turn, ContinuousClock.Instant?) async throws
-            -> NativeAgentNotificationPostResult = { note, turn, deadline in
-            await NativeAgentNotifications.postMessage(title: note.title, subtitle: note.subtitle, body: note.message, router: .shared, turn: turn,
-                deadline: deadline)
+        macNotificationSender: @escaping @Sendable (NativeAgentNotificationDefaults.Note, Turn) async throws
+            -> NativeAgentNotificationPostResult = { note, turn in
+            await NativeAgentNotifications.postMessage(title: note.title, subtitle: note.subtitle, body: note.message, router: .shared, turn: turn)
         },
         macIntegrationPermissionStore: MacIntegrationPermissionStore = .shared,
         doctorStatusProvider: (@Sendable (_ repair: Bool?, _ checkID: String?, _ turn: Turn) async throws -> JSONValue)? = nil,

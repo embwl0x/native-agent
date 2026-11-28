@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `OrganismPrediction+Horizon.swift` | Bounded horizon registers; named identity and whole-second unnamed plans |
+// Blueprint: | `OrganismPrediction+Horizon.swift` | Dated horizons and job-backed peer waits; identity, projection and settlement |
 
 // Horizons use bounded real-store pointers and semantic-expectation rows; projected anticipation never changes stored chemistry.
 
@@ -13,48 +13,69 @@ public enum OrganismHorizonSourceKind: String, Codable, Sendable, Equatable, Cas
     case stagedApproval
     /// Only an unanswered completion may supply this expectation.
     case openQuestion
-    /// Delegated work stays open until a reply arrives.
+    /// A peer job supplies its own wait and settlement.
     case peerReply
 }
 
 /// Only an explicit horizon wire key distinguishes horizon rows from ordinary semantic expectations.
 public struct OrganismHorizonExpectation: Codable, Sendable, Equatable {
     public let sourceKind: OrganismHorizonSourceKind
-    /// Bounded subject — WHO or WHAT the agent is waiting on. Canonicalised and prefix-capped at construction; empty only for unnamed memory plans.
+    /// Bounded subject — WHO or WHAT the agent is waiting on. Empty only for unnamed memory plans.
     public let label: String
     /// The agent's guess at how it will feel: > 0 looking forward, < 0 dreading, 0 flat. A GUESS, not a measurement — it scales an undertone, never a mood.
     public let valence: Double
+    public let peerJobID: String?
 
-    public init(sourceKind: OrganismHorizonSourceKind, label: String, valence: Double) {
+    public init(sourceKind: OrganismHorizonSourceKind, label: String, valence: Double, peerJobID: String? = nil) {
+        let jobID = sourceKind == .peerReply ? peerJobID : nil
         self.sourceKind = sourceKind
-        self.label = OrganismHorizonRegister.sourceLabel(sourceKind: sourceKind, label: label)
+        self.peerJobID = jobID
+        self.label = jobID == nil ? OrganismHorizonRegister.sourceLabel(sourceKind: sourceKind, label: label)
+            : String(label.prefix(48))
         self.valence = valence.isFinite ? valence.clampedSigned() : 0
     }
 }
 
-/// Expose only the nearest payload-free horizon for felt-word attribution.
+/// Expose the leading payload-free horizon for felt-word attribution.
 public struct OrganismTowardRead: Sendable, Equatable {
     /// Bounded subject: only unnamed plan words are derived at this read's clock.
     public let label: String
     public let sourceKind: OrganismHorizonSourceKind
     /// −1 dreading · 0 flat · +1 looking forward. A SIGN, not a magnitude: the capsule picks a word, it does not render a number.
     public let valenceSign: Int
-    public let dueAt: Date
+    public let dueAt: Date?
+    public let peerStartedAt: Date?
     /// An unanswered passed horizon is waiting, never a presumed result.
     public let isOverdue: Bool
 
-    /// Canonical labels are security-bounded identifiers; display restores spaces so the capsule reads as language.
-    public var displayLabel: String { label.replacingOccurrences(of: "-", with: " ") }
+    /// Display restores spaces in canonical labels and keeps the peer's display name.
+    public var displayLabel: String { peerStartedAt != nil ? label : label.replacingOccurrences(of: "-", with: " ") }
+
+    public func peerWaitAge(at now: Date) -> String? {
+        guard let start = peerStartedAt else { return nil }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return formatter.localizedString(fromTimeInterval: min(0, start.timeIntervalSince(now)))
+    }
 }
 
 /// Keep horizon identity, wire bounds and projection rules together.
 public enum OrganismHorizonRegister {
+    public enum PeerTransition: String, Sendable {
+        case close
+        case satisfied
+        case violated
+    }
+
     /// Metadata key on the mint signal. Its value is an ARRAY of encoded source tokens (see `encodeSource`) describing the current source inventory. Inventory
     /// absence never proves an outcome.
     public static let metadataKey = "horizonExpectations"
+    public static let peerJobsKey = "horizonPeerJobs"
+    public static let maximumPeerJobs = 256
+    fileprivate static let undated = Date.distantFuture
     /// Mint and row identity share this organ prefix.
     public static let sourceOrgan = "horizon"
-    /// Cap open horizons at eight so the register stays attention, not task tracking; evict farthest to retain what is nearest.
+    /// Cap dated horizons at eight; evict farthest to retain what is nearest.
     public static let maximumOpen = 8
     /// Nothing further out than a week weighs on anyone.
     public static let maximumHorizon: TimeInterval = 7 * 24 * 60 * 60
@@ -62,7 +83,7 @@ public enum OrganismHorizonRegister {
     public static let idPrefix = "horizon"
     /// Use a resolution label distinct from prediction-kind strings so felt provenance remains explicit; care admission still applies.
     public static let resolutionPathLabel = "horizonExpectation"
-    /// Field separator for the encoded source token. Excluded from labels by `canonicalLabel`, so a label can never split a token.
+    /// Field separator for source tokens. A peer's display name is the last field.
     private static let separator: Character = "|"
 
     /// Share canonical time-word recognition with the capsule so a bare time cannot lead as a named subject.
@@ -158,6 +179,27 @@ public enum OrganismHorizonRegister {
         return (sourceKind, label, valence.clampedSigned(), Date(timeIntervalSince1970: epoch))
     }
 
+    public static func encodePeerWait(contactID: String, jobID: String, label: String, startedAt: Date, valence: Double) -> String {
+        let display = JSONValueBounding.containsSecretLikeValue(label) ? "[redacted]" : String(label.prefix(48))
+        return [contactID, jobID, String(startedAt.timeIntervalSinceReferenceDate), String(valence), display]
+            .joined(separator: String(separator))
+    }
+
+    public static func encodePeerEnd(contactID: String, jobID: String, transition: PeerTransition, endedAt: Date?) -> String {
+        [contactID, jobID, transition.rawValue, endedAt.map { String($0.timeIntervalSinceReferenceDate) } ?? ""]
+            .joined(separator: String(separator))
+    }
+
+    fileprivate static func decodePeerJob(_ raw: String) -> (id: String, jobID: String, facts: [Substring])? {
+        let parts = raw.split(separator: separator, maxSplits: 4, omittingEmptySubsequences: false)
+        guard parts.count >= 4 else { return nil }
+        let contactID = String(parts[0]), jobID = String(parts[1])
+        guard UUID(uuidString: contactID)?.uuidString.lowercased() == contactID,
+              jobID.hasPrefix("job-"), UUID(uuidString: String(jobID.dropFirst(4))) != nil else { return nil }
+        let id = "\(idPrefix):\(OrganismHorizonSourceKind.peerReply.rawValue):\(contactID):\(jobID)"
+        return (id, jobID, Array(parts.dropFirst(2)))
+    }
+
     // MARK: - Ledger reads
 
     /// Only open rows compete for the nearest horizon.
@@ -182,13 +224,18 @@ public enum OrganismHorizonRegister {
             }
     }
 
-    /// Read nearest due time with stable id ties; expose only label and valence sign. No open horizon renders silence.
+    /// The oldest peer wait leads; otherwise read nearest due time with stable id ties.
     public static func toward(
         in ledger: OrganismPredictionLedger,
         at now: Date
     ) -> OrganismTowardRead? {
+        let rows = open(in: ledger)
+        let peer = rows.filter { $0.horizon?.peerJobID != nil }.min {
+            if $0.createdAt != $1.createdAt { return $0.createdAt < $1.createdAt }
+            return $0.id < $1.id
+        }
         // Bare time words do not name a horizon; the next named horizon leads.
-        guard let row = open(in: ledger).first(where: { row in
+        guard let row = peer ?? rows.first(where: { row in
             guard let label = displayLabel(for: row, at: now) else { return false }
             return !Self.bareTimeWords.contains(label.replacingOccurrences(of: "-", with: " "))
         }), let horizon = row.horizon,
@@ -198,8 +245,9 @@ public enum OrganismHorizonRegister {
             label: label,
             sourceKind: horizon.sourceKind,
             valenceSign: sign,
-            dueAt: row.dueAt,
-            isOverdue: row.dueAt <= now
+            dueAt: peer == nil ? row.dueAt : nil,
+            peerStartedAt: peer?.createdAt,
+            isOverdue: peer == nil && row.dueAt <= now
         )
     }
 }
@@ -214,9 +262,11 @@ extension OrganismPredictiveBody {
     ) -> (ledger: OrganismPredictionLedger, chemicalState: ChemicalState) {
         var nextLedger = ledger
         applyHorizonSources(signal: signal, ledger: &nextLedger)
+        applyPeerJobs(signal: signal, ledger: &nextLedger)
         for id in nextLedger.predictions.keys.sorted() {
             guard var row = nextLedger.predictions[id],
                   row.horizon != nil,
+                  row.horizon?.peerJobID == nil,
                   row.status == .pending,
                   row.dueAt < now else { continue }
             // The shared transition never counts waiting as a miss.
@@ -229,7 +279,7 @@ extension OrganismPredictiveBody {
     }
 
     /// Prune announced terminals, then refresh or mint present sources. Missing sources retain uncertainty until their real due instant. Neither a complete
-    /// inventory nor an empty one establishes an outcome. At most eight open rows remain; overflow evicts the farthest without a verdict.
+    /// inventory nor an empty one establishes an outcome. At most eight open dated rows remain; overflow evicts the farthest without a verdict.
     private static func applyHorizonSources(
         signal: SomaticSignal,
         ledger: inout OrganismPredictionLedger
@@ -310,12 +360,60 @@ extension OrganismPredictiveBody {
             )
         }
 
-        // Enforce the cap on the complete ledger, not only new tokens; farthest eviction is neither expiry nor outcome.
-        let openRows = OrganismHorizonRegister.open(in: ledger)
+        // Enforce the dated cap across held rows and new tokens; farthest eviction is neither expiry nor outcome.
+        let openRows = OrganismHorizonRegister.open(in: ledger).filter { $0.horizon?.peerJobID == nil }
         if openRows.count > OrganismHorizonRegister.maximumOpen {
             for stale in openRows.suffix(openRows.count - OrganismHorizonRegister.maximumOpen) {
                 ledger.predictions.removeValue(forKey: stale.id)
             }
+        }
+    }
+
+    private static func applyPeerJobs(signal: SomaticSignal, ledger: inout OrganismPredictionLedger) {
+        guard let peer = signal.metadata[OrganismHorizonRegister.peerJobsKey]?.objectValue,
+              let jobs = peer["updates"]?.arrayValue, let missing = peer["missing"]?.arrayValue else { return }
+        let missingIDs = Set(missing.compactMap(\.stringValue))
+        for (id, row) in ledger.predictions where row.status == .pending {
+            if let jobID = row.horizon?.peerJobID, missingIDs.contains(jobID) {
+                ledger.predictions.removeValue(forKey: id)
+            }
+        }
+        for token in jobs {
+            guard let raw = token.stringValue, let job = OrganismHorizonRegister.decodePeerJob(raw) else { continue }
+            if job.facts.count == 2 {
+                guard var row = ledger.predictions[job.id], row.status == .pending,
+                      row.horizon?.peerJobID == job.jobID,
+                      let end = OrganismHorizonRegister.PeerTransition(rawValue: String(job.facts[0])) else { continue }
+                if end == .close {
+                    ledger.predictions.removeValue(forKey: job.id)
+                } else {
+                    row.status = end == .satisfied ? .satisfied : .violated
+                    if let ended = Double(job.facts[1]), ended.isFinite {
+                        row.lastUpdatedAt = Date(timeIntervalSinceReferenceDate: ended)
+                    } else {
+                        row.lastUpdatedAt = signal.occurredAt
+                    }
+                    ledger.predictions[job.id] = row
+                }
+                continue
+            }
+            guard ledger.predictions[job.id] == nil, job.facts.count == 3,
+                  let started = Double(job.facts[0]), started.isFinite,
+                  let valence = Double(job.facts[1]), valence.isFinite,
+                  !job.facts[2].isEmpty else { continue }
+            let horizon = OrganismHorizonExpectation(sourceKind: .peerReply, label: String(job.facts[2]),
+                                                    valence: valence, peerJobID: job.jobID)
+            ledger.predictions[job.id] = OrganismPrediction(
+                id: job.id,
+                kind: .semanticExpectation,
+                sourceOrgan: "\(OrganismHorizonRegister.sourceOrgan).\(OrganismHorizonSourceKind.peerReply.rawValue)",
+                createdAt: Date(timeIntervalSinceReferenceDate: started),
+                dueAt: OrganismHorizonRegister.undated,
+                confidence: horizonConfidence(for: horizon),
+                uncertainty: horizonUncertainty(for: horizon),
+                lastUpdatedAt: signal.occurredAt,
+                horizon: horizon
+            )
         }
     }
 

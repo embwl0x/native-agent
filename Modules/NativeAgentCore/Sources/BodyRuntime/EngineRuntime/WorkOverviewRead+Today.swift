@@ -311,7 +311,6 @@ private struct TodaySource: Sendable, Equatable {
     static func notes(_ engine: NativeAgentEngine) async -> Self {
         var source = Self()
         let now = Date(), calendar = Calendar.autoupdatingCurrent
-        func today(_ at: Date) -> Bool { calendar.isDate(at, inSameDayAs: now) }
         do {
             let forPerson = ForPerson.at(engine.dataRoot)
             let items = try await forPerson.inbox()
@@ -348,7 +347,7 @@ private struct TodaySource: Sendable, Equatable {
                     let decision = decided[item.id]
                     if decision != nil, decision?.count == nil { source.unavailable.append("Decision count unreadable: " + item.id) }
                     source.keys[key] = .object(["open": .string("card:" + item.id)])
-                    return .object(["key": .string(key), "at": .double(at.timeIntervalSince1970), "today": .bool(today(at)),
+                    return .object(["key": .string(key), "at": .double(at.timeIntervalSince1970), "today": .bool(calendar.isDate(at, inSameDayAs: now)),
                         "source": .string(item.source), "title": .string(TodayWords.withoutIDs(TodayWords.line(item.title,limit:90))),
                         "summary": .string(TodayWords.withoutIDs(TodayWords.firstSentence(item.summary))), "job": job.map(JSONValue.string) ?? .null,
                         "kind": decision.map { JSONValue.string($0.kind) } ?? .null,
@@ -433,7 +432,6 @@ private struct TodaySource: Sendable, Equatable {
     static func dream(_ engine: NativeAgentEngine) async -> Self {
         var source = Self(), unavailable = false
         let now = Date(), calendar = Calendar.autoupdatingCurrent
-        func today(_ at: Date) -> Bool { calendar.isDate(at, inSameDayAs: now) }
         do {
             let enabled = try await engine.cognitionView.dreamEnabled()
             let diary = try await engine.cognitionView.readDreamDiary(limit: 1, enabled: enabled)
@@ -447,7 +445,7 @@ private struct TodaySource: Sendable, Equatable {
                     unavailable = true
                     source.unavailable.append("Dream entry is empty.")
                 }
-                if let at = NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(entry.modifiedAt), today(at) {
+                if let at = NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(entry.modifiedAt), calendar.isDate(at, inSameDayAs: now) {
                     if let digest = TodayDreamDigest.parse(markdown) {
                         source.input["dream"] = .object(["state": .string(unavailable ? "partial" : "available"),
                             "title": .string(digest.title), "mood": .string(digest.mood), "at": .double(at.timeIntervalSince1970)])
@@ -481,14 +479,21 @@ private struct TodaySource: Sendable, Equatable {
     static func toward(_ engine: NativeAgentEngine) async -> Self {
         var source = Self()
         let now = Date(), calendar = Calendar.autoupdatingCurrent
-        func today(_ at: Date) -> Bool { calendar.isDate(at, inSameDayAs: now) }
-        if let toward = await engine.cognitionView.towardRead() {
-            let weekday=toward.dueAt.formatted(Date.FormatStyle(calendar:calendar,timeZone:calendar.timeZone).weekday(.wide))
+        let toward = await engine.cognitionView.towardRead()
+        if let toward, let startedAt = toward.peerStartedAt {
+            let start = startedAt.formatted(Date.FormatStyle(
+                date: .abbreviated, time: .shortened, calendar: calendar, timeZone: calendar.timeZone
+            ))
+            source.input["toward"] = .object(["state": .string("available"), "sourceKind": .string(toward.sourceKind.rawValue),
+                "label": .string(TodayWords.line(toward.displayLabel)), "started": .string(start),
+                "at": .double(startedAt.timeIntervalSince1970)])
+        } else if let toward, let dueAt = toward.dueAt {
+            let weekday=dueAt.formatted(Date.FormatStyle(calendar:calendar,timeZone:calendar.timeZone).weekday(.wide))
             source.input["toward"] = .object(["state": .string("available"), "sourceKind": .string(toward.sourceKind.rawValue),
                 "label": .string(TodayWords.line(toward.displayLabel)),
-                "past": .bool(toward.dueAt <= now), "hour": .int(Int64(calendar.component(.hour, from: toward.dueAt))),
-                "today": .bool(today(toward.dueAt)), "tomorrow": .bool(calendar.isDateInTomorrow(toward.dueAt)),
-                "weekday": .string(weekday), "at": .double(toward.dueAt.timeIntervalSince1970)])
+                "past": .bool(dueAt <= now), "hour": .int(Int64(calendar.component(.hour, from: dueAt))),
+                "today": .bool(calendar.isDate(dueAt, inSameDayAs: now)), "tomorrow": .bool(calendar.isDateInTomorrow(dueAt)),
+                "weekday": .string(weekday), "at": .double(dueAt.timeIntervalSince1970)])
         } else { source.input["toward"] = .object(["state":.string(engine.cognition == nil ? "unavailable" : "empty")]) }
         return source
     }

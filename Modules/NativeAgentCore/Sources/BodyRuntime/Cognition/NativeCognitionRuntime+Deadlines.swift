@@ -10,44 +10,21 @@ import ProviderRouting
 
 /// Only the latest arm may fire an owner's cancellable deadline.
 struct CoalescingDeadline {
+    let id = UUID().uuidString
     /// Compare captured generation on firing so a superseded arm cannot act.
     private(set) var generation: UInt64 = 0
-    var task: Task<Void, Never>?
-    /// Retain the armed instant so unchanged maintenance deadlines need no new task; residual repair does not use this field.
     var scheduledAt: Date?
+    var armed: Bool { scheduledAt != nil }
+
     @discardableResult
     mutating func invalidate() -> UInt64 {
         generation &+= 1
-        task?.cancel()
-        task = nil
         scheduledAt = nil
         return generation
     }
 
-    /// Clamp wall sleep to Task.sleep's range; nonfinite delays leave the deadline unarmed.
-    /// The fire closure owns weak re-entry.
-    mutating func arm(
-        deadline: Date,
-        now: Date,
-        clampSeconds: TimeInterval,
-        fire: @escaping @Sendable () async -> Void
-    ) {
-        let rawDelay = deadline.timeIntervalSince(now)
-        guard rawDelay.isFinite else { return }
-        let delay = max(0, rawDelay)
-        task = Task {
-            if delay > 0 {
-                let nanos = UInt64(min(delay, clampSeconds) * 1_000_000_000)
-                do { try await Task.sleep(nanoseconds: nanos) } catch { return }
-            }
-            guard !Task.isCancelled else { return }
-            await fire()
-        }
-    }
-
     /// Clear the consumed arm as its firing body begins.
     mutating func consumeForFire() {
-        task = nil
         scheduledAt = nil
     }
 }
@@ -186,16 +163,25 @@ extension NativeCognitionRuntime {
                 : "cognitive maintenance completed in memory-only mode")
         } catch {
             maintenanceFailure = error.localizedDescription
-            cognitionDeadline.invalidate()
+            let generation = cognitionDeadline.invalidate()
             publishRuntimeChange(reason: "maintenance:failed")
+            await OneClock.at(dataRoot).release(held: maintenanceDeadlineID, order: generation)
             return .failed(error: "cognitive maintenance failed: \(error.localizedDescription)")
         }
     }
 
-    private static let residualRepairSleepClampSeconds: TimeInterval = 7 * 24 * 60 * 60
-    private static let cognitionMaintenanceSleepClampSeconds: TimeInterval = 30 * 24 * 60 * 60
+    private var residualDeadlineID: String { "cognition:residual:" + residualDeadline.id }
+    private var maintenanceDeadlineID: String { "cognition:maintenance:" + cognitionDeadline.id }
 
-    func rescheduleResidualRepairDeadline() async {
+    func withdrawCognitionDeadlines() async {
+        let residualGeneration = residualDeadline.invalidate()
+        let maintenanceGeneration = cognitionDeadline.invalidate()
+        let clock = OneClock.at(dataRoot)
+        await clock.release(held: residualDeadlineID, order: residualGeneration)
+        await clock.release(held: maintenanceDeadlineID, order: maintenanceGeneration)
+    }
+
+    func rescheduleResidualRepairDeadline(afterUnappliedPass: Bool = false) async {
         // Termination prevents every path from rearming this deadline; a mind not started arms none.
         guard !isAdmissionClosed, mindStarted else { return }
         let generation = residualDeadline.invalidate()
@@ -207,40 +193,45 @@ extension NativeCognitionRuntime {
         considerHorizonExpectations()
         considerRhythm()
         // Prediction expiry only rederives pressure and quiet-repair scheduling; it cannot run cognition or call a provider.
-        guard let deadline = [opportunity.nextWakeAt ?? opportunity.nextRepairAt, nextCognitiveSourceWake(at: now())]
-            .compactMap({ $0 }).min() else {
+        let repairWake = opportunity.nextWakeAt ?? (afterUnappliedPass && opportunity.ready ? nil : opportunity.nextRepairAt)
+        guard let deadline = [repairWake, nextCognitiveSourceWake(at: now())]
+            .compactMap({ $0 }).min(),
+            deadline.timeIntervalSinceNow.isFinite else {
+            await OneClock.at(dataRoot).release(held: residualDeadlineID, order: generation)
             return
         }
-        residualDeadline.arm(
-            deadline: deadline,
-            now: now(),
-            clampSeconds: Self.residualRepairSleepClampSeconds
-        ) { [weak self] in
+        await OneClock.at(dataRoot).hold(residualDeadlineID, until: deadline, order: generation) { [weak self] _, _ in
             await self?.runResidualRepairDeadline(generation: generation)
         }
     }
 
     private func runResidualRepairDeadline(generation: UInt64) async {
         guard generation == residualDeadline.generation else { return }
-        residualDeadline.consumeForFire()
         let opportunity = await organismKernel.residualRepairOpportunity()
         guard generation == residualDeadline.generation else { return }
         guard opportunity.ready else {
             await rescheduleResidualRepairDeadline()
             return
         }
-        let repaired = await organismKernel.runResidualRepairIfDue()
-        // Only the current arm may persist, publish or reschedule after awaiting repair.
-        guard generation == residualDeadline.generation else { return }
-        if repaired {
-            let saved = await persistOrganismContinuity(reason: "residual_pressure_repair")
-            publishRuntimeChange(reason: "residual_repair:completed")
-            beat(.residualRepair, saved ? .init("repaired", "repaired residual pressure and saved it")
-                : .init("failed", "repaired residual pressure in memory; continuity was not saved"))
-        } else {
-            beat(.residualRepair, .init("nothing", "no repairable residual evidence was due"))
+        var repaired = false
+        do {
+            repaired = try await organismKernel.runResidualRepairIfDue {
+                await self.residualDeadline.generation == generation
+            }
+            guard generation == residualDeadline.generation else { return }
+            if repaired {
+                let saved = await persistOrganismContinuity(reason: "residual_pressure_repair")
+                publishRuntimeChange(reason: "residual_repair:completed")
+                beat(.residualRepair, saved ? .init("repaired", "repaired residual pressure and saved it")
+                    : .init("failed", "repaired residual pressure in memory; continuity was not saved"))
+            } else {
+                beat(.residualRepair, .init("nothing", "no bounded field repair was applied"))
+            }
+        } catch {
+            guard generation == residualDeadline.generation, !Task.isCancelled else { return }
+            beat(.residualRepair, .init("failed", DreamPart.redact(error.localizedDescription)))
         }
-        await rescheduleResidualRepairDeadline()
+        await rescheduleResidualRepairDeadline(afterUnappliedPass: !repaired)
     }
 
     /// Invalidate the prior arm before Doctor invokes the same due pass so that generation cannot fire twice.
@@ -250,6 +241,7 @@ extension NativeCognitionRuntime {
         guard await organismKernel.residualRepairOpportunity().ready else { return false }
         let before = await organismKernel.snapshot().dreamRepairSummary.receiptCount
         let generation = residualDeadline.invalidate()
+        await OneClock.at(dataRoot).release(held: residualDeadlineID, order: generation)
         await runResidualRepairDeadline(generation: generation)
         let after = await organismKernel.snapshot().dreamRepairSummary.receiptCount
         let stillReady = await organismKernel.residualRepairOpportunity().ready
@@ -265,23 +257,19 @@ extension NativeCognitionRuntime {
         let currentGeneration = cognitionDeadline.generation
         let opportunity = await substrate.maintenanceOpportunity()
         guard !isAdmissionClosed, cognitionDeadline.generation == currentGeneration else { return }
-        guard let deadline = opportunity.nextMaintenanceAt else {
-            cognitionDeadline.invalidate()
+        guard let deadline = opportunity.nextMaintenanceAt, deadline.timeIntervalSinceNow.isFinite else {
+            let generation = cognitionDeadline.invalidate()
+            await OneClock.at(dataRoot).release(held: maintenanceDeadlineID, order: generation)
             return
         }
-        // Rearm on system wake because Task.sleep excludes system sleep.
         if !force,
            cognitionDeadline.scheduledAt == deadline,
-           cognitionDeadline.task != nil {
+           cognitionDeadline.armed {
             return
         }
         let generation = cognitionDeadline.invalidate()
         cognitionDeadline.scheduledAt = deadline
-        cognitionDeadline.arm(
-            deadline: deadline,
-            now: now(),
-            clampSeconds: Self.cognitionMaintenanceSleepClampSeconds
-        ) { [weak self] in
+        await OneClock.at(dataRoot).hold(maintenanceDeadlineID, until: deadline, order: generation) { [weak self] _, _ in
             await self?.runCognitionMaintenanceDeadline(
                 generation: generation,
                 scheduledAt: deadline

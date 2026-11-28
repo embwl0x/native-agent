@@ -4,21 +4,14 @@ import MindCore
 import NativeAgentShared
 import Observation
 import PersistenceCore
-// Blueprint: | `CountsStatusProjection.swift` | `CountsStatusProjection`: ordered off-main phone, health, capture, download, transport and toast values |
+// Blueprint: | `CountsStatusProjection.swift` | `CountsStatusProjection`: ordered off-main health, capture, download and toast values, plus phone page invalidation |
 
 public actor CountsStatusProjection {
     struct Input: Sendable {
-        let phoneConnection: NAPhoneConnection?
-        let phoneStanding: NAPhoneStanding?
-        let phoneStatus: String?
-        let pairingError: String?
-        let isCheckingPairing: Bool
         let health: RuntimeHealth?
         let capturePolicy: ActivityPolicy
         let captureAvailability: ActivityWatchController.PolicyAvailability
         let isCapturing: Bool
-        let telegram: TelegramPresentationSnapshot?
-        let telegramIssue: String?
     }
 
     private enum Change: Sendable {
@@ -60,7 +53,7 @@ public actor CountsStatusProjection {
     func observePhoneFace(_ sync: SyncFacade) {
         phoneFaceObservation?.cancel()
         phoneFaceObservation = Task { @MainActor in
-            await sync.loadSecret(quiet: true)
+            await sync.loadSecret()
             let changes = Observations {
                 _ = (sync.phones, sync.message, sync.phonePairedElsewhere, sync.connection,
                      sync.standing, sync.pairingError, sync.isCheckingPairing)
@@ -122,13 +115,6 @@ public actor CountsStatusProjection {
     private func apply(_ change: Change) async {
         switch change {
         case .owners(let input):
-            value.phoneConnection = input.phoneConnection.map {
-                .init(pairing: disclosed($0.pairing), transport: disclosed($0.transport), exchange: disclosed($0.exchange))
-            }
-            value.phoneStanding = input.phoneStanding
-            value.phoneStatus = input.phoneStatus.map(NativeAppSecretRedactor.redactText)
-            value.pairingError = input.pairingError.map(NativeAppSecretRedactor.redactText)
-            value.isCheckingPairing = input.isCheckingPairing
             value.health = input.health
             let availability: ActivityCaptureFace.Availability
             switch input.captureAvailability {
@@ -138,17 +124,6 @@ public actor CountsStatusProjection {
             }
             value.capture = .init(isCapturing: input.isCapturing,
                 capturesTitles: input.capturePolicy.captureTitles && !input.capturePolicy.appNameOnlyMode, availability: availability)
-            value.telegram = input.telegram.map {
-                .init(enabled: $0.transport.enabled, pollerRunning: $0.transport.pollerEnabled,
-                    lastError: $0.lastError.map(NativeAppSecretRedactor.redactText),
-                    credentialIssue: $0.credentialIssue.map(NativeAppSecretRedactor.redactText),
-                    routingIssue: $0.routingIssue.map(NativeAppSecretRedactor.redactText),
-                    readIssue: input.telegramIssue.map(NativeAppSecretRedactor.redactText))
-            }
-            if input.telegram == nil, let issue = input.telegramIssue {
-                value.telegram = .init(enabled: nil, pollerRunning: nil, lastError: nil, credentialIssue: nil,
-                    routingIssue: nil, readIssue: NativeAppSecretRedactor.redactText(issue))
-            }
         case .download(let status, let activating):
             var disclosed = status
             disclosed.phase = NativeAppSecretRedactor.redactText(status.phase)
@@ -166,21 +141,14 @@ public actor CountsStatusProjection {
         sent = value
         await countsFeed.updateStatuses(value)
     }
-
-    private func disclosed(_ fact: NAPhoneConnection.Fact) -> NAPhoneConnection.Fact {
-        .init(fact.state, NativeAppSecretRedactor.redactText(fact.line), owner: fact.owner,
-            lever: fact.lever.map(NativeAppSecretRedactor.redactText))
-    }
 }
 
 extension NativeAgentEngine {
     @MainActor public func bindCountStatusSources() {
         let updates = EmbeddingModelDownloadController.shared.updates()
-        let inputs = Observations { [sync, doctor, activityWatch, telegram] in
-            CountsStatusProjection.Input(phoneConnection: sync.connection, phoneStanding: sync.standing,
-                phoneStatus: sync.status, pairingError: sync.pairingError, isCheckingPairing: sync.isCheckingPairing,
-                health: doctor.health, capturePolicy: activityWatch.policy, captureAvailability: activityWatch.policyAvailability,
-                isCapturing: activityWatch.isCapturing, telegram: telegram.status, telegramIssue: telegram.statusIssue)
+        let inputs = Observations { [doctor, activityWatch] in
+            CountsStatusProjection.Input(health: doctor.health, capturePolicy: activityWatch.policy,
+                captureAvailability: activityWatch.policyAvailability, isCapturing: activityWatch.isCapturing)
         }
         Task { [countsStatus] in
             await countsStatus.observeDownload(updates)

@@ -225,7 +225,7 @@ extension SwiftToolDispatcher {
                 try botCheck(candidate.bot, definitions: definitions, schedule: args.settings.schedule)
                 let currentModel: String?
                 if candidate.bot.modelPinned == true { currentModel = nil }
-                else { currentModel = try await SwiftNativeProviderRouting(dataRoot: dataRoot).modelForSurface("chat").model }
+                else { currentModel = try await SwiftNativeProviderRouting(dataRoot: dataRoot).modelForSurface().model }
                 let created: BotDefinition
                 progress.writeStarted = true
                 do { created = try definitions.create(candidate.bot) }
@@ -242,7 +242,7 @@ extension SwiftToolDispatcher {
                 catch let error as ToolFailureError { throw botFieldsError(error) }
                 let currentModel: String?
                 if candidate.bot.modelPinned == true { currentModel = nil }
-                else { currentModel = try await SwiftNativeProviderRouting(dataRoot: dataRoot).modelForSurface("chat").model }
+                else { currentModel = try await SwiftNativeProviderRouting(dataRoot: dataRoot).modelForSurface().model }
                 let updated: BotDefinition
                 progress.writeStarted = true
                 do { updated = try definitions.update(candidate.bot) }
@@ -269,7 +269,7 @@ extension SwiftToolDispatcher {
                 }
                 let currentModel: String?
                 if bot.modelPinned == true { currentModel = nil }
-                else { currentModel = try await SwiftNativeProviderRouting(dataRoot: dataRoot).modelForSurface("chat").model }
+                else { currentModel = try await SwiftNativeProviderRouting(dataRoot: dataRoot).modelForSurface().model }
                 progress.writeStarted = true
                 return try botDefinitionJSON(definitions.pause(bot.id, paused: paused),
                     details: details, operation: paused ? "paused" : "resumed",
@@ -400,7 +400,7 @@ extension SwiftToolDispatcher {
         let details = args.details ?? false
         let includeModels = args.includeModels ?? false
         let selected = try args.id.map { try definitions.get(botReference($0, definitions: definitions, dataRoot: dataRoot)) }
-        let currentModel = try await SwiftNativeProviderRouting(dataRoot: dataRoot).modelForSurface("chat").model
+        let currentModel = try await SwiftNativeProviderRouting(dataRoot: dataRoot).modelForSurface().model
         // Each helper's last run and last reply are distinct.
         let byBot = try shelf.entriesByBot()
         let iso = ISO8601DateFormatter()

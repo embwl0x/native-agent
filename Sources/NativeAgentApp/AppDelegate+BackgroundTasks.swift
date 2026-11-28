@@ -5,7 +5,7 @@ import AppKit
 import SenseCore
 import NativeAgentCore
 import NativeAgentShared
-// Blueprint: | `AppDelegate+BackgroundTasks.swift` | `AppDoctorPort`: Doctor platform, both Inspectors and discovery-admitted browser health |
+// Blueprint: | `AppDelegate+BackgroundTasks.swift` | `AppDoctorPort`: Doctor platform, the renderer's Inspector and discovery-admitted browser health |
 
 struct AppDoctorPort: EngineDoctorPlatformPort {
     let dataRoot: URL

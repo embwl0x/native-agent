@@ -83,14 +83,6 @@ public struct DeskPaletteQuery: Equatable, Sendable {
         case close
         case deferItem = "defer"
         case note
-
-        public var actionLabel: String {
-            switch self {
-            case .close: return "Close"
-            case .deferItem: return "Defer"
-            case .note: return "Add note"
-            }
-        }
     }
 
     public var verb: Verb?

@@ -277,6 +277,7 @@ public actor BotRunnerScheduler {
     }
 
     private func rejected(_ id: UUID, due: Date, error: Error) async {
+        guard !(error is CancellationError) else { return }
         do {
             switch error {
             case is BotRunAdmissionError: try recordMissed(id, due: due, reason: .queueBusy)

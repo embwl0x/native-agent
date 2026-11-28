@@ -132,7 +132,7 @@ if [ "$bridge_rc" -eq 0 ]; then
   loop_budget="$(jq -r '.organism.behavior.loopBudget // "unknown"' "$state_file")"
   signal_count="$(jq -r '.organism.signalCount // 0' "$state_file")"
   body_line="$(jq -r '.organism.promptVisibleBodyLine // "quiet"' "$state_file")"
-  dream_proposals="$(jq -r '.organism.dreamRepair.proposedStandingViews // 0' "$state_file")"
+  dream_proposals="$(jq -r '.organism.dreamRepair.receiptCount // 0' "$state_file")"
   evidence_count="$(jq -r '(.organism.dreamRepair.latestEvidence // []) | length' "$state_file")"
 
   if [ "$chat_ready" = "true" ]; then
@@ -149,7 +149,7 @@ if [ "$bridge_rc" -eq 0 ]; then
   status INFO "active model" "$active_model"
   status INFO "behavior posture" "posture=$posture claims=$claims strategy=$strategy loops=$loop_budget"
   status INFO "body line" "$body_line"
-  status INFO "organism counters" "signals=$signal_count dreamEvidence=$evidence_count dreamProposals=$dream_proposals"
+  status INFO "organism counters" "signals=$signal_count dreamEvidence=$evidence_count dreamReceipts=$dream_proposals"
 
   providers="$(jq -r '.organism.bodySchema.providersHealthy // false' "$state_file")"
   tools="$(jq -r '.organism.bodySchema.toolHandsAvailable // false' "$state_file")"

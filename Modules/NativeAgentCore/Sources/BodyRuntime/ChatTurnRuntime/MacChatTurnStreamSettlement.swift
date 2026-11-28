@@ -205,7 +205,7 @@ public extension ChatStreamExecution {
                 message: message, sessionId: sessionId,
                 model: "", reasoningEffort: "", fileAccess: "auto",
                 attachments: attachments, persona: nil, surface: "chat",
-                suppressUserAppend: hideUserBubble, choice: nil,
+                suppressUserAppend: hideUserBubble,
                 consumerRendersInlineCards: true, replyRowID: replyRowId, onScreenPreview: onScreenPreview,
              turn: turn)
         }

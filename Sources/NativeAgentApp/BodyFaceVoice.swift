@@ -49,7 +49,7 @@ final class BodyFaceVoice {
 
     private func voice(_ command: VoiceAct) async throws -> FaceActReply {
         switch command {
-        case .beginDictation(let id, let session, let revision):
+        case .beginDictation(let id, let session):
             guard captures[id] == nil, !startingDictations.contains(id) else {
                 throw BodyFaceServices.failure("voice_operation_exists", "This dictation operation is already open.")
             }
@@ -69,7 +69,7 @@ final class BodyFaceVoice {
             guard input.isListening else {
                 throw BodyFaceServices.failure("voice_capture_failed", input.errorMessage ?? "The microphone did not start.")
             }
-            let value = VoiceFace(operation: id, session: session, message: nil, composerRevision: revision,
+            let value = VoiceFace(operation: id, session: session, message: nil,
                 phase: .listening, text: input.transcript, attachment: nil, state: .ready)
             captures[id] = Capture(input: input, value: value)
             await engine.face.post(value, at: .voice(id))
@@ -82,12 +82,11 @@ final class BodyFaceVoice {
         case .finishDictation(let id):
             guard let capture = captures[id] else { throw BodyFaceServices.failure("voice_operation_missing", "This dictation operation is not open.") }
             let result = await capture.input.stopListeningResult()
-            try Task.checkCancellation()
-            // The finished value, recorded audio included, goes back in this reply; the feed lets the closed operation go.
             let watch = captures.removeValue(forKey: id)?.watch
             watch?.cancel()
             await watch?.value
             await engine.face.remove(.voice(id))
+            try Task.checkCancellation()
             var value = capture.value
             value.phase = .finished
             switch result {
@@ -100,7 +99,7 @@ final class BodyFaceVoice {
             return .voice(value)
         case .discardDictation(let id):
             if startingDictations.remove(id) != nil {
-                let cancelled = VoiceFace(operation: id, session: nil, message: nil, composerRevision: nil,
+                let cancelled = VoiceFace(operation: id, session: nil, message: nil,
                     phase: .cancelled, text: nil, attachment: nil, state: .ready)
                 return .voice(cancelled)
             }
@@ -134,7 +133,7 @@ final class BodyFaceVoice {
             let playback = VoiceOutputController.sharedMessagePlayback
             await playback.speak(text: text, dataRoot: engine.dataRoot, policy: engine.trust.policy,
                 loadPolicy: { try await self.engine.trust.load() }, ownerID: owner)
-            let value = VoiceFace(operation: id, session: session, message: message, composerRevision: nil,
+            let value = VoiceFace(operation: id, session: session, message: message,
                 phase: playback.isSpeaking(ownerID: owner) ? .speaking : .finished, text: nil, attachment: nil,
                 state: playback.consumeError(ownerID: owner).map {
                     .unavailable(BodyFaceServices.failure("speech_failed", $0))
@@ -155,7 +154,7 @@ final class BodyFaceVoice {
             await watch?.value
             // The stopped value goes back in this reply; the feed lets the operation go.
             await engine.face.remove(.voice(id))
-            let value = VoiceFace(operation: id, session: nil, message: nil, composerRevision: nil,
+            let value = VoiceFace(operation: id, session: nil, message: nil,
                 phase: .cancelled, text: nil, attachment: nil, state: .ready)
             return .voice(value)
         }

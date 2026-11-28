@@ -27,7 +27,7 @@ extension AgentConversationSession {
     static func queue(turn: Turn, mac: MacOperationContext, conversation: AgentConversationContext, workspace: WorkspaceOperation,
         behind row: AgentConversationRecord, name: String, peer: AgentPeerContact?,
                               args: [String: JSONValue], expectsReply: JSONValue?, scope: String, surface: String, dataRoot: URL,
-                              perform: @escaping Dispatch) throws -> JSONValue? {
+                              continuingTurn: Turn?, perform: @escaping Dispatch) throws -> JSONValue? {
         guard let text = args["text"]?.nonblankString else { return nil }
         let store = AgentConversationStore(dataRoot: dataRoot)
         let transport = peer?.transport
@@ -35,7 +35,7 @@ extension AgentConversationSession {
         arguments["expects_reply"] = expectsReply
         guard let queued = try store.enqueue(id: row.id, scopeSessionID: scope, text: text,
                 byPerson: turn.personInitiatedSend?.matches(args) == true, steeredBy: turn.steeringStamp(),
-                arguments: arguments,
+                arguments: arguments, continuingTurn: continuingTurn, peer: peer,
                 stillInFlight: { try inFlight($0, transport, dataRoot: dataRoot) }) else { return nil }
         let (saved, item) = queued
         let carried = args.filter { ["session_id", "__session_id"].contains($0.key) }

@@ -8,7 +8,44 @@ import DeskCore
 import PersistenceCore
 import ProviderRouting
 
-// Blueprint: | `NativeCognitionRuntime+Organism.swift` | `NativeCognitionRuntime`. |
+// Blueprint: | `NativeCognitionRuntime+Organism.swift` | Organism signal admission and checked field-repair part calls |
+
+actor FieldRepairPart {
+    enum Key: NativeAgentCore.TurnPart { static let unset: FieldRepairPart? = nil }
+    static let id = "native-field-repair"
+    let input: JSONValue
+    let reading: OrganismDreamRepair.Reading
+    private(set) var plan: OrganismDreamRepair.Plan?
+
+    init(_ reading: OrganismDreamRepair.Reading) {
+        self.reading = reading
+        input = reading.input
+    }
+
+    func read(root: URL, parent: Turn?) async throws -> OrganismDreamRepair.Plan {
+        let engine = NativeAgentEngine.forRoot(root)
+        let envelope = parent?.envelope ?? TurnEnvelope.native("background:field-repair", surface: "field-repair")
+        var turn = parent ?? Turn(dataRoot: root, session: "field-repair")
+        if turn[AppActionBinding.Parts.self] == nil { turn[AppActionBinding.Parts.self] = engine.partBinding }
+        turn[Key.self] = self
+        let input = self.input
+        let result = try await engine.withPartDoor(envelope: envelope, fileAccess: turn.fileAccess ?? "auto", turn: turn) { door in
+            await Parts(root: root).call(id: Self.id, input: input,
+                within: .init(actions: [], capabilities: []), invocation: door.invocation, as: JSONValue.self)
+        }
+        switch result {
+        case .success:
+            guard let plan else {
+                throw PartCallError(code: "bad_field_repair", message: "The organism received no verified field repair plan.")
+            }
+            return plan
+        case .failure(let error) where error.code == "cancelled": throw CancellationError()
+        case .failure(let error): throw error
+        }
+    }
+
+    func keep(_ plan: OrganismDreamRepair.Plan) { self.plan = plan }
+}
 
 extension NativeCognitionRuntime {
     func startApprovalLifecycleObservationIfNeeded() async {
@@ -156,7 +193,7 @@ extension NativeCognitionRuntime {
     }
 
     /// Dormant bodies owe no effect; awake bodies acknowledge only durable identity claims so retries cannot sleep twice.
-    public func completeDreamSignal(id: UUID, occurredAt: Date, metadata: [String: JSONValue]) async throws -> Bool {
+    public func completeDreamSignal(id: UUID, occurredAt: Date, metadata: [String: JSONValue], parent: Turn) async throws -> Bool {
         await bootstrap()
         guard !isFlushedForTermination else {
             throw PersistenceCoreError.ioFailure("dream completion awaits the running mind")
@@ -176,7 +213,7 @@ extension NativeCognitionRuntime {
             let signal = SomaticSignal(id: id, kind: .dreamCompleted, sourceOrgan: "dream",
                 occurredAt: occurredAt, intensity: 0.62, valence: 0.35, arousal: 0.12, metadata: metadata)
             // Once admitted, Stop cannot abandon the body mutation's save.
-            let saved = await settle { [self] in await self.settleDreamSignal(signal) }
+            let saved = await settle { [self] in await self.settleDreamSignal(signal, parent: parent) }
             try saved.get()
         } else {
             guard await persistOrganismContinuity(reason: "dream:\(id.uuidString)") else {
@@ -189,8 +226,12 @@ extension NativeCognitionRuntime {
         return true
     }
 
-    private func settleDreamSignal(_ signal: SomaticSignal) async -> Result<Void, PersistenceCoreError> {
-        await organismKernel.ingest(signal, movesFeelings: CognitiveSomaticSignals.movesFeelings(.dreamCompleted))
+    private func settleDreamSignal(_ signal: SomaticSignal, parent: Turn) async -> Result<Void, PersistenceCoreError> {
+        do {
+            try await organismKernel.ingest(signal, movesFeelings: CognitiveSomaticSignals.movesFeelings(.dreamCompleted), parent: parent)
+        } catch {
+            return .failure(.ioFailure("Dream completion field repair remains owed: " + DreamPart.redact(error.localizedDescription)))
+        }
         await drainFeltResolutionsIntoSubstrate()
         bodyReadOrder.write { cachedBodyRead = nil }
         guard await organismKernel.hasCompletedDream(signal.id),
@@ -247,18 +288,20 @@ extension NativeCognitionRuntime {
         persistSynchronously: Bool
     ) async {
         let kind = signal.kind
-        await organismKernel.ingest(signal, movesFeelings: CognitiveSomaticSignals.movesFeelings(kind))
-        await drainFeltResolutionsIntoSubstrate()
-        bodyReadOrder.write { cachedBodyRead = nil }
-        if persistSynchronously {
-            await persistOrganismContinuity(reason: "somatic:\(kind.rawValue)")
-        } else {
-            scheduleOrganismContinuityPersistence(reason: "somatic:\(kind.rawValue)")
+        do {
+            try await organismKernel.ingest(signal, movesFeelings: CognitiveSomaticSignals.movesFeelings(kind))
+            await drainFeltResolutionsIntoSubstrate()
+            bodyReadOrder.write { cachedBodyRead = nil }
+            if persistSynchronously {
+                await persistOrganismContinuity(reason: "somatic:\(kind.rawValue)")
+            } else {
+                scheduleOrganismContinuityPersistence(reason: "somatic:\(kind.rawValue)")
+            }
+            if !isAdmissionClosed { await rescheduleResidualRepairDeadline() }
+            publishRuntimeChange(reason: "somatic:\(kind.rawValue)")
+        } catch {
+            nativeLog("[organism] %@ field repair failed: %@", kind.rawValue, DreamPart.redact(error.localizedDescription))
         }
-        if !isAdmissionClosed {
-            await rescheduleResidualRepairDeadline()
-        }
-        publishRuntimeChange(reason: "somatic:\(kind.rawValue)")
         // Replay follows canonical dream/REM writes and rereads their durable owners; the signal carries no payload.
         // One daily integrity pass covers out-of-process writes and crash-window event loss.
         if !isAdmissionClosed, kind == .dreamCompleted || kind == .remIntegrated {
@@ -304,12 +347,13 @@ extension NativeCognitionRuntime {
     public func clearOrganismDebugBodyOverride() async -> OrganismSnapshot {
         organismDebugBodyOverride = nil
         let phoneDelivery = await organismKernel.latestPrediction(ofKind: .phoneDelivery)
-        let liveRead = await Self.makeOrganismBodyRead(
+        var liveRead = await Self.makeOrganismBodyRead(
             dataRoot: dataRoot,
             mobileConfigured: await checkedPhoneNotificationConfiguration(),
             phoneDeliveryPrediction: phoneDelivery
         )
-        await organismKernel.refreshBodySchema(liveRead, integratesChemistry: false)
+        liveRead.resourcePressureReading = (await resourcePressureSample()).reading
+        await organismKernel.refreshBodySchema(liveRead)
         let snapshot = await organismKernel.snapshot()
         publishRuntimeChange(reason: "organism:debug_override_cleared")
         return snapshot
@@ -326,11 +370,6 @@ extension NativeCognitionRuntime {
     public func organismSnapshot() async -> OrganismSnapshot {
         await refreshOrganismBodySchema(reason: "snapshot")
         return await organismKernel.snapshot()
-    }
-
-    public func organismBehaviorPosture() async -> OrganismBehaviorPosture? {
-        await refreshOrganismBodySchema(reason: "behavior posture")
-        return await organismKernel.behaviorPosture()
     }
 
     /// Restore a failed reset baseline only while its kernel revision still owns the state, preserving newer events.
@@ -411,21 +450,19 @@ extension NativeCognitionRuntime {
     }
 
     func refreshOrganismBodySchema(reason _: String) async {
-        let fixedAt = now()
-        let sample = await organismBodySample(at: fixedAt)
+        let (sample, fixedAt) = await organismBodySample()
         let canonicalAffect = await substrate.canonicalAffectProjection(at: fixedAt)
         await organismKernel.refreshBodySchema(
             sample,
-            integratesChemistry: false,
             canonicalAffect: canonicalAffect
         )
     }
 
-    func organismBodySample(at fixedAt: Date) async -> OrganismBodyRead {
+    func organismBodySample() async -> (read: OrganismBodyRead, fixedAt: Date) {
+        let (resourcePressure, fixedAt) = await resourcePressureSample()
         // Refresh the clock for frozen turn reads as well as background projection.
         await refreshOrganismDiurnalClockIfInvalidated()
         var liveRead: OrganismBodyRead
-        // Retain the two-second cache only for the composite host/transport gauge, which has no complete push owner.
         if let cached = cachedBodyRead, fixedAt.timeIntervalSince(cached.at) < 2.0 {
             liveRead = cached.read
         } else {
@@ -439,6 +476,7 @@ extension NativeCognitionRuntime {
                 )
             }, publish: { cachedBodyRead = ($0, fixedAt) })
         }
+        liveRead.resourcePressureReading = resourcePressure
         if liveRead.providersAvailable == true {
             let providerEvidence = providerPathEvidence(at: fixedAt)
             liveRead.providerPathBelief = ProviderPathBeliefProjector.project(evidence: providerEvidence, now: fixedAt)
@@ -446,15 +484,15 @@ extension NativeCognitionRuntime {
             liveRead.providerPathBelief = nil
         }
         if let override = organismDebugBodyOverride, override.expiresAt > fixedAt {
-            return Self.simulatedOrganismBodyRead(
+            return (Self.simulatedOrganismBodyRead(
                 base: liveRead,
                 scenario: override.scenario,
                 now: fixedAt
-            )
+            ), fixedAt)
         } else {
             organismDebugBodyOverride = nil
             // Provider, tool, memory, phone and thermal facts guide operational posture, never feelings.
-            return liveRead
+            return (liveRead, fixedAt)
         }
     }
 

@@ -731,17 +731,12 @@ final class iCloudBridge {
         }
     }
 
-    func tearDown(preservingConsumers: Bool = false) {
+    func tearDown() {
         setupGeneration += 1
         stopForegroundReceiving()
         deviceIncomingSetupTask?.cancel()
         deviceIncomingSetupTask = nil
         NotificationCenter.default.removeObserver(self)
-        if !preservingConsumers {
-            messageHandlers = [:]
-            rejectionHandlers = [:]
-            resyncHintHandlers = [:]
-        }
         deviceTransport = nil
         deliveryPairingKey = nil
         unacceptedDeliveries = [:]

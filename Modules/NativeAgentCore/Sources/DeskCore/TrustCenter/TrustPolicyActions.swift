@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `TrustPolicyActions.swift` | `TrustPolicyActions`, `saveMemoryPolicy`, `saveAgentAccessMode`, `saveMacControlPolicy` |
+// Blueprint: | `TrustPolicyActions.swift` | `TrustPolicyActions`, `saveMacIntegrationPreset`, `saveMacControlPolicy` |
 
 
 public struct TrustPolicyActions: Sendable {
@@ -26,28 +26,6 @@ public struct TrustPolicyActions: Sendable {
         try await postTrustWrite(body: [
             "securityPolicy": ["killSwitchEnabled": enabled]
         ])
-    }
-
-    public func saveMemoryPolicy(crossSessionRecall: Bool) async throws -> TrustPolicy {
-        try await postTrustWrite(body: [
-            "memoryPolicy": [
-                "cross_session_recall": crossSessionRecall,
-            ]
-        ])
-    }
-
-    public func patchMemoryPolicy(
-        knowledgeGraphEnabled: Bool? = nil,
-        adaptivePromotion: Bool? = nil
-    ) async throws -> TrustPolicy {
-        var memoryPolicy: [String: Any] = [:]
-        if let knowledgeGraphEnabled {
-            memoryPolicy["knowledge_graph_enabled"] = knowledgeGraphEnabled
-        }
-        if let adaptivePromotion {
-            memoryPolicy["adaptive_promotion"] = adaptivePromotion
-        }
-        return try await postTrustWrite(body: ["memoryPolicy": memoryPolicy])
     }
 
     /// Compare edited-field baselines under the canonical write lock so conflicts refuse while unrelated choices survive.
@@ -74,10 +52,19 @@ public struct TrustPolicyActions: Sendable {
         )
     }
 
-    public func saveMacIntegrationPreset(_ preset: String, currentPolicy: TrustPolicy? = nil) async throws -> TrustPolicy {
+    public func saveMacIntegrationPreset(_ preset: String) async throws -> TrustPolicy {
         let normalized = preset.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().replacingOccurrences(of: "-", with: "_")
         if normalized == "full" || normalized == "full_mac" {
-            return try await saveAgentAccessMode("full", currentPolicy: currentPolicy)
+            return try await postTrustWrite(body: [
+                "permissionLevel": "full_mac_os",
+                "autonomyDefault": "workspace_autonomous",
+                "developerMode": true,
+                "filePolicy": [
+                    "requireBackupBeforeWrite": true,
+                    "outsideWorkspaceDefault": "allow",
+                ],
+                "macControlPolicy": Self.macControlPolicyForAccessMode("full", remoteFromIosAllowed: true, developerMode: true),
+            ])
         }
 
         let filePolicy: [String: Any] = [
@@ -112,36 +99,6 @@ public struct TrustPolicyActions: Sendable {
                 "macControlPolicy": Self.macControlPolicyForAccessMode("workspace", remoteFromIosAllowed: true),
             ]
         }
-        return try await postTrustWrite(body: body)
-    }
-
-    public func saveAgentAccessMode(_ mode: String, currentPolicy: TrustPolicy? = nil, developerMode: Bool? = nil) async throws -> TrustPolicy {
-        let normalized = TrustAccessModeCapabilityCatalog.normalizedMode(mode)
-        let existingPolicy: TrustPolicy?
-        if let currentPolicy {
-            existingPolicy = currentPolicy
-        } else {
-            existingPolicy = try? await SwiftNativeTrustCenter(dataRoot: dataRoot).getTrust()
-        }
-        let requestedDeveloperMode = developerMode ?? (normalized == "full")
-        let destructiveMode = normalized == "full" && requestedDeveloperMode
-        let remoteFromIosAllowed = existingPolicy?.macControlPolicy?.remoteFromIosAllowed ?? false
-        let full = normalized == "full"
-        let workspace = normalized == "workspace"
-        let body: [String: Any] = [
-            "permissionLevel": full ? "full_mac_os" : normalized == "read_only" ? "strict" : "balanced",
-            "autonomyDefault": full || workspace ? "workspace_autonomous" : "supervised",
-            "developerMode": destructiveMode,
-            "filePolicy": [
-                "requireBackupBeforeWrite": true,
-                "outsideWorkspaceDefault": full ? "allow" : "deny",
-            ],
-            "macControlPolicy": Self.macControlPolicyForAccessMode(
-                normalized,
-                remoteFromIosAllowed: full || (workspace && remoteFromIosAllowed),
-                developerMode: destructiveMode
-            ),
-        ]
         return try await postTrustWrite(body: body)
     }
 

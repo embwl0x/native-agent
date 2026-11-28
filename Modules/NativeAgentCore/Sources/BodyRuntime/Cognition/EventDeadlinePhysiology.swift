@@ -37,17 +37,16 @@ public enum EventDeadlinePhysiology {
         paths: [URL],
         stores: Set<StoreChange.Store> = [],
         notifications: [Notification.Name] = [],
-        loopId: String? = nil,
-        selfWrites: PhysiologySelfWriteRegistry = .shared
+        loopId: String? = nil
     ) -> AsyncStream<Void> {
         let normalized = Set(paths.map(\.standardizedFileURL))
         if let loopId {
-            selfWrites.register(loopId: loopId, paths: Array(normalized))
+            PhysiologySelfWriteRegistry.shared.register(loopId: loopId, paths: Array(normalized))
         }
         let pair = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
         // Evaluate suppression at delivery because delayed filesystem events must be compared with the consumer's current read.
         let deliver: @Sendable () -> Void = { [continuation = pair.continuation] in
-            if let loopId, selfWrites.isSelfWriteEcho(loopId: loopId) { return }
+            if let loopId, PhysiologySelfWriteRegistry.shared.isSelfWriteEcho(loopId: loopId) { return }
             continuation.yield(())
         }
         let watcher = FileChangeWatcher(paths: Array(normalized)) { _ in
@@ -88,12 +87,11 @@ public enum EventDeadlinePhysiology {
         notifications: [Notification.Name] = [],
         debounceDelay: Duration = .milliseconds(250),
         directoryFiles: @escaping DirectoryFiles = { try FileManager.default.contentsOfDirectory(at: $0, includingPropertiesForKeys: nil) },
-        fileReading: @escaping FileReading = { _ in nil },
         label: String = "",
         refresh: @escaping @MainActor @Sendable () async -> Void
     ) async {
         let observation = await readEvents(paths: paths, stores: stores, notifications: notifications,
-            directoryFiles: directoryFiles, fileReading: fileReading)
+            directoryFiles: directoryFiles)
         let causes = Mutex(Set<String>())
         let debouncer = StoreReloadDebouncer(delay: debounceDelay) {
             causes.withLock {

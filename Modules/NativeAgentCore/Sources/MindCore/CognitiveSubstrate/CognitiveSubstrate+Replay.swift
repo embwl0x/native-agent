@@ -21,7 +21,6 @@ extension CognitiveSubstrate {
         let now = dependencies.now()
         var episodeIds: [UUID] = []
         var schemaProposalIds: [UUID] = []
-        var skippedEvidenceIds: [String] = []
         var timelineEventIds: [UUID] = []
         var writes: [CognitiveArtifactWrite] = []
         var stagedEpisodes: [CognitiveEpisodeReference] = []
@@ -39,7 +38,6 @@ extension CognitiveSubstrate {
             }
             guard stagedEvidence.insert(evidenceId).inserted,
                   episodes.values.contains(where: { $0.externalEvidenceIds.contains(evidenceId) }) == false else {
-                skippedEvidenceIds.append(evidenceId)
                 continue
             }
             let episode = CognitiveEpisodeReference(
@@ -80,7 +78,6 @@ extension CognitiveSubstrate {
             }
             if schemaProposals.values.contains(where: { $0.externalEvidenceIds.contains(evidenceId) })
                 || stagedSchemas.contains(where: { $0.externalEvidenceIds.contains(evidenceId) }) {
-                skippedEvidenceIds.append(evidenceId)
                 continue
             }
 
@@ -95,7 +92,6 @@ extension CognitiveSubstrate {
                 lineageId: TextClipping.prefixOrWhole("rem:\(proposal.id)", maxCharacters: 120)
             )
             guard !schema.body.isEmpty else {
-                skippedEvidenceIds.append(evidenceId)
                 continue
             }
             stagedSchemas.append(schema)
@@ -150,7 +146,6 @@ extension CognitiveSubstrate {
         return CognitiveReplayIntegrationResult(
             episodeIds: episodeIds,
             schemaProposalIds: schemaProposalIds,
-            skippedEvidenceIds: skippedEvidenceIds,
             timelineEventIds: timelineEventIds
         )
     }

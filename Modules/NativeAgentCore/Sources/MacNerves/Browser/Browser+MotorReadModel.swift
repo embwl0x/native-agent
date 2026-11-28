@@ -57,18 +57,15 @@ extension SwiftNativeBrowserClient: MotorActionReadModelProviding {
         let phase: MotorActionPhase
         let verification: MotorVerificationState
         let expectedEvidence: String?
-        let isCancellable: Bool
         switch normalized {
         case "running":
             phase = .running
             verification = .pending
             expectedEvidence = "browser_navigation_terminal"
-            isCancellable = true
         case "waiting_approval":
             phase = .awaitingApproval
             verification = .notStarted
             expectedEvidence = "approval_resolution"
-            isCancellable = true
         case "succeeded":
             phase = .succeeded
             if case .bool(true)? = run["opened"] {
@@ -80,34 +77,24 @@ extension SwiftNativeBrowserClient: MotorActionReadModelProviding {
                 verification = .unverified
                 expectedEvidence = "browser_navigation_receipt"
             }
-            isCancellable = false
         case "failed":
             phase = .failed
             verification = .failed
             expectedEvidence = nil
-            isCancellable = false
         case "canceled", "denied":
             phase = .cancelled
             verification = .notRequired
             expectedEvidence = nil
-            isCancellable = false
         default:
             throw BrowserMotorReadModelError.invalidStatusToken
         }
 
         let opaqueID = CausalTransitionEvidence.opaqueIdentity(runID)
-        let deadline: MotorActionDeadlineReadModel?
         if normalized == "running", let raw = run["deadlineSeconds"] {
             guard case .int(let seconds) = raw,
                   seconds > 0, seconds <= 86_400 else {
                 throw BrowserMotorReadModelError.invalidDeadline
             }
-            deadline = MotorActionDeadlineReadModel(
-                scope: .operation,
-                timeoutSeconds: Int(seconds)
-            )
-        } else {
-            deadline = nil
         }
         return MotorActionReadModel(
             domain: "browser",
@@ -116,9 +103,7 @@ extension SwiftNativeBrowserClient: MotorActionReadModelProviding {
             domainState: persistedStatus,
             verification: verification,
             expectedNextEvidence: expectedEvidence,
-            updatedAt: try canonicalMotorTimestamp(run: run, status: normalized),
-            cancellationIdentity: isCancellable ? opaqueID : nil,
-            deadline: deadline
+            updatedAt: try canonicalMotorTimestamp(run: run, status: normalized)
         )
     }
 

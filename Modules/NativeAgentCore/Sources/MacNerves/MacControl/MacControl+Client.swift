@@ -326,11 +326,12 @@ public actor SwiftNativeMacControl: MacControlClient {
             begin = try await operationStore.begin(
                 operationId: operationId,
                 action: normalized,
-                requestDigest: requestDigest,
-                deadlineAt: context.wallDate
+                requestDigest: requestDigest
             )
         } catch let error as ToolFailureError {
             throw error
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             throw MacControlError.operation(error.localizedDescription)
         }
@@ -420,7 +421,7 @@ public actor SwiftNativeMacControl: MacControlClient {
             let bodyResult = (await task.result).map { self.driverCheckedResult($0, action: normalized, context: context) }
             let settled: MacControlInFlightExecution.Settlement = await settle {
                 do { return .init(response: try await self.finishKnownOperationResult(bodyResult,
-                    action: normalized, operationId: operationId, trigger: .ordinary), failure: nil) }
+                    action: normalized, operationId: operationId), failure: nil) }
                 catch { return .init(response: Self.settlementFailure(error, body: bodyResult,
                     action: normalized, operationId: operationId, context: context), failure: error) }
             }
@@ -645,7 +646,6 @@ public actor SwiftNativeMacControl: MacControlClient {
         case "file/trash":  return try await handleFileTrash(body)
         case "applescript": return try await handleAppleScript(body, context: context)
         case "volume":      return try await handleVolume(body)
-        case "media":       return try await handleMedia(body, context: context)
         case "focus_app":   return try await handleFocusApp(body, turn: turn, context: context)
         case "quit_app":    return try await handleQuitApp(body, context: context)
         case "open_target": return try await handleOpenTarget(body, context: context)
@@ -709,15 +709,13 @@ public actor SwiftNativeMacControl: MacControlClient {
 public func makeMacControl(
     policyProvider: (any MacControlPolicyProvider)? = nil,
     auditDataRoot: URL? = nil,
-    operationDataRoot: URL? = nil,
     notificationCenterAdapter: (any NotificationPosting)? = nil
 ) -> any MacControlClient {
-    let dataRoot = operationDataRoot ?? auditDataRoot
     return SwiftNativeMacControl(
         notificationCenterAdapter: notificationCenterAdapter,
         policyProvider: policyProvider,
         auditDataRoot: auditDataRoot,
-        operationStore: dataRoot.map { MacControlOperationStore(dataRoot: $0) },
-        permissionDataRoot: dataRoot ?? defaultDataRoot()
+        operationStore: auditDataRoot.map { MacControlOperationStore(dataRoot: $0) },
+        permissionDataRoot: auditDataRoot ?? defaultDataRoot()
     )
 }

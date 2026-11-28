@@ -10,6 +10,14 @@ import NativeAgentShared
 // Blueprint: | `ToolArguments.swift` | Checked admission; lossless normalization; explicit tool operation and app-door dependencies |
 // Normalize optional nulls from the native schema before gates; preserve required nulls and false.
 public enum ToolArguments {
+    static func integerArgument(_ value: JSONValue?) -> Int? {
+        switch value {
+        case .int(let value): return Int(value)
+        case .double(let value): return Int(exactly: value.rounded(.towardZero))
+        case .string(let value): return Int(value)
+        default: return nil
+        }
+    }
 
     /// The door's three item-address words name one schema-declared field; bind it before validation, Trust and receipts read the call.
     public static func itemAddress<Value>(_ input: [String: Value], schema: JSONValue)
@@ -34,7 +42,10 @@ public enum ToolArguments {
         // The call's one reading comes first, so the address binding, gates and receipts all see an action's arguments inside args.
         let input = ToolNameAliases.hostArgs(canonical, ToolNameAliases.doorArgs(canonical, ToolNameAliases.doorCall(canonical, input)))
         try SwiftToolDispatcher.validateDeskMutationArguments(canonical, input: input)
-        let authoring = canonical == "sense_make" || (canonical == "ability_manage" && input["verb"] == .string("save"))
+        let preserving: Set<String> = if canonical == "app" { ["expect"] }
+            else if canonical == "ability_manage", input["verb"] == .string("save") { ["learned", "choices", "params"] }
+            else if canonical == "sense_make" { ["learned", "choices"] }
+            else { [] }
         // No executor runs without the current catalog contract.
         let normalized: [String: JSONValue]
         if let schema {
@@ -61,7 +72,7 @@ public enum ToolArguments {
             }
             let input = itemAddress(input, schema: parameters).args
             normalized = MacContactsExecutor.parameters(for: canonical) != nil ? input
-                : ToolArguments.normalized(input, schema: parameters, preserving: authoring ? ["learned", "choices"] : [], recordShims: recordShims)
+                : ToolArguments.normalized(input, schema: parameters, preserving: preserving, recordShims: recordShims)
             // A wake supplies input.wake, not the authored call's parameters. Native actions reached during that wake still admit their own args.
             let native = SwiftToolDispatcher.nativeCanonicalToolNames.contains(canonical)
                 || AppActionBinding.declaredSchema(canonical) != nil

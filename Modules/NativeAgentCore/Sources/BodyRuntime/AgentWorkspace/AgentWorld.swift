@@ -56,7 +56,7 @@ struct AgentWorld: Sendable {
     /// A completed source read failed; never described as still pending.
     var failures: [String: String] = [:]
     /// Identity of each retained source result, including a failure. Home reuses only derivations of these exact owner readings.
-    var readings: [String: UUID] = [:]
+    var readings: [String: (identity: UUID, at: Date)] = [:]
     var oldest: Date?
     var profile: PersonalityProfile?
     var work: [AgentScreen.JobGlance] = []
@@ -93,13 +93,12 @@ extension AgentScreen {
         return "\(info.st_ino).\(info.st_size).\(info.st_mtimespec.tv_sec).\(info.st_mtimespec.tv_nsec)"
     }
 
-    /// A folder and each entry in it (or `file` inside each entry).
-    static func stamps(_ dir: URL, file: String? = nil) throws -> [String] {
+    static func stamps(_ dir: URL) throws -> [String] {
         let names: [String]
         do { names = try FileManager.default.contentsOfDirectory(atPath: dir.path).sorted() }
         catch let error as CocoaError where error.code == .fileReadNoSuchFile { names = [] }
         return [stamp(dir)] + names.map { name in
-            stamp(file.map { dir.appendingPathComponent(name).appendingPathComponent($0) } ?? dir.appendingPathComponent(name))
+            stamp(dir.appendingPathComponent(name))
         }
     }
 
@@ -136,8 +135,10 @@ extension AgentScreen {
                      _ compute: @escaping @Sendable () async throws -> T) -> T? {
             if observing { memo.observe(root + key, paths: paths, notifications: notifications, compute: compute) }
             let kept: (value: Result<T, Error>, current: Bool, at: Date, identity: UUID)? = memo.peek(root + key)
-            world.readings[key] = kept?.identity
-            if let at = kept?.at { world.oldest = min(world.oldest ?? at, at) }
+            if let kept {
+                world.readings[key] = (kept.identity, kept.at)
+                world.oldest = min(world.oldest ?? kept.at, kept.at)
+            }
             if kept?.current != true { world.pending.append(key) }
             if kept == nil { world.unread.append(key) }
             switch kept?.value {
@@ -197,12 +198,14 @@ extension AgentScreen {
             reading.world.records = people.records; reading.world.chats = people.chats; reading.world.answered = people.answered
             reading.world.handed = people.handed
         }
-        @Sendable func bridges() -> URL { InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot) }
-        if let people: (AgentContactIdentity, [Contact], [Contact], [String: BridgeChat]) = reading.part("contacts", [at("agents/peers.json"), bridges(),
-                bridges().appendingPathComponent("claude-bridge"), bridges().appendingPathComponent("claude-bridge/bridge.json"),
-                bridges().appendingPathComponent("claude-bridge/token"), at("chat/messages"), ContactReplyReads.url(dataRoot)],
+        if let people: (AgentContactIdentity, [Contact], [Contact], [String: BridgeChat]) = reading.part("contacts", [
+                at("agents/peers.json"), InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot),
+                InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot).appendingPathComponent("claude-bridge"),
+                InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot).appendingPathComponent("claude-bridge/bridge.json"),
+                InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot).appendingPathComponent("claude-bridge/token"),
+                at("chat/messages"), ContactReplyReads.url(dataRoot)],
                 notifications: [ChatTranscriptDidChange.name], {
-            let identity = try workspace.ports.conversations.identity(dataRoot: dataRoot)
+            let identity = try AgentContactIdentity(dataRoot: dataRoot)
             let people = contacts(identity: identity)
             let transcripts = try ChatSessionRetention.transcriptFiles(dataRoot: dataRoot, archived: [:])
             let threads = try Dictionary(uniqueKeysWithValues: people.compactMap { contact in
@@ -213,8 +216,8 @@ extension AgentScreen {
             (reading.world.identity, reading.world.contacts, reading.world.routes, reading.world.threads) = people
         }
         if let jobs: (jobs: [DelegationReadout], allStoresReadable: Bool) = reading.part("delegations",
-                DelegationStatusProjector(configRoot: bridges(), dataRoot: dataRoot).watchedPaths, {
-            DelegationStatusProjector(configRoot: bridges(), dataRoot: dataRoot).allJobsWithAvailability()
+                DelegationStatusProjector(configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot), dataRoot: dataRoot).watchedPaths, {
+            DelegationStatusProjector(configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot), dataRoot: dataRoot).allJobsWithAvailability()
         }) {
             reading.world.jobs = jobs.jobs
             if !jobs.allStoresReadable {
@@ -227,7 +230,7 @@ extension AgentScreen {
         }
         reading.world.health = reading.part("health", [AgentLocalHealth.url(dataRoot), at("agents/peers.json")],
                 notifications: workspace.ports.conversations.healthNotifications, {
-            try workspace.ports.conversations.liveHealth(dataRoot: dataRoot)
+            try AgentContactHealth.read(dataRoot: dataRoot)
         }) ?? [:]
     }
 
@@ -320,7 +323,7 @@ extension AgentScreen {
             try await BodyField.require(bodyField).recentWindows(dataRoot)
         } ?? []
         reading.world.repairs = reading.part("owed", [], notifications: [HomeFace.ExperiencesChanged.name]) {
-            try await ExperienceStore.at(dataRoot).projection()
+            try await ExperienceStore.at(dataRoot).committedProjection()
         } ?? []
         // The mind stream and what is owed are readings of the record, so they refresh with it like the owed rows.
         reading.world.thoughts = reading.part("thoughts", [], notifications: [HomeFace.ExperiencesChanged.name]) {

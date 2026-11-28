@@ -248,10 +248,14 @@ final class iCloudSyncEngine {
     var approvalsSnapshotLoaded = false
 
     var agentDisplayName: String {
+        displayName(fallback: "NativeAgent")
+    }
+
+    func displayName(fallback: String) -> String {
         let secret = pairingStore?.iCloudPairingSecret
         let lastKnown = AgentNameCache.name(pairing: secret)
         let currentName = personalityPairing == AgentNameCache.fingerprint(secret) ? personality?.name : nil
-        return NativeAgentIdentity.displayName(currentName, fallback: NativeAgentIdentity.displayName(lastKnown))
+        return NativeAgentIdentity.displayName(currentName, fallback: NativeAgentIdentity.displayName(lastKnown, fallback: fallback))
     }
 
     // MARK: - Private

@@ -17,14 +17,14 @@ final class FaceVoiceInput {
     var isListening: Bool { part("listening") { $0?.phase == .listening } }
     var isStopping: Bool { part("recognizing") { $0?.phase == .recognizing } }
 
-    func start(client: any FaceClient, session: String, revision: UInt64) async throws -> VoiceFace {
+    func start(client: any FaceClient, session: String) async throws -> VoiceFace {
         let id = UUID()
         self.client = client
         operation = id
         isStarting = true
         defer { if operation == id { isStarting = false } }
         errorMessage = nil
-        let reply = try await client.act(.voice(.beginDictation(id: id, session: session, composerRevision: revision)))
+        let reply = try await client.act(.voice(.beginDictation(id: id, session: session)))
         let value = try voiceReply(reply, id: id)
         return value
     }

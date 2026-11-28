@@ -1314,10 +1314,10 @@ reasoning +17 points and knowledge updates +5 on LongMemEval with GPT-4o
 (Rasmussen 2025), where conflict resolution defeats everything else
 (MemoryAgentBench; Memora). Their store now carries `valid_from`, `valid_to`,
 `observed_at` and `evidence_json` alongside its recorded/update timestamps.
-Supersession closes the old fact's `valid_to` at the replacement's `valid_from`
-(or the current time when absent); disclosure excludes intervals that have
-closed. Historical rows are not assigned invented dates. The remaining gap
-is historical recall: no recall asks for an earlier world state yet. See
+`memory.commit` accepts explicit bounds. Current recall applies both bounds,
+and supersession can shorten an older fact's validity in the replacement
+transaction. Historical rows are not assigned invented dates. Historical recall
+of an earlier world state remains open. See
 [the memory map](../MEMORY_SYSTEM_MAP.md#corrections-supersession-and-scope).
 
 **Graph databases and PageRank.** Kùzu Inc. archived Kuzu in October 2025

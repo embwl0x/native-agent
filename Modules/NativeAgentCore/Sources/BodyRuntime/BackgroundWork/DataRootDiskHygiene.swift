@@ -334,14 +334,7 @@ public enum DataRootDiskHygiene {
 
     /// Sum regular files without following symlinks; a missing root has no storage to scan.
     /// File and depth budgets bound the walk and mark incomplete accounting.
-    public static func scan(
-        dataRoot: URL,
-        maxDepth: Int = defaultMaxDepth,
-        singleFileThreshold: Int64 = defaultSingleFileThreshold,
-        totalThreshold: Int64 = defaultTotalThreshold,
-        maxScannedEntries: Int = defaultMaxScannedEntries,
-        directoryThreshold: Int64 = defaultDirectoryThreshold
-    ) -> DiskHygieneReport {
+    public static func scan(dataRoot: URL) -> DiskHygieneReport {
         let startedAt = Date()
         let fm = FileManager.default
         var total: Int64 = 0
@@ -372,7 +365,7 @@ public enum DataRootDiskHygiene {
                 if depth > 0 {
                     let rel = relativePath(of: dir, under: dataRoot)
                     directoryBytes[rel] = subtree
-                    if subtree > directoryThreshold {
+                    if subtree > defaultDirectoryThreshold {
                         var parent = (rel as NSString).deletingLastPathComponent
                         while !parent.isEmpty {
                             hasOffendingChild.insert(parent)
@@ -393,7 +386,7 @@ public enum DataRootDiskHygiene {
             }
             for entry in entries {
                 scanned += 1
-                if scanned > maxScannedEntries { truncated = true; return subtree }
+                if scanned > defaultMaxScannedEntries { truncated = true; return subtree }
                 let values: URLResourceValues
                 do {
                     values = try entry.resourceValues(forKeys: [
@@ -407,7 +400,7 @@ public enum DataRootDiskHygiene {
                 }
                 if values.isSymbolicLink == true { continue }
                 if values.isDirectory == true {
-                    if depth < maxDepth {
+                    if depth < defaultMaxDepth {
                         subtree += walk(entry, depth: depth + 1)
                     } else {
                         // Unvisited directories make accounting incomplete, never a clean bill.
@@ -429,7 +422,7 @@ public enum DataRootDiskHygiene {
                     }
                     subtree += size
                     fileBytes[relativePath(of: entry, under: dataRoot)] = size
-                    if size > singleFileThreshold {
+                    if size > defaultSingleFileThreshold {
                         offenders.append(DiskHygieneOffender(
                             relativePath: relativePath(of: entry, under: dataRoot),
                             sizeBytes: size
@@ -452,7 +445,7 @@ public enum DataRootDiskHygiene {
         offenders.sort { $0.sizeBytes > $1.sizeBytes }
         let directoryOffenders = directoryBytes
             .filter { rel, bytes in
-                (bytes > directoryThreshold && !hasOffendingChild.contains(rel))
+                (bytes > defaultDirectoryThreshold && !hasOffendingChild.contains(rel))
                     // Residue is actionable at any size and belongs to one finding at its root.
                     || isResidue(relativePath: rel)
             }
@@ -465,7 +458,7 @@ public enum DataRootDiskHygiene {
         return DiskHygieneReport(
             largeFiles: offenders,
             totalBytes: total,
-            totalOverBudget: total - staticModelBytes > totalThreshold,
+            totalOverBudget: total - staticModelBytes > defaultTotalThreshold,
             truncated: truncated,
             depthTruncated: depthTruncated,
             readFailed: readFailed,
@@ -519,34 +512,17 @@ public enum DataRootDiskHygiene {
 /// The persisted day books local midnight; an unreserved day keeps the hourly failure retry.
 public struct DataRootDiskHygieneCheck: EventDeadlineLoopRunner {
     public let loopId: String = "data_root_disk_hygiene"
-    public let wake: OrganWake
+    public let wake: OrganWake = .every(24 * 60 * 60)
 
     private let dataRoot: URL
-    private let clock: @Sendable () -> Date
-    private let maxDepth: Int
-    private let singleFileThreshold: Int64
-    private let totalThreshold: Int64
-    private let directoryThreshold: Int64
     /// Returns whether the notice landed; failure releases the daily reservation for retry.
     private let fileNotice: @Sendable (DiskHygieneReport) async -> Bool
 
     public init(
-        interval: TimeInterval = 24 * 60 * 60,
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        clock: @escaping @Sendable () -> Date = { Date() },
-        maxDepth: Int = DataRootDiskHygiene.defaultMaxDepth,
-        singleFileThreshold: Int64 = DataRootDiskHygiene.defaultSingleFileThreshold,
-        totalThreshold: Int64 = DataRootDiskHygiene.defaultTotalThreshold,
-        directoryThreshold: Int64 = DataRootDiskHygiene.defaultDirectoryThreshold,
         fileNotice: @escaping @Sendable (DiskHygieneReport) async -> Bool
     ) {
-        self.directoryThreshold = directoryThreshold
-        self.wake = .every(interval)
         self.dataRoot = dataRoot
-        self.clock = clock
-        self.maxDepth = maxDepth
-        self.singleFileThreshold = singleFileThreshold
-        self.totalThreshold = totalThreshold
         self.fileNotice = fileNotice
     }
 
@@ -576,7 +552,7 @@ public struct DataRootDiskHygieneCheck: EventDeadlineLoopRunner {
     }
 
     public func tickOutcome() async -> LoopTickOutcome {
-        let now = clock()
+        let now = Date()
         do {
             try FileManager.default.createDirectory(
                 at: marker.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -592,13 +568,7 @@ public struct DataRootDiskHygieneCheck: EventDeadlineLoopRunner {
         case .reserved(_, let rb):
             rollback = rb
         }
-        let report = DataRootDiskHygiene.scan(
-            dataRoot: dataRoot,
-            maxDepth: maxDepth,
-            singleFileThreshold: singleFileThreshold,
-            totalThreshold: totalThreshold,
-            directoryThreshold: directoryThreshold
-        )
+        let report = DataRootDiskHygiene.scan(dataRoot: dataRoot)
         // A bound is not a transient read failure: consume the day and retain the partial findings.
         guard !report.readFailed else {
             await rollback()

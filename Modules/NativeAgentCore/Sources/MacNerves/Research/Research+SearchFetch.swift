@@ -113,11 +113,13 @@ extension SwiftNativeResearchClient {
                 response = try await http.getBounded(url: url, timeout: 25, maxBytes: 1_000_000)
             }
         } catch {
+            if error is CancellationError || Task.isCancelled { throw CancellationError() }
             if Self.localServerIsDown(error, url: url) {
                 throw ResearchClientError.localServerNotRunning(url.absoluteString)
             }
             throw ResearchClientError.transportFailure(error, url: url)
         }
+        try Task.checkCancellation()
         if !(200...299).contains(response.status) {
             throw ResearchClientError.httpStatus(response.status)
         }
@@ -322,37 +324,37 @@ extension SwiftNativeResearchClient {
         return target
     }
 
+    private static let namedHTMLEntities: [String: String] = [
+        "amp": "&", "lt": "<", "gt": ">", "quot": "\"", "apos": "'",
+        "nbsp": "\u{00A0}", "copy": "\u{00A9}", "reg": "\u{00AE}", "trade": "\u{2122}",
+        "hellip": "\u{2026}", "mdash": "\u{2014}", "ndash": "\u{2013}", "rsquo": "\u{2019}",
+        "lsquo": "\u{2018}", "ldquo": "\u{201C}", "rdquo": "\u{201D}", "deg": "\u{00B0}",
+        "euro": "\u{20AC}", "pound": "\u{00A3}", "cent": "\u{00A2}", "yen": "\u{00A5}",
+        "bull": "\u{2022}", "middot": "\u{00B7}", "sect": "\u{00A7}", "para": "\u{00B6}",
+        "laquo": "\u{00AB}", "raquo": "\u{00BB}", "times": "\u{00D7}", "divide": "\u{00F7}",
+        "plusmn": "\u{00B1}", "frac12": "\u{00BD}", "frac14": "\u{00BC}", "frac34": "\u{00BE}",
+        "dagger": "\u{2020}", "Dagger": "\u{2021}", "permil": "\u{2030}",
+        "prime": "\u{2032}", "Prime": "\u{2033}", "infin": "\u{221E}",
+        "larr": "\u{2190}", "uarr": "\u{2191}", "rarr": "\u{2192}", "darr": "\u{2193}",
+        "harr": "\u{2194}", "hearts": "\u{2665}", "spades": "\u{2660}",
+        "clubs": "\u{2663}", "diams": "\u{2666}", "ensp": "\u{2002}", "emsp": "\u{2003}",
+        "thinsp": "\u{2009}", "shy": "\u{00AD}", "macr": "\u{00AF}", "micro": "\u{00B5}",
+        "sup1": "\u{00B9}", "sup2": "\u{00B2}", "sup3": "\u{00B3}", "ordm": "\u{00BA}",
+        "ordf": "\u{00AA}", "iexcl": "\u{00A1}", "iquest": "\u{00BF}",
+        "agrave": "\u{00E0}", "aacute": "\u{00E1}", "acirc": "\u{00E2}",
+        "atilde": "\u{00E3}", "auml": "\u{00E4}", "aring": "\u{00E5}",
+        "aelig": "\u{00E6}", "ccedil": "\u{00E7}", "egrave": "\u{00E8}",
+        "eacute": "\u{00E9}", "ecirc": "\u{00EA}", "euml": "\u{00EB}",
+        "iacute": "\u{00ED}", "ntilde": "\u{00F1}", "oacute": "\u{00F3}",
+        "ouml": "\u{00F6}", "uacute": "\u{00FA}", "uuml": "\u{00FC}",
+        "szlig": "\u{00DF}",
+    ]
 
     /// Decode common named and numeric HTML references; leave unknown references verbatim. Entity lookup spans at most 32 characters; decoding checks
     /// cancellation.
     static func decodeHTMLEntities(_ s: String) throws -> String {
         try Task.checkCancellation()
         guard s.contains("&") else { return s }
-        let named: [String: String] = [
-            "amp": "&", "lt": "<", "gt": ">", "quot": "\"", "apos": "'",
-            "nbsp": "\u{00A0}", "copy": "\u{00A9}", "reg": "\u{00AE}", "trade": "\u{2122}",
-            "hellip": "\u{2026}", "mdash": "\u{2014}", "ndash": "\u{2013}", "rsquo": "\u{2019}",
-            "lsquo": "\u{2018}", "ldquo": "\u{201C}", "rdquo": "\u{201D}", "deg": "\u{00B0}",
-            "euro": "\u{20AC}", "pound": "\u{00A3}", "cent": "\u{00A2}", "yen": "\u{00A5}",
-            "bull": "\u{2022}", "middot": "\u{00B7}", "sect": "\u{00A7}", "para": "\u{00B6}",
-            "laquo": "\u{00AB}", "raquo": "\u{00BB}", "times": "\u{00D7}", "divide": "\u{00F7}",
-            "plusmn": "\u{00B1}", "frac12": "\u{00BD}", "frac14": "\u{00BC}", "frac34": "\u{00BE}",
-            "dagger": "\u{2020}", "Dagger": "\u{2021}", "permil": "\u{2030}",
-            "prime": "\u{2032}", "Prime": "\u{2033}", "infin": "\u{221E}",
-            "larr": "\u{2190}", "uarr": "\u{2191}", "rarr": "\u{2192}", "darr": "\u{2193}",
-            "harr": "\u{2194}", "hearts": "\u{2665}", "spades": "\u{2660}",
-            "clubs": "\u{2663}", "diams": "\u{2666}", "ensp": "\u{2002}", "emsp": "\u{2003}",
-            "thinsp": "\u{2009}", "shy": "\u{00AD}", "macr": "\u{00AF}", "micro": "\u{00B5}",
-            "sup1": "\u{00B9}", "sup2": "\u{00B2}", "sup3": "\u{00B3}", "ordm": "\u{00BA}",
-            "ordf": "\u{00AA}", "iexcl": "\u{00A1}", "iquest": "\u{00BF}",
-            "agrave": "\u{00E0}", "aacute": "\u{00E1}", "acirc": "\u{00E2}",
-            "atilde": "\u{00E3}", "auml": "\u{00E4}", "aring": "\u{00E5}",
-            "aelig": "\u{00E6}", "ccedil": "\u{00E7}", "egrave": "\u{00E8}",
-            "eacute": "\u{00E9}", "ecirc": "\u{00EA}", "euml": "\u{00EB}",
-            "iacute": "\u{00ED}", "ntilde": "\u{00F1}", "oacute": "\u{00F3}",
-            "ouml": "\u{00F6}", "uacute": "\u{00FA}", "uuml": "\u{00FC}",
-            "szlig": "\u{00DF}",
-        ]
         var out = ""
         let chars = Array(s)
         var i = 0
@@ -380,7 +382,7 @@ extension SwiftNativeResearchClient {
                             i = semi + 1
                             continue
                         }
-                    } else if let repl = named[entity] {
+                    } else if let repl = Self.namedHTMLEntities[entity] {
                         out.append(repl)
                         i = semi + 1
                         continue

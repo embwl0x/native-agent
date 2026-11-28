@@ -17,7 +17,7 @@ extension NativeAgentShared.ChatAttachmentTypeResolver {
         prepareDraft(draft.text, draft.manualEditRevision)
         showToast("Checking microphone…")
         do {
-            let started = try await input.start(client: client, session: draft.sessionId, revision: draft.manualEditRevision)
+            let started = try await input.start(client: client, session: draft.sessionId)
             guard isCurrent() else { input.discardListening(); return false }
             if started.phase == .listening { showToast("Listening") }
             return started.phase == .listening
@@ -29,12 +29,11 @@ extension NativeAgentShared.ChatAttachmentTypeResolver {
         let text: String
         let editedAt: Date
         let revision: UInt64
-        let session: String
         let attachments: [FaceAttachment]
 
         init(_ draft: ChatComposerDraft, attachments: [FaceAttachment]) {
             text = draft.text; editedAt = draft.editedAt
-            revision = draft.manualEditRevision; session = draft.sessionId
+            revision = draft.manualEditRevision
             self.attachments = attachments
         }
 
@@ -49,15 +48,13 @@ extension NativeAgentShared.ChatAttachmentTypeResolver {
 
     @MainActor
     static func sendScreenshot(
-        _ draft: ScreenshotDraft, client: any FaceClient, expectedSelection: String?, canSubmit: () -> Bool,
+        _ draft: ScreenshotDraft, client: any FaceClient, canSubmit: () -> Bool,
         submit: @MainActor (String, [FaceAttachment]) async -> AppModel.ChatTurnAcceptance,
         accepted: (String) -> Void, showToast: (String) -> Void
     ) async {
         do {
             let id = UUID()
-            let request = ScreenCaptureRequest(operation: id, session: draft.session, composerRevision: draft.revision,
-                                               expectedSelection: expectedSelection, sendWithText: nil)
-            let attachment = try admittedAttachment(try await client.act(.captureScreen(request)), id: id.uuidString, warning: showToast)
+            let attachment = try admittedAttachment(try await client.act(.captureScreen), id: id.uuidString, warning: showToast)
             guard canSubmit() else { return }
             let prompt = draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? "Look at this screenshot and tell me what you see." : draft.text
@@ -208,7 +205,7 @@ extension NativeAgentShared.ChatAttachmentTypeResolver {
     static func attachLocalFile(
         _ url: URL, to appModel: AppModel, sessionId: @autoclosure () -> String,
         resolveType: (String) -> (type: String, mime: String)?,
-        canAttach: @escaping @MainActor () -> Bool = { true }, showToast: @escaping @MainActor (String) -> Void
+        showToast: @escaping @MainActor (String) -> Void
     ) {
         let session = sessionId()
         guard let kind = resolveType(url.pathExtension.lowercased()) else { showToast("Unsupported file type"); return }
@@ -225,7 +222,6 @@ extension NativeAgentShared.ChatAttachmentTypeResolver {
                 let attachment = FaceAttachment(id: UUID().uuidString, name: grant.name, mimeType: kind.mime,
                                                 byteCount: size, resource: grant, bytes: nil)
                 let admitted = try await ingest(attachment, appModel: appModel, session: session, showWarning: showToast)
-                guard canAttach() else { return }
                 appModel.chatPendingAttachments[session, default: []].append(admitted)
                 showToast("Attached " + grant.name)
             } catch { showToast(error.localizedDescription) }

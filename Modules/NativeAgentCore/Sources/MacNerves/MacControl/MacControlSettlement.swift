@@ -12,23 +12,16 @@ extension SwiftNativeMacControl {
         public typealias Subject = NSURL
         public let root: URL
     }
-    enum OperationSettlementTrigger: Equatable {
-        case ordinary
-        case deadline
-        case cancellation
-    }
 
     func finishKnownOperationResult(
         _ executionResult: Result<MacControlResult, Error>,
         action: String,
-        operationId: String,
-        trigger requestedTrigger: OperationSettlementTrigger
+        operationId: String
     ) async throws -> MacControlResult {
         guard let operationStore else {
             return try executionResult.get()
         }
         let current = try await operationStore.record(operationId: operationId)
-        let trigger: OperationSettlementTrigger = current?.outcomeCode == "deadline_effect_unknown" ? .deadline : requestedTrigger
         if let current,
            current.state.isTerminal, current.terminalAt != nil {
             if current.state == .cancelAcknowledged, current.startedAt == nil {
@@ -86,7 +79,8 @@ extension SwiftNativeMacControl {
                         "message": .string(incomplete.localizedDescription)
                     ]), error: "process_io_incomplete", durationMs: 0), record: record)
             }
-            if error is CancellationError || error is ProcessRunCancellation {
+            let scriptStop = error as? AppleScriptExecution.ScriptStopped
+            if error is CancellationError || error is ProcessRunCancellation || scriptStop != nil {
                 let produced = (error as? ProcessRunCancellation).map { stopped in
                     MacControlResult(ok: false, action: action, output: .object([
                         "stdout": .string(stopped.result.stdout), "stderr": .string(stopped.result.stderr),
@@ -96,8 +90,8 @@ extension SwiftNativeMacControl {
                         "cancelled": .bool(true), "timed_out": .bool(stopped.result.timedOut),
                         "channel_errors": .array(stopped.channels.map(JSONValue.string))
                     ]), error: "process_cancelled", durationMs: 0)
-                }
-                if trigger == .deadline {
+                } ?? scriptStop?.result
+                if current?.outcomeCode == "deadline_effect_unknown" {
                     let record = try await operationStore.transition(
                         operationId: operationId,
                         to: .timedOut,

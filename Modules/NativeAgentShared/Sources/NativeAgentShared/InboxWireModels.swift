@@ -52,20 +52,6 @@ public struct InboxRelatedGroup: Identifiable, Codable, Hashable, Sendable {
         self.item_ids = item_ids
         self.source = source
     }
-
-    public var itemIDs: Set<String> {
-        Set(item_ids ?? [])
-    }
-
-    public func matches(itemID: String, title itemTitle: String) -> Bool {
-        if itemID == id { return false }
-        let ids = itemIDs
-        if !ids.isEmpty && ids.contains(itemID) {
-            return true
-        }
-        let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        return !cleanTitle.isEmpty && itemTitle == cleanTitle
-    }
 }
 
 public struct InboxActionRecord: Codable, Hashable, Sendable {

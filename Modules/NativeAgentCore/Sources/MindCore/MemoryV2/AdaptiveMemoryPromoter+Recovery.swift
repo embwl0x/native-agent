@@ -119,9 +119,9 @@ extension AdaptiveMemoryPromoter {
         case .judgment:
             basis.route = await memoryManager?.judgmentRouteKey()
             let identity = NativeAgentBuildIdentity.current
-            if let content = identity.sourceContentID {
-                basis.build = MemoryManagerLane.fingerprint([identity.version, identity.build, content])
-            }
+            let selected = try AbilityStore(dataRoot: door.dataRoot).selectedPart("native-turn-digest")?.row
+            basis.build = MemoryManagerLane.fingerprint([identity.version, identity.build, identity.sourceContentID ?? "",
+                selected?["codeFingerprint"]?.stringValue ?? "", selected?["status"]?.stringValue ?? ""])
         case .desk:
             let store = SwiftNativeDeskStore(dataRoot: door.dataRoot)
             basis.desk = try signature([store.opsPath, store.basePath, store.archivePath])
@@ -369,7 +369,7 @@ extension AdaptiveMemoryPromoter {
                         ? "settled with nothing to judge" : "judged while she was idle")
                     : after?.meaning != nil ? "judged while she was idle; its fold remains owed"
                     : "left owed: " + (result.extraction.failure?.localizedDescription ?? "no judgment was made; due on the next drain"),
-                heldTurn: nil)
+                heldTurn: nil, meaning: after?.meaning ?? result.interpretation.flatMap(Self.encodedMeaning))
         }
         guard result.extraction.failure != nil || result.stagingFailed || unfinished else {
             recoveries[moment.id] = nil

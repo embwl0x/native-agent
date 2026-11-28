@@ -3,7 +3,7 @@ import struct MindCore.MemoryRecord
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MemoryActions+MemoryCurationTools.swift` | `MemoryCuration`: `listMemories`, `rewriteMemory` restates roots and writes nothing when the memory already reads that way (a read steers nothing); `rewriteTarget` shares read-only preview validation; `SwiftToolDispatcher`: `impl_forget_memory`, `impl_rebuild_knowledge_graph` |
+// Blueprint: | `MemoryActions+MemoryCurationTools.swift` | `MemoryCuration`: `listMemories`, `rewriteMemory` restates roots and writes nothing when the memory already reads that way (a read steers nothing); `rewriteTarget` shares read-only preview validation; `SwiftToolDispatcher`: `impl_forget_memory` |
 
 
 /// Share the Memories page’s owner and store so curation cannot diverge across doors.
@@ -25,7 +25,7 @@ public struct MemoryCuration: Sendable {
 
     /// How the agent knows a memory, restated whole: one telling per root, each {how, by?, since?}. The agent's unsteered roots become these; roots
     /// a principal the person does not trust steered stay as they are.
-    func statedRoots(_ input: [String: JSONValue]) throws -> [MemoryRoot.Telling]? {
+    func statedRoots(_ input: [String: JSONValue], tellers: [String]?) throws -> [MemoryRoot.Telling]? {
         let accepted = "roots: [{how: \(MemoryRoot.How.stated.map(\.rawValue).joined(separator: "|")), by?, since?}], at least one"
         switch input["roots"] {
         case nil, .null?: return nil
@@ -37,6 +37,7 @@ public struct MemoryCuration: Sendable {
                         accepted: accepted, effects: .none, code: "memory_roots_invalid", status: .refused,
                         instruction: "Correct \(path) in memory.rewrite.", recovery: .correctArguments)
                 }
+                if let tellers { return MemoryRoot.Telling(how: .told, by: tellers[index]) }
                 guard let telling = try SwiftToolDispatcher.telling(how: fields["how"], by: fields["by"], since: fields["since"],
                     names: (path + ".how", path + ".by", path + ".since")), telling.how != .kept else {
                     throw ToolFailureError("\(path) needs how.", argumentPath: path + ".how", accepted: accepted, effects: .none,
@@ -52,8 +53,6 @@ public struct MemoryCuration: Sendable {
         }
     }
 
-    /// Why a rewrite wrote nothing, in words that match what is stored. A restatement leaves every root a door carried as it is (so a change of
-    /// trust can bring its steer back), and a telling from the same source on the same day is the root already held.
     static func unchangedNote(_ metadata: JSONValue?, restated: Bool, trust: PeerDataTaint.TrustRead) -> String {
         guard restated, case .held(let roots) = MemoryRoot.reading(metadata) else { return "It already reads this way; nothing was written." }
         let doors = Array(Set(roots.flatMap(\.through))).sorted().map { trust.sourceName($0) ?? $0 }
@@ -61,7 +60,7 @@ public struct MemoryCuration: Sendable {
             return "Nothing was written: each root you stated is one this memory already holds, from the same source on the same day."
         }
         return "Nothing was written: roots carried through " + doors.joined(separator: ", ") + " stay as they are whatever a rewrite states, so a "
-            + "change of trust can bring their steer back, and a telling from the same source on the same day is the root already held."
+            + "change of trust can bring their steer back. An already held telling keeps its date and sources."
     }
 
     func curationInt(_ input: [String: JSONValue], _ key: String) -> Int? {
@@ -192,7 +191,8 @@ public struct MemoryCuration: Sendable {
         return .object(out)
     }
 
-    public func rewriteTarget(input: [String: JSONValue], surface: String, persona: String?) async throws -> MemoryRecord {
+    func rewriteTarget(input: [String: JSONValue], surface: String, persona: String?, turn: Turn) async throws
+        -> (row: MemoryRecord, roots: [MemoryRoot.Telling]?, tellers: [String]?) {
         guard let id = input["id"]?.trimmedString else {
             throw ToolFailureError("memory.rewrite needs a memory id.", argumentPath: "id", accepted: "an id from memory.list",
                 effects: .none, nextCall: ToolFailureError.call("app", ["action": .string("memory.list")]),
@@ -201,8 +201,8 @@ public struct MemoryCuration: Sendable {
         let text = input["text"]?.trimmedString
         let pinned = input["pinned"]?.boolValue
         let restore = input["restore"]?.boolValue == true
-        let roots = try statedRoots(input)
-        guard text != nil || pinned != nil || restore || roots != nil else {
+        let hasRoots = input["roots"] != nil && input["roots"] != .null
+        guard text != nil || pinned != nil || restore || hasRoots else {
             throw ToolFailureError("memory.rewrite needs a change.", argumentPath: "text / pinned / restore / roots",
                 accepted: "text: nonempty string; pinned: true or false; restore: true; roots: [{how, by?, since?}]",
                 effects: .none, nextCall: ToolFailureError.call("app", ["find": .string("memory.rewrite")]),
@@ -254,14 +254,19 @@ public struct MemoryCuration: Sendable {
         if pinned == true, let refusal = UserMDGenerator.pinFailure(kind: row.memoryKind) {
             throw refusal
         }
-        return row
+        let tellers = try PeerDataTaintDispatcher.memoryTellers("rewrite_memory", input: input, surface: surface, turn: turn,
+            rewriteChangesText: text.map { $0 != row.text } == true)
+        let roots = try statedRoots(input, tellers: tellers)
+        return (row, roots, tellers)
     }
 
     /// Rewrite through the owner to preserve identity/provenance and recompute embeddings in one update.
     public func rewriteMemory(turn: Turn, invocation: ChatToolInvocation, input: [String: JSONValue], surface: String,
         persona: String?) async throws -> JSONValue {
         let row: MemoryRecord
-        do { row = try await rewriteTarget(input: input, surface: surface, persona: persona) }
+        let roots: [MemoryRoot.Telling]?
+        let tellers: [String]?
+        do { (row, roots, tellers) = try await rewriteTarget(input: input, surface: surface, persona: persona, turn: turn) }
         catch {
             guard case .object(var failure) = SwiftToolDispatcher.memoryFailure(error) else { throw error }
             failure["execution"] = .string("not_run")
@@ -271,22 +276,11 @@ public struct MemoryCuration: Sendable {
         let text = input["text"]?.trimmedString
         let pinned = input["pinned"]?.boolValue
         let restore = input["restore"]?.boolValue == true
-        let roots: [MemoryRoot.Telling]?
-        do { roots = try statedRoots(input) } catch { return SwiftToolDispatcher.memoryFailure(error) }
-        // The teller of words a peer steered is the door that carried them, the one rule memory.commit keeps; the agent's own turn names any teller.
-        if roots != nil, let refusal = PeerDataTaintDispatcher.provenanceRefusal(
-            tool: "rewrite_memory", input: input, surface: surface, turn: turn, peerStore: AgentPeerStore(dataRoot: dataRoot)) {
-            return SwiftToolDispatcher.memoryFailure(ToolFailureError(refusal, argumentPath: "roots", effects: .none,
-                code: "memory_teller_steered", status: .refused,
-                instruction: "Restate each root as told by the door that started this turn, without since, or leave how you know it as it is.",
-                recovery: .correctArguments))
-        }
         // The steer is the one fact outside the agent's say: words an untrusted agent steered, in this turn or in the memory's own roots, are never
         // restated as the agent's own past.
-        // New wording is the agent's observation. The store's one root constructor attributes untrusted steering to its teller, as on commit;
-        // trusted principals remain recorded without turning the agent's own words into their telling. Unchanged words and metadata edits add none.
+        let telling = tellers?.first.map { MemoryRoot.Telling(how: .told, by: $0) } ?? MemoryRoot.Telling(how: .noticed)
         let context = MemoryWriteContext(turn: turn, senseReads: invocation.senseRead?.senseReads ?? invocation.senseReads,
-                                         telling: text == nil ? nil : MemoryRoot.Telling(how: .noticed))
+                                         telling: text.map { $0 != row.text } == true ? telling : nil, tellers: tellers)
         let trust = MemoryDataProvenance.reading(dataRoot: dataRoot, [row.extras], principals: context.through)
         let steer = MemoryDataProvenance.steering(context.through, trust: trust) + MemoryDataProvenance.sources(in: row.extras, trust: trust)
         if !steer.isEmpty, let restating = roots?.firstIndex(where: \.restatesOwnPast) {
@@ -353,83 +347,6 @@ extension SwiftToolDispatcher {
                 return Self.memoryFailure(MemoryCuration.missingMemoryFailure())
             }
             return .object(["status": .string("ok"), "id": .string(id)])
-        } catch {
-            return Self.memoryFailure(error)
-        }
-    }
-
-    /// Re-derive after curation so entities from rewritten or forgotten rows cannot linger.
-    func impl_rebuild_knowledge_graph(input: RebuildKnowledgeGraphArgs) async throws -> JSONValue {
-        // Disabled graph and damaged Trust are distinct checked causes.
-        if let failure = MemoryPolicyGate.knowledgeGraphFailure(dataRoot: dataRoot) {
-            return ChatToolOutcome.failure(error: failure)
-        }
-        let mode = input.mode ?? "rebuild"
-        guard ["rebuild", "sweep_orphans"].contains(mode) else {
-            return MemoryCuration.curationRefusal("mode must be rebuild or sweep_orphans.")
-        }
-        if mode == "sweep_orphans" {
-            return await sweepKnowledgeGraphOrphans(confirmIDs: input.confirmIDs)
-        }
-        do {
-            let report = try await memoryV2.reconcileKnowledgeGraphProjection()
-            return .object([
-                "status": .string("ok"),
-                "report": .string(String(describing: report)),
-            ])
-        } catch {
-            return Self.memoryFailure(error)
-        }
-    }
-
-    /// Preview removes nothing; confirmation must still match the live orphan set the page would confirm.
-    private func sweepKnowledgeGraphOrphans(confirmIDs: [String]?) async -> JSONValue {
-        let actions = KnowledgeGraphMaintenanceActions(dataRoot: dataRoot)
-        func candidateRows(_ candidates: [KnowledgeGraphGCCandidate]) -> JSONValue {
-            .array(candidates.map {
-                .object([
-                    "id": .string($0.id),
-                    "name": .string($0.name),
-                    "type": .string($0.type),
-                    "mentions": .int(Int64($0.mentionCount)),
-                ])
-            })
-        }
-        guard let confirmIDs, !confirmIDs.isEmpty else {
-            do {
-                let report = try await actions.previewOrphanSweep()
-                return .object([
-                    "status": .string("preview"),
-                    "candidates": candidateRows(report.candidates),
-                    "count": .int(Int64(report.candidates.count)),
-                    "next": .string(report.candidates.isEmpty
-                        ? "No orphaned entities; nothing to remove."
-                        : "Nothing removed yet. To remove these, call rebuild_knowledge_graph mode sweep_orphans with confirm_ids set to all of these ids."),
-                ])
-            } catch {
-                return Self.memoryFailure(error)
-            }
-        }
-        let ids = Set(confirmIDs)
-        do {
-            switch try await actions.applyOrphanSweep(expectedCandidateIDs: ids) {
-            case let .applied(report):
-                return .object([
-                    "status": .string("ok"),
-                    "entities_removed": .int(Int64(report.entitiesDeleted)),
-                    "edges_removed": .int(Int64(report.edgesDeleted)),
-                ])
-            case let .previewDiverged(current):
-                return .object([
-                    "status": .string("refused"),
-                    "reason": .string("""
-                        The orphan set changed since the preview, so nothing was removed. Review these candidates and confirm again with exactly \
-                        their ids.
-                        """),
-                    "candidates": candidateRows(current),
-                    "count": .int(Int64(current.count)),
-                ])
-            }
         } catch {
             return Self.memoryFailure(error)
         }

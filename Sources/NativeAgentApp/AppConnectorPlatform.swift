@@ -18,7 +18,7 @@ extension TrustCenterMacControlPolicyProvider {
             makeMacControl(
                 policyProvider: TrustCenterMacControlPolicyProvider(dataRoot: dataRoot),
                 auditDataRoot: auditRoot,
-                notificationCenterAdapter: MacNotificationPosting(turn: turn, deadline: context.deadline)
+                notificationCenterAdapter: MacNotificationPosting(turn: turn)
             )
         }
     }
@@ -83,11 +83,11 @@ private enum SharedFolderGrant {
 
 extension AppConnectorActionPlatform {
     init(engine: NativeAgentEngine) {
-        self.init(dataRoot: engine.dataRoot, statusPlatform: AppConnectorStatusPlatform(),
+        self.init(dataRoot: engine.dataRoot,
                   macAssistant: engine.macIntegration,
                   notification: { note, turn in
                       await NativeAgentNotifications.postMessage(title: note.title, subtitle: note.subtitle, body: note.message, router: .shared,
-                          turn: turn, deadline: nil).deliveryFields()
+                          turn: turn).deliveryFields()
                   })
     }
 }

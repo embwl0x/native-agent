@@ -94,6 +94,7 @@ extension OwnedProgram {
         public var entries: [String] { facts.entries }
         public var functions: [String: [Int]] { facts.functions }
         public var callLines: [String: Int]? { facts.callLines }
+        package let secretLines: [String: Int]
         public let calls: Calls
         public let steps: [Step]
 
@@ -127,21 +128,25 @@ extension OwnedProgram {
         }
 
         package init(data: Data, source: String) throws {
-            let facts = try JSONDecoder().decode(Facts.self, from: data)
+            let fresh = try JSONDecoder().decode(FreshFacts.self, from: data)
+            let facts = fresh.facts
             let length = source.utf16.count, lineCount = Self.lines(source).count
             guard facts.functions.values.allSatisfy({ $0.count == 2 && $0[0] >= 0 && $0[0] <= $0[1] && $0[1] <= length }),
                   facts.calls.allSatisfy({ (1...lineCount).contains($0.line) }),
-                  facts.callLines?.values.allSatisfy({ (0...lineCount).contains($0) }) != false else {
+                  facts.callLines?.values.allSatisfy({ (0...lineCount).contains($0) }) != false,
+                  fresh.secretLines.values.allSatisfy({ (1...lineCount).contains($0) }) else {
                 throw SenseFailure(code: "bad_output", message: "The analyzer returned a location outside the submitted source.")
             }
-            try self.init(facts: facts)
+            try self.init(facts: facts, secretLines: fresh.secretLines)
         }
 
         public init(from decoder: Decoder) throws { try self.init(facts: Facts(from: decoder)) }
         public func encode(to encoder: Encoder) throws { try facts.encode(to: encoder) }
+        public static func == (lhs: Self, rhs: Self) -> Bool { lhs.facts == rhs.facts }
 
-        private init(facts: Facts) throws {
+        private init(facts: Facts, secretLines: [String: Int] = [:]) throws {
             self.facts = facts
+            self.secretLines = secretLines
             var shapes: [Calls.Argument] = []
             func argument(_ index: Int) throws -> Calls.Argument {
                 guard shapes.indices.contains(index) else {
@@ -175,6 +180,16 @@ extension OwnedProgram {
 
     private enum Shape: Codable, Equatable, Sendable {
         case unknown, value(JSONValue), array([Int]), object([String: Int])
+    }
+    private struct FreshFacts: Decodable {
+        private enum CodingKeys: String, CodingKey { case secretLines }
+        let facts: Facts
+        let secretLines: [String: Int]
+
+        init(from decoder: Decoder) throws {
+            facts = try Facts(from: decoder)
+            secretLines = try decoder.container(keyedBy: CodingKeys.self).decodeIfPresent([String: Int].self, forKey: .secretLines) ?? [:]
+        }
     }
     private struct Facts: Codable, Equatable, Sendable {
         let callLines: [String: Int]?
@@ -305,7 +320,9 @@ extension OwnedProgram {
             let operation: String?
             if members == ["call"] { operation = call.first }
             else if members == ["fetch"] { operation = "fetch" }
-            else if members.count == 2, members[0] == "state", ["get", "set"].contains(members[1]) { return }
+            else if OwnedProgramRunner.layeredHostPrimitives.contains(members.joined(separator: ".")) { operation = members.joined(separator: ".") }
+            else if members == ["app", "openURL"] { operation = PartOpenURLRequest.operation }
+            else if members.count == 2, members[0] == "state", ["get", "set", "delete", "list", "cas"].contains(members[1]) { return }
             else if members.count == 2, OwnedProgramRunner.hostPrimitiveNamespaces.contains(members[0]) {
                 operation = members.joined(separator: ".")
             } else if OwnedProgramRunner.hostDoorActions.contains(members.joined(separator: ".")) {

@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 
 // Blueprint: | `ContextFeedback.swift` | `ContextFeedbackReducer`: rebuildable utility and use reachability |
 
@@ -74,7 +75,7 @@ public struct ContextFeedbackSeed: Codable, Equatable, Sendable {
         self.baseDecay = Self.clamp(baseDecay, to: 0 ... 1)
     }
 
-    private static func clamp(_ value: Double, to range: ClosedRange<Double>) -> Double {
+    fileprivate static func clamp(_ value: Double, to range: ClosedRange<Double>) -> Double {
         min(range.upperBound, max(range.lowerBound, value.isFinite ? value : 0))
     }
 }
@@ -87,10 +88,6 @@ private struct ContextFeedbackConfiguration: Sendable {
     public let utilityRetentionPerBucket: Double = 0.995
     public let activationRetentionPerBucket: Double = 0.82
     public let decayRetentionPerBucket: Double = 0.997
-    /// Buckets are five minutes (`ContextPreparation.feedbackTimeBucket`).
-    public let bucketsPerDay: Double = 288
-    /// ACT-R base-level decay uses an exponent near 0.5.
-    public let useDecay: Double = 0.5
 }
 
 public struct ContextFeedbackAtomState: Equatable, Sendable {
@@ -191,12 +188,12 @@ private extension ContextFeedbackReducer {
 
         init(seed: ContextFeedbackSeed, configuration: ContextFeedbackConfiguration) {
             atomID = seed.atomID
-            outcomeUtility = Self.clamp(
+            outcomeUtility = ContextFeedbackSeed.clamp(
                 seed.baseUtility,
-                configuration.minimumUtility ... configuration.maximumUtility
+                to: configuration.minimumUtility ... configuration.maximumUtility
             )
-            temporaryActivation = Self.clamp(seed.baseActivation, -1 ... 1)
-            decay = Self.clamp(seed.baseDecay, 0 ... 1)
+            temporaryActivation = ContextFeedbackSeed.clamp(seed.baseActivation, to: -1 ... 1)
+            decay = ContextFeedbackSeed.clamp(seed.baseDecay, to: 0 ... 1)
         }
 
         mutating func advance(
@@ -263,41 +260,35 @@ private extension ContextFeedbackReducer {
                 temporaryActivation -= 0.18
                 decay -= 0.12
             }
-            retrievalUtility = Self.clamp(
+            retrievalUtility = ContextFeedbackSeed.clamp(
                 retrievalUtility,
-                0 ... configuration.retrievalUtilityCap
+                to: 0 ... configuration.retrievalUtilityCap
             )
-            outcomeUtility = Self.clamp(
+            outcomeUtility = ContextFeedbackSeed.clamp(
                 outcomeUtility,
-                configuration.minimumUtility ... configuration.maximumUtility
+                to: configuration.minimumUtility ... configuration.maximumUtility
             )
-            temporaryActivation = Self.clamp(temporaryActivation, -1 ... 1)
-            decay = Self.clamp(decay, 0 ... 1)
+            temporaryActivation = ContextFeedbackSeed.clamp(temporaryActivation, to: -1 ... 1)
+            decay = ContextFeedbackSeed.clamp(decay, to: 0 ... 1)
         }
 
         func frozen(
             configuration: ContextFeedbackConfiguration, at bucket: Int64?
         ) throws -> ContextFeedbackAtomState {
             let now = bucket ?? uses.max() ?? 0
-            let odds = try uses.reduce(1.0) { sum, use in
-                let (elapsed, overflow) = now.subtractingReportingOverflow(use)
-                guard !overflow else { throw ContextFeedbackError.elapsedOverflow(atomID) }
-                return sum + pow(Double(max(1, elapsed)) / configuration.bucketsPerDay, -configuration.useDecay)
+            guard let reachability = MemoryStrength.reachability(useBuckets: uses, at: now) else {
+                throw ContextFeedbackError.elapsedOverflow(atomID)
             }
             return ContextFeedbackAtomState(
                 atomID: atomID,
-                utility: Self.clamp(
+                utility: ContextFeedbackSeed.clamp(
                     outcomeUtility + retrievalUtility,
-                    configuration.minimumUtility ... configuration.maximumUtility
+                    to: configuration.minimumUtility ... configuration.maximumUtility
                 ),
                 temporaryActivation: temporaryActivation,
                 decay: decay,
-                reachability: odds / (1 + odds)
+                reachability: reachability
             )
-        }
-
-        static func clamp(_ value: Double, _ range: ClosedRange<Double>) -> Double {
-            min(range.upperBound, max(range.lowerBound, value.isFinite ? value : 0))
         }
     }
 }

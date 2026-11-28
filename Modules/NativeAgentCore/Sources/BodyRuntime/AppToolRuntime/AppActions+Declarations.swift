@@ -29,9 +29,20 @@ extension AppActions {
     static let queueAddSchema = arguments("my_queue", ["text": ToolSchema.strSchema(),
         "when": SchedulerJobNormalizer.intentionWhenSchema, "until": .object([:]),
         "say": ToolSchema.strSchema(), "action": .object([:])], required: ["text"])
+    static let queueWaitSchema: JSONValue = {
+        func exact(_ fields: [String: JSONValue]) -> JSONValue {
+            .object(["type": .string("object"), "properties": .object(fields),
+                     "required": .array(fields.keys.sorted().map(JSONValue.string)), "additionalProperties": .bool(false)])
+        }
+        return ToolSchema.nullable(.object(["oneOf": .array([
+            exact(["at": ToolSchema.strSchema()]), exact(["desk": ToolSchema.strSchema()]),
+            exact(["happening": exact(["kind": ToolSchema.enumStringSchema(Happening.Kind.allCases.map(\.rawValue)),
+                                      "subject": ToolSchema.strSchema()])]),
+        ])]))
+    }()
     static let queueUpdateSchema = arguments("my_queue", ["id": ToolSchema.strSchema(),
         "action": .object([:]), "say": .object([:]), "when": SchedulerJobNormalizer.intentionWhenSchema,
-        "until": .object([:])], required: ["id"])
+        "until": .object([:]), "wait_for": queueWaitSchema], required: ["id"])
 
     /// AgentJobs.commission owns these shapes and refuses anything else.
     static let agentJobSchema = arguments("agent_job", [
@@ -46,7 +57,8 @@ extension AppActions {
         "brief": ToolSchema.strSchema("The job in your words: what to make or change, and what done looks like."),
         "where": ToolSchema.strSchema("""
             Another agent only: the one folder it works in, or a git repository's folder; omit for work that needs no place. It cannot overlap your \
-            data or credential roots, including their parents; the same fence checks an omitted where's saved starting folder. Your own line has your hands.
+            data or credential roots, including their parents. A Git checkout is allowed; Git metadata directories are refused, including for linked \
+            worktrees. An omitted where's saved starting folder still passes the credential fence. Your own line has your hands.
             """),
         "reach": .object(["type": .string("object"), "additionalProperties": .bool(false), "description": .string("""
             Another agent only: what it may touch within Trust and this turn's file access: writes default true with where, false under read_only; \

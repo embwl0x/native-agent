@@ -164,7 +164,7 @@ extension SchedulerJobNormalizer {
     }
 
     /// Parse at/time as H[:MM], otherwise strict hour/minute fields with defaults only when absent.
-    static func timeParts(_ spec: [String: JSONValue], defaultHour: Int = 9, defaultMinute: Int = 0) throws -> (Int, Int) {
+    static func timeParts(_ spec: [String: JSONValue]) throws -> (Int, Int) {
         let raw = firstPresent(spec["at"], spec["time"])
         let hour: Int
         let minute: Int
@@ -180,8 +180,8 @@ extension SchedulerJobNormalizer {
             minute = m
         } else {
             // Documented defaults apply only to absent fields.
-            hour = try spec["hour"].map { try integer($0) } ?? defaultHour
-            minute = try spec["minute"].map { try integer($0) } ?? defaultMinute
+            hour = try spec["hour"].map { try integer($0) } ?? 9
+            minute = try spec["minute"].map { try integer($0) } ?? 0
         }
         guard (0...23).contains(hour), (0...59).contains(minute) else {
             throw TriggerSchedulerError.schedulerInvalid("scheduled hour/minute out of range")

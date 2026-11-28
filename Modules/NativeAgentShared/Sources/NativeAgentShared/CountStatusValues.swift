@@ -1,16 +1,10 @@
 import Foundation
-// Blueprint: | `CountStatusValues.swift` | `CountStatusValues`: phone, transport, health, capture, download and notice facts drawn through the counts slot |
+// Blueprint: | `CountStatusValues.swift` | `CountStatusValues`: health, capture, download and notice facts drawn through the counts slot |
 
 public struct CountStatusValues: FaceValue {
-    public var phoneConnection: NAPhoneConnection?
-    public var phoneStanding: NAPhoneStanding?
-    public var phoneStatus: String?
-    public var pairingError: String?
-    public var isCheckingPairing: Bool?
     public var health: RuntimeHealth?
     public var capture: ActivityCaptureFace?
     public var download: EmbeddingDownloadFace?
-    public var telegram: TransportStatusFace?
     public var toastQueues: [UUID: [SystemToast]] = [:]
 
     public init() {}
@@ -31,24 +25,6 @@ public struct ActivityCaptureFace: FaceValue {
         self.isCapturing = isCapturing
         self.capturesTitles = capturesTitles
         self.availability = availability
-    }
-}
-
-public struct TransportStatusFace: FaceValue {
-    public let enabled: Bool?
-    public let pollerRunning: Bool?
-    public let lastError: String?
-    public let credentialIssue: String?
-    public let routingIssue: String?
-    public let readIssue: String?
-
-    public init(enabled: Bool?, pollerRunning: Bool?, lastError: String?, credentialIssue: String?, routingIssue: String?, readIssue: String?) {
-        self.enabled = enabled
-        self.pollerRunning = pollerRunning
-        self.lastError = lastError
-        self.credentialIssue = credentialIssue
-        self.routingIssue = routingIssue
-        self.readIssue = readIssue
     }
 }
 
@@ -75,8 +51,8 @@ public struct EmbeddingDownloadFace: FaceValue {
     }
 }
 
-public struct RuntimeStatusFace: FaceValue {
-    public enum Tone: FaceValue { case neutral, success, warning, failure }
+public struct RuntimeStatusFace: Sendable {
+    public enum Tone: Sendable { case neutral, success, warning, failure }
     public let text: String
     public let detail: String?
     public let tone: Tone

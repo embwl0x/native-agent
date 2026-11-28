@@ -287,26 +287,14 @@ public struct TurnTracePersistLane: Sendable {
         public let row: PersistedRow
     }
 
-    private static let dayFormatter = Mutex<DateFormatter>({
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.timeZone = TimeZone.current
-        f.dateFormat = "yyyy-MM-dd"
-        return f
-    }())
-
     package static func dayString(from date: Date) -> String {
-        dayFormatter.withLock { $0.string(from: date) }
-    }
-
-    package static func day(from string: String) -> Date? {
-        dayFormatter.withLock { $0.date(from: string) }
+        NativeTimestampFormat.calendarDay(date)
     }
 
     /// Day arithmetic on the Mac's clock, including across DST changes.
     package static var dayCalendar: Calendar {
         var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = dayFormatter.withLock { $0.timeZone }
+        calendar.timeZone = .autoupdatingCurrent
         return calendar
     }
 }

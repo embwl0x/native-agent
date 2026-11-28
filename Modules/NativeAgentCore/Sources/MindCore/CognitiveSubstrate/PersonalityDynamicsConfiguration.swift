@@ -5,11 +5,14 @@ import Foundation
 /// Fixed felt-layer constants with bounded warmth and humor derived from the persona.
 public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
     private static let baseWarmthEarnedSpan = 0.30
+    /// The distance from neutral rest up to the former rest: the span starts at neutral, so earned warmth still reaches as high as it did.
+    private static let restToFormerRest = 0.15
 
-    // MARK: - Felt warmth range (CognitiveSubstrate+Capsule.swift)
+    // MARK: - Felt warmth range (CognitiveSubstrate+CapsuleFeltSignals.swift)
 
-    /// Where felt warmth rests with no earned warmth at all. Sits AT the `warm` word gate and clear of `tender`, so an agent has a reachable neutral.
-    public let feltWarmthRest: Double = 0.55
+    /// Where felt warmth rests with no earned warmth at all: neutral, between the `reserved` gate (0.35) and the `warm` gate (0.45). Warmth is earned upward
+    /// from here and uncertainty cools downward, so every warmth word from lonely to tender is reachable and rest itself reads neither warm nor cold.
+    public let feltWarmthRest: Double = 0.40
     /// Only live social warmth earns this scale span.
     public let feltWarmthEarnedSpan: Double?
     /// Uncertainty cools felt warmth without making a tense working moment cold.
@@ -46,8 +49,8 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
 
     /// Recent workspace feeling fades faster than the mood integral.
     public let fingerprintTintHalfLife: TimeInterval = 300
-    /// Asymmetric warm-with-the-user baseline lift on fingerprint valence.
-    public let personaValenceLift: Double = 0.10
+    /// No lift: fingerprint valence reads as it is, so a mild low is felt as surely as a mild high.
+    public let personaValenceLift: Double = 0
     /// Below this intensity no expressive fingerprint word is chosen; the frame still describes the available mood and body.
     public let feltIntensityFloor: Double = 0.14
 
@@ -86,7 +89,7 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
     /// Weight of `play` mode in exemplar selection, derived from the persona's humor trait.
     public let playModeWeight: Double?
 
-    private init(feltWarmthEarnedSpan: Double? = PersonalityDynamicsConfiguration.baseWarmthEarnedSpan, playModeWeight: Double? = 0.5) {
+    private init(feltWarmthEarnedSpan: Double? = PersonalityDynamicsConfiguration.restToFormerRest + PersonalityDynamicsConfiguration.baseWarmthEarnedSpan, playModeWeight: Double? = 0.5) {
         self.feltWarmthEarnedSpan = feltWarmthEarnedSpan
         self.playModeWeight = playModeWeight
     }
@@ -99,7 +102,8 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
     public static func derived(warmth: Double, humor: Double) -> PersonalityDynamicsConfiguration {
         let centeredWarmth = (warmth.clamped01() - 0.5) * 2
         return PersonalityDynamicsConfiguration(
-            feltWarmthEarnedSpan: baseWarmthEarnedSpan * (1 + centeredWarmth * 0.5),
+            // Every persona can reach tender and beyond (at least 0.85); a warmer persona rises faster.
+            feltWarmthEarnedSpan: max(0.45, restToFormerRest + baseWarmthEarnedSpan * (1 + centeredWarmth * 0.5)),
             playModeWeight: humor.clamped01()
         )
     }

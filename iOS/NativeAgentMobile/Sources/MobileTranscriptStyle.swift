@@ -5,20 +5,12 @@ import UIKit
 
 // Blueprint: | `MobileTranscriptStyle.swift` | The phone's transcript look (UIKit tokens at the reader's text size) for the press's Shared renderer, and action links |
 
-/// The phone's tokens as the document lays them out: the 740 pt room column inside the page inset, bubbles, code insets and gaps.
 enum TranscriptMetrics {
-    /// Room above a user bubble for its provenance or bridge line.
-    static let tagSpace: CGFloat = 16
-    static let column = NativeAgentMobileTheme.Layout.roomColumn
-    /// The column never comes closer than this to the screen's edges.
-    static let pageInset: CGFloat = 20
     static let documentInset: CGFloat = NativeAgentSpacing.md
     static let bubblePadH: CGFloat = 14
     static let bubblePadV: CGFloat = 10
     static let userCorners = (topLeading: CGFloat(18), topTrailing: CGFloat(18), bottomTrailing: CGFloat(6), bottomLeading: CGFloat(18))
     static let codePad: CGFloat = NativeAgentSpacing.md
-    /// The strip above the code that holds its language, when it has one.
-    static let codeHeader: CGFloat = 22
     static let codeRadius: CGFloat = 12
 }
 

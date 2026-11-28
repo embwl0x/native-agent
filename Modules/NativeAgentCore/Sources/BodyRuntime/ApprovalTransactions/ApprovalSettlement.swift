@@ -63,7 +63,7 @@ extension ApprovalExecution {
             return
         }
         let carried: (sources: [String], elevated: [String])
-        do { carried = try AgentScreen.queueApprovalSteering(rec, dataRoot: dataRoot) }
+        do { carried = try AgentScreen.queueApprovalSteering(rec) }
         catch {
             RepairOwed.owe(dataRoot, id: "approval.provenance:" + rec.id, kind: .run,
                 operation: "approval.provenance:" + rec.id, owner: "Approval " + rec.id,
@@ -148,9 +148,13 @@ extension ApprovalExecution {
             let base = host?.turn ?? TurnRequest(message: "", sessionID: replay.sessionId, fileAccess: replay.fileAccess,
                 surface: replay.surface, envelope: envelope, verifiedSessionID: .some(replay.sessionId))
                 .turn(dataRoot: dataRoot)
-            let steer = base.peerSteering ?? PeerDataTaint(dataRoot: base.dataRoot, restoring: carried.sources, elevated: carried.elevated)
-            carried.sources.forEach { steer.mark(dataRoot: base.dataRoot, peer: $0) }
-            carried.elevated.forEach { steer.elevate(dataRoot: base.dataRoot, peer: $0) }
+            let steer = base.peerSteering ?? PeerDataTaint()
+            for source in carried.sources + carried.elevated { steer.mark(dataRoot: base.dataRoot, peer: source) }
+            if host != nil, rec.decision == "approved", rec.scope == "task" {
+                for source in carried.sources where !PeerDataTaint.ownerTrusts(dataRoot, source) && !carried.elevated.contains(source) {
+                    steer.elevate(dataRoot: base.dataRoot, peer: source)
+                }
+            }
             let turn = base.with(\.envelope, envelope)
                 .with(\.verifiedSessionID, replay.sessionId)
                 .with(\.fileAccess, replay.fileAccess)
@@ -261,7 +265,7 @@ extension ApprovalExecution {
         let summary = (try? JSONValue.object(envelope).serialize(pretty: false)) ?? prose
         let payload: [String: JSONValue] = if case .object(let fields) = rec.payload { fields } else { [:] }
         let carried: (sources: [String], elevated: [String])
-        do { carried = try AgentScreen.queueApprovalSteering(rec, dataRoot: dataRoot) }
+        do { carried = try AgentScreen.queueApprovalSteering(rec) }
         catch {
             RepairOwed.owe(dataRoot, id: "approval.provenance:" + rec.id, kind: .run,
                 operation: "approval.provenance:" + rec.id, owner: "Approval " + rec.id,
@@ -284,18 +288,19 @@ extension ApprovalExecution {
                 effects: executedAction.objectValue?["effects"]?.stringValue,
                 recoveredAt: continueConversation ? nil : (rec.resolvedAt ?? rec.createdAt))
             // Filing reads this transition under the same Desk lock as the continuation's scan.
+            let continuationCeiling = try? replay.fileAccessCeiling.get()
             let resume = try await SwiftNativePersistenceCore.withFileLock(SwiftNativeDeskStore(dataRoot: dataRoot).opsPath) {
-                () -> (text: String, sources: [String], elevated: [String])? in
+                () -> (text: String, sources: [String])? in
                 if continueConversation, !abandonedClaim,
                    !(try await inbox.annotateChatContinuation(rec.id, done: false)) { return nil }
                 return await AgentScreen.resume(card: rec.id, decision: decision, completed: resultClass == .succeeded,
-                                               handOff: continueConversation && !abandonedClaim, dataRoot: dataRoot)
+                                               handOff: continueConversation && !abandonedClaim, fileAccessCeiling: continuationCeiling, dataRoot: dataRoot)
             }
             // The receipt is durable before any claim becomes evictable. A prior process may have delivered already, so never resend it.
             if abandonedClaim {
                 _ = try await inbox.annotateChatContinuation(rec.id, done: true, settlement: "interrupted")
             } else if continueConversation, let resume {
-                let steer = PeerDataTaint(dataRoot: dataRoot, restoring: carried.sources + resume.sources, elevated: carried.elevated + resume.elevated)
+                let steer = PeerDataTaint(dataRoot: dataRoot, restoring: carried.sources + carried.elevated + resume.sources)
                 var settlement = "completed"
                 do {
                     let turn = TurnRequest(message: "", sessionID: safeSessionID, surface: replay.surface,

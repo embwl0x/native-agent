@@ -1,7 +1,7 @@
+import PersistenceCore
 import MacNerves
 import NativeAgentCore
 import NativeAgentShared
-import PersistenceCore
 import DeskCore
 import SenseCore
 import Foundation
@@ -23,17 +23,12 @@ extension AppActions {
         .fold("desk_add_ref", "desk", subject: ["handle"]),
         .fold("desk_blocked_on", "desk", subject: ["handle"]),
         .fold("desk_defer", "desk", subject: ["handle"]),
-        .fold("desk_breakdown", "desk"),
         .fold("desk_close", "desk", subject: ["handle"], argumentNames: ["reason": ["evidence", "summary"], "canceled": ["status"]],
               argumentValues: ["canceled": ["canceled": .bool(true), "cancelled": .bool(true), "done": .bool(false)]]),
-        .fold("desk_archive", "desk", subject: ["handle"]),
         .fold("desk_work_log", "desk", subject: ["handle"]),
         .fold("desk_set_cadence", "desk", subject: ["handle"]),
         .fold("desk_set_notify", "desk", subject: ["handle"]),
         .fold("desk_nag_control", "desk"),
-        .fold("desk_open_pursuit", "desk"),
-        .fold("task_ledger_list", "desk", "Shared task ledger: a separate list from your Desk", read: true),
-        .fold("task_ledger_post", "desk", "Post to the shared task ledger (separate from your Desk)"),
         .fold("scheduler_list_jobs", "desk", read: true),
         .fold("scheduler_create_job", "desk", """
             Schedule a read on the clock: connector_action (a watch) or proactive_scan; for intentions, check-ins and reminders use queue.add

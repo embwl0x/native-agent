@@ -137,7 +137,8 @@ extension MemoryStorage {
                 let validFrom: String? = try row.decode(forColumn: "valid_from")
                 let validTo: String? = try row.decode(forColumn: "valid_to")
                 try Self.validateTemporalEvidence(id: id, validFrom: validFrom, validTo: validTo, observedAt: nil)
-                guard MemoryRecordDisclosurePolicy.isTemporallyEligible(validTo: validTo, at: now) else { continue }
+                guard MemoryRecallScoring.hasStarted(validFrom: validFrom, at: now),
+                      MemoryRecordDisclosurePolicy.isTemporallyEligible(validTo: validTo, at: now) else { continue }
                 let item = SwiftNativeMemoryIndexer.makeItem(
                     id: id,
                     text: try row.decode(forColumn: "content"),

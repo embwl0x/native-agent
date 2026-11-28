@@ -220,11 +220,9 @@ public struct MacIntegrationDeliveryActions: ChatMacIntegrationToolBridge {
 /// MacControl's words tell a matter pinned to the Mac; its OS receipt proves the banner.
 public struct MacNotificationPosting: NotificationPosting {
     private let turn: Turn?
-    private let deadline: ContinuousClock.Instant?
 
-    public init(turn: Turn?, deadline: ContinuousClock.Instant?) {
+    public init(turn: Turn?) {
         self.turn = turn
-        self.deadline = deadline
     }
     public func postNotificationReceipt(
         title: String,
@@ -233,7 +231,7 @@ public struct MacNotificationPosting: NotificationPosting {
     ) async throws -> NotificationPostReceipt {
         let result = await NativeAgentNotifications.postMessage(
             title: title, body: message, soundName: soundName, router: NativeAgentEngine.live.ports.backgroundWork.attention,
-            turn: turn, deadline: deadline)
+            turn: turn)
         if case .deferred = result.notificationOutcome {
             return NotificationPostReceipt(authorization: nil, requestIdentifier: result.identifier, delivery: result.notificationOutcome)
         }

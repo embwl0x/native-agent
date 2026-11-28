@@ -360,6 +360,16 @@ public enum DoctorLoopHealth {
         recentFailureDates: [String: [FailureIncident]],
         now: Date
     ) -> CheckResult {
+        doctorCheck(observations: observations,
+                    verdicts: evaluate(observations: observations, recentFailureDates: recentFailureDates, now: now),
+                    now: now)
+    }
+
+    static func doctorCheck(
+        observations: [LoopStatus],
+        verdicts: [LoopHealthVerdict],
+        now: Date
+    ) -> CheckResult {
         // The fleet registers at launch; an empty status list proves no scheduler health.
         guard !observations.isEmpty else {
             return CheckResult(source: "Background loop registrations",
@@ -370,11 +380,6 @@ public enum DoctorLoopHealth {
                 human_action: "Quit and reopen NativeAgent to start background scheduling, then run Doctor again."
             )
         }
-        let verdicts = evaluate(
-            observations: observations,
-            recentFailureDates: recentFailureDates,
-            now: now
-        )
         let dormant = Set(
             observations
                 .filter { dormancyVerdict(for: $0, now: now) != nil }

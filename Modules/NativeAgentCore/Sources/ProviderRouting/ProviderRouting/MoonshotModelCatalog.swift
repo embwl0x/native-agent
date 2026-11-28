@@ -55,7 +55,7 @@ public enum MoonshotModelCatalog {
     ) -> Bool {
         let needle = id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !needle.isEmpty else { return false }
-        return readCache(dataRoot: dataRoot)?.contains { $0.id.lowercased() == needle } ?? false
+        return cache.currentModels(dataRoot: dataRoot)?.contains { $0.id.lowercased() == needle } ?? false
     }
 
     static func parseModelsResponse(_ data: Data) throws -> [ProviderModelInfo] {
@@ -136,11 +136,6 @@ public enum MoonshotModelCatalog {
             return try cache.currentCache(dataRoot: dataRoot) == nil
                 ? "Moonshot model catalog is not available. Refresh its models in Providers." : nil
         } catch { return error.localizedDescription }
-    }
-
-    static func readCache(dataRoot: URL) -> [ProviderModelInfo]? {
-        do { return try cache.currentCache(dataRoot: dataRoot)?.models }
-        catch { return nil } // cacheFault carries the unavailable cause.
     }
 
     private static let decodedCache = ModelCatalogDecodeCache()

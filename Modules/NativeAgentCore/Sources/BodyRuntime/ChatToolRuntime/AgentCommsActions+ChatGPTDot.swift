@@ -114,7 +114,7 @@ extension SwiftToolDispatcher {
                     tap: "Tell the person: this copy of NativeAgent is missing chatgpt_dot_ipc.js.",
                         instruction: "Report the missing Dot helper to the person."))
         }
-        guard let node = AgentBridgeRuntime.executableURL(named: "node", environment: environment) else {
+        guard let node = AgentBridgeRuntime.executableURL(environment: environment) else {
             return unavailable("dot_runtime_missing", "Node.js is missing from the helper's executable search path.",
                 remedy: Repair.remedy(owner: "Node.js", nextCall: nil,
                     tap: "Node.js installer → install Node.js", instruction: "Install Node.js on the app's executable search path."))

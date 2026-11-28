@@ -331,10 +331,9 @@ public final class InlineInteractionCoordinator {
         }
         // The waiting turn is this card's continuation: it takes the card's after_card steps.
         let queued = await AgentScreen.resume(card: current.id, decision: current.state.outcome != nil ? "approved" : "declined",
-            completed: current.state.outcome != nil, handOff: true, dataRoot: dataRoot)
+            completed: current.state.outcome != nil, handOff: true, fileAccessCeiling: turn.fileAccessCeiling, dataRoot: dataRoot)
         try await invalidateContinuation(id: raised.id, sessionID: sessionID, dataRoot: turn.dataRoot)
         queued.sources.forEach { turn.peerSteering?.mark(dataRoot: turn.dataRoot, peer: $0) }
-        queued.elevated.forEach { turn.peerSteering?.elevate(dataRoot: turn.dataRoot, peer: $0) }
         guard case .object(var receipt) = Self.receiptEnvelope(current) else { return Self.receiptEnvelope(current) }
         if case .declined = current.state { receipt["reason"] = .string("declined"); receipt["effects"] = .string("none") }
         if let choice = current.state.outcome?.selection { receipt["answer"] = .string(choice) }
@@ -382,7 +381,8 @@ public final class InlineInteractionCoordinator {
                 requestingTool: requestingTool, origin: origin, dataRoot: dataRoot, turn: turn)
             stamped = filed.card
             changed = filed.changed
-        } catch {
+        } catch is CancellationError { return nil }
+        catch {
             await RepairOwed.owe(dataRoot, id: interaction.id, kind: .decision, operation: "interaction.raise:" + interaction.id, owner: "interaction",
                 words: "The request could not be filed: " + TurnSecretRedactor.redactText(error.localizedDescription),
                 lever: "Repair the request's transcript filing and raise this same request again.").value

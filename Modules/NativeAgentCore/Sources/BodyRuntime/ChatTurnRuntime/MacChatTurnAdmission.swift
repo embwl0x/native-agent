@@ -34,7 +34,8 @@ public extension MacChatTurnPresentationPort {
         requireIdleAndEmpty: Bool = false,
         origin: ChatMessageOrigin? = nil,
         parent: Turn? = nil,
-        renderer: UUID? = nil
+        renderer: UUID? = nil,
+        cardAnswer: Bool = false
     ) async -> MacChatStartedTurn {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty else {
@@ -106,7 +107,8 @@ public extension MacChatTurnPresentationPort {
         if let renderer { turn[FacePresentationPart.self] = renderer }
         // The words exactly as the turn writes its row, so the saved row, a steered row and the turn's own are one row.
         let words = trimmed.isEmpty ? "(see attachments)" : trimmed
-        let arrival = TurnArrival(words: words, attachments: attachments, surface: "chat", row: hideUserBubble ? .hidden : .saved)
+        let arrival = TurnArrival(words: words, attachments: attachments, surface: "chat",
+            row: hideUserBubble ? .hidden : .saved, cardAnswer: cardAnswer)
         // Await Stop's flag write before the busy guards and this turn's flag-clear.
         await awaitPendingCancelFlagWrite(for: targetSessionId)
         let repairAvailable = await repairChatTurnLifecyclesIfNeeded(
@@ -283,6 +285,7 @@ public extension MacChatTurnPresentationPort {
     /// A replacement generation must survive that cleanup; admission without a task is revoked by requestStop.
     @MainActor
     func stopChatStream(sessionId: String? = nil,
+                        runID: String? = nil,
                         revokeDriverControl: (@MainActor @Sendable () async -> Void)? = nil,
                         didWrite: (@MainActor @Sendable (Result<Void, Error>) -> Void)? = nil) {
         // Main-window Stop targets only its active session; choosing an arbitrary background stream could cancel unrelated work.
@@ -302,7 +305,7 @@ public extension MacChatTurnPresentationPort {
                 await persistChatTurnLifecycleUpdate(identity: requested.identity)
             }
         }
-        macChatTurns.requestStop(sessionId: sid,
+        macChatTurns.requestStop(sessionId: sid, runID: runID,
                                  revokeDriverControl: revokeDriverControl, didWrite: didWrite)
         // Let the in-flight task clean its own busy state and buffers to avoid racing settlement.
     }

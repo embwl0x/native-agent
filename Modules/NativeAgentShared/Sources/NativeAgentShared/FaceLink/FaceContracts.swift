@@ -5,10 +5,8 @@ public enum FaceEffects: String, Codable, Sendable { case none, known, unknown }
 public enum FacePresentationPolicy: String, Codable, Sendable { case foreground, quiet }
 public enum FaceNavigationDisposition: String, Codable, Sendable { case mounted, queued, unavailable }
 public enum FollowOutcome: String, Codable, Sendable { case tookBack, kept }
-public enum ComposerEditDisposition: String, Codable, Sendable { case applied, conflict, preservedExisting }
+public enum ComposerEditDisposition: String, Codable, Sendable { case applied, conflict }
 public enum FaceEffectDisposition: String, Codable, Sendable { case completed, skipped }
-public enum FaceApprovalDecision: String, Codable, Sendable { case approved, denied, canceled }
-public enum ProposalDecision: String, Codable, Sendable { case accept, reject }
 
 public enum DocumentSubject: Codable, Sendable, Equatable {
     case pageItem(page: String, item: String)
@@ -123,12 +121,6 @@ public struct FaceDestination: Codable, Sendable, Equatable {
     }
 }
 
-public struct OpenCommandRouteRequest: NotificationCenter.MainActorMessage {
-    public typealias Subject = NSObject
-    public let route: String
-    public init(route: String) { self.route = route }
-}
-
 public struct FaceNavigationRequest: Codable, Sendable, Equatable {
     public var destination: FaceDestination
     public var policy: FacePresentationPolicy
@@ -240,15 +232,13 @@ public struct SendRequest: Codable, Sendable, Equatable {
     public var session: String?
     public var text: String
     public var attachments: [FaceAttachment]
-    public var composerRevision: UInt64
     public var expectedSelection: String?
     public var options: FaceSendOptions
-    public init(session: String?, text: String, attachments: [FaceAttachment], composerRevision: UInt64, expectedSelection: String?,
+    public init(session: String?, text: String, attachments: [FaceAttachment], expectedSelection: String?,
                 options: FaceSendOptions) {
         self.session = session
         self.text = text
         self.attachments = attachments
-        self.composerRevision = composerRevision
         self.expectedSelection = expectedSelection
         self.options = options
     }
@@ -282,18 +272,21 @@ public struct PageActRequest: Codable, Sendable, Equatable {
     public var action: String
     public var value: PartFace.Value?
     public var expectedRevision: String?
+    public var expectedPageRevision: String?
     public var expectedCall: PartFace.Call?
     public var answers: Bool?
     public var operation: UUID?
     public var undoOf: UUID?
     public var checking: Bool?
     public init(page: String, row: String, action: String, value: PartFace.Value?, expectedRevision: String?, expectedCall: PartFace.Call?,
-                answers: Bool? = nil, operation: UUID? = nil, undoOf: UUID? = nil, checking: Bool? = nil) {
+                answers: Bool? = nil, operation: UUID? = nil, undoOf: UUID? = nil, checking: Bool? = nil,
+                expectedPageRevision: String? = nil) {
         self.page = page
         self.row = row
         self.action = action
         self.value = value
         self.expectedRevision = expectedRevision
+        self.expectedPageRevision = expectedPageRevision
         self.expectedCall = expectedCall
         self.answers = answers
         self.operation = operation
@@ -456,17 +449,6 @@ public struct ConnectorCredentialWrite: Codable, Sendable, Equatable {
     }
 }
 
-public struct TelegramConfigurationWrite: Codable, Sendable, Equatable {
-    public var token: Data?
-    public var allowedUserIDs: [String]
-    public var allowedChatIDs: [String]
-    public init(token: Data?, allowedUserIDs: [String], allowedChatIDs: [String]) {
-        self.token = token
-        self.allowedUserIDs = allowedUserIDs
-        self.allowedChatIDs = allowedChatIDs
-    }
-}
-
 public struct GrokCredentialWrite: Codable, Sendable, Equatable {
     public var operation: UUID
     public var contact: String
@@ -489,33 +471,6 @@ public struct TrustPresetRequest: Codable, Sendable, Equatable {
     }
 }
 
-public struct MemoryPolicyPatch: Codable, Sendable, Equatable {
-    public var fields: [String: PartFace.Value]
-    public var expectedRevision: String
-    public init(fields: [String: PartFace.Value], expectedRevision: String) {
-        self.fields = fields
-        self.expectedRevision = expectedRevision
-    }
-}
-
-public struct MacControlPolicyWrite: Codable, Sendable, Equatable {
-    public var policy: MacControlPolicyWireSnapshot
-    public var baseline: MacControlPolicyWireSnapshot
-    public init(policy: MacControlPolicyWireSnapshot, baseline: MacControlPolicyWireSnapshot) {
-        self.policy = policy
-        self.baseline = baseline
-    }
-}
-
-public struct MultimodalPolicyWrite: Codable, Sendable, Equatable {
-    public var fields: [String: PartFace.Value]
-    public var expectedRevision: String
-    public init(fields: [String: PartFace.Value], expectedRevision: String) {
-        self.fields = fields
-        self.expectedRevision = expectedRevision
-    }
-}
-
 public struct MacControlRequest: Codable, Sendable, Equatable {
     public var action: String
     public var arguments: [String: PartFace.Value]
@@ -524,24 +479,6 @@ public struct MacControlRequest: Codable, Sendable, Equatable {
         self.action = action
         self.arguments = arguments
         self.checking = checking
-    }
-}
-
-public struct ActivityPolicyWrite: Codable, Sendable, Equatable {
-    public var fields: [String: PartFace.Value]
-    public var expectedRevision: String
-    public init(fields: [String: PartFace.Value], expectedRevision: String) {
-        self.fields = fields
-        self.expectedRevision = expectedRevision
-    }
-}
-
-public struct DoctorRequest: Codable, Sendable, Equatable {
-    public var scope: String
-    public var repair: Bool
-    public init(scope: String, repair: Bool) {
-        self.scope = scope
-        self.repair = repair
     }
 }
 
@@ -600,35 +537,18 @@ public struct AttachmentTransfer: Codable, Sendable, Equatable {
     }
 }
 
-public struct ScreenCaptureRequest: Codable, Sendable, Equatable {
-    public var operation: UUID
-    public var session: String?
-    public var composerRevision: UInt64
-    public var expectedSelection: String?
-    public var sendWithText: String?
-    public init(operation: UUID, session: String?, composerRevision: UInt64, expectedSelection: String?, sendWithText: String?) {
-        self.operation = operation
-        self.session = session
-        self.composerRevision = composerRevision
-        self.expectedSelection = expectedSelection
-        self.sendWithText = sendWithText
-    }
-}
-
 public struct SceneReport: Codable, Sendable, Equatable {
     public var connection: UUID
     public var id: UUID
     public var destination: FaceDestination?
-    public var isKey: Bool
     public var composerSession: String?
     public var selectedSession: String?
     public var mounted: Bool
-    public init(connection: UUID, id: UUID, destination: FaceDestination?, isKey: Bool,
+    public init(connection: UUID, id: UUID, destination: FaceDestination?,
                 composerSession: String?, selectedSession: String?, mounted: Bool) {
         self.connection = connection
         self.id = id
         self.destination = destination
-        self.isKey = isKey
         self.composerSession = composerSession
         self.selectedSession = selectedSession
         self.mounted = mounted
@@ -703,17 +623,6 @@ public struct RendererInspectorReport: Codable, Sendable, Equatable {
     }
 }
 
-public struct RendererDiagnostic: Codable, Sendable, Equatable {
-    public var kind: String
-    public var reader: UUID?
-    public var message: String
-    public init(kind: String, reader: UUID?, message: String) {
-        self.kind = kind
-        self.reader = reader
-        self.message = message
-    }
-}
-
 public struct NotificationResponse: Codable, Sendable, Equatable {
     public var id: String?
     public var action: String
@@ -770,13 +679,11 @@ public struct OAuthPresentationRequest: Codable, Sendable, Equatable {
     public var operation: UUID
     public var provider: String
     public var authorizationURL: String
-    public var expectedState: String
     public var callbackScheme: String
-    public init(operation: UUID, provider: String, authorizationURL: String, expectedState: String, callbackScheme: String) {
+    public init(operation: UUID, provider: String, authorizationURL: String, callbackScheme: String) {
         self.operation = operation
         self.provider = provider
         self.authorizationURL = authorizationURL
-        self.expectedState = expectedState
         self.callbackScheme = callbackScheme
     }
 }

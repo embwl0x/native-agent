@@ -186,6 +186,7 @@ extension AppToolExecutor {
                                 extra: ["kit": .string(kit)])
         }
         var identity: [String: JSONValue] = ["place": .string(view.page.address)]
+        var publicationEffects = ToolFailureError.Effects.none
         do {
             // Existing places keep their identity while gaining a version.
             let existing = try await registry.allChecked().first { $0.corner == corner && $0.origin != .builtIn && $0.language == .javascript }
@@ -258,12 +259,14 @@ extension AppToolExecutor {
                         "args": .object(["trial_id": .string(id), "digest": .string(candidate.digest), "keep": .bool(true)])])])])
             }
             let writeStarted = ContinuousClock.now
+            publicationEffects = .partial
             let (published, keptPage) = try await registry.keep(candidate, key: key, scope: scope, turn: turn)
             timing["write_ms"] = .double(Self.senseMilliseconds(since: writeStarted))
             SenseDoorViews.shared.forget(corner: corner, scope: scope)
             return .object(["status": .string("kept"), "place": .string(corner.key), "sense_id": .string(published.id),
                             "version": .int(Int64(published.version)), "page": .string(keptPage)])
         } catch let error as NSError where error.domain == "CapabilityLifecycle" {
+            identity["effects"] = .string(publicationEffects.rawValue)
             return Self.failure("owners_call", error.localizedDescription, extra: identity)
         } catch {
             var failure = Self.ownedFailure(error, code: "sense_make_failed", owner: "sense at \(view.page.address)",

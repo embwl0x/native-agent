@@ -101,13 +101,12 @@ public enum ChatTurnFailure: Equatable {
         return (ProviderFailure.report(error)?.work ?? .outcomeUnknown).rawValue
     }
 
-    public func line(model: String?) -> String {
-        let model = model.flatMap { $0.isEmpty ? nil : $0 }
+    public func line() -> String {
         switch self {
         case .notSent:
-            return "Your message didn't reach \(model ?? "the model"). Nothing ran, so it's safe to try again."
+            return "Your message didn't reach the model. Nothing ran, so it's safe to try again."
         case .stoppedNoActions:
-            return "\(model ?? "The model") stopped partway. No actions were taken, so it's safe to try again."
+            return "The model stopped partway. No actions were taken, so it's safe to try again."
         case .acted(let names) where names.isEmpty:
             return "It stopped after some steps had already run. Trying again could run them again."
         case .acted(let names):

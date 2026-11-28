@@ -50,7 +50,7 @@ enum EngineFaceThreadProjection {
             }
         case .helperRuns(let raw):
             guard let id = UUID(uuidString: raw) else {
-                await engine.face.post(HelperRunsFace(helper: raw, runs: [], detailRequests: [:],
+                await engine.face.post(HelperRunsFace(helper: raw, runs: [],
                     state: .unavailable(failure("helper_identity_invalid", "Choose a helper from the checked directory."))), at: key)
                 return
             }
@@ -60,7 +60,7 @@ enum EngineFaceThreadProjection {
                         state: result.entry.runtimeStatus.rawValue, date: result.entry.runAt)
                 } ?? []
                 guard !Task.isCancelled else { return }
-                await engine.face.post(HelperRunsFace(helper: raw, runs: rows, detailRequests: [:], state: state), at: key)
+                await engine.face.post(HelperRunsFace(helper: raw, runs: rows, state: state), at: key)
             }
         default: break
         }
@@ -162,7 +162,7 @@ enum EngineFaceThreadProjection {
     }
 
     private static func row(_ id: String, title: String, detail: String?, state: String, date: Date? = nil) -> PartFace.Row {
-        PartFace.Row(id: id, title: safe(title), detail: detail.map(safe), value: state, at: date.map { ISO8601DateFormatter().string(from: $0) }, actions: [])
+        PartFace.Row(id: id, title: safe(title), detail: detail.map(safe), value: state, at: date.map(NativeTimestampFormat.plainZulu), actions: [])
     }
     private static func safe(_ value: String) -> String { NativeAppSecretRedactor.redactText(value) }
     private static func failure(_ code: String, _ message: String) -> WireFailure {

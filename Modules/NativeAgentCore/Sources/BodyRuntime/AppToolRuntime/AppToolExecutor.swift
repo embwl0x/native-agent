@@ -28,7 +28,7 @@ public final class AppToolExecutor: Sendable {
     public let enforceAutonomySecurity: Bool
     public let browserActionRunner: @Sendable (String, Bool, [String: JSONValue], Turn, AppActionExecution) async throws -> JSONValue
     private let mobileNotificationSender: @Sendable (NativeAgentNotificationDefaults.Note, [String: String], Turn) async throws -> AttentionOutcome
-    private let macNotificationSender: @Sendable (NativeAgentNotificationDefaults.Note, Turn, ContinuousClock.Instant?) async throws
+    private let macNotificationSender: @Sendable (NativeAgentNotificationDefaults.Note, Turn) async throws
         -> NativeAgentNotificationPostResult
     /// Executors share persisted authority; injected stores must retain the same gate.
     private let macIntegrationPermissionStore: MacIntegrationPermissionStore
@@ -48,7 +48,7 @@ public final class AppToolExecutor: Sendable {
         chrome: @escaping @Sendable () -> ChromeControlRuntime,
         motorActionObserver: @escaping @Sendable (MotorActionReadModel) async -> Void,
         mobileNotificationSender: @escaping @Sendable (NativeAgentNotificationDefaults.Note, [String: String], Turn) async throws -> AttentionOutcome,
-        macNotificationSender: @escaping @Sendable (NativeAgentNotificationDefaults.Note, Turn, ContinuousClock.Instant?) async throws
+        macNotificationSender: @escaping @Sendable (NativeAgentNotificationDefaults.Note, Turn) async throws
             -> NativeAgentNotificationPostResult,
         macIntegrationPermissionStore: MacIntegrationPermissionStore,
         doctorStatusProvider: @escaping @Sendable (_ repair: Bool?, _ checkID: String?, _ turn: Turn) async throws -> JSONValue,
@@ -181,8 +181,6 @@ public final class AppToolExecutor: Sendable {
         switch tool {
         // App bodies route notifications here; bridge-only bodies use Core with the same backends and permission gates.
         case "mobile_notify", "mac_notify":
-            let admission = await securityCenter.fullMacYoloAuthority(
-                origin: AppActionEnvironment.securityOrigin(turn: turn, surface: surface), turn: turn)
             guard let access = SwiftToolDispatcher.macIntegrationAccess(forTool: tool) else {
                 throw ToolFailureError("Mac integration action has no permission declaration: \(tool)", effects: .none)
             }
@@ -194,7 +192,7 @@ public final class AppToolExecutor: Sendable {
             if tool == "mobile_notify" {
                 return try await Self.mobileNotify(input: input, surface: surface, toolName: "mobile.notify", turn: turn, sender: mobileNotificationSender)
             }
-            return try await runMacNotify(input: input, surface: surface, turn: turn, execution: execution)
+            return try await runMacNotify(input: input, surface: surface, turn: turn)
         case _ where Self.browserToolNames.contains(tool):
             return try await runBrowserTool(actionId: tool, input: input, surface: surface, turn: turn, execution: execution)
         case "chat_reply":
@@ -221,10 +219,9 @@ public final class AppToolExecutor: Sendable {
 
     // MARK: - Notifications
 
-    private func runMacNotify(input: [String: JSONValue], surface: String, turn: Turn,
-                              execution: AppActionExecution) async throws -> JSONValue {
+    private func runMacNotify(input: [String: JSONValue], surface: String, turn: Turn) async throws -> JSONValue {
         let note = try NativeAgentNotificationDefaults.parseInput(input, toolName: "mac.notify")
-        let result = try await macNotificationSender(note, turn, execution.invocation.waitDeadline)
+        let result = try await macNotificationSender(note, turn)
         var obj = result.deliveryFields()
         obj.merge(Self.notificationEcho(note)) { _, new in new }
         obj.merge(["tool": .string("mac.notify"), "surface": .string(surface)]) { _, new in new }
@@ -383,6 +380,26 @@ public final class AppToolExecutor: Sendable {
             return try await runChatPost(input: input, turn: turn)
         case "mac_apps":
             return try await runMacApps(input: input, execution: execution)
+        case "app_anatomy":
+            let sections: Set<MacAppAnatomy.Section>
+            if let selection = input["sections"] {
+                let names = selection.arrayValue ?? []
+                let parsed = names.compactMap { $0.stringValue.flatMap(MacAppAnatomy.Section.init(rawValue:)) }
+                guard selection.arrayValue != nil, parsed.count == names.count else {
+                    return Self.doorRefusal("invalid_argument", "sections must contain only the documented app.anatomy section names.",
+                        remedy: "correct_arguments", "Use bundle, url_schemes, scripting, app_intents, app_map or permissions.")
+                }
+                sections = Set(parsed)
+            } else {
+                sections = Set(MacAppAnatomy.Section.allCases)
+            }
+            let scrub = await execution.anatomyScrub?()
+            let result = try await MacAppAnatomy.read(JSONValue.trimmedScalarTextOrEmpty(input["app"]),
+                sections: sections, includeSdefXML: input["include_sdef_xml"] == .bool(true), scrub: scrub?.text)
+            if let scrub, !(await scrub.isCurrent()) {
+                return Self.failure("redaction_scope_changed", "The calling part's secret scope changed during the read.")
+            }
+            return result
         case "undo":
             return try await doorUndo(input: input, turn: turn, execution: execution)
         case "read_file" where action.id == "reply.attach":
@@ -462,7 +479,7 @@ public final class AppToolExecutor: Sendable {
             }
             return .object(fields)
         case "make_studio":
-            return await runMake(verb: verb, input: input, turn: turn, execution: execution)
+            return await runMake(verb: verb, input: input, turn: turn)
         case "table_change":
             return try await runTable(verb: verb, input: input, turn: turn, execution: execution)
         case "studio_intake_read":
@@ -471,8 +488,6 @@ public final class AppToolExecutor: Sendable {
             return Self.healthResult(try await doctorStatusProvider(input["repair"] == .bool(true), input["check_id"]?.scalarText, turn), surface: surface)
         case "my_queue":
             return await runMyQueue(verb: verb, input: input, surface: surface, turn: turn)
-        case "house_file":
-            return await runHouseFile(input: input, surface: surface, turn: turn)
         case "repair_let_go":
             return await runRepairLetGo(input: input)
         case "record_read":
@@ -720,9 +735,9 @@ public final class AppToolExecutor: Sendable {
             : try await curation.rewriteMemory(turn: turn, invocation: invocation, input: input, surface: surface, persona: nil)
     }
 
-    @concurrent private static func checkMemoryRewrite(root: URL, input: [String: JSONValue], surface: String) async throws {
+    @concurrent private static func checkMemoryRewrite(root: URL, input: [String: JSONValue], surface: String, turn: Turn) async throws {
         _ = try await MemoryCuration(memoryV2: SwiftNativeMemoryV2.resolvedOwner(dataRoot: root), dataRoot: root)
-            .rewriteTarget(input: input, surface: surface, persona: nil)
+            .rewriteTarget(input: input, surface: surface, persona: nil, turn: turn)
     }
 
     /// Preview shares execution's read-only card, setting, composer, inbox and chat checks; nil means none refuses.
@@ -768,7 +783,7 @@ public final class AppToolExecutor: Sendable {
         if action.tool == "rewrite_memory" {
             let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
             do {
-                try await Self.checkMemoryRewrite(root: root, input: input, surface: surface)
+                try await Self.checkMemoryRewrite(root: root, input: input, surface: surface, turn: turn)
             } catch { return ChatToolOutcome.failure(error: error, tool: action.tool) }
         }
         if action.tool == "mind_run", let verb = action.input["verb"]?.scalarText,

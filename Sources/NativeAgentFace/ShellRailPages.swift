@@ -43,28 +43,32 @@ enum ShellRailTab {
     @MainActor static func shown(_ page: SidebarItem, _ tabs: [ShellTab<String>], _ layout: SurfaceLayoutAvailability) -> [ShellTab<String>] {
         layout.arranged("tabs." + page.rawValue.lowercased(), profile: ShellViewMode.advanced, tabs) { $0.key }
     }
+
+    @MainActor static func match(_ word: String, page: SidebarItem, layout: SurfaceLayoutAvailability?) -> String? {
+        let tabs = layout.flatMap { all($0).first(where: { $0.page == page })?.tabs } ?? []
+        let destinations = page == .personality ? PersonalityFaceDestinations.tabs : []
+        return (tabs + destinations).first {
+            $0.key.caseInsensitiveCompare(word) == .orderedSame || $0.title.caseInsensitiveCompare(word) == .orderedSame
+        }?.key
+    }
 }
 
 extension View {
     /// Keep an unavailable saved selection visible until the person chooses a tab.
     @MainActor func keepsShownTab(
-        _ page: SidebarItem,
         _ tabs: [ShellTab<String>],
-        _ selection: Binding<String>,
-        _ layout: SurfaceLayoutAvailability
+        _ selection: Binding<String>
     ) -> some View {
-        modifier(ShownRailTab(page: page, tabs: tabs, selection: selection, layout: layout))
+        modifier(ShownRailTab(tabs: tabs, selection: selection))
     }
 }
 
 private struct ShownRailTab: ViewModifier {
-    let page: SidebarItem
     let tabs: [ShellTab<String>]
     @Binding var selection: String
-    let layout: SurfaceLayoutAvailability
     func body(content: Content) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            if !ShellRailTab.shown(page, tabs, layout).contains(where: { $0.key == selection }) {
+            if !tabs.contains(where: { $0.key == selection }) {
                 Text("Tab ‘\(selection)’ is unavailable. Choose a visible tab.")
                     .font(.caption).foregroundStyle(.red).padding(8)
             }
@@ -133,7 +137,7 @@ struct DiagnosticsRailPage: View {
                             set: { if $0 == nil { appModel.diagnosticsRunID = nil } })) { run in
             ShellRunDetail(id: run.id)
         }
-        .keepsShownTab(.diagnostics, Self.tabs, tab, layout)
+        .keepsShownTab(Self.tabs, tab)
         }
     }
 }

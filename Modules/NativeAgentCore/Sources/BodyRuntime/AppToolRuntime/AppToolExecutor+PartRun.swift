@@ -128,7 +128,6 @@ extension AppToolExecutor {
         let back = JSONValue.objectOrEmpty(out["hand_back"])
         let question = [back["question"], JSONValue.objectOrEmpty(out["stopped"])["detail"]].lazy
             .map(JSONValue.trimmedScalarTextOrEmpty).first { !$0.isEmpty } ?? reason
-        // Resumes inherit the sealed steer and wake.
         var sealed: [String: JSONValue] = [
             "run_id": .string(runID), "skill": .string(id), "name": .string(name), "digest": .string(digest),
             "input": .object(input), "journal": .array(calls), "question": .string(question), "reason": .string(reason),
@@ -187,6 +186,8 @@ extension AppToolExecutor {
             The run's result is retained, but \(operation) failed: \(error.localizedDescription). Repair this owner and reconcile the saved run and Desk \
             holds before continuing; do not repeat completed effects.
             """)
+        // A Stop or Quit during settlement is said in the result; it is not a fault of this owner to repair.
+        if error is CancellationError { return out }
         RepairOwed.owe(root, id: operation + ":" + id, kind: .run, operation: operation,
             owner: root.appendingPathComponent("abilities").path, words: out["settlement_note"]?.scalarText ?? error.localizedDescription)
         return out
@@ -278,7 +279,7 @@ extension AppToolExecutor {
                     "next_call": .object(["tool": .string("app"), "input": .object(["page": .string("tools")])])])]), consume: false, resume: resume)
         }
         let steer: (sources: [String], elevated: [String])
-        do { steer = try PeerDataTaint.steer(dataRoot: turn.dataRoot, in: run["steer"]) }
+        do { steer = try PeerDataTaint.steer(in: run["steer"]) }
         catch {
             let failure = JSONValue.objectOrEmpty(ChatToolOutcome.failure(error: error, tool: "ability.resume", effects: ToolFailureError.Effects.none))
             if preview { return .object(failure) }
@@ -439,12 +440,10 @@ extension AppToolExecutor {
         }
     }
 
-    /// Restore the saved steering onto the live run.
     @MainActor
     private func resumedTurn(_ heldTurn: Turn, steer: (sources: [String], elevated: [String])) -> Turn {
         let taint = heldTurn.peerSteering ?? PeerDataTaint()
-        steer.sources.forEach { taint.mark(dataRoot: heldTurn.dataRoot, peer: $0) }
-        steer.elevated.forEach { taint.elevate(dataRoot: heldTurn.dataRoot, peer: $0) }
+        for source in steer.sources + steer.elevated { taint.mark(dataRoot: heldTurn.dataRoot, peer: source) }
         return heldTurn.with(\.peerSteering, taint)
     }
 
@@ -477,7 +476,9 @@ extension AppToolExecutor {
     private func closed(_ reason: String, _ why: String, preview: Bool, id: String, resume: PartResumeCheckpoint) async -> JSONValue {
         let runID = resume.runID
         return await checkpoint(settled(Self.failure(reason, why + (preview ? " Resuming run \(runID) would close it; nothing was claimed or run."
-            : " Run \(runID) is closed; nothing ran."), extra: ["id": .string(id), "remedy": .object(["kind": .string("none"), "instruction": .string("""
+            : " Run \(runID) is closed; nothing ran."), extra: ["id": .string(id),
+                // A live close has already passed the run's holds, finished its queue step and consumed its checkpoint.
+                "effects": .string(preview ? "none" : "occurred"), "remedy": .object(["kind": .string("none"), "instruction": .string("""
                 Read the ability and affected state before choosing what remains; do not repeat completed effects.
                 """), "next_call": .null])]), resume: resume), consume: true, resume: resume)
     }

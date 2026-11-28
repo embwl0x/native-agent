@@ -4,7 +4,7 @@ import Foundation
 
 /// Only browser/session presentation uses MainActor; callback listeners and sign-in storage run off the UI actor.
 public protocol NativeOAuthPlatformPort: Sendable {
-    @MainActor static func runAuthSession(authURL: URL, expectedState: String, providerId: String) async throws -> URL
+    @MainActor static func runAuthSession(authURL: URL, providerId: String) async throws -> URL
     static func isCanceledLogin(_ error: Error) -> Bool
 }
 

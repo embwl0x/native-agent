@@ -30,7 +30,6 @@ public enum HumanConversationReader {
     private static let recentByteLimit = 1024 * 1024
     private static let recentMessageLimit = 128
 
-    public static func rows(dataRoot: URL) throws -> [[String: JSONValue]] { try HumanConversationIndex.rows(dataRoot: dataRoot) }
     @concurrent public static func read(sessionID: String, dataRoot: URL, surface: String? = nil) async throws -> HumanConversationSnapshot {
         try await readSnapshot(sessionID: sessionID, dataRoot: dataRoot, surface: surface)
     }
@@ -39,7 +38,7 @@ public enum HumanConversationReader {
     /// `read`.
     @concurrent public static func readForSessionDelivery(sessionID: String, dataRoot: URL) async throws -> ChatToolSessionContext.ReplyRoute? {
         guard NativeAgentChatSessionID.normalizedPathComponent(sessionID) != nil,
-              let row = try rows(dataRoot: dataRoot).first(where: { $0["id"]?.stringValue == sessionID }),
+              let row = try HumanConversationIndex.rows(dataRoot: dataRoot).first(where: { $0["id"]?.stringValue == sessionID }),
               let source = row["source"]?.stringValue else { return nil }
         // The index owns local presentation; transcript size is irrelevant. Its row records a source; a route names the surface it arrived on.
         let surface = ChatThreadKind.surface(transcriptSource: source)
@@ -64,7 +63,7 @@ public enum HumanConversationReader {
     /// The same person-index resolution admits an explicit reply and its advertised availability.
     private static func replyRow(sessionID: String, dataRoot: URL) throws -> [String: JSONValue]? {
         guard NativeAgentChatSessionID.normalizedPathComponent(sessionID) != nil else { return nil }
-        return try rows(dataRoot: dataRoot).first { $0["id"]?.stringValue == sessionID }
+        return try HumanConversationIndex.rows(dataRoot: dataRoot).first { $0["id"]?.stringValue == sessionID }
     }
 
     @concurrent private static func readSnapshot(sessionID: String, dataRoot: URL, surface: String?) async throws -> HumanConversationSnapshot {
@@ -192,6 +191,7 @@ public enum HumanConversationReader {
                 "timestamp": line.timestamp.map(JSONValue.string) ?? .null, "message_id": line.id.isEmpty ? .null : .string(line.id),
                 "stamp": line.stamp.json,
                 "truncated": .bool(line.text.count > 6000)]
+            value["send"] = line.sendID.map(JSONValue.string)
             if let speaker = line.speakers.first {
                 let principal = trust.principal(speaker)
                 let trusted = trust.ownerTrusts(principal)

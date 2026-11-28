@@ -40,7 +40,7 @@ func handleFaceNotification(_ response: NotificationResponse, model: AppModel, t
     }, startChatTurn: { text, session in
         if let navigationFailure { return navigationFailure }
         do {
-            let reply = try await target.act(.send(.init(session: session, text: text, attachments: [], composerRevision: 0,
+            let reply = try await target.act(.send(.init(session: session, text: text, attachments: [],
                 expectedSelection: nil, options: .init(hideUserBubble: false, choice: nil, continuationReference: nil))))
             switch reply {
             case .accepted: return nil

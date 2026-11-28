@@ -280,6 +280,8 @@ extension LocalPIMConnectorActions {
 
         do {
             try store.save(event)
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             return .object([
                 "status": .string("failed"),
@@ -421,6 +423,8 @@ extension LocalPIMConnectorActions {
 
         do {
             try store.save(event)
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             return .object([
                 "status": .string("failed"),
@@ -483,6 +487,8 @@ extension LocalPIMConnectorActions {
         guard event.calendar.allowsContentModifications else { return failed("calendar_read_only") }
         do {
             try store.remove(event)
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             return failed(error.localizedDescription, effects: "unknown")
         }

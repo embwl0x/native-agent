@@ -23,7 +23,7 @@ extension CognitiveSubstrate {
         let now = dependencies.now()
         try await persistMaintenanceTransition(
             nodes: field.snapshot(at: now, configuration: configuration),
-            artifacts: affectCheckpoint(), deletedArtifactIDs: [], receipts: [], at: now
+            artifacts: affectCheckpoint(), receipts: [], at: now
         )
     }
 
@@ -51,9 +51,9 @@ extension CognitiveSubstrate {
         try await store.appendReceipt(kind: kind, payload: payload, at: dependencies.now(), id: id)
     }
 
-    public func recordReceipt(kind: String, payload: JSONValue = .object([:])) async {
+    public func recordReceipt(kind: String, payload: JSONValue = .object([:]), id: UUID = UUID()) async {
         guard configuration.enabled, configuration.persistenceEnabled, let store else { return }
-        do { try await store.appendReceipt(kind: kind, payload: payload, at: dependencies.now()) } catch {
+        do { try await store.appendReceipt(kind: kind, payload: payload, at: dependencies.now(), id: id) } catch {
             // A log line has no resident state to reconcile: it stays an owed repair until its owner lets it go, without blocking health.
             oweUnsaved("receipt.\(kind)", error, store: store)
         }
@@ -159,20 +159,16 @@ extension CognitiveSubstrate {
         id: UUID,
         status: String,
         score: Double,
-        payload: JSONValue,
-        mindEpoch expectedMindEpoch: UInt64? = nil
+        payload: JSONValue
     ) async throws {
-        if let expectedMindEpoch, expectedMindEpoch != mindEpoch { throw CognitiveWriteDiscarded() }
         try await persistArtifactTransition(
             artifacts: [CognitiveArtifactWrite(kind: kind, id: id, status: status, score: score, payload: payload)],
-            deletedArtifactIDs: [],
             at: dependencies.now()
         )
     }
 
     func persistArtifactTransition(
         artifacts: [CognitiveArtifactWrite],
-        deletedArtifactIDs: [UUID],
         at now: Date
     ) async throws {
         guard configuration.persistenceEnabled else { return }
@@ -181,21 +177,18 @@ extension CognitiveSubstrate {
         // learns it is NOT durable.
         if forgettingInFlight {
             forgettingDiscarded.append(contentsOf: artifacts.map { (kind: $0.kind, id: $0.id) })
-            forgettingDiscarded.append(contentsOf: deletedArtifactIDs.map { (kind: "deleted", id: $0) })
             throw CognitiveWriteDiscarded()
         }
         guard !persistenceHealth.writesBlocked else {
             throw CognitivePersistenceError.writesBlocked(
                 status: persistenceHealth.status, detail: persistenceHealth.failureDetail)
         }
-        try await store.commitArtifactTransition(
-            artifacts: artifacts, deletedArtifactIDs: deletedArtifactIDs, at: now)
+        try await store.commitArtifactTransition(artifacts: artifacts, at: now)
     }
 
     func persistMaintenanceTransition(
         nodes: [CognitiveNode],
         artifacts: [CognitiveArtifactWrite],
-        deletedArtifactIDs: [UUID],
         receipts: [CognitiveReceiptWrite],
         at now: Date
     ) async throws {
@@ -206,7 +199,6 @@ extension CognitiveSubstrate {
         if forgettingInFlight {
             forgettingDiscarded.append((kind: "snapshot", id: UUID()))
             forgettingDiscarded.append(contentsOf: artifacts.map { (kind: $0.kind, id: $0.id) })
-            forgettingDiscarded.append(contentsOf: deletedArtifactIDs.map { (kind: "deleted", id: $0) })
             throw CognitiveWriteDiscarded()
         }
         guard !persistenceHealth.writesBlocked else {
@@ -232,7 +224,7 @@ extension CognitiveSubstrate {
             try await store.commitMaintenance(
                 nodes: nodes,
                 artifacts: artifacts,
-                deletedArtifactIDs: deletedArtifactIDs,
+                deletedArtifactIDs: [],
                 receipts: receipts + evictionReceipts,
                 maxArtifacts: artifactCap(configuration),
                 at: now

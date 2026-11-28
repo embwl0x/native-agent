@@ -10,8 +10,7 @@ extension SwiftNativeProviderRouting {
     }
     /// Catalog discovery finishes before the one checked routing read. Every displayed connection and resolved preference then uses the same config cache.
     public func checkedProviderSnapshot(
-        codexCacheURL: URL? = nil,
-        authEnvironment: [String: String] = ProcessInfo.processInfo.environment, preview: Bool = false
+        authEnvironment: [String: String] = ProcessInfo.processInfo.environment
     ) async throws -> ProviderCatalogSnapshot {
         async let openRouterRead = OpenRouterModelCatalog.modelsWithFreshness(dataRoot: dataRoot)
         async let moonshotRead = MoonshotModelCatalog.modelsWithFreshness(dataRoot: dataRoot)
@@ -20,16 +19,16 @@ extension SwiftNativeProviderRouting {
         let inventory = try nativeListProviders(
             openRouterModels: openRouter.models.map { $0.providerJSON() },
             moonshotModels: moonshot.models.map { $0.providerJSON() },
-            codexCacheURL: codexCacheURL, authEnvironment: authEnvironment,
+            authEnvironment: authEnvironment,
             additionalProviderIDs: Set(state.active.values),
-            savedModels: Set(state.surfaces.values.compactMap { $0.objectValue?["model"]?.stringValue }), preview: preview
+            savedModels: Set(state.surfaces.values.compactMap { $0.objectValue?["model"]?.stringValue })
         )
         let cache = inventory.cache
         return ProviderCatalogSnapshot(
             routing: try routingSnapshot(
                 surfaces: state.surfaces, activeProviders: state.active,
                 soleConnectedRoute: soleConnectedProviderID(cache: cache), configCache: cache,
-                revision: state.revision, preview: preview
+                revision: state.revision
             ),
             providers: inventory.providers.map { provider in
                 var row = provider
@@ -103,8 +102,8 @@ extension SwiftNativeProviderRouting {
     /// so re-saving it with other settings is not a choice. Nil when it may; else the first cause, in its own words. The account is the one the
     /// helper names and runs on, never a sibling of its family: an API key and a sign-in of one vendor list different models.
     public func botModelRefusal(provider: String, model: String, held: String?) throws -> BotModelRefusal? {
-        let openRouterModels = OpenRouterModelCatalog.readCache(dataRoot: dataRoot)?.map { $0.providerJSON() }
-        let moonshotModels = MoonshotModelCatalog.readCache(dataRoot: dataRoot)?.map { $0.providerJSON() }
+        let openRouterModels = OpenRouterModelCatalog.cache.currentModels(dataRoot: dataRoot)?.map { $0.providerJSON() }
+        let moonshotModels = MoonshotModelCatalog.cache.currentModels(dataRoot: dataRoot)?.map { $0.providerJSON() }
         let route = provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let notConnected = "\(provider) is not connected. Connect it in Providers, or choose an account that is."
         guard let account = try nativeListProviders(openRouterModels: openRouterModels, moonshotModels: moonshotModels).providers
@@ -134,8 +133,8 @@ extension SwiftNativeProviderRouting {
     }
     /// Local choices for helper creation; no network probe or setting change. The normal creation gate still validates the explicitly chosen tuple.
     public func botModelChoices() throws -> JSONValue {
-        let openRouterModels = OpenRouterModelCatalog.readCache(dataRoot: dataRoot)?.map { $0.providerJSON() }
-        let moonshotModels = MoonshotModelCatalog.readCache(dataRoot: dataRoot)?.map { $0.providerJSON() }
+        let openRouterModels = OpenRouterModelCatalog.cache.currentModels(dataRoot: dataRoot)?.map { $0.providerJSON() }
+        let moonshotModels = MoonshotModelCatalog.cache.currentModels(dataRoot: dataRoot)?.map { $0.providerJSON() }
         let rows = try nativeListProviders(
             openRouterModels: openRouterModels, moonshotModels: moonshotModels
         ).providers.filter { $0.configured == true }.map { provider in
@@ -175,7 +174,7 @@ extension SwiftNativeProviderRouting {
                 Non-shipped catalogs may be incomplete; creation validates the chosen route. No account or model setting changed.
                 """)])
     }
-    public func configureProvider(id: String, config: JSONValue, expectedRevision: String? = nil) async throws -> Provider {
+    public func configureProvider(id: String, config: JSONValue, expectedRevision: String? = nil) async throws {
         guard case .object(let body) = config else {
             throw ProviderRoutingError.invalidRequest
         }
@@ -275,9 +274,8 @@ extension SwiftNativeProviderRouting {
                 break
             }
         }
-        return try await getProvider(id: id)
     }
-    public func saveModelConfig(_ body: JSONValue) async throws -> ModelPreferences {
+    public func saveModelConfig(_ body: JSONValue) async throws {
         guard case .object(let obj) = body,
               let rawSurface = JSONValue.firstTrimmedString(obj, keys: ["surface"]) else {
             throw ProviderRoutingError.invalidRequest
@@ -295,10 +293,8 @@ extension SwiftNativeProviderRouting {
             surface: surface,
             model: model,
             reasoningEffort: effort,
-            serviceTier: serviceTier,
-            providerId: nil
+            serviceTier: serviceTier
         )
-        return try await modelPreferencesFromComputed()
     }
     /// Durable intent protects the group tuple across restart and cancellation; unrelated bytes fail closed instead of overwriting another commit.
     public func saveGroupSelection(
@@ -330,20 +326,12 @@ extension SwiftNativeProviderRouting {
         surface: String,
         model: String?,
         reasoningEffort: String?,
-        serviceTier: String?,
-        providerId: String?,
-        seedMissingControls: Bool = false,
-        reconcilePinnedModelWithProvider: Bool = false,
-        clearOverride: Bool = false,
-        selectionValidator: (@Sendable (String, String, String?) throws -> Void)? = nil
+        serviceTier: String?
     ) async throws {
         // Surface commands must mutate their owning group like the picker.
         _ = try await saveSurfaceConfigurations(
-            surfaces: ProviderSurfaceGroups.members(of: surface).filter { !clearOverride || $0 != "chat" }, model: model,
-            reasoningEffort: reasoningEffort, serviceTier: serviceTier, providerId: providerId,
-            seedMissingControls: seedMissingControls,
-            reconcilePinnedModelWithProvider: reconcilePinnedModelWithProvider,
-            clearOverride: clearOverride, selectionValidator: selectionValidator
+            surfaces: ProviderSurfaceGroups.members(of: surface), model: model,
+            reasoningEffort: reasoningEffort, serviceTier: serviceTier, providerId: nil
         )
     }
     private func saveSurfaceConfigurations(
@@ -356,7 +344,6 @@ extension SwiftNativeProviderRouting {
         reconcilePinnedModelWithProvider: Bool = false,
         clearOverride: Bool = false,
         adoptingConnectedProvider: Bool = false,
-        selectionValidator: (@Sendable (String, String, String?) throws -> Void)? = nil,
         expectedRevision: Double? = nil,
         expectedChatChoice: ProviderTurnChoice? = nil
     ) async throws -> ProviderGroupWriteResult {
@@ -365,7 +352,6 @@ extension SwiftNativeProviderRouting {
         try validateSurfaceProvider(providerId)
         let validateSelection: (@Sendable (String, String, String?) throws -> Void)?
         if clearOverride || (model == nil && reasoningEffort == nil) { validateSelection = nil }
-        else if let selectionValidator { validateSelection = selectionValidator }
         else { validateSelection = try await self.selectionValidator(reasoningEffort: reasoningEffort) }
         try FileManager.default.createDirectory(
             at: surfaceTransactionPath.deletingLastPathComponent(),
@@ -497,7 +483,7 @@ extension SwiftNativeProviderRouting {
             if let model, !clearOverride {
                 guard let route = providerId ?? current?.activeProviders[surface],
                       Self.connectableProviderIds.contains(where: { Self.normalizeProviderId($0) == Self.normalizeProviderId(route) }),
-                      !Self.normalizeModelIdStatic(model, fallback: "").isEmpty else {
+                      !Self.normalizeModelIdStatic(model).isEmpty else {
                     throw ProviderRoutingError.configurationFailed("Choose a valid model on a configured account.")
                 }
                 if let family = self.inferProviderForModel(model), !Self.providerCanServeModel(route, inferredProvider: family) {

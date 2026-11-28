@@ -10,8 +10,7 @@ public func makeResidentProviderLLMClient(
     dataRoot: URL = PersistenceCore.defaultDataRoot(),
     providersRoot: URL? = nil,
     router suppliedRouter: SwiftNativeProviderRouting? = nil,
-    lifecycleObserver: (any LLMCallLifecycleObserving)? = nil,
-    processEnvironmentOverride: [String: String]? = nil
+    lifecycleObserver: (any LLMCallLifecycleObserving)? = nil
 ) -> any LLMClient {
     let credentialRoot = providersRoot?.standardizedFileURL
     let router = suppliedRouter ?? SwiftNativeProviderRouting(dataRoot: credentialRoot ?? dataRoot)
@@ -20,8 +19,7 @@ public func makeResidentProviderLLMClient(
     let llm: any LLMClient
     if usesCanonicalBody {
         let telemetryRoot: URL? = credentialRoot == nil ? nil : dataRoot
-        let registry = ProviderRegistry(dataRoot: dataRoot, credentials: credentialRoot, telemetry: telemetryRoot,
-            processEnvironment: processEnvironmentOverride)
+        let registry = ProviderRegistry(dataRoot: dataRoot, credentials: credentialRoot, telemetry: telemetryRoot)
         llm = SwiftNativeLLMClient(
             router: router, registry: registry,
             diagnosticDataRoot: dataRoot,
@@ -42,7 +40,6 @@ public struct ProviderRegistry: Sendable {
         let data: URL
         let credentials: URL?
         let telemetry: URL?
-        let processEnvironment: [String: String]?
     }
 
     struct ProviderProfile: Sendable {
@@ -60,7 +57,7 @@ public struct ProviderRegistry: Sendable {
 
     static let profiles = [
         ProviderProfile("codex", CodexProcess.self) { root in
-            CodexProcess(processEnvironmentOverride: root.processEnvironment, dataRootOverride: root.credentials ?? root.data)
+            CodexProcess(dataRootOverride: root.credentials ?? root.data)
         },
         ProviderProfile("openai", OpenAITransport.self) {
             OpenAITransport(dataRootOverride: $0.credentials, telemetryDataRootOverride: $0.telemetry)
@@ -93,8 +90,8 @@ public struct ProviderRegistry: Sendable {
         ProviderProfile("openrouter", OpenRouterTransport.self) { OpenRouterTransport(dataRootOverride: $0.credentials).transport },
     ]
 
-    public init(dataRoot: URL, credentials: URL?, telemetry: URL?, processEnvironment: [String: String]?) {
-        let roots = Roots(data: dataRoot, credentials: credentials, telemetry: telemetry, processEnvironment: processEnvironment)
+    public init(dataRoot: URL, credentials: URL?, telemetry: URL?) {
+        let roots = Roots(data: dataRoot, credentials: credentials, telemetry: telemetry)
         transports = Dictionary(uniqueKeysWithValues: Self.profiles.map { ($0.id, $0.make(roots)) })
     }
 }
@@ -132,28 +129,9 @@ extension ProviderToolCapability {
 /// The checked explicit route alone selects the transport.
 public protocol LLMTransport: Sendable {
     var providerId: String { get }
-    /// Receipts for whole-reply collection; every adapter that collects its own stream names the recorder it writes to.
-    var telemetry: LLMCallTraceRecorder { get }
     /// Exact wire output cap; zero explicitly declares no output-cap field. A transport that writes a cap takes it, while a run's budget is bound,
     /// from `FirstPartyExecutionControls.budgetedOutputTokens`: min(remaining budget, effective ceiling).
     func requestOutputTokens(model: String, call: LLMCall) throws -> Int
-    /// Adapters declare whether native schemas or the text tool protocol can reach the provider; Codex CLI does not carry NativeAgent tools.
-    func complete(
-        prompt: String,
-        system: String?,
-        model: String,
-        tools: [LLMToolSchema]?,
-        call: LLMCall
-    ) async throws -> String
-
-    /// Structured history stays separate from the turn-level system prompt.
-    func completeMessages(
-        messages: [LLMMessage],
-        system: String?,
-        model: String,
-        tools: [LLMToolSchema]?,
-        call: LLMCall
-    ) async throws -> String
 
     func streamMessages(
         messages: [LLMMessage],
@@ -169,31 +147,6 @@ public enum LLMMessagesStreamKind: String, Sendable {
     case incremental
     /// Bound by SwiftNativeLLMClient around the adapter's `streamMessages` so the adapter's `llm.call` row carries the kind.
     @TaskLocal public static var current: LLMMessagesStreamKind?
-}
-
-extension LLMTransport {
-
-    /// Collect a whole reply from the adapter's stream.
-    public func complete(
-        prompt: String,
-        system: String?,
-        model: String,
-        tools: [LLMToolSchema]?,
-        call: LLMCall
-    ) async throws -> String {
-        try await completeMessages(messages: [.user(prompt)], system: system, model: model, tools: tools, call: call)
-    }
-
-    public func completeMessages(
-        messages: [LLMMessage],
-        system: String?,
-        model: String,
-        tools: [LLMToolSchema]?,
-        call: LLMCall
-    ) async throws -> String {
-        try await LLMMessageStreamEvent.reply(collecting:
-            { held in self.streamMessages(messages: messages, system: system, model: model, tools: tools, call: held) }, using: telemetry, call: call)
-    }
 }
 
 // MARK: - LLMError
@@ -306,13 +259,11 @@ public final class SwiftNativeLLMClient: LLMClient {
         phase: LLMCallLifecyclePhase,
         receipt: LLMCallTraceRecorder.Tally<LLMCallTraceRecorder.Receipt>? = nil,
         streamKind: LLMMessagesStreamKind? = nil,
-        error: Error? = nil, call: LLMCall
+        call: LLMCall
     ) async {
         guard !call.preview else { return }
-        var noReply = false
-        if case .noReply? = error.flatMap(ProviderFailure.classify) { noReply = true }
         guard let terminal = started.terminal(
-            phase, firstOutputMs: receipt?.withLock { $0.ttftMs }, streamKind: streamKind?.rawValue, noReply: noReply,
+            phase, streamKind: streamKind?.rawValue,
             requestBytes: receipt?.withLock { $0.requestBytes }) else { return }
         await lifecycleObserver?.observeProviderCall(terminal)
         if phase == .succeeded {
@@ -349,11 +300,6 @@ public final class SwiftNativeLLMClient: LLMClient {
                 usage: nil, ttftMs: nil,
                 durationMs: Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1000),
                 status: "failed", errorDetail: ProviderFailure.diagnosticDescription(error))
-        }
-        // The stream guard's cut, countable on its own beside the failed call, under the provider id its samples carry (the guard's label is prose).
-        if case .noReply(_, let seconds, let events, _)? = ProviderFailure.classify(error) {
-            await LLMCallTraceRecorder(dataRootOverride: diagnosticDataRoot)
-                .recordNoReply(provider: started.providerId, seconds: seconds, events: events, surface: started.surface, call: call)
         }
         if case .outputLengthLimit = error as? LLMError { return error }
         // This owns valid pipe prefixes and exact invalid bytes. A prose-only Diagnostic would discard the evidence needed to repair the encoding.
@@ -425,7 +371,6 @@ public final class SwiftNativeLLMClient: LLMClient {
         guard let chosen = registry.transports[resolution.providerId] else {
             throw LLMError.notConfigured(provider: resolution.providerId)
         }
-        // A marker transport (the Claude subscription) is never handed a tools array; reaching here with one is this body's own disagreement, said as such.
         if tools != nil, ProviderToolCapability.wire(providerID: resolution.providerId) == .textMarkers {
             let setting = "providers." + (ProviderSurfaceGroups.group(for: call.surface)
                 ?? ProviderSurfaceGroups.chat).id + "_model"
@@ -505,7 +450,7 @@ public final class SwiftNativeLLMClient: LLMClient {
                 // A caller that brings its own sent-credential evidence (the connection check) records that verdict itself.
                 let sent = call.sentCredential == nil ? SentCredential() : nil
                 let attemptStartedAt = ProcessInfo.processInfo.systemUptime
-                let requestBytes = LLMMessage.inputBytes(messages, system: system, tools: tools ?? [])
+                let requestBytes = LLMMessage.inputBytes(messages, system: system, tools: tools ?? [], toolResultContent: providerToolResultContent)
                 let recorded = LLMCallTraceRecorder.Tally(LLMCallTraceRecorder.Receipt())
                 recorded.withLock { $0.requestBytes = requestBytes }
                 // What the provider's prefix cache sees, without the words: the scope and the request's first 2k and 8k bytes, hashed.
@@ -521,7 +466,8 @@ public final class SwiftNativeLLMClient: LLMClient {
                 do {
                     if !call.requestShapeUnmeasured, call.conversationRequest {
                         recorded.withLock {
-                            $0.requestCharacters = LLMMessage.inputCharacters(messages, system: system, tools: tools ?? [])
+                            $0.requestCharacters = LLMMessage.inputCharacters(messages, system: system, tools: tools ?? [],
+                                toolResultContent: providerToolResultContent)
                             $0.requestPlan = call.requestPlan
                         }
                     }
@@ -587,7 +533,7 @@ public final class SwiftNativeLLMClient: LLMClient {
                     if let lifecycle {
                         let answeredAt = Date()
                         await self.providerLifecycleFinish(lifecycle, phase: .failed, receipt: recorded,
-                            streamKind: streamKind, error: error, call: call)
+                            streamKind: streamKind, call: call)
                         let owned = await self.recordFailedCall(lifecycle, error: error,
                             startedAt: attemptStartedAt, recorded: recorded, call: call)
                         allowStopCancel()

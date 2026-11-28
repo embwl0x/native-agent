@@ -259,23 +259,17 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     static func loadCompiledModel(
         packageURL: URL,
         artifactDigest: String,
-        configuration: MLModelConfiguration,
-        cacheRoot overrideRoot: URL? = nil,
-        osKey overrideOSKey: String? = nil
+        configuration: MLModelConfiguration
     ) throws -> MLModel {
         let fm = FileManager.default
-        let root = try overrideRoot ?? compileCacheRoot()
+        let root = try compileCacheRoot()
         let cacheDir = try compileCacheDirectory(
             packageURL: packageURL,
-            artifactDigest: artifactDigest,
-            cacheRoot: overrideRoot,
-            osKey: overrideOSKey
+            artifactDigest: artifactDigest
         ).deletingLastPathComponent()
         let cached = try compileCacheDirectory(
             packageURL: packageURL,
-            artifactDigest: artifactDigest,
-            cacheRoot: overrideRoot,
-            osKey: overrideOSKey
+            artifactDigest: artifactDigest
         )
 
         try fm.createDirectory(at: root, withIntermediateDirectories: true)
@@ -312,28 +306,26 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
 
     static func compileCacheDirectory(
         packageURL: URL,
-        artifactDigest: String,
-        cacheRoot overrideRoot: URL? = nil,
-        osKey overrideOSKey: String? = nil
+        artifactDigest: String
     ) throws -> URL {
         let base = packageURL.deletingPathExtension().lastPathComponent
-        let osKey = sanitizedCacheComponent(overrideOSKey ?? operatingSystemCacheKey())
+        let osKey = sanitizedCacheComponent(operatingSystemCacheKey())
         let digest = sanitizedCacheComponent(artifactDigest)
-        return try (overrideRoot ?? compileCacheRoot())
+        return try compileCacheRoot()
             .appendingPathComponent(base, isDirectory: true)
             .appendingPathComponent(osKey, isDirectory: true)
             .appendingPathComponent("\(digest).mlmodelc", isDirectory: true)
     }
 
-    static func compileCacheRoot(fileManager: FileManager = .default) throws -> URL {
-        let base = try fileManager.url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+    static func compileCacheRoot() throws -> URL {
+        let base = try FileManager.default.url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
         return base
             .appendingPathComponent(InstallPaths.current.name("NativeAgent"), isDirectory: true)
             .appendingPathComponent("coreml-compiled-v2", isDirectory: true)
     }
 
-    static func operatingSystemCacheKey(processInfo: ProcessInfo = .processInfo) -> String {
-        let version = processInfo.operatingSystemVersion
+    static func operatingSystemCacheKey() -> String {
+        let version = ProcessInfo.processInfo.operatingSystemVersion
         let build = systemBuildVersion() ?? "unknown-build"
         return "macos-\(version.majorVersion).\(version.minorVersion).\(version.patchVersion)-\(build)"
     }
@@ -502,18 +494,11 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         return MemoryEmbeddingItemBatch(epoch: embeddingEpoch, items: items)
     }
 
-    @concurrent func embedCompleteTexts(_ texts: [String]) async throws -> [[Float]]? {
-        let encoded = texts.map { tokenizer.encode($0, maxLength: maxSeqLength) }
-        guard encoded.allSatisfy({ $0.isComplete }) else { return nil }
-        let items = try await embed(encoded)
-        return try MemoryEmbeddingItemBatch(epoch: embeddingEpoch, items: items).requireVectors()
-    }
-
-    private func embed(_ encoded: [(inputIds: [Int], attentionMask: [Int], isComplete: Bool)]) async throws -> [MemoryEmbeddingItem] {
+    private func embed(_ encoded: [(inputIds: [Int], attentionMask: [Int])]) async throws -> [MemoryEmbeddingItem] {
         var inputs: [MLFeatureProvider] = []
         var masks: [[Int]] = []
         inputs.reserveCapacity(encoded.count)
-        for (ids, mask, _) in encoded {
+        for (ids, mask) in encoded {
             let inputArr = try Self.inputTensor(ids, length: maxSeqLength)
             let maskArr = try Self.inputTensor(mask, length: maxSeqLength)
             do {

@@ -7,12 +7,16 @@ import DeskCore
 
 
 enum ShellRailTab {
-
-    /// Share layout order between page routes and command search.
-    @MainActor static func all(_ layout: SurfaceLayoutAvailability) -> [(page: SidebarItem, tabs: [ShellTab<String>])] {
-        [(.memories, shown(.memories, [ShellTab(key: "memories", title: "Memories"), ShellTab(key: "knowledge", title: "Knowledge graph")], layout)),
-         (.personality, shown(.personality, PersonalityFaceDestinations.tabs, layout)),
-         (.diagnostics, shown(.diagnostics, DiagnosticsRailPage.tabs, layout))]
+    @MainActor static func all(_ layout: SurfaceLayoutAvailability, includeHidden: Bool = false) -> [(page: SidebarItem, tabs: [ShellTab<String>])] {
+        let destinations: [(SidebarItem, [ShellTab<String>])] = [
+            (.memories, [ShellTab(key: "memories", title: "Memories"), ShellTab(key: "knowledge", title: "Knowledge graph")]),
+            (.personality, PersonalityFaceDestinations.tabs), (.diagnostics, DiagnosticsRailPage.tabs),
+        ]
+        return destinations.map { page, tabs in
+            let visible = shown(page, tabs, layout)
+            guard includeHidden else { return (page, visible) }
+            return (page, visible + tabs.filter { tab in !visible.contains { $0.key == tab.key } })
+        }
     }
 
     @MainActor static func shown(_ page: SidebarItem, _ tabs: [ShellTab<String>], _ layout: SurfaceLayoutAvailability) -> [ShellTab<String>] {

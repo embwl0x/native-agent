@@ -1,9 +1,9 @@
 import SenseCore
 import Foundation
 import NativeAgentShared
-import Observation
 import PersistenceCore
 import DeskCore
+import Observation
 // Blueprint: | `ConnectorFace+Phone.swift` | Connectors' iPhone rows: iCloud pairing facts, paired devices, notification route, phone senses; Pair, Remove and Rotate are the person's; each row is a door call, and the pairing verbs no other verb runs run here |
 
 /// Changes of the pairing owner's published values, so the Connectors page re-reads them.

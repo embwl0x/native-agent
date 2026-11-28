@@ -139,12 +139,8 @@ extension CognitiveSubstrate {
         at now: Date,
         dreamNight: String? = nil,
         // Each disposition writer names its source so experience remains distinguishable from decay.
-        source: String = "experience",
-        // Only the agent's own reflection and dream updates are undoable.
-        undoable: Bool = false,
-        reflectionRequest: CognitiveReflectionRequest? = nil
+        source: String = "experience"
     ) async -> Bool {
-        if let reflectionRequest, !ownsReflectionReservation(reflectionRequest) { return false }
         guard configuration.enabled, tone != 0 else { return true }
         let previousDisposition = disposition
         let previousDreamNights = dreamDispositionNights
@@ -161,16 +157,14 @@ extension CognitiveSubstrate {
                 score: (written.valence + 1) / 2,
                 payload: dispositionArtifactPayload(at: now)
             )
-            if let reflectionRequest, !ownsReflectionReservation(reflectionRequest) { return false }
-            if undoable { await recordDispositionUndo(what: "undertone nudge: \(source)",
-                             previous: .object([
-                                 "valence": .double(previousDisposition.valence),
-                                 "updatedAt": .double(previousDisposition.updatedAt.timeIntervalSince1970),
-                             ]),
-                             stamp: Self.undoStamp(written)) }
+            await recordDispositionUndo(what: "undertone nudge: \(source)",
+                previous: .object([
+                    "valence": .double(previousDisposition.valence),
+                    "updatedAt": .double(previousDisposition.updatedAt.timeIntervalSince1970),
+                ]),
+                stamp: Self.undoStamp(written))
             return true
         } catch {
-            if let reflectionRequest, !ownsReflectionReservation(reflectionRequest) { return false }
             // Restore only this failed write; a later writer owns its own value.
             guard disposition == written else { return false }
             disposition = previousDisposition
@@ -347,7 +341,7 @@ extension CognitiveSubstrate {
 
     /// Pure felt-day reads color dream tone without scripting it; no feeling means no section. Name only live conversation/correction subjects and studio
     /// pointers, never journal prose.
-    public func feltDaySummary(at now: Date) async -> String? {
+    public func feltDaySummary(at now: Date, redacting: @Sendable (String) -> String = TurnSecretRedactor.redactText) async -> String? {
         guard configuration.enabled else { return nil }
 
         let felt = feltDayNodes(at: now)
@@ -371,28 +365,27 @@ extension CognitiveSubstrate {
             guard let word = node.feltDirection?.rawValue else { continue }
             // Use studio title and id only; journal prose must never reach the prompt here.
             if let entryID = CognitiveFeltOrigin(node: node).studioEntryID {
-                lines.append(feltStudioEntryLine(word: word, node: node, entryID: entryID))
+                lines.append(feltStudioEntryLine(word: word, title: redacting(node.subjectReference.label ?? ""),
+                    entryID: redacting(entryID)))
                 continue
             }
             let signal = capsuleSignalText(
-                node.summary, maxCharacters: Self.feltDaySummaryNodeSignalCharacters)
+                redacting(node.summary), maxCharacters: Self.feltDaySummaryNodeSignalCharacters)
             guard isUsefulCapsuleSignalText(signal) else { continue }
             lines.append("- \(word) — \(signal)")
         }
 
         // Enforce the total summary ceiling even when per-node bounds already fit.
-        return String(lines.joined(separator: "\n").prefix(Self.feltDaySummaryMaxCharacters))
+        return String(redacting(lines.joined(separator: "\n")).prefix(Self.feltDaySummaryMaxCharacters))
     }
 
     /// A title-less studio entry cites its id alone; source content is not a substitute name.
-    private func feltStudioEntryLine(word: String, node: CognitiveNode, entryID: String) -> String {
+    private func feltStudioEntryLine(word: String, title: String, entryID: String) -> String {
         let citation = "(studio entry "
             + TextClipping.prefixOrWhole(entryID, maxCharacters: Self.feltDaySummaryStudioEntryIDCharacters) + ")"
-        let title = capsuleSignalText(
-            node.subjectReference.label ?? "",
-            maxCharacters: Self.feltDaySummaryNodeSignalCharacters)
-        guard isUsefulCapsuleSignalText(title) else { return "- \(word) — \(citation)" }
-        return "- \(word) — \(title) \(citation)"
+        let signal = capsuleSignalText(title, maxCharacters: Self.feltDaySummaryNodeSignalCharacters)
+        guard isUsefulCapsuleSignalText(signal) else { return "- \(word) — \(citation)" }
+        return "- \(word) — \(signal) \(citation)"
     }
 
     /// Use capsule mood bands with felt-moment count as the only quantity, keeping measurements from posing as feelings.

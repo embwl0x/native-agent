@@ -56,31 +56,18 @@ final class UpdateController: NSObject {
     private var automaticChecksObservation: NSKeyValueObservation?
     private let unavailability: Unavailability?
     private let info: [String: Any]
-    private let preferencesSuiteName: String?
     private var initialization: Task<Void, Never>?
     private var noticeWrite: Task<Void, Never>?
 
-    override convenience init() {
-        self.init(
-            info: Bundle.main.infoDictionary ?? [:],
-            preferencesSuiteName: nil
-        )
-    }
-
-    init(
-        info: [String: Any],
-        preferencesSuiteName: String?
-    ) {
-        let unavailability = SoftwareUpdateState.resolveUnavailability(info: info)
-        self.unavailability = unavailability
+    override init() {
+        let info = Bundle.main.infoDictionary ?? [:]
+        self.unavailability = SoftwareUpdateState.resolveUnavailability(info: info)
         self.info = info
-        self.preferencesSuiteName = preferencesSuiteName
-        self.updater = nil
         super.init()
         initialization = Task { [weak self] in
             guard let self else { return }
             let notice = await SoftwareUpdateState.restoreNotice(
-                info: self.info, preferencesSuiteName: self.preferencesSuiteName, isNewer: Self.isVersion)
+                info: self.info, isNewer: Self.isVersion)
             self.applyNotice(notice)
             self.startUpdater()
         }
@@ -147,14 +134,7 @@ final class UpdateController: NSObject {
     var automaticChecksEnabled: Bool { updatesAreAvailable && status.automaticChecksEnabled }
 
     var settingsFeedSource: SoftwareUpdateSettingsFace.Source {
-        let unavailable: SoftwareUpdateSettingsFace.Unavailability?
-        switch unavailability {
-        case .feedNotPublished: unavailable = .feedNotPublished
-        case .notConfigured: unavailable = .notConfigured
-        case nil: unavailable = nil
-        }
-        return .init(availableVersion: status.availableVersion, canCheck: status.canCheckForUpdates,
-                     automaticChecks: status.automaticChecksEnabled, failure: status.noticeFailure, unavailable: unavailable)
+        .init(availableVersion: status.availableVersion)
     }
 
     /// Offer Check for Updates only when a check can run; name a known update directly.
@@ -243,9 +223,9 @@ final class UpdateController: NSObject {
     func request(_ command: UpdateCommand, presentation: BodyFacePresentation? = nil) async throws -> FaceActReply {
         await initialization?.value
         try Task.checkCancellation()
-        if command == .check || command == .showAvailableUpdate { restartReleasedUpdater() }
         switch command {
         case .check, .showAvailableUpdate:
+            restartReleasedUpdater()
             if let presentation {
                 if let startupFailure { throw PartCallError(code: "updater_start_failed", message: startupFailure) }
                 guard updatesAreAvailable, let updater, let userDriver else {
@@ -261,20 +241,6 @@ final class UpdateController: NSObject {
             }
             showUpdateControl()
             return .acknowledged
-        case .probe:
-            let result = await probeForUpdate()
-            if let refusal = result.refusal {
-                return .refused(.init(code: refusal.reason, message: refusal.detail, cause: nil, effects: .none))
-            }
-            return .result(.string(result.detail))
-        case .setAutomaticChecksOn, .setAutomaticChecksOff:
-            guard let updater else {
-                throw PartCallError(code: "updates_unavailable", message: settingsDetail)
-            }
-            let enabled = command == .setAutomaticChecksOn
-            if updater.automaticallyChecksForUpdates != enabled { updater.automaticallyChecksForUpdates = enabled }
-            return .committed(.init(identities: ["updates"], value: .bool(updater.automaticallyChecksForUpdates),
-                revision: nil, effects: .known, publicationFailure: nil))
         }
     }
 
@@ -322,21 +288,13 @@ final class UpdateController: NSObject {
         ) == .orderedDescending
     }
 
-    func handleFoundUpdate(displayVersion: String) {
-        storeNotice(displayVersion)
-    }
-
-    func handleNoUpdate() {
-        storeNotice(nil)
-    }
-
     private func storeNotice(_ version: String?) {
         let previous = noticeWrite
         noticeWrite = Task { [weak self] in
             await previous?.value
             guard let self else { return }
             self.applyNotice(await SoftwareUpdateState.storeNotice(
-                version, info: self.info, preferencesSuiteName: self.preferencesSuiteName, isNewer: Self.isVersion))
+                version, info: self.info, isNewer: Self.isVersion))
         }
     }
 
@@ -366,15 +324,15 @@ extension UpdateController: SPUUpdaterDelegate {
         forUpdate updateItem: SUAppcastItem,
         state: SPUUserUpdateState
     ) {
-        if choice == .skip { handleNoUpdate() }
+        if choice == .skip { storeNotice(nil) }
     }
 
     func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
-        handleFoundUpdate(displayVersion: item.displayVersionString)
+        storeNotice(item.displayVersionString)
     }
 
     func updaterDidNotFindUpdate(_ updater: SPUUpdater) {
-        handleNoUpdate()
+        storeNotice(nil)
     }
 
     func updater(

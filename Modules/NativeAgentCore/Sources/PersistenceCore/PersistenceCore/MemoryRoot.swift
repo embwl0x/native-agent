@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
-// Blueprint: | `MemoryRoot.swift` | `MemoryRoot`: one moment a memory reached the agent (how, by, at, through); its codec, union, lines and short lead form |
+// Blueprint: | `MemoryRoot.swift` | `MemoryRoot`: a telling, its attested teller and steering principals; codec, union, lines and short lead form |
 
 /// One moment the agent came to know a memory: how it knows it, who told it or where its past was kept, when that reached it, and the principals
 /// the stem attests for the turn that wrote it. A memory's roots live in `metadata.roots`; the memory store is their only writer.
@@ -51,13 +51,19 @@ public struct MemoryRoot: Sendable, Hashable, Codable {
     public let written: String
     /// Principals, sorted and unique; empty is a clean attestation.
     public let through: [String]
+    package let teller: String?
 
     public init(how: How, by: String?, at: String, written: String, through: [String]) {
+        self.init(how: how, by: by, at: at, written: written, through: through, teller: nil)
+    }
+
+    package init(how: How, by: String?, at: String, written: String, through: [String], teller: String?) {
         self.how = how
         self.by = by
         self.at = at
         self.written = written
         self.through = Array(Set(through.filter { !$0.isEmpty })).sorted()
+        self.teller = teller
     }
 
     public var date: Date? { NativeTimestampFormat.parseISO8601FractionalFirst(at) }
@@ -81,7 +87,7 @@ public struct MemoryRoot: Sendable, Hashable, Codable {
 
     // MARK: Codec
 
-    private enum CodingKeys: String, CodingKey { case how, by, at, written, through }
+    private enum CodingKeys: String, CodingKey { case how, by, at, written, through, teller }
 
     public init(from decoder: Decoder) throws {
         let fields = try decoder.container(keyedBy: CodingKeys.self)
@@ -96,7 +102,11 @@ public struct MemoryRoot: Sendable, Hashable, Codable {
         guard NativeTimestampFormat.parseISO8601FractionalFirst(written) != nil else { throw Unreadable("written is not an ISO-8601 time") }
         let through = try fields.decode([String].self, forKey: .through)
         guard through.allSatisfy({ !$0.isEmpty }) else { throw Unreadable("through holds an empty principal") }
-        self.init(how: how, by: by, at: at, written: written, through: through)
+        let teller = try fields.decodeIfPresent(String.self, forKey: .teller)
+        if let teller, how != .told || !through.contains(teller) {
+            throw Unreadable("teller must be a principal in a told root's through")
+        }
+        self.init(how: how, by: by, at: at, written: written, through: through, teller: teller)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -106,18 +116,20 @@ public struct MemoryRoot: Sendable, Hashable, Codable {
         try fields.encode(at, forKey: .at)
         try fields.encode(written, forKey: .written)
         try fields.encode(through, forKey: .through)
+        try fields.encodeIfPresent(teller, forKey: .teller)
     }
 
     public var json: JSONValue {
         var fields: [String: JSONValue] = ["how": .string(how.rawValue), "at": .string(at), "written": .string(written),
                                            "through": .array(through.map(JSONValue.string))]
         if let by { fields["by"] = .string(by) }
+        if let teller { fields["teller"] = .string(teller) }
         return .object(fields)
     }
 
     public static func decode(_ value: JSONValue) throws -> MemoryRoot {
         guard case .object(let fields) = value else { throw Unreadable("a root is not an object") }
-        let extra = Set(fields.keys).subtracting(["how", "by", "at", "written", "through"])
+        let extra = Set(fields.keys).subtracting(["how", "by", "at", "written", "through", "teller"])
         guard extra.isEmpty else { throw Unreadable("a root holds unknown fields \(extra.sorted().joined(separator: ", "))") }
         guard case .string(let rawHow)? = fields["how"], let how = How(rawValue: rawHow) else {
             throw Unreadable("how is not one of \(How.allCases.map(\.rawValue).joined(separator: ", "))")
@@ -139,7 +151,13 @@ public struct MemoryRoot: Sendable, Hashable, Codable {
             guard case .string(let principal) = value, !principal.isEmpty else { throw Unreadable("through holds a principal that is not a name") }
             return principal
         }
-        return MemoryRoot(how: how, by: by, at: at, written: written, through: through)
+        let teller: String?
+        switch fields["teller"] {
+        case nil: teller = nil
+        case .string(let principal)? where how == .told && through.contains(principal): teller = principal
+        default: throw Unreadable("teller must be a principal in a told root's through")
+        }
+        return MemoryRoot(how: how, by: by, at: at, written: written, through: through, teller: teller)
     }
 
     /// The roots a memory's metadata holds. A memory always has at least one; none, or any malformed root, is unreadable.
@@ -177,11 +195,9 @@ public struct MemoryRoot: Sendable, Hashable, Codable {
         return String(format: "%04d-%02d-%02d", parts.year ?? 0, parts.month ?? 0, parts.day ?? 0)
     }
 
-    /// The same telling: the same how, by and through on the same day of the person's calendar. A source telling it on another day is another
-    /// moment, dated when it was told: an older root of the same source never dates newer words.
     public func isSame(as other: MemoryRoot) -> Bool {
         let calendar = Self.calendar(in: .current)
-        return how == other.how && by?.lowercased() == other.by?.lowercased() && through == other.through
+        return how == other.how && by?.lowercased() == other.by?.lowercased() && through == other.through && teller == other.teller
             && day(in: calendar) == other.day(in: calendar)
     }
 

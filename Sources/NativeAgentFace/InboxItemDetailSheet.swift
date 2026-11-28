@@ -24,19 +24,24 @@ extension InboxItemRecord {
 
 struct InboxItemDetailSheet: View {
     let item: InboxItemRecord
-    let onAction: @MainActor (String) async -> InboxRowActionFlight.Outcome
+    let actionFlight: InboxRowActionFlight
     let onClose: () -> Void
 
+    @Environment(AppModel.self) private var appModel
     @State private var session = FacePageSession()
 
-    private var visibleActions: [InboxActionRecord] {
-        InboxVisibleActionsPresentation.actions(for: item)
+    private var snapshot: PartFaceSnapshot? {
+        appModel.face.slot(.page("inbox")).value(as: PartFaceSnapshot.self)
     }
 
     var body: some View {
+        let snapshot = self.snapshot
+        let row = snapshot?.drawnFace?.allRows.first { $0.id == item.id }
+        let detail = row?.detail.map(TurnSecretRedactor.redactText)
+        let door = self.door(detail: detail)
         VStack(alignment: .leading, spacing: 0) {
             List {
-                FaceView(face: page, door: door, session: session)
+                FaceView(face: page(row: row, detail: detail, snapshot: snapshot), door: door, session: session)
             }
             .faceList()
             .listStyle(.plain)
@@ -52,67 +57,49 @@ struct InboxItemDetailSheet: View {
             .padding(.vertical, 12)
         }
         .frame(minWidth: 320, idealWidth: 560, minHeight: 320, idealHeight: 480)
-        .onAppear {
-            guard session.operation(for: item.id) == nil else { return }
+        .modifier(FaceObservation(demand: .key(.page("inbox"))))
+        .onChange(of: row?.id, initial: true) { _, _ in
+            guard let row, session.operation(for: item.id) == nil,
+                  let read = row.actions?.first(where: { $0.id == "read" }), read.runs(from: "mac") else { return }
             session.submit(.init(section: "face:note", row: item.id), row: item.id, action: "read", value: nil,
-                           call: actionCall("read"), door: door)
+                           call: read.call, door: door, expectedPageRevision: row.pageRevision)
         }
     }
 
     private var detailKey: String { "inbox-detail:" + item.id }
-    private var filesKey: String { "inbox-files:" + item.id }
-    private var documents: [String: String] {
-        var documents: [String: String] = [:]
-        if let detail = item.detail, !detail.isEmpty { documents[detailKey] = detail }
-        if let paths = item.related_paths, !paths.isEmpty { documents[filesKey] = paths.joined(separator: "\n") }
-        return documents
-    }
 
-    private var page: PartFace {
-        var sections: [PartFace.Section] = [
-            .init(id: "note", title: item.detailEyebrow, rows: [
-                .init(id: item.id, title: item.title, detail: item.summary, at: item.created_at, symbol: item.sourceIcon,
-                      tone: item.waitsOnPerson ? .attention : nil,
-                      actions: visibleActions.map { action in
-                    .init(id: action.id, label: action.label,
-                          role: ["archive", "dismiss", "reject", "deny"].contains(action.id) ? .destructive
-                            : InboxActionWords.isPrimary(action.id) ? .primary : nil,
-                          call: actionCall(action.id),
-                          aside: InboxActionVocabulary.inboxVerbs.contains { $0.id == action.id } ? true : nil)
-                }),
-            ]),
-        ]
-        for key in [detailKey, filesKey] {
-            if let text = documents[key] {
-                sections.append(.init(id: key, title: key == filesKey ? "Files" : nil, rows: [], block: .init(key: key,
-                    text: text.utf8.count <= PartFace.Block.inlineByteLimit ? text : nil, revision: SHA256Hex.of(utf8: text))))
+    private func page(row: PartFace.Row?, detail: String?, snapshot: PartFaceSnapshot?) -> PartFace {
+        let heading: PartFace.Row
+        if let row {
+            let actions = row.actions?.filter { !["read", "view", "reply"].contains($0.id) }.map { action in
+                PartFace.Action(id: action.id, label: TurnSecretRedactor.redactText(action.label), role: action.role,
+                    doors: action.doors, call: action.call, open: action.open, unavailable: action.unavailable, aside: action.aside)
             }
+            heading = .init(id: row.id, title: TurnSecretRedactor.redactText(row.title), at: row.at, symbol: row.symbol,
+                            tone: row.tone, actions: actions, pageRevision: row.pageRevision)
+        } else {
+            heading = .init(id: item.id, title: item.title,
+                            detail: snapshot?.error?.message ?? (snapshot == nil ? "Reading this note…" : "This note is absent from the current Inbox."))
+        }
+        var sections: [PartFace.Section] = [
+            .init(id: "note", title: item.detailEyebrow, rows: [heading]),
+        ]
+        if let detail, !detail.isEmpty {
+            sections.append(.init(id: detailKey, rows: [], block: .init(key: detailKey,
+                text: detail.utf8.count <= PartFace.Block.inlineByteLimit ? detail : nil, revision: SHA256Hex.of(utf8: detail))))
         }
         return PartFace(sections: sections)
     }
 
-    private func actionCall(_ action: String) -> PartFace.Call {
-        .init("inbox.action", ["id": .string(item.id), "action": .string(action)])
-    }
-
-    private var door: ClosureFaceDoor {
-        ClosureFaceDoor(open: { _ in }, waitingOn: "the note", read: { request in
-            guard let text = documents[request.key], request.revision == SHA256Hex.of(utf8: text) else {
+    private func door(detail: String?) -> ClosureFaceDoor {
+        let owner = appModel.pageDoor(page: "inbox", open: { _ in })
+        return ClosureFaceDoor(open: { _ in }, waitingOn: owner.waitingOn, read: { request in
+            guard let detail, request.key == detailKey, request.revision == SHA256Hex.of(utf8: detail) else {
                 throw PartCallError(code: "inbox_detail_changed", message: "The selected note's detail changed. Open it again.")
             }
-            return text
+            return detail
         }, perform: { submission in
-            guard submission.row == item.id,
-                  submission.action == "read" || visibleActions.contains(where: { $0.id == submission.action }),
-                  submission.expectedCall == actionCall(submission.action) else {
-                return .interrupted(WireFailure(code: "inbox_action_changed", message: "The note's action changed. Open it again.",
-                                                cause: nil, effects: .none))
-            }
-            if submission.checking {
-                return .interrupted(WireFailure(code: "inbox_action_unconfirmed", message: "Read the Inbox to check this action's result.",
-                                                cause: nil, effects: .unknown))
-            }
-            let outcome = await onAction(submission.action).faceOutcome
+            let outcome = await actionFlight.perform { await owner.act(submission) }
             if submission.action != "read", outcome.accepted, outcome.failure == nil, outcome.effects != .unknown { onClose() }
             return outcome
         })
@@ -120,51 +107,18 @@ struct InboxItemDetailSheet: View {
 
 }
 
-enum InboxActionWords {
-    static func isPrimary(_ actionID: String) -> Bool {
-        actionID == "act" || actionID == "approve" || actionID == "open_approvals" || actionID == "repair"
-    }
-
-}
-
 /// One action flight prevents duplicate writes and preserves the terminal outcome.
 @MainActor @Observable
 final class InboxRowActionFlight {
-    enum Outcome: Equatable {
-        case dropped
-        case succeeded
-        case failed(WireFailure)
-
-        var faceOutcome: FaceActOutcome {
-            switch self {
-            case .succeeded: .init(effects: .known, accepted: true)
-            case .failed(let failure): .interrupted(failure)
-            case .dropped:
-                .interrupted(WireFailure(code: "inbox_action_pending", message: "Another note action is still waiting on its owner.",
-                                         cause: nil, effects: .none))
-            }
-        }
-    }
-
     private(set) var isInFlight = false
 
-    func perform(operation: @escaping @MainActor () async throws -> Void) async -> Outcome {
-        guard !isInFlight else { return .dropped }
+    func perform(operation: @MainActor () async -> FaceActOutcome) async -> FaceActOutcome {
+        guard !isInFlight else {
+            return .interrupted(WireFailure(code: "inbox_action_pending", message: "Another note action is still waiting on its owner.",
+                                            cause: nil, effects: .none))
+        }
         isInFlight = true
         defer { isInFlight = false }
-
-        do {
-            try await operation()
-            return .succeeded
-        } catch {
-            let detail = String(TurnSecretRedactor.redactText(error.localizedDescription).prefix(1_000))
-            ModuleLog.app("%@", "[inbox] action failed: \(detail)")
-            var failure: WireFailure
-            if let known = error as? WireFailure { failure = known }
-            else { failure = WireFailure(code: "inbox_action_unconfirmed", message: detail, cause: nil, effects: .unknown) }
-            failure.message = TurnSecretRedactor.redactText(failure.message)
-            failure.cause = failure.cause.map(TurnSecretRedactor.redactText)
-            return .failed(failure)
-        }
+        return await operation()
     }
 }

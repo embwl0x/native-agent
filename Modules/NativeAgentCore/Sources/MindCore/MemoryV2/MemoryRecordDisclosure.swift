@@ -106,12 +106,14 @@ public enum MemoryRecordDisclosurePolicy {
         return expiry > now
     }
 
-    public static func classify(_ record: MemoryRecord, at now: Date = Date()) -> MemoryDisclosureClassification? {
-        guard isTemporallyEligible(validTo: record.validTo, at: now) else { return nil }
+    public static func classify(_ record: MemoryRecord, at now: Date = Date(),
+                                includingNoncurrent: Bool = false) -> MemoryDisclosureClassification? {
+        guard includingNoncurrent || isTemporallyEligible(validTo: record.validTo, at: now) else { return nil }
+        let superseded = [MemoryLifecycle.corrected, MemoryLifecycle.contradicted].contains(MemoryLifecycle.normalized(record.lifecycle))
         return classify(
             personaID: record.personaId,
             status: record.status,
-            lifecycle: record.lifecycle,
+            lifecycle: includingNoncurrent && superseded ? nil : record.lifecycle,
             tags: record.tags,
             metadata: record.extras
         )

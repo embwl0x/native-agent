@@ -142,7 +142,7 @@ extension TelegramPollLoop {
                         "TelegramPollLoop: upload_photo action failed: \(TurnSecretRedactor.redactText(String(describing: error)))\n".utf8))
                 }
                 try await Self.sendPhoto(token: token, destination: destination, imagePath: path,
-                    imageData: bytes, caption: nil, silent: silent)
+                    imageData: bytes, silent: silent)
             }
         )
     }
@@ -201,23 +201,13 @@ extension TelegramPollLoop {
         case .replyTextSettled, .writing:
             return nil
         case .notice(_, let text):
-            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
-        case .toolResult:
+            return text.trimmedNonEmpty
+        case .toolResult, .unstartedStep:
             return nil
         case .delta, .final, .error:
             return nil  // native draft preview, never a discrete message
         case .toolUse(let name, let input):
-            let lower = name.lowercased()
-            switch lower {
-            case "read_skill":
-                if let fields = input.objectValue, let skill = JSONValue.firstTrimmedString(fields, keys: ["name", "skill", "id"]) {
-                    return "Loading skill: \(skill)"
-                }
-                return "Loading skill"
-            default:
-                return ToolActivityPresentation.progress(name, args: input.stringFields)
-            }
+            return ToolActivityPresentation.progress(name, args: input.stringFields)
         }
     }
 

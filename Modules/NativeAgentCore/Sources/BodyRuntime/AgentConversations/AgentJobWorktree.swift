@@ -27,11 +27,23 @@ extension AgentJob {
 public typealias AgentJobGit = @Sendable (_ args: [String], _ cwd: String) async throws -> JSONValue
 
 extension AgentJobs {
-    static func worktreeConfigRoot(_ dataRoot: URL) -> URL { InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot) }
-
     private static func git(_ args: [String], _ folder: String) async -> BuilderWorktreeAllocator.GitResult {
         await BuilderWorktreeAllocator.git(["-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null"] + args,
                                            cwd: URL(fileURLWithPath: folder, isDirectory: true))
+    }
+
+    static func repositoryMetadata(_ folder: URL) async throws -> Bool {
+        let result = await BuilderWorktreeAllocator.git(["-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
+            "rev-parse", "--is-inside-git-dir"], cwd: folder, environment: ["LC_ALL": "C", "GIT_DISCOVERY_ACROSS_FILESYSTEM": "1"])
+        switch (result.status, result.trimmed) {
+        case (0, "true"): return true
+        case (0, "false"): return false
+        case (128, "") where result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            == "fatal: not a git repository (or any of the parent directories): .git": return false
+        default:
+            let detail = BuilderWorktreeAllocator.detail(result)
+            throw JobRefusal(detail.isEmpty ? "Git discovery returned status \(result.status) without a diagnostic." : detail)
+        }
     }
 
     // MARK: The cut
@@ -40,7 +52,7 @@ extension AgentJobs {
     static func cut(_ id: String, repo: String, dataRoot: URL) async -> Result<AgentJob.Worktree, JobRefusal> {
         let result: BuilderWorktreeAllocator.AllocationResult
         do {
-            result = try await BuilderWorktreeAllocator.shared.resolve(identity: id, directory: repo, configRoot: worktreeConfigRoot(dataRoot))
+            result = try await BuilderWorktreeAllocator.shared.resolve(identity: id, directory: repo, configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot))
         } catch { return .failure(JobRefusal("Its worktree could not be made: \(error.localizedDescription) Nothing was sent.")) }
         switch result {
         case .unchanged:
@@ -59,7 +71,7 @@ extension AgentJobs {
 
     /// Undo a cut no organ ever worked in. Its own sentence says what is left.
     static func uncut(_ id: String, repo: String, dataRoot: URL) async -> String {
-        switch await BuilderWorktreeAllocator.shared.discard(identity: id, repo: repo, configRoot: worktreeConfigRoot(dataRoot)) {
+        switch await BuilderWorktreeAllocator.shared.discard(identity: id, repo: repo, configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)) {
         case .discarded(_, _, let note): return "Its worktree and branch were removed." + (note.map { " " + $0 } ?? "")
         case .failed(let reason, let detail, _): return "Its worktree and branch could not be removed (\(reason)): \(detail)"
         }
@@ -129,7 +141,7 @@ extension AgentJobs {
             captured.patch = patch.path
             captured.patchBytes = bytes
             // The job keeps its patch where its record points; Make holds the agent's copy.
-            let made = try register(patch, AgentJobProvenance(contact: job.name, job: job.id, brief: job.brief))
+            let made = try register(patch, job.provenance)
             return (captured, .init(path: patch.path, ref: made.ref, version: made.version))
         } catch { return (captured, .init(path: patch.path, refusal: error.localizedDescription)) }
     }
@@ -280,7 +292,7 @@ extension AgentJobs {
             return .object(["status": .string("already_discarded"), "effects": .string("none"), "job": .string(id),
                             "detail": .string("\(id) was already discarded. Nothing was removed.")])
         }
-        switch await BuilderWorktreeAllocator.shared.discard(identity: id, repo: place.path, configRoot: worktreeConfigRoot(dataRoot)) {
+        switch await BuilderWorktreeAllocator.shared.discard(identity: id, repo: place.path, configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)) {
         case .failed(let reason, let detail, let removed):
             let gone = removed ? "Its worktree \(worktree.path) was removed; its branch \(worktree.branch) stays." : "Nothing was removed."
             return failedHands("\(id) could not be discarded (\(reason)): \(detail) \(gone)", effects: removed ? "occurred" : "none", job: id)

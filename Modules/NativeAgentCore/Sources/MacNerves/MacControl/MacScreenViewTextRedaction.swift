@@ -221,6 +221,12 @@ public enum MacScreenViewTextRedaction {
         var seed: [MacAXFrame] = []
         for node in nodes {
             guard let frame = node.attributes.frame else { continue }
+            if node.attributes.queryFields?["redacted"] == .bool(true) {
+                secret.append(frame)
+                cvv.append(frame)
+                seed.append(frame)
+                continue
+            }
             for candidate in [node.attributes.title, node.attributes.value].compactMap({ $0 }) {
                 if looksLikeSecretLabel(candidate) { secret.append(frame) }
                 if isCardVerificationLabel(candidate) { cvv.append(frame) }
@@ -261,11 +267,49 @@ public enum MacScreenViewTextRedaction {
         }
         return redacted
     }
+    static func strictSecretField(_ attributes: MacAXAttributes, fieldHints: [String?]) -> Bool {
+        MacScreenViewBuilder.isSecretField(role: attributes.role, subrole: attributes.subrole,
+            label: attributes.title, value: attributes.value)
+            || fieldHints.compactMap { $0 }.contains { hint in
+                guard hint.utf8.prefix(16_385).count <= 16_384 else { return true }
+                let words = captionWords(hint)
+                return MacScreenViewBuilder.isSecretField(role: attributes.role, subrole: attributes.subrole, label: hint)
+                    || captionContainsWord(words, anyOf: ["password", "passcode", "pin", "passkey"])
+                    || ["password", "passcode", "passkey"].contains { hint.localizedCaseInsensitiveContains($0) }
+                    || hint.range(of: #"(?i)^pin(field|entry|input|code|text)"#, options: .regularExpression) != nil
+            }
+    }
+
+    static func protectedPath(_ raw: String, dataRoot: URL) throws -> Bool {
+        guard raw.utf8.prefix(16_385).count <= 16_384 else { return true }
+        let raw = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let path: String
+        if raw.lowercased().hasPrefix("file:") {
+            guard let url = URL(string: raw), url.isFileURL, url.path.hasPrefix("/") else { return true }
+            path = url.path
+        } else {
+            guard raw.hasPrefix("/") || raw.hasPrefix("~/") else { return false }
+            path = (raw as NSString).expandingTildeInPath
+        }
+        if MacControlSensitivePathFence.reason(forPath: path) != nil { return true }
+        let candidate = URL(fileURLWithPath: path).standardizedFileURL
+        let credentials = dataRoot.appendingPathComponent("credentials", isDirectory: true).standardizedFileURL
+        if NativeAgentWorkspaceRoot.relativePath(candidate.path.lowercased(), under: credentials.path.lowercased()) != nil { return true }
+        let resolved = candidate.resolvingSymlinksInPath()
+        let resolvedCredentials = credentials.resolvingSymlinksInPath()
+        if NativeAgentWorkspaceRoot.relativePath(resolved.path.lowercased(), under: resolvedCredentials.path.lowercased()) != nil { return true }
+        if try MacControlSensitivePathFence.isCredentialPath(resolved, dataRoot: dataRoot) { return true }
+        return try SenseSandboxProfile.containsResolved(resolved, roots: [resolvedCredentials])
+    }
+
     /// Redact every text channel without removing node addressing.
     public static func redactedNodeFields(
         _ node: MacAXNode,
         valueChars: Int = MacAXLimits.hardValueChars,
-        context: NodeSecretContext
+        context: NodeSecretContext,
+        strictMasks: [MacAXFrame]? = nil,
+        dataRoot: URL? = nil,
+        scrub: (String) -> String = { $0 }
     ) -> [String: JSONValue] {
         let attributes = node.attributes
         var object: [String: JSONValue] = [
@@ -273,6 +317,43 @@ public enum MacScreenViewTextRedaction {
             "enabled": attributes.enabled.map(JSONValue.bool) ?? .null,
             "path": .array(node.path.map { .int(Int64($0)) }),
         ]
+        if let strictMasks {
+            let withheld: [String: JSONValue] = ["redacted": .bool(true), "path": object["path"] ?? .null]
+            if attributes.queryFields?["redacted"] == .bool(true) {
+                var secure = withheld
+                for key in ["value", "title", "description", "help", "placeholder", "selected_text"] {
+                    secure[key] = .string("[REDACTED:secure_field]")
+                }
+                return secure
+            }
+            guard let dataRoot, let frame = attributes.frame, frame.w > 0, frame.h > 0,
+                  [frame.x, frame.y, frame.w, frame.h].allSatisfy(\.isFinite),
+                  !strictSecretField(attributes, fieldHints: []), attributes.attributeGaps.isEmpty, !attributes.labelUnreadable,
+                  !strictMasks.contains(where: {
+                      MacScreenViewGeometry(bounds: $0, pixelWidth: 1, pixelHeight: 1).intersects(frame)
+                  }) else { return withheld }
+            object.merge(attributes.queryFields ?? [:]) { original, _ in original }
+            object["subrole"] = attributes.subrole.map(JSONValue.string)
+            object["value"] = attributes.value.map(JSONValue.string)
+            object["selected"] = attributes.selected.map(JSONValue.bool)
+            object["frame"] = frame.toJSON()
+            let enclosing = enclosingKinds(forNodeAt: frame, path: node.path, among: context.enclosingCaptions)
+            var readable = true
+            for (key, field) in object {
+                guard case .string(let raw) = field else { continue }
+                guard raw.utf8.prefix(16_385).count <= 16_384, scrub(raw) == raw, readable,
+                      (try? protectedPath(raw, dataRoot: dataRoot)) == false,
+                      case .string(let text) = redactedNodeString(
+                          raw, valueChars: valueChars, frame: frame, under: key == "title" ? nil : attributes.title,
+                          enclosing: enclosing, context: context) else {
+                    readable = false
+                    continue
+                }
+                object[key] = .string(text)
+            }
+            object["redacted"] = .bool(false)
+            return readable ? object : withheld
+        }
         if !attributes.attributeGaps.isEmpty {
             object["attribute_gaps"] = .array(attributes.attributeGaps.map(JSONValue.string))
         }
@@ -455,7 +536,7 @@ public enum MacScreenViewTextRedaction {
     }
     /// Coverage must be complete; callers own timing and minimum frame size.
     public static func inspectSecretFields(source: any MacAXElementSource, root: MacAXElementRef,
-        deadline: Date, nonnegativeFrames: Bool = true, context: MacOperationContext) throws -> [MacAXNode] {
+        deadline: Date, context: MacOperationContext) throws -> [MacAXNode] {
         try context.holding(\.readDeadline, deadline) { context in
             // A list can publish every row and cell as visible with frames far off the window (Music's library): they cannot appear in the window's pixels.
             let bounds = source.attributes(of: root, context: context)?.frame
@@ -476,7 +557,7 @@ public enum MacScreenViewTextRedaction {
                     || MacScreenViewBuilder.textRoles.contains(attributes.role)
                     || attributes.title != nil || attributes.value != nil || !attributes.attributeGaps.isEmpty else { continue }
                 guard let frame = attributes.frame,
-                      (!nonnegativeFrames || frame.w >= 0 && frame.h >= 0),
+                      frame.w >= 0 && frame.h >= 0,
                       [frame.x, frame.y, frame.w, frame.h].allSatisfy(\.isFinite) else {
                     throw SenseFailure(code: "redaction_coverage_unavailable",
                         message: "Secret masking element at path \(node.path) (\(attributes.role)) has unreadable AXPosition/AXSize: no finite frame.")
@@ -489,8 +570,10 @@ public enum MacScreenViewTextRedaction {
     public static func secretFrames(
         nodes: [MacAXNode],
         geometry: MacScreenViewGeometry,
-        deadline: Date
-    , context: MacOperationContext) -> [MacAXFrame]? {
+        deadline: Date,
+        strict: Bool = false,
+        context: MacOperationContext
+    ) -> [MacAXFrame]? {
         // Under Full Mac her eyes see what the person sees.
         if context.seesAsPerson { return [] }
         let context = nodeSecretContext(nodes)
@@ -512,7 +595,17 @@ public enum MacScreenViewTextRedaction {
         for node in nodes {
             guard Date() < deadline else { return nil }
             let attributes = node.attributes
-            guard let frame = attributes.frame, frame.w > 0, frame.h > 0, geometry.intersects(frame) else { continue }
+            guard let frame = attributes.frame, frame.w > 0, frame.h > 0,
+                  !strict || [frame.x, frame.y, frame.w, frame.h].allSatisfy(\.isFinite) else {
+                if strict, attributes.title != nil || attributes.value != nil
+                    || attributes.queryFields?.values.contains(where: { $0.stringValue != nil }) == true { return nil }
+                continue
+            }
+            guard strict || geometry.intersects(frame) else { continue }
+            if strict, attributes.queryFields?["redacted"] == .bool(true) {
+                frames.append(frame)
+                continue
+            }
             let enclosing = enclosingKinds(forNodeAt: frame, path: node.path, among: context.enclosingCaptions)
             func withheld(_ text: String?, under label: String?) -> Bool {
                 guard let text else { return false }

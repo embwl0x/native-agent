@@ -128,7 +128,7 @@ final class MacBridgeClient {
         connectionGeneration += 1
         isConnecting = false
         // A disconnect ends the transport, not the app's listeners: Chat keeps its registrations, so live replies resume on reconnect.
-        bridge.tearDown(preservingConsumers: true)
+        bridge.tearDown()
         refreshConnection()
     }
 
@@ -148,7 +148,7 @@ final class MacBridgeClient {
         connectionGeneration += 1
         isConnecting = false
         bridge.clearMacConfirmationForConnectionRepair()
-        bridge.tearDown(preservingConsumers: true)
+        bridge.tearDown()
         sync.clearConnectionDeliveryHistory()
         refreshConnection()
         bridge.setup()

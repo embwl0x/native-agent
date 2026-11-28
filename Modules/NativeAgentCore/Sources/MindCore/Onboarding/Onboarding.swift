@@ -88,38 +88,32 @@ public struct SwiftNativeOnboardingClient: Sendable {
         AbilityOverviewEntry(
             id: "chat",
             title: "Chat with memory",
-            detail: "Long-running conversations, recall, corrections, and personality growth.",
-            systemImage: "message"
+            detail: "Long-running conversations, recall, corrections, and personality growth."
         ),
         AbilityOverviewEntry(
             id: "projects",
             title: "Build with you",
-            detail: "Read approved projects, edit files, run tests, and show results and keep an activity record when access allows.",
-            systemImage: "hammer"
+            detail: "Read approved projects, edit files, run tests, and show results and keep an activity record when access allows."
         ),
         AbilityOverviewEntry(
             id: "mac",
             title: "Use Mac actions",
-            detail: "Notifications, Spotlight, Shortcuts, files, shell, and app control with your permission, managed in Trust.",
-            systemImage: "macbook"
+            detail: "Notifications, Spotlight, Shortcuts, files, shell, and app control with your permission, managed in Trust."
         ),
         AbilityOverviewEntry(
             id: "connectors",
             title: "Connect services",
-            detail: "Optional providers and connectors for chat models, Telegram, email, calendar, and more.",
-            systemImage: "point.3.connected.trianglepath.dotted"
+            detail: "Optional providers and connectors for chat models, Telegram, email, calendar, and more."
         ),
         AbilityOverviewEntry(
             id: "mobile",
             title: "Work from iPhone",
-            detail: "Pair the mobile app for chat, approvals, push notifications, inbox, activity, and remote actions.",
-            systemImage: "iphone"
+            detail: "Pair the mobile app for chat, approvals, push notifications, inbox, activity, and remote actions."
         ),
         AbilityOverviewEntry(
             id: "improve",
             title: "The agent improves with use",
-            detail: "Work is checked and kept in a record you can read.",
-            systemImage: "checkmark.shield"
+            detail: "Work is checked and kept in a record you can read."
         ),
     ]
 }

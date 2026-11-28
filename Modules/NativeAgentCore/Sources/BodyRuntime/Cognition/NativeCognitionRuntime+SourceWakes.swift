@@ -94,7 +94,8 @@ extension NativeCognitionRuntime {
 
     func startCognitiveSourceObservations() {
         guard !isAdmissionClosed, sourceWakes.clockObservation == nil else { return }
-        OrganJudge.beat(Self.reflectionOrgan, .held, note: "waiting for dream or replay evidence")
+        // Arming at launch is not a hold: only a reflection pass that was held back counts toward stuck, so relaunches cannot read as one.
+        OrganJudge.beat(Self.reflectionOrgan, .nothing, note: "armed; waiting for dream or replay evidence")
         startRhythmObservation()
         let root = dataRoot
         let memory = ["memory/memory.sqlite", "memory/memory.sqlite-wal"].map { root.appendingPathComponent($0) }
@@ -105,14 +106,11 @@ extension NativeCognitionRuntime {
             Self.canonSourceEvents(at: root)
         }
         let horizonEvents: @Sendable () -> AsyncStream<Void> = {
-            let peer = DelegationStatusProjector(configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: root), dataRoot: root)
-            return EventDeadlinePhysiology.storeAndFileEvents(paths: memory + desk + peer.watchedPaths
-                + [approvals])
+            EventDeadlinePhysiology.storeAndFileEvents(paths: memory + desk + [AgentJobStore(dataRoot: root).fileURL, approvals])
         }
         // Mark readiness only after registration; rearm before reads so new children also receive watches.
         let clock = EventDeadlinePhysiology.storeAndFileEvents(paths: [preferences], notifications: [
-            .NSCalendarDayChanged, .NSSystemTimeZoneDidChange, .NSSystemClockDidChange,
-            ProcessInfo.thermalStateDidChangeNotification
+            .NSCalendarDayChanged, .NSSystemTimeZoneDidChange, .NSSystemClockDidChange
         ])
         sourceWakes.canonObservation = Task { [weak self] in
             guard var events = await self?.admittedSourceEvents(canonEvents) else { return }
@@ -190,6 +188,11 @@ extension NativeCognitionRuntime {
         await rescheduleResidualRepairDeadline()
     }
 
+    func thermalPressureChanged() {
+        guard !isAdmissionClosed else { return }
+        publishRuntimeChange(reason: "body:thermal")
+    }
+
     private func clockSourceChanged() async {
         guard !isAdmissionClosed else { return }
         rhythm.dirty = true
@@ -234,6 +237,8 @@ extension NativeCognitionRuntime {
                 try await careMoved(care, at: index, once: once)
                 sourceWakes.careMoments.insert(once)
                 RepairOwed.settle(dataRoot, operation: "attention.amend:" + once, evidence: .init(source: "care", id: once))
+            } catch is CancellationError {
+                return
             } catch {
                 RepairOwed.owe(dataRoot, id: "attention.amend:" + once, kind: .act,
                     operation: "attention.amend:" + once, owner: care.id.uuidString, words: error.localizedDescription,

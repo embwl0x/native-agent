@@ -123,7 +123,7 @@ actor ChromeControlChannel {
     private nonisolated let writeQueue = DispatchQueue(
         label: "com.nativeagent.chromecontrol.write"
     )
-    let requestTimeout: Duration
+    static let requestTimeout: Duration = .seconds(30)
     private let onReloadFailure: @Sendable (String, String) -> Void
     private var readTask: Task<Void, Never>?
     private var driverTask: Task<Void, Never>?
@@ -148,7 +148,7 @@ actor ChromeControlChannel {
     private var closed = false
     private let onDisconnect: @Sendable () -> Void
 
-    init(descriptor: Int32, previousTabs: [Int64: ChromeConversationTab] = [:], requestTimeout: Duration = .seconds(30),
+    init(descriptor: Int32, previousTabs: [Int64: ChromeConversationTab] = [:],
          onReloadFailure: @escaping @Sendable (String, String) -> Void = { _, _ in },
          onCaptureFailure: @escaping @Sendable (Int64, String, Date) -> Void = { _, _, _ in },
          onTabReleased: @escaping @Sendable (JSONValue) async -> Void = { _ in },
@@ -156,7 +156,6 @@ actor ChromeControlChannel {
          onDisconnect: @escaping @Sendable () -> Void = {}) {
         socket = ChromeSocketHandle(descriptor: descriptor)
         ownTabs = previousTabs
-        self.requestTimeout = requestTimeout
         self.onReloadFailure = onReloadFailure
         self.onCaptureFailure = onCaptureFailure
         self.onTabReleased = onTabReleased
@@ -223,7 +222,7 @@ actor ChromeControlChannel {
             if action == .navigate || action == .snapshot || action == .look {
                 timeout = nil
             } else {
-                let budget: Duration = action == .preview ? .seconds(2) : requestTimeout
+                let budget: Duration = action == .preview ? .seconds(2) : Self.requestTimeout
                 timeout = Task { [weak self] in
                     do { try await Task.sleep(for: budget) } catch { return }
                     await self?.timeoutRequest(id, context: context)

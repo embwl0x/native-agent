@@ -17,10 +17,7 @@ public struct EmbeddingRuntimeSnapshot: Sendable, Equatable {
     public var coreMLResourcesAvailable: Bool
     public var coreMLLoaded: Bool
     public var modelLoadable: Bool
-    public var lastUsedAt: String?
     public var lastLoadedAt: String?
-    public var lastUnloadedAt: String?
-    public var unloadReason: String?
     public var lastLoadError: String?
     public var loadCount: Int
     public var unloadCount: Int
@@ -38,10 +35,7 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider {
 
     private struct State {
         var coreMLProvider: CoreMLEmbeddingProvider?
-        var lastUsedAt: Date?
         var lastLoadedAt: Date?
-        var lastUnloadedAt: Date?
-        var unloadReason: String?
         var lastLoadError: String?
         var loadCount: Int = 0
         var unloadCount: Int = 0
@@ -81,10 +75,17 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider {
                 if let loaded { return loaded.embeddingEpoch }
                 return try CoreMLEmbeddingProvider.bundledEmbeddingEpoch(extrasRoot: dataRoot)
             } catch {
-                state.withLock { state in
-                    // A cold probe cannot invalidate a provider loaded while it was reading.
-                    guard state.loadGeneration == generation, state.coreMLProvider == nil else { return }
-                    state.lastLoadError = String(describing: error)
+                let failure = String(describing: error)
+                guard state.withLock({
+                    $0.loadGeneration == generation && $0.coreMLProvider == nil && $0.lastLoadError != failure
+                }) else { throw error }
+                withMutation(keyPath: \.runtimeSnapshot) {
+                    state.withLock { state in
+                        // A cold probe cannot invalidate a provider loaded while it was reading.
+                        guard state.loadGeneration == generation, state.coreMLProvider == nil,
+                              state.lastLoadError != failure else { return }
+                        state.lastLoadError = failure
+                    }
                 }
                 throw error
             }
@@ -116,15 +117,10 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider {
     }
 
     /// Retain vectors and identity from one provider across suspension; cold or mock state returns nil without loading or taking loadLock.
-    @concurrent public func embedIfResidentWithEpoch(_ texts: [String], requireFullText: Bool = false) async throws -> MemoryEmbeddingBatch? {
+    @concurrent public func embedIfResidentWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingBatch? {
         let config = try Self.readBackendChecked(dataRoot: dataRoot)
         guard config != Self.mockBackend, !texts.isEmpty else { return nil }
         guard let provider = state.withLock({ $0.coreMLProvider }) else { return nil }
-        noteUse()
-        if requireFullText {
-            guard let vectors = try await provider.embedCompleteTexts(texts) else { return nil }
-            return MemoryEmbeddingBatch(epoch: provider.embeddingEpoch, vectors: vectors)
-        }
         return try await provider.embedWithEpoch(texts)
     }
 
@@ -173,12 +169,16 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider {
                     + "\(error.localizedDescription)"]
             )
         }
-        noteUse()
         // Prediction failures and cancellation retain the resident model.
         return provider
     }
 
     public func snapshot() -> EmbeddingRuntimeSnapshot {
+        access(keyPath: \.runtimeSnapshot)
+        return runtimeSnapshot
+    }
+
+    private var runtimeSnapshot: EmbeddingRuntimeSnapshot {
         let config: String
         let configurationError: String?
         do { config = try Self.readBackendChecked(dataRoot: dataRoot); configurationError = nil }
@@ -230,10 +230,7 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider {
                 coreMLResourcesAvailable: resourcesAvailable,
                 coreMLLoaded: loaded,
                 modelLoadable: configurationError == nil && resourcesAvailable && state.lastLoadError == nil,
-                lastUsedAt: state.lastUsedAt.map(NativeTimestampFormat.plainZulu),
                 lastLoadedAt: state.lastLoadedAt.map(NativeTimestampFormat.plainZulu),
-                lastUnloadedAt: state.lastUnloadedAt.map(NativeTimestampFormat.plainZulu),
-                unloadReason: state.unloadReason,
                 lastLoadError: configurationError ?? state.lastLoadError ?? installedModelProblem,
                 loadCount: state.loadCount,
                 unloadCount: state.unloadCount
@@ -255,22 +252,22 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider {
             value: enabled ? Self.coreMLBackend : Self.mockBackend
         )
         if previous != (enabled ? Self.coreMLBackend : Self.mockBackend) {
-            state.withLock { $0.loadGeneration &+= 1 }
+            withMutation(keyPath: \.runtimeSnapshot) {
+                state.withLock { $0.loadGeneration &+= 1 }
+            }
         }
     }
 
-    @discardableResult
-    public func release(reason: String = "manual release") -> EmbeddingRuntimeSnapshot {
-        state.withLock { state in
-            if state.coreMLProvider != nil {
-                state.unloadCount += 1
+    public func release() {
+        withMutation(keyPath: \.runtimeSnapshot) {
+            state.withLock { state in
+                if state.coreMLProvider != nil {
+                    state.unloadCount += 1
+                }
+                state.coreMLProvider = nil
+                state.loadGeneration &+= 1
             }
-            state.coreMLProvider = nil
-            state.lastUnloadedAt = Date()
-            state.unloadReason = reason
-            state.loadGeneration &+= 1
         }
-        return snapshot()
     }
 
     private func loadCoreMLProvider(config: String) throws -> any EmbeddingProvider {
@@ -288,32 +285,31 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider {
                 recordLoadFailure(error, generation: generation)
                 throw error
             }
-            return try state.withLock { state in
-                guard state.loadGeneration == generation,
-                      try Self.readBackendChecked(dataRoot: dataRoot) == config else { throw CancellationError() }
-                state.coreMLProvider = provider
-                state.lastLoadedAt = Date()
-                state.unloadReason = nil
-                state.lastLoadError = nil
-                state.loadCount += 1
-                return provider
+            let installed: Result<Bool, Error> = withMutation(keyPath: \.runtimeSnapshot) {
+                state.withLock { state in
+                    Result {
+                        guard state.loadGeneration == generation,
+                              try Self.readBackendChecked(dataRoot: dataRoot) == config else { return false }
+                        state.coreMLProvider = provider
+                        state.lastLoadedAt = Date()
+                        state.lastLoadError = nil
+                        state.loadCount += 1
+                        return true
+                    }
+                }
             }
-        }
-    }
-
-    private func noteUse() {
-        state.withLock { state in
-            state.lastUsedAt = Date()
+            guard try installed.get() else { throw CancellationError() }
+            return provider
         }
     }
 
     private func recordLoadFailure(_ error: Error, generation: UInt64) {
-        state.withLock { state in
-            guard state.loadGeneration == generation else { return }
-            state.lastLoadError = String(describing: error)
-            state.coreMLProvider = nil
-            state.lastUnloadedAt = Date()
-            state.unloadReason = "load failed; fail-closed (embed() will throw)"
+        withMutation(keyPath: \.runtimeSnapshot) {
+            state.withLock { state in
+                guard state.loadGeneration == generation else { return }
+                state.lastLoadError = String(describing: error)
+                state.coreMLProvider = nil
+            }
         }
     }
 

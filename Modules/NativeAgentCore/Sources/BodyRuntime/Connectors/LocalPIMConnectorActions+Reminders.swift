@@ -278,6 +278,7 @@ extension LocalPIMConnectorActions {
         }
         try Task.checkCancellation()
         do { try store.save(reminder) }
+        catch is CancellationError { throw CancellationError() }
         catch {
             return .object(["status": .string("failed"), "actionId": .string(actionId), "reason": .string(error.localizedDescription)])
         }
@@ -349,6 +350,7 @@ extension LocalPIMConnectorActions {
         list.title = name
         try Task.checkCancellation()
         do { try store.save(list) }
+        catch is CancellationError { throw CancellationError() }
         catch {
             var result: [String: JSONValue] = ["status": .string("failed"), "actionId": .string(actionId),
                 "effects": .string("unknown"), "source": .string("eventkit"),
@@ -467,6 +469,8 @@ extension LocalPIMConnectorActions {
 
         do {
             try store.save(reminder)
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             return .object([
                 "status": .string("failed"),
@@ -545,6 +549,8 @@ extension LocalPIMConnectorActions {
 
         do {
             try store.save(reminder)
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             return .object([
                 "status": .string("failed"),
@@ -592,6 +598,7 @@ extension LocalPIMConnectorActions {
         }
         guard reminder.calendar.allowsContentModifications else { return failed("reminder_list_read_only") }
         do { try store.remove(reminder) }
+        catch is CancellationError { throw CancellationError() }
         catch { return failed(error.localizedDescription, effects: "unknown") }
         return .object([
             "status": .string("completed"), "actionId": .string(actionId),

@@ -2,6 +2,8 @@ import SwiftUI
 import Foundation
 #if os(macOS)
 import AppKit
+import Combine
+import CoreGraphics
 #elseif os(iOS)
 import UIKit
 #endif
@@ -25,6 +27,11 @@ struct FaceRowView: View {
     @Environment(\.faceContainerWidth) private var containerWidth
     #if os(macOS)
     @Environment(FaceConfirmations.self) private var confirmations
+    @Environment(\.faceInlineTextSelection) private var inlineTextSelection
+    private var selectsInlineText: Bool {
+        inlineTextSelection && sectionStyle == .note && actions.isEmpty && row.open == nil && !discloses
+            && row.control == nil && row.group.isEmpty && row.meter == nil
+    }
     private var pendingConfirmation: FaceConfirmations.Request? {
         get { confirmations.pending }
         nonmutating set { confirmations.pending = newValue }
@@ -34,19 +41,22 @@ struct FaceRowView: View {
     #endif
     @Environment(\.faceStyle) private var style
     @Environment(\.faceListWidth) private var listWidth
+    @Environment(\.faceListCompact) private var listCompact
     private var inList: Bool { listWidth != nil }
     @State private var confirmationSource = UUID()
     @State private var hovering = false
     @State private var trailingWidth: CGFloat = 0
     private var measuresControl: Bool { row.control != nil || row.group.contains { $0.control != nil } }
-    private var width: CGFloat { max(0, containerWidth - leading) }
+    private var width: CGFloat { max(0, (listWidth?.width ?? containerWidth) - leading) }
 
     private var actions: [PartFace.Action] { row.actions ?? [] }
     private var operation: FacePageSession.Operation? { session.operation(for: item.row) }
     private var pendingOperation: FacePageSession.Operation? { operation?.outcome == nil || operation?.checking == true ? operation : nil }
     private var sent: String? { operation?.outcome == nil ? operation?.submission.value : nil }
     private var compact: Bool {
-        let given = inList ? width + style.insets.leading + style.insets.trailing : width
+        let insets = style.insets.leading + style.insets.trailing
+        if inList, leading == 0, let listCompact, listCompact.insets == insets { return listCompact.value }
+        let given = inList ? width + insets : width
         return given > 0 && given < 420
     }
     private var focused: Bool { focus.wrappedValue?.item == item }
@@ -122,13 +132,16 @@ struct FaceRowView: View {
     }
 
     private var line: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            surface
-            outcomeView
+        Group {
+            #if os(macOS)
+            if selectsInlineText { lineContent }
+            else { lineContent.contextMenu { menu } }
+            #else
+            lineContent.contextMenu { menu }
+            #endif
         }
             .contentShape(Rectangle())
             .onHover { hovering = $0 }
-            .contextMenu { menu }
             .accessibilityElement(children: .contain)
             .accessibilityLabel(Text(text))
             .accessibilityActions { accessibleActions }
@@ -175,6 +188,14 @@ struct FaceRowView: View {
                 }
             }
             #endif
+    }
+
+    private var lineContent: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            surface
+            outcomeView
+        }
+        .contentShape(Rectangle())
     }
 
     @ViewBuilder private var surface: some View {
@@ -235,7 +256,17 @@ struct FaceRowView: View {
         Button(door.cancellationLabel) { session.cancel(item) }.disabled(operation.cancelling).buttonStyle(.plain)
     }
 
-    private var rowBody: some View {
+    @ViewBuilder private var rowBody: some View {
+        #if os(macOS)
+        if selectsInlineText {
+            SelectableFaceRowText(row: row, copyText: text, session: session)
+        } else { rowFields }
+        #else
+        rowFields
+        #endif
+    }
+
+    private var rowFields: some View {
         VStack(alignment: .leading, spacing: 4) {
             if !row.group.isEmpty {
                 // The group is placed by what fits, not by a width threshold: beside the title when both fit, beneath it otherwise.
@@ -632,7 +663,8 @@ struct FaceRowView: View {
     }
 
     private func submit(_ action: String, _ value: String?, _ call: PartFace.Call?) {
-        session.submit(item, row: row.id, action: action, value: value, call: call, door: door)
+        session.submit(item, row: row.id, action: action, value: value, call: call, door: door,
+                       expectedPageRevision: row.pageRevision)
     }
 
     @ViewBuilder private var outcomeView: some View {
@@ -665,7 +697,7 @@ struct FaceRowView: View {
                 if let undo = outcome.undo, !session.held(item) {
                     Button(word.map { "Undo " + $0 } ?? "Undo") {
                         session.submit(item, row: row.id, action: "undo", value: nil, call: undo, door: door,
-                                       undoOf: operation.submission.id)
+                                       undoOf: operation.submission.id, expectedPageRevision: row.pageRevision)
                     }.buttonStyle(FaceActionButtonStyle(fill: nil))
                 }
             } else {
@@ -690,6 +722,139 @@ struct FaceRowView: View {
         #endif
     }
 }
+
+#if os(macOS)
+private struct SelectableFaceRowText: View {
+    let row: PartFace.Row
+    let copyText: String
+    let session: FacePageSession
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @State private var textScale = BoardGeometry.macTextScale
+
+    var body: some View {
+        InlineFaceText(title: row.title, value: row.value, tone: row.tone, copyText: copyText, session: session, textScale: textScale)
+            .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.AccessibilityDisplayOptionsDidChangeMessage.name)) { _ in
+                textScale = BoardGeometry.macTextScale
+            }
+            .onChange(of: dynamicTypeSize, initial: true) { _, _ in textScale = BoardGeometry.macTextScale }
+    }
+}
+
+private struct InlineFaceText: NSViewRepresentable {
+    let title: String
+    let value: String?
+    let tone: PartFace.Tone?
+    let copyText: String
+    let session: FacePageSession
+    let textScale: CGFloat
+
+    func makeNSView(context: Context) -> ReadingView {
+        let view = ReadingView(usingTextLayoutManager: false)
+        view.session = session
+        view.delegate = view
+        view.isEditable = false
+        view.isSelectable = true
+        view.drawsBackground = false
+        view.textContainerInset = .zero
+        view.textContainer?.lineFragmentPadding = 0
+        view.textContainer?.widthTracksTextView = true
+        return view
+    }
+
+    func updateNSView(_ view: ReadingView, context: Context) {
+        let words = NSMutableAttributedString(string: title, attributes: [
+            .font: NSFont.systemFont(ofSize: (NSFont.systemFontSize * textScale).rounded(), weight: .medium),
+            .foregroundColor: tone == .failed ? NSColor.systemRed : NSColor.secondaryLabelColor
+        ])
+        if let value, !value.isEmpty {
+            words.append(NSAttributedString(string: "  " + value, attributes: [
+                .font: NSFont.systemFont(ofSize: (NSFont.smallSystemFontSize * textScale).rounded()),
+                .foregroundColor: NSColor(FaceTone.color(tone))
+            ]))
+        }
+        view.pending = (words, copyText)
+        view.refresh()
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: ReadingView, context: Context) -> CGSize? {
+        guard let width = proposal.width, width.isFinite, width > 0 else { return nil }
+        let rect = nsView.attributedString().boundingRect(with: CGSize(width: width, height: .greatestFiniteMagnitude),
+                                                         options: [.usesLineFragmentOrigin, .usesFontLeading])
+        return CGSize(width: width, height: ceil(rect.height))
+    }
+
+    static func dismantleNSView(_ view: ReadingView, coordinator: ()) {
+        view.clearFocus()
+        view.session?.textSelections.remove(view.id)
+        view.session?.copyMenus.remove(view.id)
+        view.session = nil
+    }
+
+    final class ReadingView: NSTextView, NSTextViewDelegate, NSMenuDelegate {
+        let id = UUID()
+        weak var session: FacePageSession?
+        var pending: (words: NSAttributedString, copyText: String)?
+        private var copyText = ""
+
+        func refresh() {
+            guard selectedRange().length == 0, session?.copyMenus.contains(id) != true, let pending else { return }
+            self.pending = nil
+            copyText = pending.copyText
+            if attributedString() != pending.words { textStorage?.setAttributedString(pending.words) }
+        }
+
+        func textViewDidChangeSelection(_ notification: Notification) {
+            if selectedRange().length > 0 { session?.textSelections.insert(id) }
+            else {
+                session?.textSelections.remove(id)
+                refresh()
+            }
+        }
+
+        override func becomeFirstResponder() -> Bool {
+            guard super.becomeFirstResponder() else { return false }
+            session?.focusedTextView = id
+            return true
+        }
+
+        override func resignFirstResponder() -> Bool {
+            guard super.resignFirstResponder() else { return false }
+            clearFocus()
+            setSelectedRange(NSRange(location: 0, length: 0))
+            session?.textSelections.remove(id)
+            refresh()
+            return true
+        }
+
+        func clearFocus() {
+            if session?.focusedTextView == id { session?.focusedTextView = nil }
+        }
+
+        override func menu(for event: NSEvent) -> NSMenu? {
+            let menu = NSMenu()
+            menu.delegate = self
+            menu.autoenablesItems = false
+            let item = menu.addItem(withTitle: "Copy", action: #selector(copyFromMenu(_:)), keyEquivalent: "")
+            item.target = self
+            let range = selectedRange()
+            item.representedObject = range.length > 0 ? attributedString().attributedSubstring(from: range).string : copyText
+            return menu
+        }
+
+        func menuWillOpen(_ menu: NSMenu) { session?.copyMenus.insert(id) }
+        func menuDidClose(_ menu: NSMenu) {
+            session?.copyMenus.remove(id)
+            refresh()
+        }
+
+        @objc private func copyFromMenu(_ item: NSMenuItem) {
+            guard let words = item.representedObject as? String else { return }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(words, forType: .string)
+        }
+    }
+}
+#endif
 
 /// One line, cut by the system at its tail. A plain Text is measured once and cached, so a title as long as a whole prompt costs the
 /// same as a short one however deeply its row is nested; only the part a line could ever show is handed over. A `whole` title (a row that

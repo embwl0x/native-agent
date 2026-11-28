@@ -81,9 +81,22 @@ public struct CapabilityLifecycleCommands: Sendable {
                     : "\(id)'s version write did not complete, so it may or may not be on file: \(why). ability.read it, then ability.save again.",
                     ["effects": .string(committed ? "occurred" : "unknown"), "candidate_digest": .string(digest)])
             } catch let failure as ToolFailureError {
+                var fields = failure.failureEvidence(defaultCode: "ability_save_failed")
+                fields["remedy"] = Parts.boundedSaveRemedy(fields["remedy"])
                 return CapabilityCommandOutcome(false, "\(id.isEmpty ? "The ability" : id) was not saved: \(failure.localizedDescription)",
-                    failure.failureEvidence(defaultCode: "ability_save_failed"))
+                    fields)
             } catch {
+                let refusal = error as? Parts.SaveRefusal
+                if var failure = refusal?.failure ?? (error as? SenseFailure) {
+                    failure.remedy = Parts.boundedSaveRemedy(refusal?.failure.remedy)
+                    var fields = ChatToolOutcome.failure(error: failure, tool: "ability_manage", effects: ToolFailureError.Effects.none).objectValue ?? [:]
+                    if let dependency = refusal?.dependency {
+                        fields.merge(dependency.failureEvidence(defaultCode: "ability_save_failed")) { _, original in original }
+                        fields["remedy"] = failure.remedy
+                    }
+                    fields["execution"] = .string("not_run")
+                    return CapabilityCommandOutcome(false, fields["detail"]?.stringValue ?? failure.message, fields)
+                }
                 return CapabilityCommandOutcome(false, "\(id.isEmpty ? "The ability" : id) was not saved: \(error.localizedDescription)", ["effects": .string(
                     "none")])
             }
@@ -97,7 +110,10 @@ public struct CapabilityLifecycleCommands: Sendable {
                 let exactStatus = fields["status"]?.stringValue == reply.status
                 return CapabilityCommandOutcome(exactStatus && reply.said("ok"), fields["detail"]?.scalarText ?? "", fields)
             } catch { return CapabilityCommandOutcome(false, "Your abilities didn't read (\(error.localizedDescription))." + Self.retry, [:]) }
-        case "validate": outcome = await parts.validate(id, input: input["input"], capture: input["capture"] == .bool(true), invocation: invocation)
+        case "validate":
+            let engine = NativeAgentEngine.forRoot(dataRoot)
+            outcome = await parts.validate(id, input: input["input"], capture: input["capture"] == .bool(true),
+                faceSampleInput: input["faceSampleInput"], facePages: [engine.pages, engine.phoneMemoryPages], invocation: invocation)
         case "enable", "restore":
             outcome = await parts.enable(id, version: input["version"]?.scalarText,
                                          fullMac: fullMac, ownerAuthorized: owner, preview: preview, invocation: invocation)

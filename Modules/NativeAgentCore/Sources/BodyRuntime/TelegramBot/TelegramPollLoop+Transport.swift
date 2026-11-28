@@ -206,7 +206,6 @@ extension TelegramPollLoop {
         chatId: Int,
         text: String,
         threadId: Int? = nil,
-        session: URLSession? = nil,
         sleep: @escaping @Sendable (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) }
     ) async throws {
         // Split below Telegram's 4096-character limit, preferring newline boundaries.
@@ -216,7 +215,7 @@ extension TelegramPollLoop {
                     token: token,
                     method: "sendMessage",
                     resultType: TelegramAPIMessageResult.self,
-                    session: session ?? replySendSession
+                    session: replySendSession
                 ) {
                     var body = _tgDestinationBody(
                         TelegramDestination(chatId: chatId, threadId: threadId)
@@ -230,7 +229,7 @@ extension TelegramPollLoop {
 
     static func sendPhoto(
         token: String, destination: TelegramDestination, imagePath: String,
-        imageData: Data, caption: String?, silent: Bool = false
+        imageData: Data, silent: Bool = false
     ) async throws {
         try await _tgSendInChatLane(chatId: destination.chatId) {
             guard let url = _tgBuildBotURL(token: token, method: "sendPhoto") else {
@@ -259,9 +258,6 @@ extension TelegramPollLoop {
                     boundary: boundary,
                     to: &body
                 )
-            }
-            if let caption = caption?.trimmingCharacters(in: .whitespacesAndNewlines), !caption.isEmpty {
-                _tgAppendMultipartField(name: "caption", value: String(caption.prefix(1_024)), boundary: boundary, to: &body)
             }
             _tgAppendMultipartFile(
                 name: "photo",

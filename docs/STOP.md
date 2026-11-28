@@ -18,6 +18,15 @@ no started activity or cognitive work charge; its paired receipt still settles.
 The [turn anatomy](ANATOMY_OF_A_TURN.md#1-a-surface-admits-the-turn) owns arrival
 eligibility and the boundary checks.
 
+The Mac Chat step face can also withdraw unstarted work for the displayed
+resident turn. The gesture is bound to the drawn page revision and saved in
+the exact turn and run's checkpoint before acknowledgment. It stays in force
+across relaunch for remaining dispatch slots, including unstarted batch
+entries. A withdrawn slot settles as `skipped` / `not_run` with
+`effects: none` and `reason: owner_withdrawal`. Running calls retain their
+receipts. The separate Stop control uses the existing cancellation path for
+the displayed turn's run, including helper runs.
+
 The turn program's optional `hear` may cut only a generating provider round.
 A cut retains prose, discards every unstarted proposal, saves its checkpoint
 and reads arrivals before asking again. It cancels the round's stream wait,
@@ -47,8 +56,9 @@ lifecycle retains that response detail. Helpers join
 their Stop watcher before selecting the saved and returned outcome, reporting
 the same cause through their reply detail and notice. Work returning after an
 observed unreadable marker keeps its output and settles stopped. Telegram's
-pre-chat media settlement keeps it in its cancelled card and error record
-rather than requeueing that message on shutdown.
+pre-chat media settlement keeps an unreadable marker's cause in the cancelled
+card and error record. If shutdown interrupts voice or attachment preparation
+without a run Stop, the claim returns to pending for replay.
 
 Work in flight has two parts:
 
@@ -120,6 +130,9 @@ and await its actual terminal result before forming the final receipt. A
 result arriving after Stop keeps its real effects and handles in the journal;
 the stopped program cannot continue, and completed writes are never replayed.
 
+An item refresh that catches cancellation returns the same `cancelled` error
+code as a packet refresh.
+
 An admitted authored fetch owns its network request separately from the calling
 program's response wait. Stop, caller expiry and run close end that wait without
 cancelling the request. The admitted request runs to its own end: NativeAgent
@@ -163,6 +176,15 @@ execution or discard its late result. Mac dispatch, four-verb actions and watch
 hands add no response deadline; inherited caller deadlines remain in effect.
 The process adapter's typed cancellation carries drained stdout, stderr and
 truncation flags; Mac dispatch returns that material with its stopped receipt.
+The built-in AppleScript action likewise carries an observed Stop and the
+script's effect evidence to terminal settlement.
+Exact Mac focus passes activation cancellation to that same settlement owner.
+Cancelled input before emission returns the hand's existing stopped receipt.
+
+A cancelled production export clears its running state through `settle`, and
+Capabilities returns to the export registry's current reading.
+Finishing Mac dictation releases its capture, joins its watcher and removes
+its feed value before reporting cancellation.
 
 Restoring changes the data-root life. A missing stamp means the first life;
 work from another life reads **stopped**, reason **restored**.
@@ -198,8 +220,10 @@ cancels and joins its queue observer. The clock closes scheduled delivery admiss
 for every occurrence it already recorded as delivered to finish. Future occurrences stay pending.
 
 Reply-mirror reconciliation keeps each row's failed preparation owed and names
-its cause after processing the remaining rows. Cancellation stops the pass;
-an unavailable shared reconciliation read fails the pass before delivery.
+its cause after processing the remaining rows. A retained mirror whose route
+preparation failed takes its route on a later reconciliation once preparation
+succeeds. Cancellation stops the pass. An unavailable shared reconciliation
+read fails the pass before delivery.
 
 Quit raises each captured in-flight turn's own Stop. Ordinary quit waits for
 the captured runs in its initial wait. Restart skips that initial wait
@@ -279,6 +303,10 @@ unit allowed to write to it has settled.
 An act restores its temporarily raised app and releases enhanced Accessibility
 through `settle` under the original driver's settlement binding. Stop cannot
 cancel that release; takeover, handback and shutdown still revoke its generation.
+A declared text restore uses ordinary act admission and retains the original
+driver. The driver checks the run's Stop marker before emission. If Stop wins,
+the deed leaves the field as it stands and settles a skipped-cleanup receipt.
+A restore can run once.
 An owned repeated-act attention session is released once by its captured session
 identity through the same settlement binding. A replaced session is untouched;
 this input-free release needs no renewed work admission, and release failures
@@ -328,6 +356,9 @@ saved in its one durable work record through `settle`, even when Stop raced the
 model response. Publication recovers by the section's immutable diary identity.
 Lessons, reflection, care and dated mood delivery checkpoint that record only
 after their checked durable effects land; diary evidence stays byte-stable.
+When Stop alone interrupts those effects, their inputs remain in that journal
+without filing or clearing dream repair. The dream records a stopped beat, as
+does a care-night pass that throws cancellation.
 Reflection disabled by a switch or a zero budget settles with its off reason.
 A held two-hour slot or an exhausted positive waking budget leaves dream
 reflection eligible. Reflection deferred by an in-flight judgment, failed
@@ -343,6 +374,7 @@ Sleep also joins cognition's retained launch chores, recent-life reading,
 event reflection, canon, horizon and Reach producers before `appSleep` and the
 final saves. Closing admission prevents another recent-life provider call;
 judgments already returned finish their settlement.
+Closing cognition admission invalidates and withdraws its held residual-repair and maintenance times from the clock.
 
 A tool dispatch owns its actual body across the deadline/Stop race. The first
 response stays selected. A call whose wait is found dead or not answering, or
@@ -350,9 +382,10 @@ that passes its own declared time, is Stopped as one call: the body is
 cancelled, the caller released without joining a body that has not returned,
 and the agent reads `reason:found_dead` or `reason:ran_out_of_time` with
 `effects:unknown` while the turn goes on. No call is ended by the app's clock. The
-original body keeps its checkpoint until actual exit, records the real receipt
-through `settle`, and emits `tool.dispatch.settled` with the invocation/call
-IDs. A late receipt is evidence for the original dispatch. If the action already
+original body keeps its checkpoint until actual exit. When it returns after its
+waiter was released, it writes the original dispatch's redacted result through
+`settle` as `tool.dispatch.settled` with the invocation and pairing IDs. An
+unconfirmed write reports a settlement failure. If the action already
 reported its committed ID when Stop selected the response, the caller's receipt
 includes that ID and `effects: occurred`. A direct `memory.commit` reports its
 ID before post-save lookups, and settlement carries that evidence through a

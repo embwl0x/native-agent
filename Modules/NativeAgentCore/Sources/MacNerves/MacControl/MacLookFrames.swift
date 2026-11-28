@@ -353,6 +353,10 @@ public final class MacLookFrameStore {
         let source = context.frameSource
         publication(for: source).write { latestBySource[source] = frame }
     }
+    func discard(frameId: String) {
+        guard let source = latestBySource.first(where: { $0.value.frameId == frameId })?.key else { return }
+        publication(for: source).write { latestBySource[source] = nil }
+    }
     public func latestFrameId(context: MacOperationContext) -> String? { latest(context: context)?.frameId }
     public func frame(frameId: String, context: MacOperationContext) -> MacLookFrame? {
         if let held = context.batchFrames?[frameId] { return held }

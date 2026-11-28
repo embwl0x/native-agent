@@ -1,6 +1,5 @@
 import SenseCore
 import Foundation
-import Observation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
@@ -8,18 +7,12 @@ import ProviderRouting
 import MindCore
 import MacNerves
 import Darwin
+import Observation
 // Blueprint: | `TranscriptReading.swift` | TranscriptsFacade canonical file/index reads, retention and one-revision card/attachment preparation |
 extension TranscriptsFacade {
-    nonisolated internal var chatRoot: URL {
-        DataRootPaths.chatDirectory(in: dataRoot)
-    }
-    nonisolated internal var sessionsPath: URL {
-        DataRootPaths.chatSessionIndex(in: dataRoot)
-    }
-
     /// Selection checks identity without preparing sidebar speech from message files.
     @concurrent public nonisolated func readSessionIdentity(_ id: String) async throws -> NativeAgentShared.ChatSession? {
-        let path = sessionsPath
+        let path = DataRootPaths.chatSessionIndex(in: dataRoot)
         return try await SwiftNativePersistenceCore.withFileLock(path) {
             let rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: path)
             guard let row = rows.first(where: { $0["id"] == .string(id) }) else { return nil }
@@ -30,13 +23,13 @@ extension TranscriptsFacade {
     /// Read the session index after retention under the same lock; checked absence is empty.
     @concurrent private nonisolated func sessionRows() async throws -> [[String: JSONValue]] {
         let dataRoot = self.dataRoot
-        let url = sessionsPath
+        let url = DataRootPaths.chatSessionIndex(in: self.dataRoot)
         return try await SwiftNativePersistenceCore.withFileLock(url) {
             return try ChatSessionRetention.enforce(
                 dataRoot: dataRoot,
                 rows: ChatSessionIndexFile.loadObjectRowsForMutation(at: url),
                 now: Date()
-            ).rows
+            )
         }
     }
     /// A present row without a counter differs from an absent session.
@@ -80,7 +73,7 @@ extension TranscriptsFacade {
     }
     /// Use the newest archived row per id, excluding sessions restored to the hot index; checked absence is empty.
     @concurrent public nonisolated func listArchived() async throws -> [NativeAgentShared.ChatSession] {
-        let url = sessionsPath
+        let url = DataRootPaths.chatSessionIndex(in: dataRoot)
         return try await SwiftNativePersistenceCore.withFileLock(url) {
             let hot = Set(try ChatSessionIndexFile.loadObjectRowsForMutation(at: url).compactMap { row -> String? in
                 guard case .string(let id)? = row["id"], row["archived"] != .bool(true) else { return nil }
@@ -121,7 +114,7 @@ extension TranscriptsFacade {
         let read = try await cache.history(at: dataRoot.appendingPathComponent("chat/messages/\(safeSessionId).jsonl"), cached: cached, limit: limit)
         let history = read.history
         if history.stats.mode == "missing" {
-            let index = sessionsPath
+            let index = DataRootPaths.chatSessionIndex(in: dataRoot)
             let declaredEmpty = try await SwiftNativePersistenceCore.withFileLock(index) {
                 try ChatSessionIndexFile.loadObjectRowsForMutation(at: index).contains {
                     $0["id"] == .string(safeSessionId) && $0["messageCount"] == .int(0)

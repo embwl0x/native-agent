@@ -35,7 +35,7 @@ extension ChatView {
         isSubmittingSend = true
         Task { @MainActor in
             defer { isSubmittingSend = false }
-            switch await appModel.startActiveChatTurn(message, attachments: attachments, expectedSessionId: session, composerRevision: revision) {
+            switch await appModel.startActiveChatTurn(message, attachments: attachments, expectedSessionId: session) {
             case .accepted(let accepted):
                 guard accepted == session else { return }
                 // Sent words leave the chat they were sent from even if the person has moved on; only scroll and focus need it in view.

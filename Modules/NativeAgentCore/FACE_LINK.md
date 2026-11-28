@@ -59,6 +59,9 @@ availability, so an invalid root setting cannot prevent its Use default command
 or hide its failure. Preference writes and Settings navigation require the
 committed reply, including any independent publication failure. Other receipt
 consumers retain committed effects separately from publication.
+Connector credential and Anthropic setup-token acts return a committed reply
+with a redacted publication failure if their post-save refresh fails. Protected
+entry uses the commit to clear the submitted fields whose revisions still match.
 Window commands open the main window, including from a remaining detached
 conversation. Preference edits open it only when its navigation is unmounted;
 an existing scene handles them without taking focus. Each scene task captures
@@ -87,8 +90,9 @@ a producer still releasing its final reader. Platform observation setup is held
 as a task before suspension, so disconnect joins setup before releasing it.
 There is no timeout, polling or automatic replay.
 
-`EngineFaceProjection` supplies layout, graph, dream diary/entry, mood, run
-history/detail, contacts and helpers. It copies owner state on
+`EngineFaceProjection` supplies layout, graph, dream diary/entry, mood,
+individual run detail, contacts and helpers. `DiagnosticsPacket.swift` assembles
+the Diagnostics page's recent-runs list. The projection copies owner state on
 the owner's actor and assembles Shared values off main. Graph neighborhoods have
 entity-keyed slots derived from the canonical graph snapshot; whole-graph updates
 cannot replace a detail slot. Missing entities and failed storage stay explicit.
@@ -96,7 +100,7 @@ Inspector Live and Replay observations hold readers on the engine's existing
 `TurnInspectorFeed`. The last observation releases its reader without stopping
 the shared trace owner. Replay readers do not publish Live slots. Cards carry
 the owner's actual vnode-observation health, independently of act admission.
-Both Mac windows draw the controls and cards through `FaceView`. Each card
+The Mac renderer draws the controls and cards through `FaceView`. Each card
 retains its selected feed value; its event collection reads at most 256 rows
 per continuation, and expanding an event holds its shared document demand.
 Long evidence uses the shared TextKit reader rather than a row's text label.
@@ -105,20 +109,39 @@ The renderer serializes selection, reverse rearm and closure through one held
 view lifetime, joining release before admitting a new reader. Reverse
 health/rearm calls describe the held view, mounted subscription and supplied
 source health. A failed subscription remains a mounted, failed view. Offscreen
-Inspector drawing starts no reader. `BodyFaceDoctor` measures the original
-Inspector and the attached renderer through `AppDoctorPort`, including Doctor
-page-row actions. It checks the canonical trace observer independently of the
-renderer report. Read failures remain failed health, never a closed Inspector.
-Repair makes one attempt to re-arm the shared engine file observer, then checks
-each window independently. An inactive observer stops that repair before
-subscription replacement. A later subscription-call failure retains the known
-source and main-window receipts. Repair names the exact renderer connection,
-view and subscription. Changed selections refuse; a replacement subscription
-without confirmed source health remains unverified. Disconnect removes that
-connection's Doctor target without closing the body's Inspector.
+Inspector drawing starts no reader. `BodyFaceDoctor` measures the attached
+renderer's Inspector through `AppDoctorPort`, including Doctor page-row actions.
+It checks the canonical trace observer independently of the renderer report.
+A disconnected renderer reports a closed Inspector. Other read failures report
+failed health. Repair makes one attempt to re-arm the shared engine file
+observer, then checks the renderer's replacement subscription. An inactive
+observer stops that repair before subscription replacement. A later
+subscription-call failure retains the source observation receipt. Repair names
+the exact renderer connection, view and subscription. Changed selections refuse.
+A replacement subscription without confirmed source health remains unverified.
+Disconnect removes that connection's Doctor target.
 Agent-view room observations use `TurnsFacade.readAgentScreen` with room/session
 keys. Workspace, ability and source-file events refresh redacted read-only text;
 watch failure stays unavailable. Home keeps its existing page face.
+In Mac Chat, `TurnFaceProjection` uses the existing redacted turn steps to
+publish a transient `PartFaceSnapshot` through `PartFaces` and its `LatestRead`
+gate. The slot is keyed by conversation and each value names the exact turn.
+Its native levers carry the turn and run IDs and the revision the Mac drew.
+`PartFaces.actOutcome` checks the revision and drawn call before the owner
+admits **Withdraw unstarted steps** or **Stop**. The resident dispatch owner
+checkpoints withdrawal and leaves running calls to finish. Stop uses the
+existing cancellation path for that run, including helper runs.
+When the turn ends, settlement removes its feed value. A held Mac renderer
+can still read the same turn's final steps from `TurnFace`, including steps that
+arrive for the first time in its ending. A withdrawn proposal or never-run
+withdrawal receipt reads “Withdrawn before start · no effect.” Proposal IDs
+enter row identities as fixed-size digests. An ended call closes its displayed
+start, and a stopped call with a confirmed effect reads “Effect recorded.”
+In a reading that follows updates, a live row whose terminal evidence is
+unavailable becomes unconfirmed. **Check** reads the exact withdrawal
+checkpoint or run-tagged Stop marker. The reader can dismiss an unresolved
+reply after the turn ends. Transient slots use the existing FaceLink page key
+and value types, outside the paired-phone snapshot inventory.
 Waiting and unavailable states are explicit. `EngineFaceMindProjection` holds
 independent cognition and context-health producers and supplies memory
 diagnostics. Cognition events refresh frozen detail. `NativeContextFlowRuntime`
@@ -154,10 +177,10 @@ The Sense presentation follows its existing registry/news owner and carries an
 identity for the exact current view. Events recheck that identity and enabled
 version before reaching the Sense runner. Registry failure withholds the view.
 Desk search uses the canonical parser and fuzzy ranking against active items in
-the retained revision. Its query stays bound to the view's observation. Close
-carries the shown update stamp through the gated compare-and-set tool; note and
-park commands use the face's own presentation. Failed tool outcomes keep note
-drafts open and cannot become committed changes.
+the retained revision. Its query and retained result end with the view's
+observation. Close carries the shown update stamp through the gated
+compare-and-set tool; note and park commands use the face's own presentation.
+Failed tool outcomes keep note drafts open and cannot become committed changes.
 Click and Return carry the rendered row's command snapshot, so a feed update
 cannot retarget an already displayed Close.
 Run detail reads the complete canonical ledger; the history
@@ -174,8 +197,6 @@ Checked command results retain their scope:
   missing terminal evidence remains unknown.
 - Memory search returns its own `LatestRead` result, independently of later
   searches. A short query returns no performed search, not an empty result set.
-- Persona profile save returns the committed profile and any independent
-  document-refresh issue. It does not reread another save's profile.
 - Shared conversation-anchor failure accompanies the accepted conversation in
   `CommittedResult.publicationFailure`.
 - Session selection keeps the existing `activeChatSessionId` key; an empty
@@ -188,9 +209,10 @@ and several app-specific services still depend on the mounted `AppModel`.
 face process's window. `BodyFaceTranscripts`, `BodyFaceVoice` and `BodyFaceServices`
 supply transcript readers, speech/capture, resource grants, contacts, graph
 sweeps, image regeneration through Desk's gated tool router and selected Desk operations.
-Search and Agent-room projections use their canonical owners. The copied Chat
-capsule's `inboxAction` uses reverse calls for its navigation and draft effects,
-through the existing Inbox transaction. `prepareChatDraft` awaits creation when
+Search and Agent-room projections use their canonical owners. The Chat note
+sheet sends the Inbox row's drawn call and `expectedPageRevision` in `pageAct`.
+The Inbox transaction uses reverse calls for its navigation and draft effects.
+`prepareChatDraft` awaits creation when
 there is no selected conversation and returns an applied composer edit; existing
 text refuses the edit and all attachments are retained. Desk reply drafts use
 that same renderer operation. Refusal, conflict and cancellation leave the Inbox
@@ -225,11 +247,11 @@ The visible Shotgun panel holds its own Mac-control observation independently of
 the main Chat page; hiding it releases that reader.
 
 Transcript dimensions and visible paragraph membership are separate events.
-`resizeTranscriptReader` carries changed width, height or scale; a viewport receipt
-updates paragraph priority without pretending the window resized. Both stay on
-the reader's ordered command chain. Link records name reader, script and base
-identities, and the settings frame's mounted composer identities, without words
-or provider credentials.
+`resizeTranscriptReader` is sent when width or scale changes and the viewport
+height is finite and positive. A viewport receipt updates paragraph priority and
+is deferred during live resize. Both stay on the reader's ordered command chain.
+Link records name reader, script and base identities, and the settings frame's
+mounted composer identities, without words or provider credentials.
 
 Offscreen native captures prepare page, graph, dream, cognition and Inspector
 values through their canonical readers before flushing the connection's frame.
@@ -264,7 +286,8 @@ Personality's own Name/document and Dream diary links select the copied native
 editor or diary destination. They do not request a page-item document body.
 The conversation column uses the canonical view-keyed session search instead
 of global palette results. Its title/preview matching, section membership and
-navigation failures keep their existing owners; cancellation joins reader removal.
+navigation failures keep their existing owners. Cancellation joins reader removal
+and removes the view's retained search result.
 
 Make export checks the originating conversation and selected shelf version.
 It uses the canonical project destination/name policy before asking the face
@@ -281,8 +304,8 @@ speech and message data do not read a synthetic chat file. These rows never
 claim a first-visible resident reply. Contact states publish through the shared
 per-session `LatestRead` and outbox; message actions preserve source failures.
 Helper history reads the contact owner's checked result snapshot, excluding
-results already represented in the thread. The helper detail
-reader publishes its full saved reply and returns bot/session identities for
+results already represented in the thread. A plain helper navigation read
+returns `entry_id`, `bot_id`, and `session_id` in the act reply for
 acknowledged conversation selection. Last-reader release cancels and joins the
 connection's observations and press work; sends remain with their real owners.
 
@@ -293,7 +316,7 @@ writes. Body rows preserve off, stale, invalid and absent evidence and project
 the live provider belief explicitly. The persistence encoder does not define
 the presentation. Rejected memory documents read rejected proposals by id;
 active memories and proposal documents use their canonical readers. Document
-text is credential-redacted before either feed or act publication.
+presentation reads return credential-redacted text in the act reply.
 
 Transcript geometry carries the laid-out viewport ids through subsequent press
 updates. The body checks each applied script receipt; a first-visible reply

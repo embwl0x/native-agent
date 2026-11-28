@@ -1,7 +1,7 @@
 import SwiftUI
 import Foundation
 import NativeAgentShared
-// Blueprint: | `AdvancedView.swift` | Shared More rows over the Mac layout, local destinations and native pairing |
+// Blueprint: | `AdvancedView.swift` | Agent and Advanced indexes over shared faces, local destinations and native pairing |
 
 enum MoreAboutPresentation {
     static let text = """
@@ -10,65 +10,85 @@ enum MoreAboutPresentation {
 }
 
 struct AdvancedView: View {
+    let isAgent: Bool
     @Binding var opensMemories: Bool
-    init(opensMemories: Binding<Bool> = .constant(false)) { _opensMemories = opensMemories }
+    @Binding var localDestination: Destination?
+    init(isAgent: Bool = false, opensMemories: Binding<Bool> = .constant(false), localDestination: Binding<Destination?>) {
+        self.isAgent = isAgent
+        _opensMemories = opensMemories
+        _localDestination = localDestination
+    }
     @Environment(PairingStore.self) private var pairingStore
     @Environment(MacBridgeClient.self) private var bridgeClient
     @State private var showPairingRecovery = false
-    @State private var localDestination: Destination?
     @State private var remoteDestination: FaceDestination?
     private let sync = iCloudSyncEngine.shared
-    private var session: FacePageSession { sync.pageSessions.page("phone-more") }
-    private enum Destination: String, Identifiable {
+    private var session: FacePageSession { sync.pageSessions.page(isAgent ? "phone-agent" : "phone-more") }
+    enum Destination: String, Identifiable {
         case settings, graph, turns, tools, diagnostics
         var id: String { rawValue }
     }
 
     var body: some View {
-        NavigationStack {
-            AlivePage(title: "More", line: "Rooms, settings and tools.", style: .root) {
-                FaceView(face: face, door: door, session: session)
-            }
-            .refreshable {
-                await sync.refreshLightweightSnapshots()
-                _ = await sync.refreshFacesSnapshot()
-                await sync.refreshSnapshotGroup(.advanced)
-            }
-            .navigationDestination(isPresented: $opensMemories) { MobileFacePage(page: "memories") }
-            .navigationDestination(item: $remoteDestination) { $0.view }
-            .navigationDestination(item: $localDestination) { destination in
-                switch destination {
-                case .settings: SettingsViewFull(presentation: .pushed)
-                case .graph: KnowledgeGraphView()
-                case .turns: TurnInspectorView()
-                case .tools: MacToolsView()
-                case .diagnostics: DiagnosticsView()
-                }
-            }
-            .sheet(isPresented: $showPairingRecovery) {
-                PairingView(onSkip: { showPairingRecovery = false }, onPaired: { showPairingRecovery = false })
-                    .environment(pairingStore)
-            }
-            #if DEBUG
-            .onAppear {
-                switch MobileDesignSamples.screen {
-                case "settings": localDestination = .settings
-                case "mac-tools": localDestination = .tools
-                case "graph": localDestination = .graph
-                case "turns": localDestination = .turns
-                case "status": localDestination = .diagnostics
-                case "pairing": showPairingRecovery = true
-                case .some(let page): remoteDestination = FaceDestination("page:" + page)
-                case .none: break
-                }
-            }
-            #endif
+        AlivePage(title: isAgent ? sync.displayName(fallback: "Agent") : "Advanced", style: isAgent ? .root : .pushed) {
+            FaceView(face: isAgent ? agentFace : face, door: door, session: session)
         }
-        .macSyncErrorBanner()
+        .refreshable {
+            await sync.refreshLightweightSnapshots()
+            _ = await sync.refreshFacesSnapshot()
+            await sync.refreshSnapshotGroup(.advanced)
+        }
+        .navigationDestination(isPresented: $opensMemories) { MobileFacePage(page: "memories") }
+        .navigationDestination(item: $remoteDestination) { $0.view }
+        .navigationDestination(item: $localDestination) { destination in
+            switch destination {
+            case .settings: SettingsViewFull(presentation: .pushed)
+            case .graph: KnowledgeGraphView()
+            case .turns: TurnInspectorView()
+            case .tools: MacToolsView()
+            case .diagnostics: DiagnosticsView()
+            }
+        }
+        .sheet(isPresented: $showPairingRecovery) {
+            PairingView(onSkip: { showPairingRecovery = false }, onPaired: { showPairingRecovery = false })
+                .environment(pairingStore)
+        }
+        #if DEBUG
+        .onAppear {
+            guard !isAgent else { return }
+            switch MobileDesignSamples.screen {
+            case "settings": localDestination = .settings
+            case "mac-tools": localDestination = .tools
+            case "graph": localDestination = .graph
+            case "turns": localDestination = .turns
+            case "status", "diagnostics": localDestination = .diagnostics
+            case "pairing": showPairingRecovery = true
+            case .some(let page): remoteDestination = FaceDestination("page:" + page)
+            case .none: break
+            }
+        }
+        #endif
     }
 
-    private func link(_ id: String, _ title: String, _ detail: String? = nil, local: Bool = false) -> PartFace.Row {
-        .init(id: id, title: title, detail: detail, open: "page:" + (local ? "phone-" : "") + id)
+    private func link(_ id: String, _ title: String, _ detail: String? = nil) -> PartFace.Row {
+        .init(id: id, title: title, detail: detail, open: "page:" + id)
+    }
+
+    private func localLink(_ destination: Destination, _ title: String, _ detail: String? = nil) -> PartFace.Row {
+        let id = "phone.local/" + destination.rawValue
+        return .init(id: id, title: title, detail: detail, open: "page:" + id)
+    }
+
+    private var agentFace: PartFace {
+        let rows = [
+            link("home", "Home"), link("memories", "Memories"), localLink(.graph, "Knowledge Graph"),
+            link("personality", "Personality"), link("dreams", "Dreams"), link("capabilities", "Capabilities"),
+        ]
+        let own = sync.faces.keys.sorted().compactMap { id -> PartFace.Row? in
+            guard AppDoorNames.ownPageRefusal(id) == nil, let snapshot = sync.faces[id] else { return nil }
+            return link(id, snapshot.face?.title.flatMap { $0.isEmpty ? nil : $0 } ?? id, snapshot.face?.line)
+        }
+        return .init(sections: [.init(id: "agent", rows: rows + own)])
     }
 
     private var face: PartFace {
@@ -101,11 +121,11 @@ struct AdvancedView: View {
                     link("connectors", "Connectors", "The services I can reach"), link("trust", "Trust", "What I may do on my own")
                 ]))
             case "setup": sections.append(.init(id: "setup", title: "Setup", rows: [
-                link("settings", "Settings", "This iPhone, the Mac link and every Mac setting", local: true)
+                localLink(.settings, "Settings", "This iPhone, the Mac link and every Mac setting")
             ]))
             case "power": sections.append(.init(id: "power", title: "Power user", footer: MoreAboutPresentation.text, rows: [
-                link("graph", "Knowledge Graph", local: true), link("turns", "Turn Inspector", local: true),
-                link("tools", "Mac Tools", local: true), link("diagnostics", "Diagnostics", local: true)
+                localLink(.graph, "Knowledge Graph"), localLink(.turns, "Turn Inspector"),
+                localLink(.tools, "Mac Tools"), localLink(.diagnostics, "Diagnostics")
             ]))
             default:
                 if let page = SurfaceLayout.ownPage("more", block), let snapshot = sync.faces[page] {
@@ -119,7 +139,7 @@ struct AdvancedView: View {
 
     private var door: ClosureFaceDoor {
         ClosureFaceDoor(open: { link in
-            if link.hasPrefix("page:phone-"), let destination = Destination(rawValue: String(link.dropFirst("page:phone-".count))) {
+            if case .page("phone.local", let id?)? = FaceLink(link), let destination = Destination(rawValue: id) {
                 localDestination = destination
             } else if let destination = FaceDestination(link) { remoteDestination = destination }
             else { SystemToastCenter.shared.push(info: "This page has not arrived from your Mac.") }

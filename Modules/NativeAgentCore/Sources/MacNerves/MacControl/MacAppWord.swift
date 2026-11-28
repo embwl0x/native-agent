@@ -88,7 +88,7 @@ private final class MacAppReplyState: Sendable {
 }
 
 /// A private AX element keeps a busy app's IPC off the shared observer run loop.
-@concurrent func macAppReply(pid: Int32, patience: Double, context: MacOperationContext,
+@concurrent func macAppReply(pid: Int32, context: MacOperationContext,
                              onFailure: @escaping @Sendable (String) -> Void = { _ in }) async -> MacAppReply {
     if Task.isCancelled { return .stopped }
     if context.expired { return .busy }
@@ -142,7 +142,7 @@ private final class MacAppReplyState: Sendable {
             observation.invalidate()
         }
     }
-    var seconds = max(0, patience)
+    var seconds: Double = 10
     if let wall = context.wallDate { seconds = min(seconds, max(0, wall.timeIntervalSinceNow)) }
     let end = await macSettleLoop("app_reply", signals: signals, patience: seconds, until: [], record: false) { state.value.withLock { $0.reply != nil } }
     let reply: MacAppReply = state.value.withLock {
@@ -157,7 +157,7 @@ private final class MacAppReplyState: Sendable {
 
 @concurrent func macAdmit(pid: Int32, context: MacOperationContext,
                           onFailure: @escaping @Sendable (String) -> Void = { _ in }) async -> MacAppReply {
-    let reply = await macAppReply(pid: pid, patience: 10, context: context, onFailure: onFailure)
+    let reply = await macAppReply(pid: pid, context: context, onFailure: onFailure)
     guard reply == .answered, !Task.isCancelled, !context.expired else {
         return Task.isCancelled ? .stopped : reply == .answered ? .busy : reply
     }

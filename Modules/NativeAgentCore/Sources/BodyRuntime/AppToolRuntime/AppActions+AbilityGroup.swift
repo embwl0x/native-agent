@@ -16,7 +16,7 @@ extension AppActions {
         AppAction("ability.save", "tools", """
             Grow an ability beyond existing actions: apps through AppleScript/Apple Events, programs, servers or services; or keep a route that worked by \
             hand. Resident abilities hold programs/connections until turned off or app quit; reopening at launch requires wake [\"resumed\"] and reopening \
-            code
+            code. WebSocket and SSE streams end when their run ends or the ability is disabled or replaced.
             """,
                   ToolSignature.doorArgs(abilitySaveSchema.parametersJSON).map(DoorActionArguments.Field.init(admitted:)),
                   warn: """
@@ -31,8 +31,11 @@ extension AppActions {
                       app({actions:[…]}), runs any action under ordinary gates; calls are derived from code. app.step(label,guidance), \
                       app.decide(question,data), app.expect(ok,what), app.expect_fail(code,fn) make a strict journal; decide hands back its question for \
                       ability.resume {run_id,answer}. Calls return action data plus call (action id) and effects (none,occurred,partial,unknown); failures \
-                      throw catchable AppError with e.reason,e.effects,e.call,e.receipt. host.state.get() and host.state.set(value) persist this ability's \
-                      JSON. host.files: read/list/info/excerpt/grep/spotlight/write/copy/move/trash/patch. host.network: \
+                      throw catchable AppError with e.reason,e.effects,e.call,e.receipt. host.state.get() and host.state.set(value) read and write \
+                      the default "part" entry, which supplies an authored page. For cursors and caches use host.state.get(key), set(key,value,{ttl_seconds}?), \
+                      delete(key), list(prefix?) and cas(key,expected,value,{ttl_seconds}?). CAS reports swapped and the revision. The notebook holds \
+                      up to 256 keys, 256 KiB per value and 2 MiB total. Keep credential values and references out of it. host.files: \
+                      read/list/info/excerpt/grep/spotlight/write/copy/move/trash/patch. host.network: \
                       connect/listen/accept/send/receive/close; connect takes {host,port,tls?,transport?} or {path} for a Mac socket (localhost). \
                       host.program.start({command,args?,env?,cwd?}) runs a path or a name on the login PATH, returning {id}. host.program.send and \
                       host.network.send take {id,text} or {id,base64}, each through Trust as an effect. host.program.receive({id})/host.network.receive({id}) \
@@ -51,8 +54,18 @@ extension AppActions {
                           declare model. messages: {role,content} strings.\u{20}
                           """
                       + """
-                          host.fetch({url,method?,headers?,body?}) returns {status,headers,body}, body as UTF-8. Keyless calls require network_public, or \
-                          network_localhost for loopback. Returns redirects without following.\u{20}
+                          host.fetch({url,method?,headers?,body?|body_base64?|multipart?,response_encoding?}) defaults to UTF-8 body; response_encoding:\"base64\" \
+                          returns body_base64 and bytes. Multipart parts: {name,filename?,content_type?,text|base64}. Use one body form. Fetch and SSE require \
+                          network_public (network_localhost for loopback); redirects are not followed.\u{20}
+                          """
+                      + """
+                          host.fetch.sse.open({url,method?,headers?,body?,timeout_ms?}) returns a stream id or bounded HTTP response; next({id,timeout_ms?}) \
+                          yields one {event,id,retry_ms,data} or done; close({id}) ends it. The retry_ms field does not reconnect.\u{20}
+                          """
+                      + """
+                          host.network.websocket.open({url,headers?,subprotocols?,timeout_ms?}) takes ws/wss and returns id. send({id,text|base64}) and \
+                          receive({id,timeout_ms?}) exchange text or binary messages; close({id,code?,reason?}) ends it. WebSocket shares fetch's \
+                          address check. Secrets require wss or admitted loopback, and send accepts secret placeholders only in text.\u{20}
                           """
                       + """
                           Use {{secret:<name>}} in fetch url/headers/body, network.send text or program args/env/stdin; declare secret:<name>. Values go only \
@@ -77,6 +90,17 @@ extension AppActions {
                           host.apps.call({bundle_id,script}) runs AppleScript in that app's tell context; always requires app_write:<bundle_id>. No scripting \
                           additions, resource imports, script objects or self references; every event targets that exact process. app_write grants the app's \
                           broad reach: Finder, for example, can open files/URLs in other apps.\u{20}
+                          """
+                      + """
+                          host.app.openURL({bundle_id,url,activate?}) opens a custom URL in the unique installed match for that ASCII bundle ID, only if \
+                          that app declares the scheme. Declare app_write:<bundle_id> and app_url:<bundle_id>:<scheme>; shell-level targets such as \
+                          Shortcuts, Terminal and System Settings also need shell. Activation defaults to false. Secret placeholders are refused. \
+                          Preview checks the request without opening it; live use goes through Trust.\u{20}
+                          """
+                      + """
+                          host.ax.query({bundle_id,window?,roles?,attributes?,max_depth?,max_nodes?,max_text_chars?}) reads the redacted AX legend. \
+                          Declare app_read:<bundle_id> or app_write:<bundle_id>, or use an active screen.watch for that app. \
+                          It needs Trust Full Mac Accessibility and an existing macOS grant. It never launches, focuses or acts.\u{20}
                           """
                       + """
                           Event parameters use four-character keys and JSON descriptors: primitives, lists, {type}, {enum}, {ordinal}, {record}, or \
@@ -137,7 +161,7 @@ extension AppActions {
                           """
                       + """
                           network, network_public, computer_files, arbitrary_file_write, shell, model, calendar, reminders, contacts, screen.watch, hands, \
-                          secret:<name>, app_read:<bundle_id> or app_write:<bundle_id>.\u{20}
+                          secret:<name>, app_read:<bundle_id>, app_write:<bundle_id> or app_url:<bundle_id>:<scheme>.\u{20}
                           """
                       + """
                           Read-only code declares each primitive's reach; active abilities are callable from scripts under the same gates. Under Full Mac, \
@@ -155,12 +179,15 @@ extension AppActions {
                           {text,placeholder?}|{number:{value,min?,max?,step?}}|{date:ISO},rows?:[rows],expands?:true,\
                           meter?:{value,max,start?}}],\
                           block?:{kind:"document",key,text?,format?:plain|markdown|code,language?,copy?}|\
-                          {kind:"leaf",key,leaf,ref,alt,revision?,cards?,choices?}|\
+                          {kind:"leaf",key,leaf,ref,alt,revision?,cards?,choices?,ids?}|\
                           {kind:"form",key,fields:[{id,label,kind:line|lines|choice|switch|number|date|secret,value?,placeholder?,required?,\
                           options?:[{id,label}],min?,max?,step?}],submit:[{id,label,role?,unavailable?}],revision?,protected?,receiver?,doors?}}]} \
                           from a frozen packet, with no host effects. A section has rows or block, never both. On leaf:board ref:table, choices \
                           holds at most 200 {id,label,detail,item|piece} entries with unique nonempty ids, nonempty labels, string details and \
-                          one nonempty item or make:<ref> piece address. cards holds live facts keyed by element id. A count is a row's value; progress \
+                          one nonempty item or make:<ref> piece address. cards holds live facts keyed by element id. A read-only live table slice \
+                          is {kind:"leaf",leaf:"table_slice",key,ref:"table",ids?,alt}; ids holds at most 64 exact table element ids, \
+                          and omission shows the overview. A populated slice opens the Desk table fitted to its elements. An empty slice displays a note. \
+                          A count is a row's value; progress \
                           is its meter, a bar of value out of max (max above 0, value and start from 0 to max; the words stay in value); a chart \
                           or picture is a piece: an SVG, HTML and CSS with no script (previews run none) or a picture, make.add it, then lay \
                           {kind:"leaf",key:"piece:<id>",leaf:"web"|"image",ref,revision:<its version as a string>,alt:<what it shows>}. \
@@ -182,7 +209,8 @@ extension AppActions {
                           calls that exact receiver without args. Native protected entry stores its transient bytes in Keychain, never in \
                           form args, drafts, records or feedback; you read only set/not set. Other secret receivers belong to native owners. A person's tap \
                           runs a row's call through their door; on a page of your own it is your call, asked of them. With \
-                          projection, a new page:"<id>" makes the part a page of your own, drawn from its host.state notebook (declare keys there), \
+                          projection, a new page:"<id>" makes the part a page of your own. The "part" notebook entry supplies the face packet (declare face \
+                          keys there), and face(input) reads keyed notes from input.notebook when present. The page is \
                           placed by layout.write as page:<id> on rail or more. native-desk, native-memories, native-personality and \
                           native-diagnostics draw those pages; native-document draws passive document packets. The person's levers \
                           (consent, models, forgetting, reset, approvals) are the app's: \
@@ -209,9 +237,12 @@ extension AppActions {
         AppAction("ability.list", "tools", "Your abilities with run_counts (all_versions, current_version) and last_run_at; follow next_call when has_more",
             [.optional("offset", .integer)], tool: "ability_manage",
             input: verb("list"), read: true),
-        AppAction("ability.validate", "tools", "Validate an unkept version on supplied input or one captured run; intercepted replies prove no live behavior",
-                  [.required("id"), .optional("input", .openObject), .optional("capture", .boolean)], subject: ["id"], tool: "ability_manage", input: verb("validate"), read: true,
+        AppAction("ability.validate", "tools", "Rehearse a waiting version on fixtures or a captured run, with an optional separate sample for its face",
+                  [.required("id"), .optional("input", .openObject), .optional("capture", .boolean), .optional("faceSampleInput", .openObject)],
+                  subject: ["id"], tool: "ability_manage", input: verb("validate"), read: true,
                   schema: arguments("ability_manage", ["id": ToolSchema.strSchema(), "capture": .object(["type": .string("boolean")]),
+                      "faceSampleInput": .object(["type": .string("object"), "additionalProperties": .bool(true),
+                          "description": .string("A separate face(input) packet, including its keys and any completed demand result in read. Table slice checks validate the leaf and ids against the face grammar. Fixtures still need their own input.")]),
                       "input": .object(["type": .string("object"), "additionalProperties": .bool(true),
                     "description": .string("""
                         Input for the selected ability version; its params/input schema from ability.read determines the fields and types. Omit for {} or \

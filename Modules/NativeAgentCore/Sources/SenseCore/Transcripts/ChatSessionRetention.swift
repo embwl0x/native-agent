@@ -6,46 +6,6 @@ import PersistenceCore
 import os
 // Blueprint: | `ChatSessionRetention.swift` | Locked archival preserves acknowledged transcript bytes |
 
-public struct ChatSessionRetentionPolicy: Sendable, Equatable {
-    public var maxActiveSessions: Int
-    public var staleEmptySessionAgeSeconds: TimeInterval
-    public var protectedSessionIds: Set<String>
-    public var includeMacPinnedSessions: Bool
-
-    public init(
-        maxActiveSessions: Int = 200,
-        staleEmptySessionAgeSeconds: TimeInterval = 24 * 60 * 60,
-        protectedSessionIds: Set<String> = [],
-        includeMacPinnedSessions: Bool = true
-    ) {
-        self.maxActiveSessions = maxActiveSessions
-        self.staleEmptySessionAgeSeconds = staleEmptySessionAgeSeconds
-        self.protectedSessionIds = protectedSessionIds
-        self.includeMacPinnedSessions = includeMacPinnedSessions
-    }
-
-    public static let `default` = ChatSessionRetentionPolicy()
-}
-
-public struct ChatSessionRetentionReport: Sendable, Equatable {
-    public var keptSessions: Int
-    public var archivedSessions: Int
-    public var archivedForCap: Int
-    public var archivedEmptySessions: Int
-
-    public init(
-        keptSessions: Int = 0,
-        archivedSessions: Int = 0,
-        archivedForCap: Int = 0,
-        archivedEmptySessions: Int = 0
-    ) {
-        self.keptSessions = keptSessions
-        self.archivedSessions = archivedSessions
-        self.archivedForCap = archivedForCap
-        self.archivedEmptySessions = archivedEmptySessions
-    }
-}
-
 /// Bounds the hot index without deleting history; `enforce` uses the caller's locked rows. Manual archive owns its locks. Rows append to
 /// `chat/archive/sessions.jsonl`; transcripts move from `chat/messages/` to `chat/archive/messages/`. Lock sessions index, transcript, then archive index;
 /// writers release the transcript lock before index sync. Contended transcripts stay hot for a later pass. Archive history belongs to local/off-disk backups
@@ -61,34 +21,29 @@ public enum ChatSessionRetention {
     public static func enforce(
         dataRoot: URL,
         rows: [[String: JSONValue]],
-        now: Date = Date(),
-        policy: ChatSessionRetentionPolicy = .default
-    ) throws -> (rows: [[String: JSONValue]], report: ChatSessionRetentionReport) {
-        let sessionsPath = dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("sessions.json")
+        now: Date = Date()
+    ) throws -> [[String: JSONValue]] {
+        let sessionsPath = DataRootPaths.chatSessionIndex(in: dataRoot)
         // Pruning and enforcement share the caller's locked index snapshot.
         if FileManager.default.fileExists(atPath: sessionsPath.path) { pruneArchive(dataRoot: dataRoot, now: now, rows: rows) }
         guard !rows.isEmpty else {
-            return (rows, ChatSessionRetentionReport())
+            return rows
         }
 
-        let protectedSessionIds = try resolvedProtectedSessionIds(policy, dataRoot: dataRoot, rows: rows)
+        let protectedSessionIds = try resolvedProtectedSessionIds(dataRoot: dataRoot, rows: rows)
         let reasons = plannedArchiveReasons(
             rows: rows,
             now: now,
-            policy: policy,
             protectedSessionIds: protectedSessionIds
         )
         guard !reasons.isEmpty else {
-            return (rows, ChatSessionRetentionReport(keptSessions: rows.count))
+            return rows
         }
 
         var kept: [[String: JSONValue]] = []
         kept.reserveCapacity(rows.count - reasons.count)
         var indexedRows = rows
         // The caller holds the sessions lock. Checkpoint each removal while archive still holds the transcript lock, before deleting hot history.
-        var report = ChatSessionRetentionReport()
         var staleEmptyAborts = 0
         for (index, row) in rows.enumerated() {
             guard let reason = reasons[index] else {
@@ -96,16 +51,7 @@ public enum ChatSessionRetention {
                 continue
             }
             if try archive(row: row, reason: reason, dataRoot: dataRoot, now: now,
-                           commitIndexRemoval: { try ChatSessionIndexFile.removeArchivedRow(row, from: &indexedRows, at: sessionsPath) }) != nil {
-                report.archivedSessions += 1
-                switch reason {
-                case .activeCap:
-                    report.archivedForCap += 1
-                case .staleEmpty:
-                    report.archivedEmptySessions += 1
-                case .manual: break
-                }
-            } else {
+                           commitIndexRemoval: { try ChatSessionIndexFile.removeArchivedRow(row, from: &indexedRows, at: sessionsPath) }) == nil {
                 if reason == .staleEmpty { staleEmptyAborts += 1 }
                 kept.append(row)
             }
@@ -116,37 +62,29 @@ public enum ChatSessionRetention {
             let secondReasons = plannedArchiveReasons(
                 rows: kept,
                 now: now,
-                policy: policy,
                 protectedSessionIds: protectedSessionIds
             )
             for (index, row) in kept.enumerated() where secondReasons[index] == .activeCap {
-                if try archive(row: row, reason: .activeCap, dataRoot: dataRoot, now: now,
-                               commitIndexRemoval: { try ChatSessionIndexFile.removeArchivedRow(row, from: &indexedRows, at: sessionsPath) }) != nil {
-                    report.archivedSessions += 1
-                    report.archivedForCap += 1
-                }
+                _ = try archive(row: row, reason: .activeCap, dataRoot: dataRoot, now: now,
+                                commitIndexRemoval: { try ChatSessionIndexFile.removeArchivedRow(row, from: &indexedRows, at: sessionsPath) })
             }
         }
 
-        report.keptSessions = indexedRows.count
-        return (indexedRows, report)
+        return indexedRows
     }
 
     /// Best-effort enforcement for callers whose success path must continue even if retention is temporarily unavailable. Failures are logged, never silently
     /// swallowed.
-    @discardableResult
     public static func enforceBestEffort(
         dataRoot: URL,
         rows: [[String: JSONValue]],
         now: Date = Date(),
-        policy: ChatSessionRetentionPolicy = .default,
         context: String
-    ) -> (rows: [[String: JSONValue]], report: ChatSessionRetentionReport)? {
+    ) {
         do {
-            return try enforce(dataRoot: dataRoot, rows: rows, now: now, policy: policy)
+            _ = try enforce(dataRoot: dataRoot, rows: rows, now: now)
         } catch {
             nativeLog("%@", "\(context): ChatSessionRetention.enforce failed at \(dataRoot.path): \(error)")
-            return nil
         }
     }
 
@@ -176,20 +114,16 @@ public enum ChatSessionRetention {
     private static func plannedArchiveReasons(
         rows: [[String: JSONValue]],
         now: Date,
-        policy: ChatSessionRetentionPolicy,
         protectedSessionIds: Set<String>
     ) -> [Int: ArchiveReason] {
         var reasons: [Int: ArchiveReason] = [:]
 
-        if policy.staleEmptySessionAgeSeconds > 0 {
-            for (index, row) in rows.enumerated()
-            where !isProtected(row, protectedSessionIds: protectedSessionIds)
-                && isStaleEmpty(row, now: now, policy: policy) {
-                reasons[index] = .staleEmpty
-            }
+        for (index, row) in rows.enumerated()
+        where !isProtected(row, protectedSessionIds: protectedSessionIds) && isStaleEmpty(row, now: now) {
+            reasons[index] = .staleEmpty
         }
 
-        let maxActive = max(1, policy.maxActiveSessions)
+        let maxActive = 200
         let activeIndices = rows.indices.filter {
             reasons[$0] == nil && !isProtected(rows[$0], protectedSessionIds: protectedSessionIds)
         }
@@ -204,14 +138,11 @@ public enum ChatSessionRetention {
     }
 
     private static func resolvedProtectedSessionIds(
-        _ policy: ChatSessionRetentionPolicy,
         dataRoot: URL,
         rows: [[String: JSONValue]]
     ) throws -> Set<String> {
-        var protected = policy.protectedSessionIds
-        if policy.includeMacPinnedSessions {
-            protected.formUnion(try macPinnedChatSessionIds(dataRoot: dataRoot))
-        }
+        var protected: Set<String> = []
+        protected.formUnion(try macPinnedChatSessionIds(dataRoot: dataRoot))
         // The live anchor stays protected independently of pins on every surface. Its publisher shares this caller's sessions lock, so the read is atomic.
         protected.formUnion(try ConversationAnchor.protectedSessionIds(dataRoot: dataRoot))
         // A session a door (Telegram chat, Slack channel/thread) is bound to is where that door's next message lands; archiving it would restart that door with
@@ -293,12 +224,10 @@ public enum ChatSessionRetention {
             return nil
         }
 
-        let messagesPath = dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
+        let messagesPath = DataRootPaths.chatDirectory(in: dataRoot)
             .appendingPathComponent("messages", isDirectory: true)
             .appendingPathComponent("\(safeSessionId).jsonl")
-        let archiveIndex = dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
+        let archiveIndex = DataRootPaths.chatDirectory(in: dataRoot)
             .appendingPathComponent("archive", isDirectory: true)
             .appendingPathComponent("sessions.jsonl")
         var baseArchivedRow = row
@@ -350,8 +279,7 @@ public enum ChatSessionRetention {
                     }
                 }
                 if !reused {
-                    let archiveDir = dataRoot
-                        .appendingPathComponent("chat", isDirectory: true)
+                    let archiveDir = DataRootPaths.chatDirectory(in: dataRoot)
                         .appendingPathComponent("archive", isDirectory: true)
                         .appendingPathComponent("messages", isDirectory: true)
                     try FileManager.default.createDirectory(at: archiveDir, withIntermediateDirectories: true)
@@ -405,14 +333,13 @@ public enum ChatSessionRetention {
 
     private static func isStaleEmpty(
         _ row: [String: JSONValue],
-        now: Date,
-        policy: ChatSessionRetentionPolicy
+        now: Date
     ) -> Bool {
         guard messageCount(row) <= 0,
               let stamp = NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(row["updatedAt"]?.stringValue) ?? NativeTimestampFormat.parseTrimmedISO8601FractionalFirst(row["createdAt"]?.stringValue) else {
             return false
         }
-        return now.timeIntervalSince(stamp) >= policy.staleEmptySessionAgeSeconds
+        return now.timeIntervalSince(stamp) >= 24 * 60 * 60
     }
 
     private static func messageCount(_ row: [String: JSONValue]) -> Int {

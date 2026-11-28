@@ -1,13 +1,13 @@
 import Synchronization
 import Foundation
 import SenseCore
-import os
 import DeskCore
 import NativeAgentCore
 import MacNerves
 import MindCore
 import PersistenceCore
 import NativeAgentShared
+import os
 // Blueprint: | `NativeAgentEnginePorts.swift` | Mac app ports supplied at engine construction |
 
 /// Supply platform hosts once; dispatch and chat policy remain in the engine.

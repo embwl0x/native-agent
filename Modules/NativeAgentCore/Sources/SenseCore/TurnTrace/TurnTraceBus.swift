@@ -294,8 +294,7 @@ public actor TurnTraceBus {
         sessionId: String? = nil,
         surface: String? = nil,
         payload: JSONValue = .object([:]),
-        turn: Turn?,
-        on bus: TurnTraceBus? = nil
+        turn: Turn?
     ) {
         guard let turnId = turn?.id ?? TurnTraceContext.turnId else { return }
         let event = TurnTraceEvent(
@@ -308,7 +307,7 @@ public actor TurnTraceBus {
             payload: payload,
             turn: turn
         )
-        fire(event, on: bus ?? TurnTraceContext.bus ?? .shared)
+        fire(event, on: TurnTraceContext.bus ?? .shared)
     }
 
     /// Keep subscriber delivery independent of disk latency.

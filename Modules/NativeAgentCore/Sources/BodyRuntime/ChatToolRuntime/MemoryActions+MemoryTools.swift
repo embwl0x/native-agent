@@ -1,9 +1,8 @@
 import Foundation
-import enum NativeAgentShared.NativeTimestampFormat
 import MindCore
 import struct MindCore.MemoryRecord
-import enum NativeAgentShared.SHA256Hex
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 import SenseCore
 import DeskCore
@@ -150,12 +149,8 @@ extension SwiftToolDispatcher {
 
     private static func telling(how rawHow: String?, by rawBy: String?, since rawSince: String?,
                                names: (how: String, by: String, since: String)) throws -> MemoryRoot.Telling? {
-        func text(_ value: String?) -> String? {
-            let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed?.isEmpty == false ? trimmed : nil
-        }
         let ways = MemoryRoot.How.stated.map(\.rawValue).joined(separator: ", ")
-        let by = text(rawBy), since = text(rawSince), stated = text(rawHow)
+        let by = rawBy.trimmedNonEmpty, since = rawSince.trimmedNonEmpty, stated = rawHow.trimmedNonEmpty
         if stated == nil, by != nil {
             throw ToolFailureError("\(names.by) goes with \(names.how).", argumentPath: names.how, accepted: ways, effects: .none,
                 code: "memory_provenance_required", status: .refused, instruction: "Name how you know it in \(names.how), with \(names.by).",
@@ -290,7 +285,7 @@ extension SwiftToolDispatcher {
             expectedHash = nil
         }
         guard let record = try await memoryV2.readMemoryRecord(
-            id: id, persona: nil, surface: surface
+            id: id, surface: surface, includingNoncurrent: true
         ) else {
             // Missing, inactive, tombstoned and disallowed IDs stay indistinguishable; KG must not bypass this exact-record gate.
             return .object(["status": .string("not_found"),
@@ -350,10 +345,22 @@ extension SwiftToolDispatcher {
         if case .object(let extras)? = record.extras, let versions = extras["sense_versions"] {
             result["sense_versions"] = versions
         }
-        let temporal = memoryTemporalData(record)
-        if !temporal.isEmpty {
-            result["temporal"] = .object(temporal)
+        let temporal = ["valid_from": record.validFrom, "valid_to": record.validTo, "observed_at": record.observedAt]
+            .compactMapValues { $0.map(JSONValue.string) }
+        if !temporal.isEmpty { result["temporal"] = .object(temporal) }
+        let now = Date()
+        let hasStarted = MemoryRecallScoring.hasStarted(validFrom: record.validFrom, at: now)
+        let hasNotExpired = MemoryRecordDisclosurePolicy.isTemporallyEligible(validTo: record.validTo, at: now)
+        if !hasStarted {
+            result["temporal_note"] = .string("This memory is not yet current.")
+        } else if !hasNotExpired {
+            result["temporal_note"] = .string("This memory is no longer current.")
+        } else if !temporal.isEmpty {
             result["temporal_note"] = .string("Recorded validity dates are not a current-status check; observed_at is when evidence was observed.")
+        }
+        if !hasStarted || !hasNotExpired || !MemoryLifecycle.isRecallEligible(record.lifecycle),
+           let replacementID = try await memoryV2.currentReplacementID(for: record, surface: surface) {
+            result["replaced_by"] = .string(replacementID)
         }
         // Keep evidence distinct from belief; explicitly disclose when no source was recorded.
         var evidenceTruncated = false
@@ -418,7 +425,8 @@ extension SwiftToolDispatcher {
 
     /// MemoryV2 owns the durable write, duplicate policy and metadata kind stamping.
     func impl_commit_memory(turn: Turn, invocation: ChatToolInvocation, input: CommitMemoryArgs) async throws -> JSONValue {
-        let commit = try memoryCommitRequest(input)
+        let tellers = try PeerDataTaintDispatcher.commitTellers(input.provenanceArguments, turn: turn)
+        let commit = try memoryCommitRequest(input, attested: tellers != nil)
         let supersedes = commit.supersedes, kind = commit.kind, text = commit.text, validatedTopics = commit.validatedTopics
         let telling = commit.telling, since = commit.since
         let meta = memoryCommitMetadata(turn: turn, input: input, commit: commit)
@@ -436,9 +444,8 @@ extension SwiftToolDispatcher {
                 supersedes: supersedes,
                 corrects: corrects,
                 correctionReason: correctionReason,
-                // Nothing stated is kept: nothing says how the agent knows it.
                 context: .init(turn: turn, senseReads: invocation.senseRead?.senseReads ?? invocation.senseReads,
-                               telling: telling ?? MemoryRoot.Telling(how: .kept))
+                               telling: tellers == nil ? (telling ?? MemoryRoot.Telling(how: .kept)) : nil, tellers: tellers)
             )
         } catch {
             // Keep the owner's refusal, cancellation or failure and its recovery.
@@ -478,6 +485,9 @@ extension SwiftToolDispatcher {
             "roots": MemoryDataProvenance.rootsJSON(record.extras, trust: trust),
         ]
         payload.merge(MemoryDataProvenance.fields(in: record.extras, trust: trust)) { current, _ in current }
+        if input.validFrom != nil || input.validTo != nil {
+            payload.merge(memoryTemporalData(record)) { current, _ in current }
+        }
         let first = firstKnown.flatMap(MemoryRecallScoring.parseTimestamp)
         if let since, first.map({ abs($0.timeIntervalSince(since)) >= 1 }) != false {
             payload["since_note"] = .string("""
@@ -501,7 +511,7 @@ extension SwiftToolDispatcher {
     }
 
     /// The commit's arguments, every fault collected so one refusal names every required correction.
-    private func memoryCommitRequest(_ input: CommitMemoryArgs) throws -> MemoryCommitRequest {
+    private func memoryCommitRequest(_ input: CommitMemoryArgs, attested: Bool) throws -> MemoryCommitRequest {
         // Collect faults so one refusal names every required correction.
         var problems: [String] = []
         let ids = (input.supersedes ?? []).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -529,12 +539,27 @@ extension SwiftToolDispatcher {
         // How the agent knows it is this telling's root; its since is when the agent first knew it, and the write itself stays evidence.
         var telling: MemoryRoot.Telling?
         do {
-            telling = try Self.telling(how: input.provenance, by: input.provenanceBy, since: input.since,
-                                       names: ("provenance", "provenance_by", "since"))
+            if !attested {
+                telling = try Self.telling(how: input.provenance, by: input.provenanceBy, since: input.since,
+                                           names: ("provenance", "provenance_by", "since"))
+            }
         } catch let failure as ToolFailureError where !problems.isEmpty {
             problems.append(failure.message)
         }
         let since = telling?.since
+        func validityDate(_ value: String?) -> Date? {
+            guard let value, value.utf8.count <= 64 else { return nil }
+            return MemoryRecallScoring.parseTimestamp(value)
+        }
+        let validFrom = validityDate(input.validFrom)
+        let validTo = validityDate(input.validTo)
+        if input.validFrom != nil, validFrom == nil { problems.append("'valid_from' must be an ISO-8601 date-time") }
+        if input.validTo != nil, validTo == nil { problems.append("'valid_to' must be an ISO-8601 date-time") }
+        if let validFrom, let validTo, validTo < validFrom { problems.append("'valid_to' must not precede 'valid_from'") }
+        let hasCorrectionTarget = input.corrects.map { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } == true
+        if let validFrom, validFrom > Date(), !supersedes.isEmpty || hasCorrectionTarget {
+            problems.append("'valid_from' must have begun when replacing an existing memory")
+        }
 
         guard problems.isEmpty else {
             throw ToolFailureError("memory.commit rejected \(problems.count) argument problem(s): " + problems.joined(separator: "; "),
@@ -565,6 +590,11 @@ extension SwiftToolDispatcher {
         let origin = turn.afterTurnOrigin
         meta.merge(MemoryDataProvenance.sourceMetadata(sessionId: origin?.sessionId, messageId: origin?.messageId,
             turnId: turn.id, at: since ?? origin?.occurredAt ?? Date(), speaker: "self", words: nil)) { current, _ in current }
+        if input.validFrom != nil || input.validTo != nil {
+            meta[MemoryStorage.explicitValidityKey] = .bool(true)
+            meta["valid_from"] = input.validFrom.map(JSONValue.string)
+            meta["valid_to"] = input.validTo.map(JSONValue.string)
+        }
         if let validatedTopics {
             meta["context_topics"] = .array(validatedTopics)
         }
@@ -574,55 +604,37 @@ extension SwiftToolDispatcher {
         return meta
     }
 
-    /// What a named correction came to: the same record, applied, owed until the replacement is admitted, or unreadable; null when the call
-    /// corrects nothing beyond what it supersedes.
     private func memoryCorrectionOutcome(invocation: ChatToolInvocation, record: MemoryRecord, corrects: String?, supersedes: [String]) async
         -> JSONValue {
-        var correctionField: JSONValue = .null
-        if let corrects, !supersedes.contains(corrects) {
-            if corrects == record.id {
-                correctionField = .object([
-                    "corrected_id": .string(corrects),
-                    "applied": .bool(false),
-                    "note": .string("""
-                        The saved text resolved to the same existing memory. No self-correction was applied; this call did not retire that \
-                        record.
-                        """),
-                ])
-            } else {
-                do {
-                    let pending = try MemoryStorage.owedSupersessions(record.extras).contains { $0.targetId == corrects }
-                    let target = try await memoryV2.authorityRecord(id: corrects)
-                    let marked = target.map { Self.memoryMetadataValue($0.extras, key: "corrected_by") == .string(record.id) } ?? false
-                    if marked {
-                        await invocation.preparedContext?.recordAppliedMemoryCorrection(
-                            recordID: corrects, replacementID: record.id
-                        )
-                    }
-                    correctionField = .object([
-                        "corrected_id": .string(corrects),
-                        "applied": .bool(marked),
-                        "pending_admission": .bool(pending && !marked),
-                        "note": .string(marked
-                            ? "Old memory marked corrected; it no longer surfaces in recall."
-                            : (pending ? """
-                                Replacement saved pending vector admission; correction will apply atomically if the target still matches when \
-                                admitted.
-                                """
-                                : "Correction was not applied: the old memory was missing or no longer eligible.")),
-                    ])
-                } catch {
-                    // A storage failure is NOT the same as an ineligible id — report it as what it is, never as a benign miss.
-                    correctionField = .object([
-                        "corrected_id": .string(corrects),
-                        "applied": .null,
-                        "read_error": .string(String(describing: error)),
-                        "note": .string("The save completed; reading its correction outcome failed (\(error)). Inspect the canonical records before retrying."),
-                    ])
-                }
+        guard let corrects, !supersedes.contains(corrects) else { return .null }
+        do {
+            let pending = try MemoryStorage.owedSupersessions(record.extras).contains { $0.targetId == corrects }
+            let target = try await memoryV2.authorityRecord(id: corrects)
+            let marked = target.map { Self.memoryMetadataValue($0.extras, key: "corrected_by") == .string(record.id) } ?? false
+            if marked {
+                await invocation.preparedContext?.recordAppliedMemoryCorrection(
+                    recordID: corrects, replacementID: record.id
+                )
             }
+            return .object([
+                "corrected_id": .string(corrects),
+                "applied": .bool(marked),
+                "pending_admission": .bool(pending && !marked),
+                "note": .string(marked
+                    ? "Old memory marked corrected; it no longer surfaces in recall."
+                    : (pending ? """
+                        Replacement saved pending vector admission; correction will apply atomically if the target still matches when admitted.
+                        """
+                        : "Correction was not applied: the old memory was missing or no longer eligible.")),
+            ])
+        } catch {
+            return .object([
+                "corrected_id": .string(corrects),
+                "applied": .null,
+                "read_error": .string(String(describing: error)),
+                "note": .string("The save completed; reading its correction outcome failed (\(error)). Inspect the canonical records before retrying."),
+            ])
         }
-        return correctionField
     }
 
     /// The fields a scoped save adds: the active records that declare the same subject, bounded, which it does not replace.
@@ -637,10 +649,13 @@ extension SwiftToolDispatcher {
             try Task.checkCancellation()
             let records = try await memoryV2.listMemory(kind: nil)
             try Task.checkCancellation()
+            let now = Date()
             let existing = records.filter { row in
                 guard row.id != record.id, (row.status ?? "active") == "active",
                       MemoryLifecycle.isRecallEligible(row.lifecycle),
-                      let disclosure = MemoryRecordDisclosurePolicy.classify(row),
+                      !MemoryStorage.metadataFlag(row.extras, MemoryStorage.pendingAdmissionKey),
+                      MemoryRecallScoring.hasStarted(validFrom: row.validFrom, at: now),
+                      let disclosure = MemoryRecordDisclosurePolicy.classify(row, at: now),
                       disclosure.permits(surface: turn.runtime?.surface ?? "chat", personaID: record.personaId)
                 else { return false }
                 let rowTopics = Set(JSONValue.trimmedStringArray(Self.memoryMetadataValue(row.extras, key: "context_topics")).map { $0.lowercased() })

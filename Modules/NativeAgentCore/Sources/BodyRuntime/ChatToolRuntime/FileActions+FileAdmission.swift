@@ -19,8 +19,8 @@ extension SwiftToolDispatcher {
     // MARK: - Bundled docs (read-only)
 
     /// Signed reference documents are reachable only through file reads.
-    static func bundledDocsRoot(bundle: Bundle = .main) -> URL? {
-        guard let resources = bundle.resourceURL else { return nil }
+    static func bundledDocsRoot() -> URL? {
+        guard let resources = Bundle.main.resourceURL else { return nil }
         let docs = resources
             .appendingPathComponent("docs", isDirectory: true)
             .standardizedFileURL
@@ -32,12 +32,12 @@ extension SwiftToolDispatcher {
     }
 
     /// Bundled-document resolution retains sandbox errors for ordinary paths and rejects escapes.
-    static func resolveBundledDocsPath(_ path: String, bundle: Bundle = .main) -> URL? {
+    static func resolveBundledDocsPath(_ path: String) -> URL? {
         let trimmed = path
         guard !trimmed.isEmpty, !trimmed.hasPrefix("/"), !trimmed.hasPrefix("~") else { return nil }
         let parts = trimmed.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
         guard parts.first == "docs" else { return nil }
-        guard let root = bundledDocsRoot(bundle: bundle) else { return nil }
+        guard let root = bundledDocsRoot() else { return nil }
         let candidate = parts.count == 1
             ? root
             : root
@@ -211,10 +211,10 @@ extension SwiftToolDispatcher {
         let sourceRoot = ["git_status", "git_diff", "git_log", "repo_dirty_summary"].contains(tool)
             && (input["cwd"]?.stringValue ?? "").isEmpty ? Self.builderSourceRepoRoot(dataRoot: dataRoot) : nil
         if let sourceRoot { input["cwd"] = .string(sourceRoot.path) }
-        if ["mac_volume", "mac_media"].contains(tool) {
+        if tool == "mac_volume" {
             let impl = makeMacControl(policyProvider: TrustCenterMacControlPolicyProvider(admittedPolicy: access.macPolicy, dataRoot: dataRoot),
                 auditDataRoot: dataRoot)
-            return try await impl.dispatch(action: tool == "mac_volume" ? "volume" : "media", body: input,
+            return try await impl.dispatch(action: "volume", body: input,
                 turn: turn, context: invocation.macContext(dataRoot: dataRoot)).toJSON(readContent: invocation.readContent)
         }
         let ctx = ConnectorActionContext(

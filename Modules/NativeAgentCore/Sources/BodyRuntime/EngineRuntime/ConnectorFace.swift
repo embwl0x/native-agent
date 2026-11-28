@@ -76,7 +76,7 @@ extension ConnectorReadiness {
                 let destinations = (entry.hosts + entry.programs.map(\.path)).joined(separator: ", ")
                 return .init(id: "secret:" + entry.name, title: entry.name,
                     detail: "May go to " + destinations + (entry.account.map { " · Account " + $0 } ?? ""),
-                    value: "Granted", at: ISO8601DateFormatter().string(from: entry.at), symbol: "key",
+                    value: "Granted", at: NativeTimestampFormat.plainZulu(entry.at), symbol: "key",
                     actions: [.init(id: "forget", label: "Forget", role: .destructive,
                                     call: .init("connector.forget_secret", ["name": .string(entry.name)]))])
             }

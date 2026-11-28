@@ -186,7 +186,7 @@ actor BodyFaceConnection {
         switch reply {
         case .failed, .refused:
             record("reply request=\(id) act=\(FaceLinkLog.act(act)) result=\(FaceLinkLog.reply(reply))")
-        case .committed(let result), .operation(.completed(let result)):
+        case .committed(let result):
             if result.publicationFailure != nil {
                 record("reply request=\(id) act=\(FaceLinkLog.act(act)) result=\(FaceLinkLog.reply(reply))")
             }

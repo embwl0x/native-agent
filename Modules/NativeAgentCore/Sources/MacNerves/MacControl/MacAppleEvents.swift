@@ -188,14 +188,24 @@ public final class AppleScriptExecution: Sendable {
         return app.processIdentifier
     }
 
-    private static func permission(bundleID: String, url: URL, pid: pid_t?, ask: Bool = false) -> JSONValue {
-        let target = pid.map { NSAppleEventDescriptor(processIdentifier: $0) } ?? NSAppleEventDescriptor(applicationURL: url)
+    @concurrent static func passiveAutomationStatus(pid: pid_t) async throws -> OSStatus {
+        try Task.checkCancellation()
+        let code = automationStatus(NSAppleEventDescriptor(processIdentifier: pid), ask: false)
+        try Task.checkCancellation()
+        return code
+    }
+
+    private static func automationStatus(_ target: NSAppleEventDescriptor, ask: Bool) -> OSStatus {
         // Some apps (Messages) refuse the wildcard event with paramErr (-50) instead of answering for consent; the consent asked for is the same
         // for a concrete event every scriptable app accepts (Get Data), so ask again with it.
-        var code = AEDeterminePermissionToAutomateTarget(target.aeDesc, typeWildCard, typeWildCard, ask)
-        if code == OSStatus(paramErr) {
-            code = AEDeterminePermissionToAutomateTarget(target.aeDesc, AEEventClass(kAECoreSuite), AEEventID(kAEGetData), ask)
-        }
+        let code = unsafe AEDeterminePermissionToAutomateTarget(target.aeDesc, typeWildCard, typeWildCard, ask)
+        guard code == OSStatus(paramErr) else { return code }
+        return unsafe AEDeterminePermissionToAutomateTarget(target.aeDesc, AEEventClass(kAECoreSuite), AEEventID(kAEGetData), ask)
+    }
+
+    private static func permission(bundleID: String, url: URL, pid: pid_t?, ask: Bool = false) -> JSONValue {
+        let target = pid.map { NSAppleEventDescriptor(processIdentifier: $0) } ?? NSAppleEventDescriptor(applicationURL: url)
+        let code = automationStatus(target, ask: ask)
         let state = code == 0 ? "allowed" : code == -1744 ? "needs_consent" : code == -1743 ? "denied" : "unavailable"
         var fields: [String: JSONValue] = ["bundle_id": .string(bundleID), "app_path": .string(url.path), "code": .int(Int64(code)),
                         "state": .string(state), "detail": .string(code == -1743
@@ -213,7 +223,21 @@ public final class AppleScriptExecution: Sendable {
         try await callApp(arguments, targets: targets, holder: nil, context: context)
     }
 
-    private func callApp(_ arguments: JSONValue, targets: [String: String], holder: UUID?, context: MacOperationContext) async throws -> JSONValue {
+    struct ScriptStopped: Error {
+        let output: JSONValue
+        var durationMs = 0
+
+        var result: MacControlResult {
+            MacControlResult(ok: false, action: "applescript", output: output, error: "cancelled", durationMs: durationMs)
+        }
+    }
+
+    func callAppReportingScriptStop(_ arguments: JSONValue, targets: [String: String], context: MacOperationContext) async throws -> JSONValue {
+        try await callApp(arguments, targets: targets, holder: nil, reportScriptStop: true, context: context)
+    }
+
+    private func callApp(_ arguments: JSONValue, targets: [String: String], holder: UUID?, reportScriptStop: Bool = false,
+                         context: MacOperationContext) async throws -> JSONValue {
         guard case .object(let args) = arguments, case .string(let bundleID)? = args["bundle_id"],
               let access = targets[bundleID], ["read", "write"].contains(access) else {
             throw SenseFailure(code: "undeclared_target", message: "Declare read or write reach for this app's bundle id.")
@@ -263,13 +287,14 @@ public final class AppleScriptExecution: Sendable {
             let permission = Self.permission(bundleID: bundleID, url: url, pid: pid)
             guard case .object(let consent) = permission, consent["state"] == .string("allowed") else { return permission }
             var effects: String?
+            var stopped = false
             do {
                 let value: NSAppleEventDescriptor?
                 if case .string(let source)? = args["script"] {
                     let target = bundleID.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
                     let program = "use AppleScript version \"2.4\"\ntell application id \"\(target)\"\n\(source)\nend tell"
                     value = try Self.scriptValue(program, pid: pid, readOnly: read, cancelled: cancelled,
-                        consentRoot: consentRoot, effects: &effects, context: context)
+                        consentRoot: consentRoot, effects: &effects, stopped: &stopped, context: context)
                 } else {
                     let event = NSAppleEventDescriptor.appleEvent(withEventClass: try Self.fourCode(args["event_class"]),
                         eventID: try Self.fourCode(args["event_id"]), targetDescriptor: NSAppleEventDescriptor(processIdentifier: pid),
@@ -320,6 +345,10 @@ public final class AppleScriptExecution: Sendable {
                 if error.userInfo["state"] == nil, [-1743, -1744].contains(code) {
                     failed["remedy"] = MacFourVerbsReply.permissionRemedy("applescript:" + bundleID,
                         name: "Automation for " + bundleID, mode: read ? .read : .write)
+                }
+                if reportScriptStop, stopped {
+                    failed["status"] = .string("cancelled")
+                    throw ScriptStopped(output: .object(failed))
                 }
                 return .object(failed)
             }
@@ -393,7 +422,8 @@ public final class AppleScriptExecution: Sendable {
     /// `effects` is what the script's events did: none when it sent only reads, occurred when the app accepted another event, unknown when the app answered one
     /// with an error.
     private static func scriptValue(_ source: String, pid: pid_t, readOnly: Bool, cancelled: Cancellation,
-                                    consentRoot: URL, effects: inout String?, context: MacOperationContext) throws -> NSAppleEventDescriptor {
+                                    consentRoot: URL, effects: inout String?, stopped: inout Bool,
+                                    context: MacOperationContext) throws -> NSAppleEventDescriptor {
         guard let language = OSALanguage(forName: "AppleScript") else {
             throw SenseFailure(code: "unavailable", message: "AppleScript language is unavailable.")
         }
@@ -475,7 +505,8 @@ public final class AppleScriptExecution: Sendable {
                 throw NSError(domain: "NativeAgentAppleEvent", code: -1743, userInfo: ["state": "undeclared_target",
                     NSLocalizedDescriptionKey: "The script must target only the declared app process \(pid)."])
             }
-            let number = cancelled.requested.load(ordering: .acquiring) ? -128 : error?[OSAScriptErrorNumber] as? Int ?? 0
+            stopped = cancelled.requested.load(ordering: .acquiring)
+            let number = stopped ? -128 : error?[OSAScriptErrorNumber] as? Int ?? 0
             guard number == 0, let value else {
                 let unknown = (unsafe pointer.pointee.wrote || pointer.pointee.attempted) && [ -128, -1712 ].contains(number)
                 var message = error?[OSAScriptErrorMessage] as? String ?? "AppleScript failed."

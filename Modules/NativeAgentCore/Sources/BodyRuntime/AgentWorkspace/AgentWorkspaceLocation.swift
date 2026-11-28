@@ -32,7 +32,7 @@ indirect enum AgentWorkspaceLocation: Sendable, Equatable {
         case .receipt(_, let title, _, _): return title
         case .record(let tool, let input, let title):
             if tool == "work_context", case .string(let query)? = input["query"] { return query }
-            if ["recall_memory", "recall_search"].contains(tool), case .string(let query)? = input["query"], !query.isEmpty {
+            if tool == "recall_memory", case .string(let query)? = input["query"], !query.isEmpty {
                 return "Recall: " + String(query.prefix(160))
             }
             if tool == "read_page", ["Read Page", "Web source"].contains(title),
@@ -69,7 +69,7 @@ struct AgentWorkspaceDocument: Sendable {
     static func evidence(location: AgentWorkspaceLocation, value: JSONValue) -> String? {
         if case .page(let source, _) = location { return evidence(location: source, value: value) }
         guard case .record(let tool, let input, _) = location else { return nil }
-        if tool == "read_file" || tool == "read_skill" { return evidence(value) }
+        if tool == "read_file" { return evidence(value) }
         let reply = ToolResult(value)
         guard case .object(let row) = value, reply.hasReadEvidence() else { return nil }
         let content: String

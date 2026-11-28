@@ -8,26 +8,51 @@ import NativeAgentShared
 import PersistenceCore
 import DeskCore
 import os
+import MindCore
 
 // Blueprint: | `BodyField.swift` | Gated body joints, turn-free room readings, structural wakes and daily front-app and place happenings |
 
 private struct BodyJointSnapshot: Sendable {
+    var generation: Int64?
     var status: JSONValue = TurnBodyAccess.withheld
     var joints: [String: JSONValue] = [:]
     var digests: [String: JSONValue] = [:]
     var pid: pid_t?
     var document: URL?
     var entry: String?
+    var frontTitleObservedAt: Date?
+    var somaticObservedAt: Date?
     /// Read under admitted Full Mac: her own body, felt whether or not the person is here.
     var fullMac = false
     static let names = ["front", "browser", "files", "threads", "somatic"]
+
+    func hasSameValues(as other: Self, joint: String?) -> Bool {
+        guard status == other.status, pid == other.pid else { return false }
+        if let joint { return joints[joint] == other.joints[joint] }
+        return joints == other.joints && document == other.document
+    }
+
+    func hasSameObservation(as other: Self, joint: String? = nil) -> Bool {
+        if joint == nil || joint == "front", frontTitleObservedAt != other.frontTitleObservedAt { return false }
+        if joint == nil || joint == "somatic", somaticObservedAt != other.somaticObservedAt { return false }
+        return hasSameValues(as: other, joint: joint)
+    }
 }
 
 public actor BodyField {
     struct WindowsChanged: BodySignal {}
+    private struct ThermalStateChanged: BodySignal {
+        static let name = ProcessInfo.thermalStateDidChangeNotification
+        static func makeMessage(_ notification: Notification) -> Self? { Self() }
+    }
+    private struct PowerStateChanged: BodySignal {
+        static let name = Notification.Name.NSProcessInfoPowerStateDidChange
+        static func makeMessage(_ notification: Notification) -> Self? { Self() }
+    }
     private let latest = LatestRead()
     private var snapshot = BodyJointSnapshot()
-    var room: MacRoom?
+    private var generationCounter: Int64 = 0
+    var room: (value: MacRoom, at: Date)?
     var windows: Windows?
     private(set) var root: URL?
     private var bound: URL?
@@ -36,6 +61,7 @@ public actor BodyField {
         var activation = UUID()
         var motor = false
         var roomChanged = true
+        var thermalAndPowerChanged = false
     }
     private let edges = Mutex(Edges())
     private var binding: UUID { edges.withLock { $0.binding } }
@@ -45,6 +71,7 @@ public actor BodyField {
     private var chrome: ChromeControlRuntime?
     private var network: Bool?
     private var microphoneInUse: Bool?
+    private var thermalAndPower: (state: ProcessInfo.ThermalState, lowPowerMode: Bool, observedAt: Date)?
     private var nowOn: [String: String] = [:]
     private var lastDeliveredJointDigest: [String: [String: JSONValue]] = [:]
     private var openedObserver: NSObjectProtocol?
@@ -115,11 +142,21 @@ public actor BodyField {
             self?.receive(.changed(agentDriven: false))
         }
         let bodyChanged: @Sendable () -> Void = { [weak self] in self?.receive(.changed(agentDriven: false)) }
+        let thermalAndPowerChanged: @Sendable () -> Void = { [weak self] in
+            self?.edges.withLock { pending in
+                pending.thermalAndPowerChanged = true
+                changed.yield(())
+            }
+        }
+        _ = ProcessInfo.processInfo.thermalState
         notifications = [
             center.addObserver(for: MacPersonInput.PresenceChanged.self) { _ in bodyChanged() },
             center.addObserver(for: ChromeControlRuntime.BodyTabsChanged.self) { _ in bodyChanged() },
             center.addObserver(for: ChromeControlRuntime.ConnectionDidChange.self) { _ in bodyChanged() },
+            center.addObserver(for: ThermalStateChanged.self) { _ in thermalAndPowerChanged() },
+            center.addObserver(for: PowerStateChanged.self) { _ in thermalAndPowerChanged() },
         ]
+        sampleThermalAndPower()
         let authority = FileChangeEvents(paths: [ActivityPolicyStore(dataRoot: root).fileURL, SwiftNativeTrustCenter.policyURL(dataRoot: root)])
         authorityEvents = authority
         listen { for await _ in authority.stream { changed.yield(()) } }
@@ -150,7 +187,7 @@ public actor BodyField {
         guard !stopped else { return }
         bound = root
         edges.withLock { $0.binding = UUID() }
-        latest.write { snapshot = BodyJointSnapshot() }
+        latest.write { snapshot = BodyJointSnapshot(generation: nextGeneration()) }
         changes.continuation.yield(())
     }
 
@@ -158,7 +195,7 @@ public actor BodyField {
         guard bound == root else { return }
         bound = nil
         edges.withLock { $0.binding = UUID() }
-        latest.write { snapshot = BodyJointSnapshot() }
+        latest.write { snapshot = BodyJointSnapshot(generation: nextGeneration()) }
         let pending = Array(posts.values)
         await settle { for post in pending { await post.value } }
     }
@@ -174,6 +211,28 @@ public actor BodyField {
         changes.continuation.yield(())
     }
 
+    private func nextGeneration() -> Int64 {
+        generationCounter = generationCounter == Int64.max ? 1 : generationCounter + 1
+        return generationCounter
+    }
+
+    private func sampleThermalAndPower() {
+        let process = ProcessInfo.processInfo
+        thermalAndPower = (process.thermalState, process.isLowPowerModeEnabled, Date())
+    }
+
+    func currentThermalPressure(in dataRoot: URL) -> (pressure: OrganismResourcePressure, observedAt: Date)? {
+        guard !stopped, root?.standardizedFileURL == dataRoot.standardizedFileURL, let thermalAndPower else { return nil }
+        let pressure: OrganismResourcePressure = switch thermalAndPower.state {
+        case .nominal: .nominal
+        case .fair: .elevated
+        case .serious: .high
+        case .critical: .critical
+        @unknown default: .elevated
+        }
+        return (pressure, thermalAndPower.observedAt)
+    }
+
     func places(_ places: [String: String], dataRoot: URL) {
         guard root == dataRoot, places != nowOn else { return }
         nowOn = places
@@ -182,6 +241,12 @@ public actor BodyField {
 
     private static func clean(_ text: String) -> String {
         String(NativeContextProjectionText.clean(ContextSecretContentPolicy.redactedFragment(text)).prefix(512))
+    }
+
+    private static func cleanTitle(_ title: String) -> JSONValue {
+        let cleaned = clean(title)
+        if cleaned.isEmpty, !title.isEmpty { return .null }
+        return .string(cleaned)
     }
 
     private struct Front {
@@ -238,13 +303,16 @@ public actor BodyField {
         do {
             guard let console = try await admitted(app, root: root, turn: turn, agentDriven: agentDriven) else { return next }
             let tabs = await chrome?.bodyTabs(for: pid)
-            guard !stopped, !Task.isCancelled, Self.stillPresent(pid, fullMac: console.fullMac, agentDriven: agentDriven), let nerve else { return next }
-            var front = nerve.observe(pid, agentDriven: agentDriven)
+            guard !stopped, !Task.isCancelled, Self.stillPresent(pid, fullMac: console.fullMac, agentDriven: agentDriven),
+                  let nerve, let thermalAndPower else { return next }
+            let ax = nerve.observe(pid, agentDriven: agentDriven)
+            var front = ax.fields
             let visibleTab = tabs?.active
             let browserWindow = app.isBrowser || tabs != nil
             let axDocument = front.removeValue(forKey: "document")?.stringValue
-            let title = browserWindow ? visibleTab?.title : front["title"]?.stringValue
-            front["title"] = title.map { .string(Self.clean($0)) }
+            let title = (browserWindow ? visibleTab?.title : front["title"]?.stringValue).map(Self.cleanTitle)
+            front["title"] = title
+            next.frontTitleObservedAt = browserWindow || title?.stringValue == nil ? nil : ax.titleObservedAt
             if let rawDocument = browserWindow ? visibleTab?.url : axDocument {
                 if rawDocument.hasPrefix("/") { next.document = URL(fileURLWithPath: rawDocument, isDirectory: false) }
                 else if let url = URL(string: rawDocument), url.isFileURL { next.document = url }
@@ -257,7 +325,7 @@ public actor BodyField {
             next.joints["front"] = .object(front)
             let browser: JSONValue = visibleTab.map { tab in
                 .object(["window_id": .int(Int64(tab.windowId)), "tab_id": .int(Int64(tab.tabId)),
-                         "title": tab.title.map { .string(Self.clean($0)) } ?? .null,
+                         "title": tab.title.map(Self.cleanTitle) ?? .null,
                          "url": tab.url.map { .string(Self.clean($0)) } ?? .null, "audible": .bool(tab.audible)])
             } ?? .null
             next.joints["browser"] = .object(["active_tab": browser, "own_tabs": tabs.map { .array($0.owned.map(JSONValue.int)) } ?? .null,
@@ -269,9 +337,18 @@ public actor BodyField {
             let launches = opened.keys.sorted()
             next.joints["threads"] = .object(["opened_pids": .array(launches.map { .int(Int64($0)) }),
                                               "places": .object(nowOn.mapValues { .string(Self.clean($0)) }), "untrusted_data": .bool(true)])
+            let thermal: JSONValue = switch thermalAndPower.state {
+            case .nominal: .string("nominal")
+            case .fair: .string("fair")
+            case .serious: .string("serious")
+            case .critical: .string("critical")
+            @unknown default: .null
+            }
             next.joints["somatic"] = .object(["locked": .bool(console.session.screenIsLocked), "on_console": .bool(console.session.onConsole),
                                                "person_here": .bool(console.here), "network_up": network.map(JSONValue.bool) ?? .null,
-                                               "microphone_in_use": microphoneInUse.map(JSONValue.bool) ?? .null])
+                                               "microphone_in_use": microphoneInUse.map(JSONValue.bool) ?? .null,
+                                               "thermal_state": thermal, "low_power_mode": .bool(thermalAndPower.lowPowerMode)])
+            next.somaticObservedAt = next.joints["somatic"] == snapshot.joints["somatic"] ? snapshot.somaticObservedAt : Date()
             for (joint, value) in next.joints {
                 next.digests[joint] = value == snapshot.joints[joint] ? snapshot.digests[joint] : .string(try value.serializedSHA256())
             }
@@ -285,27 +362,46 @@ public actor BodyField {
 
     private func refresh(agentDriven: Bool) async {
         guard let root, !stopped else { return }
+        if edges.withLock({ pending in
+            defer { pending.thermalAndPowerChanged = false }
+            return pending.thermalAndPowerChanged
+        }) {
+            let previous = currentThermalPressure(in: root)?.pressure
+            sampleThermalAndPower()
+            if bound == root, previous != currentThermalPressure(in: root)?.pressure {
+                await NativeAgentEngine.cognitionRuntime(for: root)?.thermalPressureChanged()
+            }
+        }
+        guard !stopped, !Task.isCancelled else { return }
         let front = MacBodyNerve.shared.frontmostApplication
         let opened = AgentOpened.shared.recordedLaunches()
         if edges.withLock({ pending in
             defer { pending.roomChanged = false }
             return pending.roomChanged
         }) { refreshRoom(front: front?.localizedName, opened: opened) }
+        await refreshSnapshot(root, app: Front(front), opened: opened, agentDriven: agentDriven)
+    }
+
+    private func refreshSnapshot(_ root: URL, app: Front?, opened: [pid_t: String], agentDriven: Bool) async {
         let epoch = binding
         _ = await latest.read {
-            await sample(root, turn: nil, app: Front(front), opened: opened, agentDriven: agentDriven)
-        } publish: { next in
+            await sample(root, turn: nil, app: app, opened: opened, agentDriven: agentDriven)
+        } publish: { sampled in
             guard !stopped, binding == epoch else { return }
             let previous = snapshot
+            var next = sampled
             if next.pid == nil, !agentDriven { nerve?.observe(nil) }
-            guard previous.status != next.status || previous.joints != next.joints || previous.document != next.document else { return }
+            guard !previous.hasSameObservation(as: next) else { return }
+            let generation = nextGeneration()
+            next.generation = generation
             snapshot = next
             watch(next.document)
             guard bound == root, let pid = next.pid, Self.stillPresent(pid, fullMac: next.fullMac, agentDriven: agentDriven), let front = next.joints["front"]?.objectValue,
                   let bundle = front["bundle_id"]?.stringValue else { return }
             let changed = BodyJointSnapshot.names.filter { previous.digests[$0] != next.digests[$0] }
             for joint in changed {
-                var payload: [String: JSONValue] = ["kind": .string(joint), "bundle_id": .string(bundle), "pid": .int(Int64(pid))]
+                var payload: [String: JSONValue] = ["kind": .string(joint), "bundle_id": .string(bundle), "pid": .int(Int64(pid)),
+                                                    "generation": .int(generation)]
                 payload["window_id"] = front["window_id"]
                 payload["has_sheet"] = front["has_sheet"]
                 AbilityStore(dataRoot: root).signal("body.changed", payload)
@@ -367,7 +463,7 @@ public actor BodyField {
         guard self.root == root, bound == root else { return TurnBodyAccess.withheld }
         guard let app = Front(), let nerve else { return TurnBodyAccess.withheld }
         let epoch = binding
-        let picture: BodyJointSnapshot
+        var picture: BodyJointSnapshot
         do {
             guard try await admitted(app, root: root, turn: turn) != nil else { return TurnBodyAccess.withheld }
             guard bound == root, binding == epoch else { return TurnBodyAccess.withheld }
@@ -383,17 +479,47 @@ public actor BodyField {
         } catch { return TurnBodyAccess.unavailable(error.localizedDescription) }
         guard binding == epoch, bound == root, !Task.isCancelled else { return TurnBodyAccess.withheld }
         guard picture.pid == app.pid else { return picture.pid == nil ? picture.status : TurnBodyAccess.withheld }
-        guard Self.stillPresent(app.pid, fullMac: picture.fullMac) else { return TurnBodyAccess.withheld }
+        let fullMac = picture.fullMac
+        guard Self.stillPresent(app.pid, fullMac: fullMac) else { return TurnBodyAccess.withheld }
+        if picture.generation == nil {
+            if !picture.hasSameObservation(as: snapshot, joint: joint) {
+                await refreshSnapshot(root, app: app, opened: AgentOpened.shared.recordedLaunches(),
+                                      agentDriven: edges.withLock { $0.motor })
+                guard binding == epoch, bound == root, !Task.isCancelled,
+                      Self.stillPresent(app.pid, fullMac: fullMac) else { return TurnBodyAccess.withheld }
+            }
+            if picture.hasSameValues(as: snapshot, joint: joint) { picture = snapshot }
+        }
+        let generation = picture.generation.map(JSONValue.int) ?? .null
+        let somaticObservedAt = picture.somaticObservedAt.map { JSONValue.string(NativeTimestampFormat.plainZulu($0)) } ?? .null
+        let frontTitleObservedAt = picture.frontTitleObservedAt.map { JSONValue.string(NativeTimestampFormat.plainZulu($0)) } ?? .null
+        var joints = picture.joints
+        if var front = joints["front"]?.objectValue {
+            front["title_observed_at"] = frontTitleObservedAt
+            if frontTitleObservedAt == .null { front["title"] = .null }
+            joints["front"] = .object(front)
+        }
         if let joint {
-            guard let value = picture.joints[joint] else { return TurnBodyAccess.unavailable("Unknown body joint.") }
-            var reply: [String: JSONValue] = ["status": .string("ok"), "atom_id": .string("body:" + joint), "joint": value, "untrusted_data": .bool(true)]
+            guard let value = joints[joint] else { return TurnBodyAccess.unavailable("Unknown body joint.") }
+            let observedAt: JSONValue = switch joint {
+            case "front": frontTitleObservedAt
+            case "somatic": somaticObservedAt
+            default: .null
+            }
+            var reply: [String: JSONValue] = ["status": .string("ok"), "atom_id": .string("body:" + joint), "joint": value,
+                                              "generation": generation, "observed_at": observedAt, "untrusted_data": .bool(true)]
             if let cause = value.objectValue?["cause"] {
                 reply["status"] = .string("unavailable")
                 reply["cause"] = cause
+            } else if joint == "front", observedAt == .null {
+                reply["status"] = .string("unavailable")
+                reply["cause"] = .string("Front window title is unknown.")
             }
             return .object(reply)
         }
-        var out = picture.joints
+        var out = joints
+        out["generation"] = generation
+        out["observed_at"] = somaticObservedAt
         out["digests"] = .object(picture.digests)
         if lastDeliveredJointDigest[session] == nil {
             lastDeliveredJointDigest[session] = picture.digests.filter { $0.key != "front" }

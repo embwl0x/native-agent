@@ -10,6 +10,10 @@ import MacNerves
 import NativeAgentShared
 // Blueprint: | `ChatOrchestrationClient+StructuredChat.swift` | Structured turns record heard words, speaker, door and birth steering before execution |
 
+enum HeardSpeaker: NativeAgentCore.TurnPart {
+    static let unset: (turnID: String, principal: String)? = nil
+}
+
 extension SwiftNativeChatOrchestrationClient {
 
     /// The one structured chat turn. Session delivery is mandatory to resolve;
@@ -189,16 +193,24 @@ extension SwiftNativeChatOrchestrationClient {
         } else {
             structured.origin = try await consumeEnqueuedMessage(sessionId: resolvedSession, runId: runId)
         }
-        let heard = Experience(id: heardID, kind: .heard,
-            evidence: (structured.origin.map { [Self.transcriptRef(resolvedSession, $0.messageId)] } ?? [])
-                + [.init(source: "door", id: turn.arrivalSurface(authorizing: surface))],
+        let speaker = if let recorded = turn[HeardSpeaker.self], recorded.turnID == boundTurnId {
+            recorded.principal
+        } else {
+            turn.originPrincipal
+        }
+        var evidence = (structured.origin.map { [Self.transcriptRef(resolvedSession, $0.messageId)] } ?? [])
+            + [.init(source: "door", id: turn.arrivalSurface(authorizing: surface))]
+        if speaker == "self", turn.origin?.authored == .agent, turn.origin?.replyTo == nil {
+            evidence.append(.init(source: "speaker", id: speaker))
+        }
+        let heard = Experience(id: heardID, kind: .heard, evidence: evidence,
             addressedTo: ["her"], owes: ["answer": .init(to: "conversation:" + resolvedSession)],
             steeredBy: turn.steeringStamp())
         let correlation = turn.replyRoute?.correlationId
         ExperienceStore.record(dataRoot, heardID) { store in
             if heardID == boundTurnId {
                 try await store.begin(heard)
-                try await store.append([.face(Self.face(message, attachments, from: turn.originPrincipal))], to: heardID)
+                try await store.append([.face(Self.face(message, attachments, from: speaker))], to: heardID)
             }
             try await store.append([.progress("working"),
                 .evidence(.init(source: "run", id: runId)),

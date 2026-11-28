@@ -178,28 +178,6 @@ extension iCloudBridge {
     var deviceReceiveNote: String {
         cloudKitPushUnavailable ? "push unavailable — repair APNs registration; incoming reads continue independently" : ""
     }
-    /// Actual push receipt or APNs refusal owns wake evidence; silence has no verdict.
-    func recordCloudKitPushEvidence(received: Bool) async {
-        let url = sync.dataRoot.appendingPathComponent("icloud/chat_push_proof.json")
-        let generation = setupGeneration
-        let observedAt = Date()
-        let previous = cloudKitPushEvidenceTask
-        let task = Task {
-            await previous?.value
-            guard generation == setupGeneration, isSetUp else { return }
-            let proof: Date? = received ? observedAt : nil
-            do {
-                try await sync.storage.perform {
-                    let data = try JSONEncoder().encode(proof)
-                    do { if try Data(contentsOf: url) == data { return } }
-                    catch CocoaError.fileReadNoSuchFile { /* A first observation needs its own durable record. */ }
-                    try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: url)
-                }
-            } catch { nativeLog("[iCloudBridge] push evidence unavailable: %@", error.localizedDescription) }
-        }
-        cloudKitPushEvidenceTask = task
-        await task.value
-    }
     /// Drain and presence are off without a transport, never overdue.
     func recordTransportOrgansOff(_ reason: String) {
         for organ in ["icloud_drain", "presence_beat"] { OrganPulse.recordOff(organ, because: reason) }
@@ -221,7 +199,6 @@ extension iCloudBridge {
     func recordCloudKitPushUnavailable() async {
         cloudKitPushUnavailable = true
         OrganPulse.record("icloud_drain", .held, note: deviceReceiveNote)
-        await recordCloudKitPushEvidence(received: false)
     }
     public func recognizesCloudKitRemoteNotification(_ userInfo: [AnyHashable: Any]) -> Bool {
         let recognized = CloudKitDeviceTransport.isDeviceSyncNotification(userInfo)
@@ -240,8 +217,6 @@ extension iCloudBridge {
             startDeviceMetadataDrainIfIdle(ck)
         }
         if CloudKitDeviceTransport.isChatNotification(userInfo) {
-            await recordCloudKitPushEvidence(received: true)
-            guard isSetUp, generation == setupGeneration else { return }
             cloudKitPushUnavailable = false
         }
         _ = await drainDeviceTransport(trigger: .cloudKitPush)

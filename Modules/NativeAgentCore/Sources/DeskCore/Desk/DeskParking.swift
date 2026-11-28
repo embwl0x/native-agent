@@ -18,7 +18,7 @@ public enum DeskParking {
         Set(SwiftNativeDeskStore.descendants(of: handle, in: children).map(\.handle)).union([handle])
     }
 
-    public static func parking(_ item: DeskItem, in state: DeskState, plan: DeskSequencing.Plan,
+    public static func parking(_ item: DeskItem, plan: DeskSequencing.Plan,
                                live: Bool, now: Date = Date()) -> (parked: Bool, boundary: Date?) {
         guard !live, let touched = lastTouch(item, in: plan.children) else { return (false, nil) }
         let quiet = Int(now.timeIntervalSince(touched) / 86_400)

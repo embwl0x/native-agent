@@ -68,7 +68,7 @@ struct ComposerContextRing: View {
                         .stroke(ringColor, style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
                         .rotationEffect(.degrees(-90))
                         .animation(
-                            NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion),
+                            Animation.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion),
                             value: usage.fillFraction
                         )
                 }

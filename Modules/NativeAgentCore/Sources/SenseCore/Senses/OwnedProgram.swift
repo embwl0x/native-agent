@@ -117,6 +117,7 @@ public struct OwnedProgramReceiptEvidence: Sendable {
 /// source-bound adapters without turn authority; hosts cannot publish versions or expand Trust.
 public protocol OwnedProgramHostProfile: Sendable {
     var actionIDs: [String] { get throws }
+    var allowsNotebook: Bool { get }
     var floorReasons: Set<String> { get }
     var scriptKey: String { get }
     func action(_ id: String) throws -> OwnedProgramAction?
@@ -125,13 +126,14 @@ public protocol OwnedProgramHostProfile: Sendable {
     func callArgumentsForEvidence(_ id: String, given: [JSONValue]) throws -> [JSONValue]
     func opensHomeItem(_ input: [String: JSONValue]) -> Bool
     func secretLine(_ text: String) -> Bool
+    func checkNotebook(_ value: Data?, keyedWrite: Bool) async throws
     func evidence(_ receipt: JSONValue) -> OwnedProgramReceiptEvidence
     func receiptField(_ key: String, in receipt: JSONValue) -> JSONValue?
     func answer(_ receipt: JSONValue) -> JSONValue
     func perform(_ input: [String: JSONValue], execution: OwnedProgramExecution) async -> JSONValue
     func validationPerform(_ input: [String: JSONValue], fixture: OwnedProgramFixtures, execution: OwnedProgramExecution) async -> JSONValue
     func decide(_ question: String, data: JSONValue, execution: OwnedProgramExecution) async throws -> JSONValue?
-    func checkPrimitive(_ operation: String, arguments: JSONValue, execution: OwnedProgramExecution) async -> JSONValue?
+    func checkPrimitive(_ operation: String, arguments: JSONValue, fixture: OwnedProgramFixtures?, execution: OwnedProgramExecution) async -> JSONValue?
     func primitiveAction(_ operation: String) -> OwnedProgramAction?
     /// Keep partial and unknown effects in terminal receipts; suppress preview effects and propagate preview into nested programs.
     func primitive(_ operation: String, arguments: JSONValue, preview: Bool, execution: OwnedProgramExecution) async throws -> JSONValue
@@ -139,12 +141,14 @@ public protocol OwnedProgramHostProfile: Sendable {
 }
 
 extension OwnedProgramHostProfile {
+    public var allowsNotebook: Bool { true }
+    public func checkNotebook(_ value: Data?, keyedWrite: Bool) async throws {}
     public func answer(_ receipt: JSONValue) -> JSONValue { receipt }
     public func validationPerform(_ input: [String: JSONValue], fixture: OwnedProgramFixtures, execution: OwnedProgramExecution) async -> JSONValue {
         await fixture.reply(input, execution: execution)
     }
     public func decide(_ question: String, data: JSONValue, execution: OwnedProgramExecution) async throws -> JSONValue? { nil }
-    public func checkPrimitive(_ operation: String, arguments: JSONValue, execution: OwnedProgramExecution) async -> JSONValue? { nil }
+    public func checkPrimitive(_ operation: String, arguments: JSONValue, fixture: OwnedProgramFixtures?, execution: OwnedProgramExecution) async -> JSONValue? { nil }
     public func primitiveAction(_ operation: String) -> OwnedProgramAction? { nil }
     public func primitive(_ operation: String, arguments: JSONValue, preview: Bool, execution: OwnedProgramExecution) async throws -> JSONValue {
         throw SenseFailure(code: "unsupported", message: "This host does not admit primitive \(operation).")
@@ -171,6 +175,16 @@ public struct OwnedProgramExecution: Sendable {
     public var wake: JSONValue?
     public var options: OwnedProgramRunOptions
     public var readContent: OwnedProgramRunner.ReadContent?
+    package struct AnatomyScrub: Sendable {
+        package let text: @Sendable (String) -> String
+        package let isCurrent: @Sendable () async -> Bool
+
+        package init(text: @escaping @Sendable (String) -> String, isCurrent: @escaping @Sendable () async -> Bool) {
+            self.text = text
+            self.isCurrent = isCurrent
+        }
+    }
+    package var anatomyScrub: (@Sendable () async -> AnatomyScrub)?
     public var dependencySnapshot: (id: String, version: String, shapes: JSONValue)?
     public var valueIdentity: (id: String, version: String)?
     public struct ValueReach: Sendable {

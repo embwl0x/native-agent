@@ -36,7 +36,7 @@ requests offer it alone. The schema is defined in
 | `app {"action":"find","args":{"what":"<words>"}}` | The same discovery reader; `query` is an alternative to `what`. |
 | `app {"action":"<id>","args":{…}}` | Run one registered action. |
 | `app {"script":"<JavaScript>"}` | Compose permitted app calls in JavaScriptCore. |
-| `app {"actions":[{…},…]}` | Many calls in one, in order, each re-entering the gate chain as its own app call. Nothing is built on a surprise, and nothing the person asked for waits on a step they did not: a step the gate refuses or files on a card is reported in its place and the steps after it still run, while after a step that fails, waits in place on the person, or does not come back as they said, later changes do not run; later reads still run. The result names the blocking step and reason, skipped changes and what ran after it, with `stopped_at:{step, as, because}` (`because` is `failed`, `waiting` or `surprise`), `failed_step` when the step failed or waits, `not_run:[{step, as, action, because}]` (`because` is `stopped` for a change after the stop, `found_not_there` for a step whose `found` could not be resolved) and `steps_total`; each receipt carries its `step` and its `as` name (steps count from 1). `then_say` and `with` beside `actions` carry their closing words (below); beside a single `action` they make it a batch of one, and a `find` beside `actions` is one more step of it. An action's single-valued argument given a list (`args.handle:[…]`) follows the same law per value: a failed write stops later write values; reads fan out fully. |
+| `app {"actions":[{…},…]}` | Many calls in one, in order, each re-entering the gate chain as its own app call. Nothing is built on a surprise, and nothing the person asked for waits on a step they did not: a step the gate refuses or files on a card is reported in its place and the steps after it still run, while after a step that fails, waits in place on the person, or does not come back as they said, later changes do not run; later reads still run. The result names the blocking step and reason, skipped changes and what ran after it, with `stopped_at:{step, as, because}` (`because` is `failed`, `waiting` or `surprise`), `failed_step` when the step failed or waits, `not_run:[{step, as, action, because}]` (`because` is `stopped` for a change after the stop, `found_not_there` for a step whose `found` could not be resolved, `only_not_one` for an `only` whose list held none or several) and `steps_total`; each receipt carries its `step` and its `as` name (steps count from 1). `then_say` and `with` beside `actions` carry their closing words (below); beside a single `action` they make it a batch of one, and a `find` beside `actions` is one more step of it. An action's single-valued argument given a list (`args.handle:[…]`) follows the same law per value: a failed write stops later write values; reads fan out fully. |
 
 `pane.show` takes `view:"steps"`, `"screen"`, `"make"` or `"table"`, with an
 optional Make `ref`. `view:"table"` opens the independent table window with its
@@ -68,7 +68,18 @@ read by the batch and never reach the action.
   such earlier step, a step that did not run or failed, a path not there)
   means the step does not run and the deed stops there, its receipt naming
   what was at the deepest place reached.
-- `as` names a step for `found`. Names are unique, not empty, not all digits
+- `{only: "<step>.<list>.<field>"}` is `found` that never picks among
+  several: each list the path passes through by name, and the one it ends
+  on, must hold exactly one element, which the path then continues into
+  (`1.contacts.phone` is the phone of the one contact). A list of none or of
+  several is a value that is not there: the step does not run, the deed stops
+  as it does for `found`, and the receipt (`only_not_one`) says how many there were; the
+  earlier step's own receipt, in the same answer, shows them. A numeric index
+  in the path is taken as written.
+- `expect: {count: N}` is met by a list of exactly N: the value itself when
+  it is a list (`{rows: {count: 2}}`), or the one list in what came back when
+  the result has no `count` field of its own, which is matched as before.
+- `as` names a step for `found` or `only`. Names are unique, not empty, not all digits
   and hold no dot, or the whole batch is refused before anything runs.
 - `cleanup: true` marks a step that puts back what the deed moved. It runs
   after a stop, through its own gates, unless its own `found` cannot be
@@ -89,7 +100,7 @@ stop later changes. Stop before the first step returns `canceled`; Stop after
 a step retains `partial` and the individual receipts.
 
 `then_say` holds their closing words as text. `with` maps each slot name to
-`{found: "<step>.<path>"}`. Put them beside `actions` and give each step an
+`{found: "<step>.<path>"}` or `{only: …}`. Put them beside `actions` and give each step an
 `expect`. For a single `action`, put `expect` and `then_say` beside it.
 The door runs the same check on step 1, whose result supplies any slots.
 
@@ -860,6 +871,16 @@ model view; each journaled step's answer stays in the private journal
 `pages` says how many pages to read in one answer, from that offset; the
 answer joins them in order, says `pages_read` and where the reading stands,
 and holds only as many as one inline result can carry.
+`select: "rows.id, rows.title, total"` (1 to 12 comma-separated paths) returns
+only those fields of the whole retained result, in their structure, under
+`selected`; a list reached by name gives the field of every row, a numeric
+segment takes one element, and a path that matched nothing is named in
+`select_missing` with the field names at the place it stopped (`there`). An
+answer held flat on a receipt or under `result` is found by either spelling. It reads the retained body as paging does, so the call's own
+receipt, settlement and trace are untouched; a result that is not one whole
+JSON value, or a selection too large for one answer, says so (authorized 11-26
+as a field projection; built on `result.page` so it cannot change what a call
+recorded).
 The helper's former 16 KiB return prefix is removed, and a program receives
 each step's whole answer; its receipt's `calls` measure that answer instead of
 carrying it ([receipts](#authority-and-receipts)). Retention failures are explicit and do not establish the action's

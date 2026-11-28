@@ -327,8 +327,14 @@ public actor AdaptiveMemoryPromoter {
 
     /// Expose interpretation outcomes through mind.why.
     static func whyInterpretation(turn: String, session: String, surface: String,
-                                  route: TurnEnvelope.DeliveryRoute?, outcome: String, heldTurn: Turn?, careFaults: [String]? = nil) {
+                                  route: TurnEnvelope.DeliveryRoute?, outcome: String, heldTurn: Turn?, careFaults: [String]? = nil,
+                                  meaning: JSONValue? = nil) {
         var fields: [String: JSONValue] = ["lane": .string("interpretation"), "outcome": .string(outcome)]
+        // How much was decided, never what: a peer session can read a why.
+        if let decided = meaning.flatMap(decodedMeaning) {
+            fields["decided"] = .object(["memories": .int(Int64(decided.memories.count)), "cares": .int(Int64(decided.cares.count)),
+                "promises": .int(Int64(decided.promises.count)), "settled": .int(Int64(decided.settled.count))])
+        }
         if let careFaults, !careFaults.isEmpty { fields["careFaults"] = .array(careFaults.map(JSONValue.string)) }
         TurnTraceBus.fire(TurnTraceEvent(turnId: turn, kind: "mind.why", sessionId: session, surface: surface,
             destinationId: route?.destinationId, threadId: route?.threadId, payload: .object(fields), turn: heldTurn))

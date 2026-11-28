@@ -37,7 +37,7 @@ private struct NoticeLaneColumn: View {
                     .transition(NativeAgentMotion.fade)
             }
         }
-        .animation(NativeAgentMotion.respecting(NativeAgentMotion.quickCurve, reduceMotion: reduceMotion), value: notices.map(\.id))
+        .animation(Animation.respecting(NativeAgentMotion.quickCurve, reduceMotion: reduceMotion), value: notices.map(\.id))
         .task(id: center.id) {
             for await queue in center.updates() { notices = Array(queue.suffix(Self.maxVisible)) }
         }

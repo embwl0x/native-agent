@@ -111,7 +111,6 @@ public actor UserMDGenerator {
                 do {
                     _ = try await regenerateDocument(persona: persona)
                 } catch {
-                    // regenerateDocument retains the exact failure through RepairOwed.
                     nativeLog("UserMDGenerator: regeneration failed for %@: %@", persona, String(describing: error))
                 }
             }
@@ -168,6 +167,7 @@ public actor UserMDGenerator {
             RepairOwed.settle(dataRoot, operation: "memory.user_projection", evidence: .init(source: "memory", id: projectionPersona))
             return target
         } catch {
+            if error is CancellationError { throw error }
             RepairOwed.owe(dataRoot, id: "user-projection:" + UUID().uuidString, kind: .act, operation: "memory.user_projection",
                 owner: target.path, words: "USER.md regeneration failed: \(error)")
             throw error
@@ -207,6 +207,7 @@ public actor UserMDGenerator {
             // Require eligible lifecycle, unexpired validity, completed admission and durable content. The document is surface-independent; prompt rendering
             // applies disclosure filtering.
             guard MemoryLifecycle.isRecallEligible(m.lifecycle) else { return nil }
+            guard MemoryRecallScoring.hasStarted(validFrom: m.validFrom, at: now) else { return nil }
             guard MemoryRecordDisclosurePolicy.isTemporallyEligible(validTo: m.validTo, at: now) else { return nil }
             // A cold write is not a fact until its vector lands and passes admission.
             guard !MemoryStorage.metadataFlag(m.metadata, MemoryStorage.pendingAdmissionKey) else { return nil }

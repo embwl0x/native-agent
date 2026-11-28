@@ -95,20 +95,23 @@ extension View {
     func moodTintWindow() -> some View { modifier(MoodTintWindowPass()) }
 
     /// Take reading-column metrics from the caller so the prose mask cannot become a second layout owner.
-    func moodTintProseGuard(columnWidth: CGFloat, leadingInset: CGFloat) -> some View {
+    func moodTintProseGuard(columnWidth: CGFloat, visible: Bool) -> some View {
         background {
-            GeometryReader { geometry in
-                let frame = geometry.frame(in: .named(MoodTintSpace.name))
-                let insets = geometry.safeAreaInsets
-                Color.clear.preference(
-                    key: MoodTintProseRectKey.self,
-                    value: CGRect(
-                        x: frame.minX + leadingInset - 24,
-                        y: frame.minY + insets.top,
-                        width: columnWidth + 48,
-                        height: max(0, frame.height - insets.top - insets.bottom)
+            if visible {
+                GeometryReader { geometry in
+                    let frame = geometry.frame(in: .named(MoodTintSpace.name))
+                    let insets = geometry.safeAreaInsets
+                    let width = min(columnWidth, frame.width)
+                    Color.clear.preference(
+                        key: MoodTintProseRectKey.self,
+                        value: CGRect(
+                            x: frame.midX - width / 2 - 24,
+                            y: frame.minY + insets.top,
+                            width: width + 48,
+                            height: max(0, frame.height - insets.top - insets.bottom)
+                        )
                     )
-                )
+                }
             }
         }
     }

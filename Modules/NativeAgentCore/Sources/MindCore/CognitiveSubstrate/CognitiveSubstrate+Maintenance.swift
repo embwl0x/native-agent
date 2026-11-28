@@ -71,7 +71,6 @@ extension CognitiveSubstrate {
                 try await persistMaintenanceTransition(
                     nodes: settledNodes,
                     artifacts: artifacts,
-                    deletedArtifactIDs: [],
                     receipts: [CognitiveReceiptWrite(
                         kind: "microcycle",
                         payload: .object([
@@ -152,7 +151,6 @@ extension CognitiveSubstrate {
             try await persistMaintenanceTransition(
                 nodes: nodes,
                 artifacts: artifacts,
-                deletedArtifactIDs: [],
                 receipts: receipts,
                 at: now
             )

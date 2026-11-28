@@ -75,7 +75,6 @@ internal actor LoopExecutionGate {
 internal struct ManagedLoopRunner: LoopRunner {
     let underlying: any LoopRunner
     let gate: LoopExecutionGate
-    let clock: @Sendable () -> Date
     let onFinished: @Sendable () async -> Void
     /// Whether the agent exists yet (setup finished); read at each start of a pass that needs the agent.
     let agentExists: @Sendable () -> Bool
@@ -95,14 +94,13 @@ internal struct ManagedLoopRunner: LoopRunner {
         await settle { await gate.join() }
     }
 
-    /// Gate admission precedes the durable due and lifecycle checks.
     func tickOutcome(
-        ifDue isDue: (@Sendable () async -> Bool)?, execution: ManagedLoopExecution
+        ifRegistered stillRegistered: @Sendable () async -> Bool, execution: ManagedLoopExecution
     ) async -> LoopTickOutcome {
-        guard let token = await gate.acquireOrJoin(startedAt: clock()) else {
+        guard let token = await gate.acquireOrJoin(startedAt: Date()) else {
             return .skipped(reason: LoopTickOutcome.coalescedSkipReason)
         }
-        if let isDue, !(await isDue()) {
+        if !(await stillRegistered()) {
             await gate.finish(token: token)
             await onFinished()
             return .skipped(

@@ -4,8 +4,8 @@ import PersistenceCore
 
 enum AgentWorkspaceActivity {
     static let destinations: [AgentWorkspaceDestination] = [
-        .init(id: "ongoing", title: "Ongoing work", summary: "The live Desk and shared work in progress.", tool: "desk_read", input: [:],
-            tools: ["task_ledger_list", "delegation_status", "desk_add_item"]),
+        .init(id: "ongoing", title: "Ongoing work", summary: "The live Desk and delegated work.", tool: "desk_read", input: [:],
+            tools: ["delegation_status", "desk_add_item"]),
         .init(id: "today", title: "Today", summary: "Today's appointments and reminders, with overdue work clearly marked.", tool: nil,
             tools: ["mac_calendar_list_upcoming", "mac_reminders_list_due_today"]),
         .init(id: "helpers", title: "My helpers", summary: "Talk to a helper, run its job, or adjust its settings.", tool: "bot_list", tools: ["bot_create",
@@ -24,7 +24,7 @@ enum AgentWorkspaceActivity {
             "agent_connect"])
     ]
 
-    static let readTools: Set<String> = ["bot_list", "shelf_read", "shelf_entry", "desk_read", "task_ledger_list", "delegation_status",
+    static let readTools: Set<String> = ["bot_list", "shelf_read", "shelf_entry", "desk_read", "delegation_status",
         "mac_calendar_list_upcoming", "mac_reminders_list_due_today", "mac_reminders_query", "mac_reminders_read", "mail.recent", "mail.read",
         "mail.search", "messages.recent", "mac_calendar_calendars", "mac_calendar_free_busy", "mac_reminders_lists"]
 
@@ -35,7 +35,6 @@ enum AgentWorkspaceActivity {
         case "shelf_entry": return reply(input: input, result: result)
         case "desk_read":
             return AgentWorkspaceWork.desk(input: input, result: result)
-        case "task_ledger_list": return tasks(input: input, result: result)
         case "delegation_status": return .init(title: "Delegated work", content: result, items: [], actions: [])
         case "mac_calendar_list_upcoming": return calendar(result)
         case "mac_calendar_calendars", "mac_calendar_free_busy":
@@ -43,8 +42,8 @@ enum AgentWorkspaceActivity {
                 read("Calendars", tool: "mac_calendar_calendars"),
                 read("Check availability", tool: "app", input: ["find": .string("mac_calendar_free_busy"), "args": .object([:])])
             ]) { row in
-                guard let id = row["calendarId"]?.stringValue.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }) else {
-                    return .init(title: row["title"]?.stringValue.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 })
+                guard let id = row["calendarId"]?.nonblankString else {
+                    return .init(title: row["title"]?.nonblankString
                         ?? "Calendar", content: .object(row), actions: [])
                 }
                 var actions = [read("Events", tool: "mac_calendar_list_upcoming", input: ["calendar_id": .string(id)]),
@@ -52,7 +51,7 @@ enum AgentWorkspaceActivity {
                 if row["writable"] == .bool(true) {
                     actions.append(read("Create an event", tool: "app", input: ["find": .string("mac_calendar_create_event"), "args": .object(["calendar_id": .string(id)])]))
                 }
-                return .init(title: row["title"]?.stringValue.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }) ?? id,
+                return .init(title: row["title"]?.nonblankString ?? id,
                     content: .object(row), actions: actions)
             }
         case "mac_reminders_list_due_today", "mac_reminders_query", "mac_reminders_read", "mac_reminders_lists":
@@ -124,8 +123,7 @@ enum AgentWorkspaceActivity {
 
     private static func replies(input: [String: JSONValue], result: JSONValue) -> WorkspacePage {
         var actions: [AgentWorkspaceButton] = []
-        if let cursor = (result.objectValue ?? [:])["nextCursor"]?.stringValue.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0
-            }) {
+        if let cursor = (result.objectValue ?? [:])["nextCursor"]?.nonblankString {
             let allowed: Set<String> = ["id", "since", "topic", "limit", "include_read", "sort"]
             var next = input.filter { allowed.contains($0.key) }
             next["cursor"] = .string(cursor)
@@ -155,7 +153,7 @@ enum AgentWorkspaceActivity {
                 actions = [
                     .init(label: "Follow up", action: .followUpSavedReply(selected), needsText: true),
                     read("Open conversation", tool: "agent_read", input: ["agent": .string(selected.agent)],
-                         title: row["agent_name"]?.stringValue.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 })
+                         title: row["agent_name"]?.nonblankString
                              ?? "Helper conversation")
                 ]
             }
@@ -168,28 +166,6 @@ enum AgentWorkspaceActivity {
                 """)
         }
         return .init(title: title, content: content.isEmpty ? result : .object(content), items: [], actions: actions)
-    }
-
-    private static func tasks(input: [String: JSONValue], result: JSONValue) -> WorkspacePage {
-        let id = input["task_id"]?.stringValue.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 })
-        let content = (result.objectValue ?? [:])
-        var actions: [AgentWorkspaceButton] = []
-        if content["has_more"] == .bool(true), case .int(let offset)? = content["next_offset"] {
-            var next = input
-            next["offset"] = .int(offset)
-            actions.append(read(id == nil ? "More shared work" : "More timeline events", tool: "task_ledger_list", input: next))
-        }
-        if let id {
-            actions.append(read("Record an update", tool: "app", input: ["find": .string("task_ledger_post"), "args": .object(["task_id": .string(id)])]))
-            return .init(title: "Selected shared work", content: result, items: [], actions: actions)
-        }
-        actions.append(read("Include finished work", tool: "task_ledger_list", input: ["include_done": .bool(true)]))
-        return list(title: "Shared work", result: result, key: "tasks", actions: actions) { row in
-            let title = row["title"]?.stringValue.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }) ?? "Shared work"
-            let buttons = row["taskId"]?.stringValue.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }).map { [read(
-                "Open work", tool: "task_ledger_list", input: ["task_id": .string($0)], title: title)] } ?? []
-            return .init(title: title, content: .object(row), actions: buttons)
-        }
     }
 
     private static func calendar(_ result: JSONValue) -> WorkspacePage {
@@ -209,16 +185,16 @@ enum AgentWorkspaceActivity {
             title: "One day", textField: "day", isEffect: false), needsText: true)
         var projection = list(title: "Calendar", result: result, key: "events", actions: [read("Create an event", tool: "app", input: ["find": .string("mac_calendar_create_event"), "args": .object([:])]),
             read("Calendars", tool: "mac_calendar_calendars"), read("Check availability", tool: "app", input: ["find": .string("mac_calendar_free_busy"), "args": .object([:])]), day]) { row in
-            let title = row["title"]?.stringValue.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }) ?? "Calendar event"
-            let rowID = row["id"]?.stringValue.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 })
+            let title = row["title"]?.nonblankString ?? "Calendar event"
+            let rowID = row["id"]?.nonblankString
             var actions: [AgentWorkspaceButton] = rowID.map { id in
                 var input: [String: JSONValue] = ["id": .string(id)]
                 if let start = row["startAt"] { input["expected_start"] = start }
                 return [read("Edit event", tool: "app", input: ["find": .string("mac_calendar_modify_event"), "args": .object(input)])]
             } ?? []
             if let id = rowID,
-                row["title"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false,
-                let start = row["startAt"]?.stringValue.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }) {
+                row["title"]?.nonblankString != nil,
+                let start = row["startAt"]?.nonblankString {
                 actions.append(read("Delete this event", tool: "app", input: ["find": .string("mac_calendar_delete_event"), "args": .object([
                     "id": .string(id), "expected_title": .string(title), "expected_start": .string(start)])]))
             }
@@ -227,7 +203,7 @@ enum AgentWorkspaceActivity {
         if projection.items.isEmpty, ["completed", "ok"].contains(result.objectValue?["status"]?.stringValue ?? ""), case .object(var content) = projection
             .content {
             let hours: Int64 = if case .int(let n)? = (result.objectValue ?? [:])["hoursAhead"] { n } else { 24 }
-            let span = (result.objectValue ?? [:])["day"]?.stringValue.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 })
+            let span = (result.objectValue ?? [:])["day"]?.nonblankString
                 ?? "in the next \(hours)h"
             content["message"] = .string("no events \(span) (calendar access ok)")
             projection.content = .object(content)
@@ -248,16 +224,16 @@ enum AgentWorkspaceActivity {
         }
         func item(_ row: [String: JSONValue]) -> AgentWorkspaceItem {
             var row = row
-            let title = row["title"]?.stringValue.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }) ?? "Reminder"
+            let title = row["title"]?.nonblankString ?? "Reminder"
             if tool != "mac_reminders_list_due_today" {
-                if let due = row["dueAt"]?.stringValue.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }),
+                if let due = row["dueAt"]?.nonblankString,
                     let date = ISO8601DateFormatter().date(from: due) {
                     let today = Calendar.current.startOfDay(for: Date())
                     row["due_status"] = .string(date < today ? "overdue" : Calendar.current.isDateInToday(date) ? "due_today" : "future")
                 } else { row["due_status"] = .string("undated") }
             }
             var actions: [AgentWorkspaceButton] = []
-            if let id = row["id"]?.stringValue.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }) {
+            if let id = row["id"]?.nonblankString {
                 if tool != "mac_reminders_read" {
                     actions.append(read("Open reminder", tool: "mac_reminders_read", input: ["id": .string(id)], title: title))
                 }
@@ -313,17 +289,15 @@ enum AgentWorkspaceActivity {
         return .init(title: title, content: .object(content), items: values.map { item(($0.objectValue ?? [:])) }, actions: actions)
     }
 
-    private static func read(_ label: String, tool: String, input: [String: JSONValue] = [:], title: String? = nil) -> AgentWorkspaceButton {
+    static func read(_ label: String, tool: String, input: [String: JSONValue] = [:], title: String? = nil) -> AgentWorkspaceButton {
         .init(label: label, action: .open(.record(tool: tool, input: input, title: title ?? label)))
     }
 
-
-
-    private static func effect(_ label: String, tool: String, input: [String: JSONValue]) -> AgentWorkspaceButton {
+    static func effect(_ label: String, tool: String, input: [String: JSONValue]) -> AgentWorkspaceButton {
         .init(label: label, action: .perform(tool: tool, input: input, title: label, textField: nil, isEffect: true))
     }
     private static func uuid(_ value: JSONValue?) -> String? {
-        guard let value = value?.stringValue.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }), UUID(
+        guard let value = value?.nonblankString, UUID(
             uuidString: value) != nil else { return nil }
         return value
     }

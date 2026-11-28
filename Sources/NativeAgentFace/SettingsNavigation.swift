@@ -41,7 +41,7 @@ struct ShellPageFrame<Content: View>: View {
             content
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 // Fade scrolled rows over the header gap to avoid a hard clipped edge.
-                .aliveTopDissolve(20)
+                .aliveTopDissolve()
                 .pageScrollColumn()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)

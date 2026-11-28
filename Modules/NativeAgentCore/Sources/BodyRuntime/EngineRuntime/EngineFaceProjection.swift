@@ -1,5 +1,6 @@
 import SenseCore
 import Foundation
+import MacNerves
 import MindCore
 import NativeAgentCore
 import NativeAgentShared
@@ -45,7 +46,7 @@ enum EngineFaceProjection {
         case .deskPalette, .agentScreen, .sessionSearch: return true
         case .key(let key):
             switch key {
-            case .layout, .knowledgeGraph, .mood, .runs, .run, .contacts, .helpers, .contactThread, .helperRuns,
+            case .layout, .knowledgeGraph, .mood, .run, .contacts, .helpers, .contactThread, .helperRuns,
                  .cognition, .contextFlowHealth, .deskDiagnostics, .workDetail, .makeShelf, .makePreview, .senseView,
                  .inspector, .inspectorReplay, .contextReceipt, .macControl:
                 return true
@@ -108,22 +109,6 @@ enum EngineFaceProjection {
                 guard !Task.isCancelled else { return }
                 await post()
             }
-        case .runs:
-            await withTaskGroup(of: Void.self) { group in
-                group.addTask {
-                    await watchFiles([engine.dataRoot.appendingPathComponent("runs/runs.json")], refresh: {
-                        await engine.runs.setObservationIssue(nil)
-                        do { _ = try await engine.runs.refresh(dataRoot: engine.dataRoot) }
-                        catch { /* The owner publishes the failed reading. */ }
-                    }, unavailable: { await engine.runs.setObservationIssue($0) })
-                }
-                await watch(read: { (engine.runs.rows, engine.runs.readSucceeded, engine.runs.readIssue, engine.runs.observationIssue) }) { input in
-                    let state = readState(issue: input.2 ?? input.3, ready: input.1 == true, owner: "run history")
-                    let rows = input.0.map { row($0.id, title: $0.kind, detail: $0.error.map(NativeAppSecretRedactor.redactText), state: $0.status) }
-                    await engine.face.post(RunsFace(ids: input.0.map(\.id), rows: rows, state: state), at: key)
-                }
-                group.cancelAll()
-            }
         case .run:
             await watchFiles([engine.dataRoot.appendingPathComponent("runs/runs.json")], refresh: { await runs(key, engine: engine) },
                 unavailable: { await unavailable(key, cause: $0, engine: engine) })
@@ -147,7 +132,9 @@ enum EngineFaceProjection {
         let paths = AgentScreenPreview.watchedPaths.map { engine.dataRoot.appendingPathComponent($0) }
         let events = FileChangeEvents(paths: paths, emitInitial: false)
         let (signals, wake) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
-        let notifications = ObservationNotifications(names: [AgentWorkspaceScreenPreview.DidChange.name, AbilityStore.DidChange.name]) { wake.yield(()) }
+        var names = [AgentWorkspaceScreenPreview.DidChange.name, AbilityStore.DidChange.name]
+        if room == "home" || room == "browser" { names.append(ChromeControlRuntime.ConnectionDidChange.name) }
+        let notifications = ObservationNotifications(names: names) { wake.yield(()) }
         defer { notifications.cancel(); wake.finish() }
         await withTaskCancellationHandler {
             guard await events.waitUntilArmed(), !Task.isCancelled else {
@@ -214,7 +201,6 @@ enum EngineFaceProjection {
         case .knowledgeGraph:
             await postGraph(engine: engine)
         case .mood: await engine.face.post(MoodFace(warmth: nil, state: state), at: key)
-        case .runs: await engine.face.post(RunsFace(ids: [], rows: [], state: state), at: key)
         case .run(let id): await engine.face.post(RunFace(id: id, record: nil, rows: [], status: nil, state: state), at: key)
         case .contacts: await engine.face.post(ContactsFace(contacts: [], state: state), at: key)
         case .helpers: await engine.face.post(HelpersFace(rows: [], runningIDs: [], waitingIDs: [], needsYouIDs: [], state: state), at: key)
@@ -246,7 +232,6 @@ enum EngineFaceProjection {
     @concurrent private static func unavailable(_ key: FaceKey, cause: String, engine: NativeAgentEngine) async {
         let state = FaceReadState.unavailable(EngineFaceActs.failure("file_observation_unavailable", cause))
         switch key {
-        case .runs: await engine.face.post(RunsFace(ids: [], rows: [], state: state), at: key)
         case .run(let id): await engine.face.post(RunFace(id: id, record: nil, rows: [], status: nil, state: state), at: key)
         default: break
         }
@@ -262,7 +247,8 @@ enum EngineFaceProjection {
     }
 
     @concurrent static func document(_ request: DocumentRequest, engine: NativeAgentEngine,
-                                     surface: String? = nil, publish: Bool = true, readUsing: PartFaces.DemandRead? = nil) async throws -> FaceActReply {
+                                     surface: String? = nil, readUsing: PartFaces.DemandRead? = nil,
+                                     stampRevision: Bool = false) async throws -> FaceActReply {
         let text: String
         let title: String
         var reply: PartFace.Value?
@@ -276,7 +262,7 @@ enum EngineFaceProjection {
                     await pages.releaseItem(page: page, item: read.scope, request: read.id)
                     return .result(.null)
                 }
-                let face = try await pages.presentation(page: page, item: item, request: read, readUsing: readUsing)
+                let face = try await pages.presentation(page: page, item: item, request: read, readUsing: readUsing, stampRevision: stampRevision)
                 try Task.checkCancellation()
                 return .result(try JSONDecoder().decode(PartFace.Value.self, from: JSONEncoder().encode(face)))
             }
@@ -369,9 +355,6 @@ enum EngineFaceProjection {
                     "session_id": entry.sessionID.map(PartFace.Value.string) ?? .null])
             }
             try Task.checkCancellation()
-            if publish { await engine.face.post(DocumentFace(id: request.id, subject: request.subject, title: NativeAppSecretRedactor.redactText(title),
-                text: NativeAppSecretRedactor.redactText(text), revision: nil, state: .ready),
-                at: .document(request.id)) }
             if request.presentation == true {
                 let safe = NativeAppSecretRedactor.redactText(text)
                 let face = try await engine.documentFace(title: NativeAppSecretRedactor.redactText(title), text: safe,
@@ -384,10 +367,6 @@ enum EngineFaceProjection {
         } catch {
             let failure = WireFailure(code: "document_unavailable", message: "The document could not be read.",
                 cause: NativeAppSecretRedactor.redactText(error.localizedDescription), effects: .none)
-            if publish, !Task.isCancelled {
-                await engine.face.post(DocumentFace(id: request.id, subject: request.subject, title: nil, text: nil, revision: nil,
-                    state: .unavailable(failure)), at: .document(request.id))
-            }
             if error is CancellationError { throw CancellationError() }
             throw failure
         }
@@ -420,7 +399,7 @@ enum EngineFaceProjection {
 
     private static func graphFace(_ snapshot: CanonicalAgentGraphReadout?, state: FaceReadState) -> KnowledgeGraphFace {
         KnowledgeGraphFace(entities: snapshot?.canvasEntities.map(entity) ?? [], edges: snapshot?.canvasEdges.map(edge) ?? [],
-            totalEntities: snapshot.map { $0.canvasEntities.count }, totalEdges: snapshot.map { $0.canvasEdges.count }, state: state)
+            state: state)
     }
     private static func contactsFace(_ contacts: [AgentContactPresentation], loaded: Bool, issue: String?) -> ContactsFace {
         ContactsFace(contacts: contacts.map { FaceContact(id: $0.id, label: $0.name, portrait: nil, appBundleID: $0.appBundleID,

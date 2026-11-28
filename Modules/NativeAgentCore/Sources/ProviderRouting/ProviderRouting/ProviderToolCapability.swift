@@ -1,5 +1,5 @@
-import Foundation
 import NativeAgentCore
+import Foundation
 
 // Blueprint: | `ProviderToolCapability.swift` | `ProviderToolCapability`: adapter-declared wire grammar |
 

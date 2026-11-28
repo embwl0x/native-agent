@@ -43,7 +43,7 @@ package actor AgentWorkspaceNavigation {
             }
             sessions.removeValue(forKey: oldest.key)
             AgentNamed.shared.removeSession(oldest.key)
-            AgentItemPages.shared.removeSession(oldest.key)
+            AgentScreen.itemPages.removeSession(oldest.key)
         }
         return sessions[key] ?? Session()
     }
@@ -134,7 +134,7 @@ package actor AgentWorkspaceNavigation {
     func navigate(_ location: AgentWorkspaceLocation, key: String) throws {
         guard var session = sessions[key] else { return }
         session.current = location
-        if case .record(let tool, _, _) = location, ["chat_conversations", "task_ledger_list", "agent_read"].contains(tool) {
+        if case .record(let tool, _, _) = location, ["chat_conversations", "agent_read"].contains(tool) {
             session.watched.removeAll { Self.placeIdentity($0) == Self.placeIdentity(location) }
             session.watched.append(location)
             if session.watched.count > 24 { session.watched.removeFirst(session.watched.count - 24) }
@@ -159,12 +159,10 @@ package actor AgentWorkspaceNavigation {
                 guard case .string(let query)? = input["query"] else { return nil }
                 if case .string(let scope)? = input["session_id"], !scope.isEmpty { return "work:" + query + "\u{0}" + scope }
                 return "work:" + query
-            case "task_ledger_list": target = "task_id"
-            case "read_skill": target = "name"
             case "read_page":
                 guard case .string(let url)? = input["url"] else { return nil }
                 return "browser:" + url
-            case "recall_memory", "recall_search": target = input["memory_id"] == nil ? "query" : "memory_id"
+            case "recall_memory": target = input["memory_id"] == nil ? "query" : "memory_id"
             case "read_chat_message": target = "message_id"
             case "shelf_entry": target = "id"
             case "screen": return "screen:" + (input["app"].flatMap { if case .string(let app) = $0 { return app }; return nil } ?? "frontmost")

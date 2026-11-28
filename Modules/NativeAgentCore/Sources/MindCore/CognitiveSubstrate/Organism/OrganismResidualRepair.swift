@@ -5,8 +5,6 @@ public struct OrganismResidualRepairOpportunity: Sendable, Equatable {
     public var generatedAt: Date
     /// Combine residuals for bounded local repair without a model judgment.
     public var pressure: Double
-    /// Bounded field-repair signal, distinct because the product contributes at most 0.15 from field charge and cannot reach the 0.30 local repair gate.
-    public var localRepairPressure: Double
     public var components: OrganismSleepPressureComponents
     public var fieldUncertaintyResidual: Double
     public var evidenceCount: Int
@@ -20,7 +18,6 @@ public struct OrganismResidualRepairOpportunity: Sendable, Equatable {
     public init(
         generatedAt: Date,
         pressure: Double = 0,
-        localRepairPressure: Double? = nil,
         components: OrganismSleepPressureComponents = .init(),
         fieldUncertaintyResidual: Double = 0,
         evidenceCount: Int = 0,
@@ -33,7 +30,6 @@ public struct OrganismResidualRepairOpportunity: Sendable, Equatable {
     ) {
         self.generatedAt = generatedAt
         self.pressure = pressure.finiteClamped01()
-        self.localRepairPressure = (localRepairPressure ?? pressure).finiteClamped01()
         self.components = components
         self.fieldUncertaintyResidual = fieldUncertaintyResidual.finiteClamped01()
         self.evidenceCount = max(0, evidenceCount)
@@ -75,32 +71,18 @@ public enum OrganismResidualRepair {
         let lastRepairAt = repairState.lastReceipt?.generatedAt
         let acknowledgedFieldGeneration = repairState.lastReceipt?.sourceFieldGeneration ?? 0
         let hasUnrepairedFieldMutation = field.mutationGeneration > acknowledgedFieldGeneration
-        let isFinishingBoundedRepair = repairState.lastReceipt != nil && hasUnrepairedFieldMutation
         let unresolvedPredictions = ledger.predictions.values.filter {
             $0.status == .violated || $0.status == .expired
         }.sorted { $0.id < $1.id }
-        let predictionResidual = min(1, unresolvedPredictions.reduce(0.0) { total, prediction in
-            let base = prediction.status == .violated
-                ? max(0.50, prediction.confidence)
-                : max(0.35, prediction.uncertainty)
-            let decay = OrganismAnalyticDecay(
-                valueAtAnchor: base,
-                halfLife: predictionHalfLife,
-                anchoredAt: prediction.lastUpdatedAt
-            )
-            return total + decay.value(at: now)
-        })
-        let derivedSurprise = min(1, unresolvedPredictions.reduce(0.0) { total, prediction in
-            let base = prediction.status == .violated
-                ? max(0.45, prediction.confidence)
-                : max(0.25, prediction.uncertainty)
-            let decay = OrganismAnalyticDecay(
-                valueAtAnchor: base,
-                halfLife: predictionHalfLife,
-                anchoredAt: prediction.lastUpdatedAt
-            )
-            return total + decay.value(at: now)
-        })
+        let residuals = unresolvedPredictions.reduce(into: (pressure: 0.0, surprise: 0.0)) { totals, prediction in
+            let violated = prediction.status == .violated
+            func decayed(_ base: Double) -> Double {
+                OrganismAnalyticDecay(valueAtAnchor: base, halfLife: predictionHalfLife,
+                    anchoredAt: prediction.lastUpdatedAt).value(at: now)
+            }
+            totals.pressure += decayed(violated ? max(0.50, prediction.confidence) : max(0.35, prediction.uncertainty))
+            totals.surprise += decayed(violated ? max(0.45, prediction.confidence) : max(0.25, prediction.uncertainty))
+        }
 
         // Inspect current tissue and bind exact target ids so delayed source timestamps cannot hide repairable evidence.
         let charged = hasUnrepairedFieldMutation ? Array(field.nodes.values.filter(OrganismDreamRepair.hasRepairableCharge)
@@ -112,6 +94,7 @@ public enum OrganismResidualRepair {
             if $0.uncertainty != $1.uncertainty { return $0.uncertainty > $1.uncertainty }
             return $0.id < $1.id
         }.prefix(4)) : []
+        let hasTargets = !charged.isEmpty || !noisy.isEmpty
         let allNodes = Array(field.nodes.values)
         let averageCharge = allNodes.isEmpty
             ? 0
@@ -135,11 +118,7 @@ public enum OrganismResidualRepair {
         })
 
         let correctionNode = field.nodes["signal:correctionReceived"]
-        let memoryCorrectionNode = field.nodes["signal:memoryCorrected"]
-        let derivedContradiction = max(
-            correctionNode.map { max($0.charge, $0.activation * 0.5) } ?? 0,
-            memoryCorrectionNode.map { max($0.charge, $0.activation * 0.5) } ?? 0
-        )
+        let derivedContradiction = correctionNode.map { max($0.charge, $0.activation * 0.5) } ?? 0
         let resolvedPredictionCount = ledger.predictions.values.filter {
             $0.status == .satisfied || $0.status == .violated || $0.status == .expired
         }.count
@@ -154,8 +133,8 @@ public enum OrganismResidualRepair {
             ? 0
             : min(1, 0.55 * ledger.strategyCaution + 0.45 * (1 - bodyConfidenceMean))
         let components = OrganismSleepPressureComponents(
-            predictionResidual: predictionResidual,
-            transitionSurprise: derivedSurprise,
+            predictionResidual: min(1, residuals.pressure),
+            transitionSurprise: min(1, residuals.surprise),
             contradictionResidual: derivedContradiction,
             fieldChargeResidual: max(fieldCharge, fieldUncertainty),
             calibrationResidual: derivedCalibration
@@ -167,17 +146,13 @@ public enum OrganismResidualRepair {
         )
         // Once a bounded repair pass has started for a generation, finish the remaining exact targets even if the aggregate residue drops below the initial
         // arming threshold. Otherwise the fifth-and-later target could remain permanently charged behind a small residual sum.
-        let localRepairPressure = (isFinishingBoundedRepair && !charged.isEmpty)
-            || (isFinishingBoundedRepair && !noisy.isEmpty)
+        let localRepairPressure = repairState.lastReceipt != nil && hasTargets
             ? max(minimumPressure, measuredLocalRepairPressure)
             : measuredLocalRepairPressure
-        let pressure = measuredPressure
         let evidenceCount = min(32, unresolvedPredictions.count
             + (correctionNode == nil ? 0 : 1)
-            + (memoryCorrectionNode == nil ? 0 : 1)
-            + (hasUnrepairedFieldMutation && (!charged.isEmpty || !noisy.isEmpty) ? 1 : 0)
+            + (hasTargets ? 1 : 0)
             + (derivedCalibration > 0 && ledger.lastUpdatedAt != nil ? 1 : 0))
-        let repairableFieldEvidenceCount = charged.count + noisy.count
 
         // Scheduling follows the trusted ingestion anchor. Source event and persisted field timestamps remain provenance, but a future-dated or delayed source
         // clock must never delay/accelerate quiet physiology.
@@ -191,26 +166,19 @@ public enum OrganismResidualRepair {
         let latestEvidenceAt = [trustedIngestionAt, trustedRepairAt].compactMap { $0 }.max()
             ?? fallbackEvidenceAt
         let localQuietUntil = latestEvidenceAt?.addingTimeInterval(quietInterval) ?? now
-        let localEligible = localRepairPressure >= minimumPressure
-            && evidenceCount > 0
-            && repairableFieldEvidenceCount > 0
-        let localReady = localEligible && (satisfyWait || now >= localQuietUntil)
+        let localEligible = localRepairPressure >= minimumPressure && evidenceCount > 0 && hasTargets
         let localNext = localEligible ? max(now, localQuietUntil) : nil
 
         let pendingPredictionDue = ledger.predictions.values
-            .filter { $0.status == .pending && $0.dueAt > now }
+            .filter { $0.status == .pending && $0.horizon?.peerJobID == nil && $0.dueAt > now }
             .map(\.dueAt)
             .min()
-        let candidateDeadlines = [localNext, pendingPredictionDue]
-            .compactMap { $0 }
-            .filter { $0 > now }
         // Below threshold, monotonic residual decay cannot create a crossing; only exact pending prediction expiries are worth scheduling. Heat never disarms
         // repair.
-        let nextWake = candidateDeadlines.min()
+        let nextWake = [localNext, pendingPredictionDue].compactMap { $0 }.filter { $0 > now }.min()
         return OrganismResidualRepairOpportunity(
             generatedAt: now,
-            pressure: pressure,
-            localRepairPressure: localRepairPressure,
+            pressure: measuredPressure,
             components: components,
             fieldUncertaintyResidual: fieldUncertainty,
             evidenceCount: evidenceCount,
@@ -219,7 +187,7 @@ public enum OrganismResidualRepair {
             quietUntil: localEligible ? localQuietUntil : nil,
             nextRepairAt: localNext,
             nextWakeAt: nextWake,
-            ready: localReady
+            ready: localEligible && (satisfyWait || now >= localQuietUntil)
         )
     }
 

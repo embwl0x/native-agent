@@ -36,11 +36,8 @@ package enum ChatWorkspaceBinding {
         return reading
     }
 
-    private struct Conversations: AgentWorkspaceConversationPort {
+    struct Conversations: Sendable {
         let turn: Turn?
-        func liveHealth(dataRoot: URL) throws -> [String: AgentLocalHealth] {
-            try AgentContactHealth.read(dataRoot: dataRoot)
-        }
         /// Dot's presence is read live from its transport, which announces its own changes.
         var healthNotifications: [Notification.Name] { [ChatGPTDotIPCTransport.DidChange.name] }
         func records(dataRoot: URL, locked: Bool) throws -> [AgentConversationRecord] {
@@ -55,7 +52,6 @@ package enum ChatWorkspaceBinding {
                 .init(id: $0.id, name: $0.name, elevationAllowed: $0.elevationAllowed, canAnswerBack: $0.canAnswerBack)
             }
         }
-        func identity(dataRoot: URL) throws -> AgentContactIdentity { try AgentContactIdentity(dataRoot: dataRoot) }
         func answeredRequests(dataRoot: URL) throws -> [(message: String?, run: String?, chat: String?, modified: Date)] {
             try GrokRequestStore(dataRoot: dataRoot).answeredRequests()
         }
@@ -66,10 +62,6 @@ package enum ChatWorkspaceBinding {
             // Consume only shown messages under their owner's stamp.
             return await HumanConversationReader.open(turn: turn, sessionID: sessionID, limit: limit, dataRoot: dataRoot)
         }
-        func presentation(_ row: AgentConversationRecord) -> JSONValue {
-            AgentConversationView.conversationPresentation(row)
-        }
-        func unsettledAttention(_ row: AgentConversationRecord) -> Bool { AgentConversationSession.unsettledAttention(row) }
         func shown(answers: [String: String], peer: String, scope: String, dataRoot: URL) throws {
             guard peer.hasPrefix("peer:") else { return }
             let store = GrokRequestStore(dataRoot: dataRoot), id = String(peer.dropFirst(5))

@@ -1,4 +1,5 @@
 import Foundation
+import os
 import MindCore
 import MacNerves
 import SenseCore
@@ -38,17 +39,16 @@ extension NativeCognitionRuntime {
             staleAfter: staleAfter, sourceUnavailable: peerReadFailure
         )
         let notificationDeliveryBelief = notificationDeliveryReading(
-            dataRoot: dataRoot,
             now: now,
             configured: mobileConfigured,
             staleAfter: staleAfter,
             phoneDeliveryPrediction: phoneDeliveryPrediction
         )
+        settleStoppedBodyReads(dataRoot: dataRoot)
         let memoryIntegrityReading = await makeMemoryIntegrityReading(dataRoot: dataRoot, now: now)
         let dreamIntegrityReading = makeDreamIntegrityReading(dataRoot: dataRoot, now: now)
         let toolCapabilityReading = await makeToolCapabilityReading(dataRoot: dataRoot, now: now)
         let approvalPathReading = makeApprovalPathReading(dataRoot: dataRoot, now: now)
-        let resourcePressureReading = currentResourcePressureReading(dataRoot: dataRoot, now: now)
 
         let providersAvailable = SwiftNativeProviderRouting(dataRoot: dataRoot).hasUsableCredentials()
         return OrganismBodyRead(
@@ -60,8 +60,7 @@ extension NativeCognitionRuntime {
             memoryIntegrityReading: memoryIntegrityReading,
             dreamIntegrityReading: dreamIntegrityReading,
             toolCapabilityReading: toolCapabilityReading,
-            approvalPathReading: approvalPathReading,
-            resourcePressureReading: resourcePressureReading
+            approvalPathReading: approvalPathReading
         )
     }
 
@@ -149,18 +148,14 @@ extension NativeCognitionRuntime {
     }
 
     private nonisolated static func notificationDeliveryReading(
-        dataRoot: URL,
         now: Date,
         configured: Bool?,
         staleAfter: TimeInterval,
         phoneDeliveryPrediction: OrganismPrediction?
     ) -> NotificationDeliveryBelief {
         guard configured != nil else {
-            let cause = bodySourceFailure(
-                PersistenceCoreError.ioFailure("Phone notification target inventory is unavailable; inspect its repair obligation."),
-                source: "phone notification targets", dataRoot: dataRoot)
-            return NotificationDeliveryBelief(generatedAt: now, transportConfigured: configured == true,
-                sourceUnavailable: cause)
+            return NotificationDeliveryBelief(generatedAt: now, transportConfigured: false,
+                sourceUnavailable: "Phone notification target inventory is unavailable.")
         }
         // The kernel owns keyless publication and signed receipt evidence; optional APNS diagnostics cannot establish delivery.
         var evidence: [BodyEvidenceReference] = []
@@ -169,16 +164,19 @@ extension NativeCognitionRuntime {
         if let latest = phoneDeliveryPrediction, latest.kind == .phoneDelivery {
             deviceReceived = latest.status == .satisfied
             deviceFailed = latest.status == .violated
-            if latest.status == .satisfied || latest.status == .violated {
-                evidence.append(BodyEvidenceReference(
-                    id: "phone-delivery:\(latest.id):\(latest.status.rawValue)",
-                    evidenceClass: latest.status == .satisfied
-                        ? .deviceProcessReceipt
-                        : .deviceProcessFailure,
-                    observedAt: latest.lastUpdatedAt,
-                    receivedAt: latest.lastUpdatedAt
-                ))
+            let evidenceClass: BodyEvidenceClass
+            let at: Date
+            switch latest.status {
+            case .satisfied: (evidenceClass, at) = (.deviceProcessReceipt, latest.lastUpdatedAt)
+            case .violated: (evidenceClass, at) = (.deviceProcessFailure, latest.lastUpdatedAt)
+            case .pending, .expired: (evidenceClass, at) = (.deliveryAttempt, latest.createdAt)
             }
+            evidence.append(BodyEvidenceReference(
+                id: "phone-delivery:\(latest.id):\(latest.status.rawValue)",
+                evidenceClass: evidenceClass,
+                observedAt: at,
+                receivedAt: at
+            ))
         }
         return NotificationDeliveryBelief(
             generatedAt: now,
@@ -332,42 +330,50 @@ extension NativeCognitionRuntime {
     }
 
     /// Only the live body senses host heat; other roots use nominal evidence. Resource pressure never gates quiet repair.
-    private nonisolated static func currentResourcePressureReading(
-        dataRoot: URL,
-        now: Date
-    ) -> ResourcePressureReading {
-        let sensesHost = dataRoot.standardizedFileURL
-            == PersistenceCore.defaultDataRoot().standardizedFileURL
-        let thermal: OrganismResourcePressure
-        switch sensesHost ? ProcessInfo.processInfo.thermalState : .nominal {
-        case .nominal:
-            thermal = .nominal
-        case .fair:
-            thermal = .elevated
-        case .serious:
-            thermal = .high
-        case .critical:
-            thermal = .critical
-        @unknown default:
-            thermal = .elevated
+    func resourcePressureSample() async -> (reading: ResourcePressureReading?, fixedAt: Date) {
+        let sensesHost = usesLiveAppBody
+        let sample: (pressure: OrganismResourcePressure, observedAt: Date)?
+        if sensesHost, let engine = try? rootEngine(), let field = engine.bodyField {
+            sample = await field.currentThermalPressure(in: dataRoot)
+        } else {
+            sample = nil
         }
+        let fixedAt = now()
+        if sensesHost, sample == nil { return (nil, fixedAt) }
+        let (thermal, observedAt) = sample ?? (.nominal, fixedAt)
         // Low Power Mode never changes what the agent does.
-        return ResourcePressureReading(
-            generatedAt: now,
+        let reading = ResourcePressureReading(
+            generatedAt: fixedAt,
             thermalPressure: thermal,
             evidence: [
                 BodyEvidenceReference(
-                    id: "thermal:\(thermal.rawValue):\(now.timeIntervalSince1970)",
+                    id: "thermal:\(thermal.rawValue):\(observedAt.timeIntervalSince1970)",
                     evidenceClass: .processThermalState,
-                    observedAt: now,
-                    receivedAt: now
+                    observedAt: observedAt,
+                    receivedAt: observedAt
                 ),
             ]
         )
+        return (reading, fixedAt)
+    }
+
+    /// A body read that was stopped was never a failed source. Rows filed for one, before a stop was told apart from a failure, are
+    /// settled once a launch; a source that truly failed keeps its row.
+    private static let stoppedReadsSettled = OSAllocatedUnfairLock(initialState: false)
+    nonisolated static func settleStoppedBodyReads(dataRoot: URL) {
+        guard stoppedReadsSettled.withLock({ done in defer { done = true }; return !done }) else { return }
+        _ = ExperienceStore.record(dataRoot, "repair:cognition.body") { store in
+            for owed in try await store.open() where owed.owes["repair"]?.phase.isSettled == false
+                && RepairDebt(owed).operation?.hasPrefix("cognition.body:") == true
+                && owed.face?.words.contains("CancellationError") == true {
+                try await store.append([.obligation(key: "repair", phase: .accepted, evidence: .init(source: "stop", id: owed.id))], to: owed.id)
+            }
+        }
     }
 
     nonisolated static func bodySourceFailure(_ error: Error, source: String, dataRoot: URL) -> String {
         let cause = source + ": " + error.localizedDescription
+        if error is CancellationError { return cause }
         RepairOwed.owe(dataRoot, id: "body-source:" + UUID().uuidString, kind: .run,
             operation: "cognition.body:" + source, owner: source,
             words: "Body evidence is unavailable: " + cause,

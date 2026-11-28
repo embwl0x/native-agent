@@ -259,6 +259,8 @@ public struct TurnEngineResult: Sendable {
         public let contextSelectedAtomCount: Int
         public let contextPacketCharacters: Int
         public let contextExpandablePointerCount: Int
+        /// How long the association walk took on this turn; nil when it did not run.
+        public var contextAssociationWalkMicroseconds: Int? = nil
 
         public init(
             reasoningEffort: String,
@@ -285,6 +287,7 @@ public struct TurnEngineResult: Sendable {
                 contextPacketCharacters: context.fluidContextTurn?.packet.characterCount ?? 0,
                 contextExpandablePointerCount: context.fluidContextTurn?.packet.expandablePointers.count ?? 0
             )
+            contextAssociationWalkMicroseconds = context.fluidContextTurn?.packet.associationWalkMicroseconds
         }
     }
 

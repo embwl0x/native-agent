@@ -15,8 +15,7 @@ extension ChatSessionRetention {
 
     /// Archive changes trigger disposable-state cleanup; canonical history never expires.
     static func pruneArchive(dataRoot: URL, now: Date, rows: [[String: JSONValue]]) {
-        let archiveDir = dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
+        let archiveDir = DataRootPaths.chatDirectory(in: dataRoot)
             .appendingPathComponent("archive", isDirectory: true)
 
         guard pruneIsDue(archiveDir: archiveDir, now: now) else { return }
@@ -28,7 +27,7 @@ extension ChatSessionRetention {
     /// never expires.
     private static func pruneSessionState(dataRoot: URL, now: Date, rows: [[String: JSONValue]]) {
         let fm = FileManager.default
-        let chatDir = dataRoot.appendingPathComponent("chat", isDirectory: true)
+        let chatDir = DataRootPaths.chatDirectory(in: dataRoot)
         let stateDir = chatDir.appendingPathComponent("session_state", isDirectory: true)
         guard fm.fileExists(atPath: stateDir.path) else { return }
 
@@ -63,17 +62,12 @@ extension ChatSessionRetention {
             (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
                 ?? .distantFuture
         }
-        var newest = mtime(directory)
-        if let children = try? FileManager.default.contentsOfDirectory(
+        guard let children = try? FileManager.default.contentsOfDirectory(
             at: directory,
             includingPropertiesForKeys: [.contentModificationDateKey],
             options: []
-        ) {
-            for child in children {
-                newest = max(newest, mtime(child))
-            }
-        }
-        return newest
+        ) else { return .distantFuture }
+        return children.reduce(mtime(directory)) { max($0, mtime($1)) }
     }
 
     public static let pruneMinIntervalSeconds: TimeInterval = 10 * 60

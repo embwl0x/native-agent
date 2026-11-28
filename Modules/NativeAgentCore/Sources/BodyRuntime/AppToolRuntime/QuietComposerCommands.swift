@@ -21,7 +21,6 @@ public protocol QuietComposerEffort: Identifiable where ID == String {
 public protocol QuietComposerCommandPort: QuietChatSessionCommandPort {
     associatedtype ComposerModel: QuietComposerModel
     associatedtype ComposerEffort: QuietComposerEffort
-    var chatPendingAttachments: [String: [NativeAgentShared.MultimodalAttachment]] { get set }
     var chatPersona: String { get set }
     var chatReasoningEffort: String { get set }
     var chatFastMode: Bool { get set }
@@ -29,12 +28,7 @@ public protocol QuietComposerCommandPort: QuietChatSessionCommandPort {
     var quietComposerProviderGroups: [(id: String, provider: String, models: [ComposerModel])] { get }
     var quietComposerEfforts: [ComposerEffort] { get }
     var quietComposerSupportsFast: Bool { get }
-    func quietComposerDraft(_ sessionID: String) -> String
-    func quietComposerDraftRevision(_ sessionID: String) -> (Date, Int)
-    func setQuietComposerDraft(_ text: String, sessionID: String)
-    func clearQuietAcceptedDraft(_ message: String, sessionID: String, editedAt: Date)
-    func quietComposerPresentationState(sessionID: String) async -> [String: JSONValue]
-    func quietComposerPresentation(verb: String, value: String, choice: String) async -> QuietComposerOutcome
+    func quietComposerPresentation(verb: String) async -> QuietComposerOutcome
     func selectQuietComposerModel(_ model: ComposerModel, provider: String) -> Task<String?, Never>?
     func saveQuietChatBrain() async -> (succeeded: Bool, agentMessage: String, reasoningEffort: String)
     func startQuietSpeech(_ text: String) async -> String?
@@ -53,34 +47,6 @@ public enum QuietComposerCommands {
     public static let usersScreenVerbs: Set = [
         "set_page", "open_card", "close_card", "show_browser", "show_pane", "hide_pane", "set_persona",
     ]
-
-    @MainActor
-    public static func state<Host: QuietComposerCommandPort>(appModel: Host, sessionId: String = "", turn: Turn?) async -> [String: JSONValue] {
-        var sessionID = appModel.activeChatSessionId
-        if !sessionId.isEmpty {
-            switch QuietChatSessionCommands.resolve(sessionId, appModel: appModel, turn: turn) {
-            case .success(let found): sessionID = found.id
-            case .failure(let refusal):
-                // Keep the resolver's cause; unknown conversation names return not_found.
-                var fields: [String: JSONValue] = if case .object(let fields) = refusal.json { fields } else { [:] }
-                if fields["reason"] == .string("unknown_session") { fields["status"] = .string("not_found") }
-                fields["effects"] = .string("none")
-                return fields
-            }
-        }
-        let draft = appModel.quietComposerDraft(sessionID)
-        var body: [String: JSONValue] = [
-            "conversation": .string(sessionID),
-            "on_screen": .bool(sessionID == appModel.activeChatSessionId),
-            "busy": .bool(QuietChatSessionCommands.isRunning(sessionID, appModel)),
-            "attachments": .array((appModel.chatPendingAttachments[sessionID] ?? []).map { .string($0.name ?? $0.type) }),
-            "draft": .string(draft),
-            "draft_characters": .int(Int64(draft.count)),
-        ]
-        let presentation = await appModel.quietComposerPresentationState(sessionID: sessionID)
-        body.merge(presentation) { _, field in field }
-        return body
-    }
 
     /// The same effect-free fences admit both preview and execution.
     @MainActor
@@ -170,7 +136,7 @@ public enum QuietComposerCommands {
     @MainActor
     public static func run<Host: QuietComposerCommandPort>(
         verb: String, value: String, choice: String,
-        sessionId: String = "", attachments: [URL] = [], reachesUser: Bool = false,
+        sessionId: String = "", reachesUser: Bool = false,
         turnSessionId: String = "", appModel: Host, turn: Turn, scope: QuietChatSessionScope? = nil
     ) async -> Outcome {
         let fenced = fence(verb: verb, value: value, sessionId: sessionId, reachesUser: reachesUser,
@@ -178,37 +144,6 @@ public enum QuietComposerCommands {
         if let refusal = fenced.refusal { return refusal }
         let sessionID = fenced.session
         switch verb {
-        case "set_draft", "send":
-            let revision = appModel.quietComposerDraftRevision(sessionID)
-            let draft = appModel.quietComposerDraft(sessionID)
-            let attachmentIDs = (appModel.chatPendingAttachments[sessionID] ?? []).map(\.id)
-            var files: [NativeAgentShared.MultimodalAttachment] = []
-            for url in attachments {
-                let read: Result<NativeAgentShared.MultimodalAttachment, ChatAttachmentTypeResolver.AttachmentRefusal>
-                switch ChatAttachmentTypeResolver.attachmentKind(url, resolveType: ChatAttachmentTypeResolver.typeAndMime) {
-                case .success(let kind): read = await ChatAttachmentTypeResolver.readAttachment(url, kind: kind)
-                case .failure(let refusal): read = .failure(refusal)
-                }
-                switch read {
-                case .success(let file): files.append(file)
-                case .failure(let refusal):
-                    return .refuse("attach button", "attachment_refused", refusal.message + " Nothing was changed.")
-                }
-            }
-            // File intake suspends. Ownership and the exact draft being changed must still hold in this synchronous mutation step.
-            let current = fence(verb: verb, value: value, sessionId: sessionID, reachesUser: reachesUser,
-                                turnSessionId: turnSessionId, appModel: appModel, turn: turn)
-            if let refusal = current.refusal { return refusal }
-            if current.session != sessionID || ((verb == "set_draft" || value.isEmpty)
-                && (appModel.quietComposerDraftRevision(sessionID) != revision
-                    || appModel.quietComposerDraft(sessionID) != draft
-                    || (appModel.chatPendingAttachments[sessionID] ?? []).map(\.id) != attachmentIDs)) {
-                return .refuse("composer draft", "draft_changed",
-                               "The conversation or draft changed while attachments were being read. Nothing was changed.")
-            }
-            return verb == "send"
-                ? await send(value, sessionID: sessionID, files: files, appModel: appModel, turn: turn)
-                : setDraft(value, sessionID: sessionID, files: files, appModel: appModel)
         case "set_model", "set_think", "set_fast":
             // Bot conversations use their own route, so the global tuple cannot change it.
             let helper: Bool
@@ -229,14 +164,12 @@ public enum QuietComposerCommands {
             case "set_think": return await setThink(value, appModel: appModel)
             default: return await setFast(value, appModel: appModel)
             }
-        case "open_card", "close_card", "set_page", "show_browser", "show_pane", "hide_pane":
-            return await appModel.quietComposerPresentation(verb: verb, value: value, choice: choice)
+        case "show_browser", "check_updates":
+            return await appModel.quietComposerPresentation(verb: verb)
         case "set_persona": return setPersona(value, appModel: appModel)
         case "speak": return await speak(value, appModel: appModel)
         case "write_scratch":
             return await writeScratch(key: choice, value: value, sessionID: sessionID, appModel: appModel)
-        case "check_updates":
-            return await appModel.quietComposerPresentation(verb: verb, value: value, choice: choice)
         default:
             return .refuse(
                 "composer", "unknown_verb",
@@ -244,84 +177,6 @@ public enum QuietComposerCommands {
                 + names.joined(separator: ", ") + "."
             )
         }
-    }
-
-    /// Files preserve an existing draft when no text is supplied.
-    @MainActor
-    private static func setDraft<Host: QuietComposerCommandPort>(
-        _ text: String, sessionID: String, files: [NativeAgentShared.MultimodalAttachment], appModel: Host
-    ) -> Outcome {
-        guard !sessionID.isEmpty else {
-            return .refuse("composer draft", "no_conversation", "No conversation is open.")
-        }
-        let before = appModel.quietComposerDraft(sessionID)
-        let after = text.isEmpty && !files.isEmpty ? before : text
-        appModel.setQuietComposerDraft(after, sessionID: sessionID)
-        if !files.isEmpty { appModel.chatPendingAttachments[sessionID, default: []].append(contentsOf: files) }
-        let attached = appModel.chatPendingAttachments[sessionID]?.count ?? 0
-        return .done(
-            "composer draft (message box)",
-            "Draft is now \(after.count) characters" + (attached == 0 ? "." : ", with \(attached) file(s) attached."),
-            changed: before != after || !files.isEmpty
-        )
-    }
-
-    /// Shared admission owns arrivals while the agent works; only accepted snapshots are cleared.
-    @MainActor
-    private static func send<Host: QuietComposerCommandPort>(
-        _ value: String, sessionID: String,
-        files: [NativeAgentShared.MultimodalAttachment], appModel: Host, turn: Turn
-    ) async -> Outcome {
-        guard !sessionID.isEmpty else {
-            return .refuse("send button", "no_conversation", "No conversation is open.")
-        }
-        let fromDraft = value.isEmpty
-        let message = fromDraft ? appModel.quietComposerDraft(sessionID) : value
-        let staged = fromDraft ? (appModel.chatPendingAttachments[sessionID] ?? []) : []
-        guard !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !(staged + files).isEmpty else {
-            return .refuse("send button", "empty_draft", "Nothing to send: pass the text in value, or set_draft first.")
-        }
-        guard !appModel.isSavingChatBrain else {
-            return .refuse(
-                "send button", "model_saving",
-                "The model change has not landed yet — the glass disables Send here too."
-            )
-        }
-        let editedAt = Date()
-        let all = staged + files
-        let steer = PeerDataTaint.carried(turn: turn)
-        var origin = QuietChatSessionCommands.agentOrigin
-        origin.peerSources = steer.sources
-        origin.elevatedPeerSources = steer.elevated
-        let acceptance = await Task.detached { [appModel, message, all, sessionID, origin, turn] in
-            await startAgentTurn(message, attachments: all, sessionID: sessionID, origin: origin, appModel: appModel, turn: turn)
-        }.value
-        switch acceptance {
-        case .accepted(let accepted):
-            if fromDraft {
-                appModel.clearQuietAcceptedDraft(message, sessionID: accepted, editedAt: editedAt)
-            }
-            let sent = Set(staged.map(\.id))
-            appModel.chatPendingAttachments[sessionID]?.removeAll { sent.contains($0.id) }
-            return .done("send button", "Sent into \(accepted).")
-        case .rejected(let message):
-            return reconcileFailure("send button", "send_rejected", message,
-                instruction: "Read the conversation to resolve this rejection before sending again.",
-                next: ["page": .string("chat"), "item": .string(sessionID)], effects: .none)
-        }
-    }
-
-    /// Reply routing stays detached; the caller's peer steering rides the send.
-    @MainActor
-    private static func startAgentTurn<Host: QuietComposerCommandPort>(
-        _ message: String, attachments: [NativeAgentShared.MultimodalAttachment],
-        sessionID: String, origin: ChatMessageOrigin, appModel: Host, turn: Turn
-    ) async -> MacChatTurnAcceptance {
-        await appModel.startChatTurn(
-            message, attachments: attachments, sessionId: sessionID,
-            hideUserBubble: false, requireActiveSession: false,
-            origin: origin, parent: turn
-        ).acceptance
     }
 
     @MainActor
@@ -451,8 +306,8 @@ public enum QuietComposerCommands {
     }
 
     private static func reconcileFailure(_ element: String, _ code: String, _ detail: String,
-                                         instruction: String, next: [String: JSONValue], effects: ToolFailureError.Effects = .unknown) -> Outcome {
-        var outcome = Outcome.refuse(element, code, detail, effects: effects)
+                                         instruction: String, next: [String: JSONValue]) -> Outcome {
+        var outcome = Outcome.refuse(element, code, detail, effects: .unknown)
         outcome.remedy = Repair.reconcile(instruction: instruction,
             nextCall: .object(["tool": .string("app"), "input": .object(next)]))
         return outcome

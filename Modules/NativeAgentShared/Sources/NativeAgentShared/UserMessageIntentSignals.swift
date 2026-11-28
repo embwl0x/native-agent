@@ -15,11 +15,6 @@ public enum UserMessageIntentSignals {
                    options: .regularExpression) != nil
     }
 
-    public static func isWorkQuestion(_ text: String) -> Bool {
-        text.range(of: #"(?i)^\s*(?:what|where|when|how|why|which|who)\b"#,
-                   options: .regularExpression) != nil
-    }
-
     /// Whole commands only: quoted examples and longer prose are ordinary turns.
     public static let controlHandoffCommands = [
         "let me take over", "stop, i got it", "stop i got it",

@@ -118,6 +118,7 @@ extension AdaptiveMemoryPromoter {
         var personWords: String!
         var replyDelivered = false
         var openMoments: [DeskItem] = []
+        var deskBasis: OwedBasis?
         var share: MomentShare!
         var settlement: Bool!
         var context: AfterTurnContext?
@@ -129,6 +130,7 @@ extension AdaptiveMemoryPromoter {
         var factsEnabled = false
         var existing: [MemoryManagerExistingMemory] = []
         var standing = 0
+        var memoryBasis: OwedBasis?
         var pendingRows: [ProposalRecord] = []
         var factsReadable = true
         var pending: [String]!
@@ -142,7 +144,6 @@ extension AdaptiveMemoryPromoter {
         // The staging pass, shared by each decision's stages.
         var staged: [ProposalRecord] = []
         var accepted: [AdaptiveCandidate] = []
-        var rejected = 0
         var savedCorrections = 0
         var pendingCorrections = 0
         var failedCorrections = 0
@@ -230,14 +231,14 @@ extension AdaptiveMemoryPromoter {
         var openMoments: [DeskItem] = []
         if storedMeaning == nil,
            !personWords.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !completedActs.isEmpty || replyDelivered {
-            let deskBasis = await beforeJudgment(run, .desk)
+            run.deskBasis = await beforeJudgment(run, .desk)
             do {
                 openMoments = try await SwiftNativeDeskStore(dataRoot: momentDoor.dataRoot).liveState().items
                     .filter { MyQueue.entry($0) != nil }
             } catch {
                 let cancelled = Self.isCancellation(error)
                 if !cancelled {
-                    await waitForChange(momentID, since: deskBasis, cause: .desk, words: error.localizedDescription)
+                    await waitForChange(momentID, since: run.deskBasis, cause: .desk, words: error.localizedDescription)
                 }
                 return AdaptiveMemoryObservation(proposals: [], extraction: .init(candidates: [], semanticStatus: .failed,
                     failure: AfterTurnMemoryFailure(reason: cancelled ? .cancelled : .provider,
@@ -274,7 +275,6 @@ extension AdaptiveMemoryPromoter {
             await settleWhole(run, "no incoming words")
             return Self.empty(.emptyInput)
         }
-        // Reading facts for retention is not memory use: disable usage recording because use_count vetoes eviction.
         let context: AfterTurnContext?
         let factsOnly = moment.input?.factsOnly == true
         if factsOnly { context = nil } else {
@@ -364,13 +364,13 @@ extension AdaptiveMemoryPromoter {
         var standing = 0
         var pendingRows: [ProposalRecord] = []
         var factsReadable = true
-        var factsBasis: OwedBasis?
         var factEmbeddingBasis: OwedBasis?
         var factsFailure: Error?
         if factsEnabled {
-            factsBasis = await beforeJudgment(run, .memory)
+            run.memoryBasis = await beforeJudgment(run, .memory)
             factEmbeddingBasis = await beforeJudgment(run, .embedding)
             do {
+                // Screening facts leaves usage unrecorded. Capacity eviction orders by retention rank, then last use or update time.
                 let recalled = try await memory.recall(
                     MemoryV2RecallRequest(text: "\(user)\n\(assistant)", topK: MemoryManagerLane.recallTopK, surface: surface),
                     recordingUsage: false
@@ -384,6 +384,7 @@ extension AdaptiveMemoryPromoter {
                 let eligible = try await memory.listMemory(kind: nil).filter {
                     $0.status == "active"
                         && !MemoryStorage.metadataFlag($0.extras, MemoryStorage.pendingAdmissionKey)
+                        && MemoryRecallScoring.hasStarted(validFrom: $0.validFrom, at: now)
                         && MemoryRecordDisclosurePolicy.classify($0, at: now)?.permits(surface: surface, personaID: nil) == true
                 }
                 var standingRecords = eligible.filter { $0.pinned == true }.sorted {
@@ -417,7 +418,7 @@ extension AdaptiveMemoryPromoter {
             let words = factsFailure?.localizedDescription ?? "The requested facts could not be read; their failure has no cause."
             let cancelled = factsFailure.map(Self.isCancellation) == true
             if !cancelled, let error = factsFailure, let cause = Self.factReadCause(error) {
-                await waitForChange(momentID, since: cause == .embedding ? factEmbeddingBasis : factsBasis, cause: cause, words: words)
+                await waitForChange(momentID, since: cause == .embedding ? factEmbeddingBasis : run.memoryBasis, cause: cause, words: words)
             } else if !cancelled {
                 oweRecoveryRepair(momentID, cause: words, door: momentDoor)
             }
@@ -445,6 +446,19 @@ extension AdaptiveMemoryPromoter {
         let settlement: Bool = run.settlement, storedMeaning = run.storedMeaning, momentID = run.momentID
         let momentDoor = run.momentDoor, surface = run.surface, context = run.context, factsEnabled = run.factsEnabled
         let factsReadable = run.factsReadable, turn = run.turn, held = run.held, sessionId = run.sessionId
+        let recorded = run.moment.input?.turn
+        if let storedMeaning, storedMeaning.cares.contains(where: { judgment in
+            guard let share = judgment.shared else { return false }
+            return recorded?.originPrincipal != "person" || recorded?.repliedAt != share.at
+                || judgment.moved == 0 || !MemoryManagerPromise.quoted(share.source, in: storedMeaning.quoteText(assistant))
+        }) {
+            let recovery = "A retained care share needs a nonzero movement and an exact quote from the recorded reply to the person."
+            await waitForChange(momentID, since: await beforeJudgment(run, .record), cause: .record, words: recovery)
+            return AdaptiveMemoryObservation(proposals: [], extraction: .init(candidates: [], semanticStatus: .failed,
+                failure: AfterTurnMemoryFailure(reason: .invalidCares, recovery: recovery, model: storedMeaning.model, surface: surface)))
+        }
+        let personReplyAt = replyDelivered && !fromReply && !run.isPeer && recorded?.originPrincipal == "person"
+            ? recorded?.repliedAt : nil
         let request = MemoryManagerRequest(
             userMessage: user,
             assistantMessage: assistant,
@@ -455,7 +469,9 @@ extension AdaptiveMemoryPromoter {
             standingAgent: standingAgent, appAuthored: fromReply, took: origin?.took,
             occurredAt: origin?.occurredAt,
             personWords: personWords, openMoments: openMoments, completedActs: completedActs,
-            completedActsUnavailable: completedActsUnavailable, replyDelivered: replyDelivered, settlesOnly: settlement
+            completedActsUnavailable: completedActsUnavailable, replyDelivered: replyDelivered, settlesOnly: settlement,
+            personReplyAt: personReplyAt, origin: MemoryManagerRequest.Origin(recordedPrincipal: recorded?.originPrincipal),
+            turnId: recorded?.turnId, careWake: run.careWake
         )
         let interpretation: AfterTurnInterpretation?
         let attemptBasis = await beforeJudgment(run, .provider)
@@ -482,6 +498,37 @@ extension AdaptiveMemoryPromoter {
             }
         } catch {
             // The row stays owed; a failed judgment changes nothing.
+            if let refusal = error as? PartCallError, !Self.isCancellation(error) {
+                let detail = TurnSecretRedactor.redactText(refusal.message)
+                let cause: OwedCause = switch refusal.code {
+                case "digest_desk_limit": .desk
+                case "digest_memory_limit": .memory
+                case "digest_record_limit": .record
+                default: .judgment
+                }
+                let helperUnavailable = refusal.code == "digest_helper_unavailable"
+                let words = if cause != .judgment { detail }
+                else if helperUnavailable {
+                    "The NativeAgent sense helper could not run the turn digest. The moment remains due on the next recovery drain. \(detail)"
+                } else {
+                    """
+                    The native-turn-digest part could not supply a judgment (\(refusal.code)). \(detail) Read its selected revision and reported \
+                    refusal with app {action:"ability.read",args:{id:"native-turn-digest"}}.
+                    """
+                }
+                let failure = AfterTurnMemoryFailure(reason: helperUnavailable ? .provider : .requestRejected,
+                    recovery: words, model: nil, surface: surface)
+                if !helperUnavailable {
+                    let basis: OwedBasis? = switch cause {
+                    case .desk: run.deskBasis
+                    case .memory: run.memoryBasis
+                    case .record: await beforeJudgment(run, .record)
+                    default: judgmentBasis
+                    }
+                    await waitForChange(momentID, since: basis, cause: cause, words: failure.localizedDescription)
+                }
+                return AdaptiveMemoryObservation(proposals: [], extraction: .init(candidates: [], semanticStatus: .failed, failure: failure))
+            }
             let reason: AfterTurnMemoryFailure.Reason
             if Self.isCancellation(error) { reason = .cancelled }
             else {
@@ -620,15 +667,16 @@ extension AdaptiveMemoryPromoter {
     /// correction; what passes them is proposed.
     private func stageDecision(_ run: MemoryInterpretationRun, _ raw: MemoryManagerDecision, operation: String) async {
         let memory = run.memory, momentID = run.momentID, turn = run.turn, senseReads = run.senseReads
-        let fromReply: Bool = run.fromReply, assistant: String = run.assistant, incoming: (key: String, trusted: Bool) = run.incoming
+        let fromReply: Bool = run.fromReply, incoming: (key: String, trusted: Bool) = run.incoming
         let origin = run.origin, sessionId = run.sessionId, user: String = run.user, isPeer: Bool = run.isPeer
         let originalHumanName = run.originalHumanName, existing = run.existing, turnId = run.turnId
+        let redactedQuotes = run.interpretation?.redactedQuotes == true
+        let assistant = redactedQuotes ? TurnSecretRedactor.redactText(run.assistant) : run.assistant
         let decision = raw
         guard let resolved = await resolveUpdateTarget(run, decision) else { return }
         let supersededPending = resolved.supersededPending, updateTarget = resolved.updateTarget
         guard decision.action != .skip else { return }
         guard decision.confidence >= MemoryManagerLane.confidenceFloor else {
-            run.rejected += 1
             return
         }
         guard decision.grounding != nil else {
@@ -644,7 +692,7 @@ extension AdaptiveMemoryPromoter {
                 return
             }
             let keepsIt = fromReply
-                ? MemoryManagerLane.statementRejectionReason(decision, userMessage: "", assistantMessage: assistant) == nil
+                ? MemoryManagerLane.statementRejectionReason(decision, userMessage: "", assistantMessage: assistant ?? "") == nil
                 : incoming.trusted && (!isCorrection || incoming.key == CognitiveCare.ownerKey)
             if prior.status == "pending", keepsIt {
                 do {
@@ -659,7 +707,6 @@ extension AdaptiveMemoryPromoter {
             return
         }
         if isCorrection, origin?.occurredAt == nil || origin?.sessionId != sessionId {
-            run.rejected += 1
             run.failedCorrections += 1
             nativeLog("MemoryV2: standing correction not saved: originating turn timestamp unavailable")
             return
@@ -667,7 +714,6 @@ extension AdaptiveMemoryPromoter {
         if isCorrection, let updateTarget,
            updateTarget.kind != "correction"
             || (updateTarget.correctionSubject != nil && updateTarget.correctionSubject != decision.correctionSubject) {
-            run.rejected += 1
             return
         }
         if isCorrection, let old = supersededPending {
@@ -676,19 +722,17 @@ extension AdaptiveMemoryPromoter {
                   let timestamp = old.metadata?.objectValue?["observed_at"]?.stringValue,
                   let priorDate = MemoryRecallScoring.parseTimestamp(timestamp),
                   let sourceDate = origin?.occurredAt, priorDate <= sourceDate else {
-                run.rejected += 1
                 run.failedCorrections += 1
                 nativeLog("MemoryV2: standing correction not saved: pending rule chronology or subject unavailable or newer")
                 return
             }
         }
+        let shownUser = redactedQuotes ? TurnSecretRedactor.redactText(user) : user
         let refusal = isCorrection
             ? MemoryManagerLane.correctionRejectionReason(decision, userMessage: user,
-                isPeer: isPeer, personName: originalHumanName)
-            : MemoryManagerLane.statementRejectionReason(decision, userMessage: fromReply ? "" : user,
-                                                         assistantMessage: assistant)
+                isPeer: isPeer, personName: originalHumanName, redactedQuotes: redactedQuotes)
+            : MemoryManagerLane.statementRejectionReason(decision, userMessage: fromReply ? "" : shownUser, assistantMessage: assistant ?? "")
         if refusal != nil {
-            run.rejected += 1
             return
         }
         if isCorrection, let kept = existing.first(where: {
@@ -748,7 +792,8 @@ extension AdaptiveMemoryPromoter {
                                  isCorrection: Bool, supersededPending: ProposalRecord?,
                                  updateTarget: MemoryManagerExistingMemory?) async {
         let memory = run.memory, sessionId = run.sessionId, surface = run.surface, origin = run.origin, turnId = run.turnId
-        let turn = run.turn, senseReads = run.senseReads, fromReply: Bool = run.fromReply, assistant: String = run.assistant
+        let turn = run.turn, senseReads = run.senseReads, fromReply: Bool = run.fromReply
+        let assistant = run.interpretation?.redactedQuotes == true ? TurnSecretRedactor.redactText(run.assistant) : run.assistant
         let incoming: (key: String, trusted: Bool) = run.incoming
         // Exclude the update's target from duplicate screening; all other kept and pending rows still screen.
         let replacedContent = updateTarget?.content ?? supersededPending?.content
@@ -760,16 +805,14 @@ extension AdaptiveMemoryPromoter {
             if !isCorrection, try await Self.nearDuplicate(
                 decision.statement, of: screened, memory: memory
             ) != nil {
-                run.rejected += 1
                 return
             }
             if try await memory.isRejected(content: decision.statement) {
-                run.rejected += 1
                 return
             }
             // A standing rule is kept only from the owner's own words.
             let keep = fromReply
-                ? MemoryManagerLane.statementRejectionReason(decision, userMessage: "", assistantMessage: assistant) == nil
+                ? MemoryManagerLane.statementRejectionReason(decision, userMessage: "", assistantMessage: assistant ?? "") == nil
                 : incoming.trusted && (!isCorrection || incoming.key == CognitiveCare.ownerKey)
             let proposal = try await memory.propose(
                 content: decision.statement,
@@ -841,24 +884,25 @@ extension AdaptiveMemoryPromoter {
         let factsProcessed = run.factsProcessed, stagingFailed = run.stagingFailed, factsEnabled = run.factsEnabled
         let factsReadable = run.factsReadable, folded: Bool = run.folded, promisesSettled: Bool = run.promisesSettled
         let momentDoor = run.momentDoor, momentID = run.momentID, staged = run.staged, accepted = run.accepted
-        let decisions: [MemoryManagerDecision] = run.decisions, rejected = run.rejected, savedCorrections = run.savedCorrections
+        let decisions: [MemoryManagerDecision] = run.decisions, savedCorrections = run.savedCorrections
         let pendingCorrections = run.pendingCorrections, failedCorrections = run.failedCorrections
         // Mark lived only after the fold, promises and facts settle. Refolding skips landed pieces by stamp and facts by operation identity.
         let factsSettled = factsProcessed ? !stagingFailed : !(factsEnabled && !factsReadable)
         if run.reflectionRecorded, folded, factsSettled, promisesSettled, !Task.isCancelled { await momentDoor.lived(momentID) }
-        return AdaptiveMemoryObservation(
+        var observation = AdaptiveMemoryObservation(
             proposals: staged,
             extraction: AdaptiveExtractionReport(
                 candidates: accepted,
                 semanticStatus: run.reflectionRecorded ? .succeeded : .failed,
                 semanticCandidateCount: decisions.count
             ),
-            hygieneRejectedCount: rejected,
             savedCorrectionCount: savedCorrections,
             pendingCorrectionCount: pendingCorrections,
             failedCorrectionCount: failedCorrections,
             stagingFailed: stagingFailed || !factsReadable || !promisesSettled
         )
+        observation.interpretation = run.interpretation
+        return observation
     }
     /// The same final step for a fresh proposal and a recovered operation. A different successor is a conflict, never proof that our step landed.
     private func finishPendingSupersession(_ old: ProposalRecord?, by successor: String,

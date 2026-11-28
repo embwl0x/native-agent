@@ -38,7 +38,13 @@ public actor SomaticSignalBus {
         // Mark before the observer await so a reentrant replay cannot be delivered while the first observation is still being integrated.
         deliveredEventKeys.insert(eventKey)
         rememberDeliveredEventKey(eventKey)
-        await observer.ingest(signal, movesFeelings: CognitiveSomaticSignals.movesFeelings(signal.kind))
+        do {
+            try await observer.ingest(signal, movesFeelings: CognitiveSomaticSignals.movesFeelings(signal.kind))
+        } catch {
+            // An observation that was not integrated is not delivered: its replay may come again.
+            deliveredEventKeys.remove(eventKey)
+            return nil
+        }
         return signal
     }
 

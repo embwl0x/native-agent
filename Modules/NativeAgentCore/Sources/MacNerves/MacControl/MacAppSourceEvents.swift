@@ -105,8 +105,6 @@ public final class MacAppSourceEvents: @unchecked Sendable {
         catch { source.cancel(); throw error }
     }
 
-    @concurrent public func readCoverage() async -> JSONValue { coverage }
-
     /// Read the subscription owner, never a caller's mirror of its health.
     public var coverage: JSONValue {
         return MacAXExecutionLane.sync {
@@ -160,7 +158,7 @@ public final class MacAppSourceEvents: @unchecked Sendable {
         guard !PersonOnlyWindows.isOwnProcess(pid), let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else {
             throw SenseFailure(code: "source_unavailable", message: "The app is no longer running or cannot observe itself.")
         }
-        guard AXIsProcessTrusted() else {
+        guard SystemPermissionPreflight.status(.accessibility) == .granted else {
             throw SenseFailure(code: "source_denied", message: "App observation requires macOS Accessibility permission.")
         }
         var created: AXObserver?
@@ -230,7 +228,7 @@ public final class MacAppSourceEvents: @unchecked Sendable {
     }
 
     private func withSubscriptionAuthority<Value>(context: MacOperationContext, _ operation: (MacOperationContext) throws -> Value) throws -> Value {
-        guard AXIsProcessTrusted() else {
+        guard SystemPermissionPreflight.status(.accessibility) == .granted else {
             throw SenseFailure(code: "source_denied", message: "App observation lost macOS Accessibility permission.")
         }
         return try operation(context)

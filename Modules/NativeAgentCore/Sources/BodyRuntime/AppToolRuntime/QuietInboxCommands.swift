@@ -14,7 +14,7 @@ import PersistenceCore
     func interactionForInboxItem(_ id: String, dataRoot: URL) async throws -> InlineInteraction?
     func readInbox() async throws -> [InboxItemRecord]
     func inboxPresentation(_ item: InboxItemRecord) -> (hidden: Bool, linkedApproval: Bool, actions: [InboxActionRecord])
-    func performInboxAction(_ id: String, action: String, metadata: [String: JSONValue], quiet: Bool, dataRootOverride: URL?, turn: Turn) async throws
+    func performInboxAction(_ id: String, action: String, quiet: Bool, dataRootOverride: URL?, turn: Turn) async throws
     func withdrawApproval(id: String, decidedBy: String) async throws
     /// The person's decision of an approval, recorded with the provenance of the door that verified the person.
     func resolveApproval(id: String, decision: String, provenance: ApprovalResolutionProvenance) async throws -> ApprovalRecord
@@ -103,7 +103,7 @@ extension QuietInboxHost {
         case "archive", "dismiss", "mark_read":
             guard !text("reason").isEmpty else {
                 return refuse(AppToolExecutor.failure("missing_reason",
-                    "Say why in reason (a few words, e.g. \"stale test note\"); it is saved on the note."))
+                    "Say why in reason (a few words, e.g. \"stale test note\"). The action receipt records it."))
             }
             if verb != "mark_read" {
                 for id in ids {
@@ -240,9 +240,8 @@ extension QuietInboxHost {
                     continue
                 }
                 do {
-                    try await self.performInboxAction(id, action: action, metadata: [
-                        "settled_by": .string(target.person ? "person" : "agent"), "settled_reason": .string(reason),
-                    ], quiet: !target.person, dataRootOverride: self.dataRootOverride, turn: turn)
+                    try await self.performInboxAction(id, action: action, quiet: !target.person,
+                        dataRootOverride: self.dataRootOverride, turn: turn)
                     done.append(.object(["id": .string(id), "was": .string(item.status)]))
                 } catch {
                     await self.refreshInboxSurfaces()
@@ -327,7 +326,7 @@ extension QuietInboxHost {
                                     "approval_id": .string(approvalID), "did": .string(words), "detail": .string(words)])
                 }
                 // The person's own tap runs as theirs (a request's Not now wakes the conversation that raised it); the agent's runs quietly.
-                try await self.performInboxAction(item.id, action: action, metadata: [:], quiet: !target.person,
+                try await self.performInboxAction(item.id, action: action, quiet: !target.person,
                     dataRootOverride: self.dataRootOverride, turn: turn)
             } catch {
                 return AppToolExecutor.ownedFailure(error, code: "inbox_act_failed", owner: "inbox \(item.id) action \(action)",

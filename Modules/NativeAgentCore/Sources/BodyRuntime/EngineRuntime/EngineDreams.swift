@@ -94,7 +94,6 @@ extension NativeAgentEngine {
     /// Manual and scheduled dreams share the same Self-half, felt origins and receipt owners; committed dreams reach the organism.
     public static func runDream(
         dataRoot root: URL,
-        force: Bool = false,
         trigger: DreamTrigger = .schedule,
         parent: Turn? = nil,
         beganAt: Date = Date()
@@ -105,10 +104,10 @@ extension NativeAgentEngine {
         let impl = try await dreamCycle(dataRoot: root)
         let report = try await DreamBackgroundWork.runDream(
             dataRoot: root, cycle: impl, cognitionRuntime: cognition,
-            force: force, trigger: trigger, parent: cause, beganAt: beganAt
+            trigger: trigger, parent: cause, beganAt: beganAt
         )
         var response: [String: Any] = [
-            "ok": report.errors.isEmpty, "backend": "swift", "force": force,
+            "ok": report.errors.isEmpty || report.stopped, "backend": "swift", "force": false,
             "trigger": report.trigger.rawValue, "sessionsProcessed": report.sessionsProcessed,
             "entriesWritten": report.entriesWritten, "disabled": report.disabled, "errors": report.errors,
             "moreMessagesRemain": report.moreMessagesRemain,
@@ -116,7 +115,9 @@ extension NativeAgentEngine {
         response["entryDate"] = DreamREMSchedule.todayKey(now: beganAt)
         if let skipReason = report.skipReason { response["skipReason"] = skipReason }
         if !report.busy.isEmpty { response["busy"] = report.busy }
-        if !report.errors.isEmpty {
+        if report.stopped {
+            response["status"] = "stopped"
+        } else if !report.errors.isEmpty {
             response["remedy"] = (report.repair ?? Repair.remedy(owner: "dream cycle",
                 nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("mind.dream")])]), tap: nil)).foundationObject
         }
@@ -135,8 +136,8 @@ extension NativeAgentEngine {
     /// Manual and weekly REM share approval staging; the weekly clock time passes `force: false` so an earlier manual run cannot distil the same dreams twice.
     public static func runRem(dataRoot root: URL, force: Bool = true, repair: Bool = false) async throws -> [String: Any] {
         let cognition = try requiredMind(for: root)
-        let impl = try makeDreamREMCycle(
-            root: root,
+        let impl = try SwiftNativeDreamREMCycle(
+            dataRoot: root,
             gate: try await CognitionViewFacade(dataRoot: root).dreamGateChecked(),
             remStageApproval: DreamBackgroundWork.makeREMProposalStager(dataRoot: root),
             lifecycleObserver: cognition

@@ -1,9 +1,9 @@
-import MacNerves
 import NativeAgentCore
-import NativeAgentShared
 import PersistenceCore
 import DeskCore
 import SenseCore
+import MacNerves
+import NativeAgentShared
 import Foundation
 import ProviderRouting
 import MindCore
@@ -42,12 +42,15 @@ extension AppActions {
                       + "The receipt shows the next times the clock heard",
                   tool: "my_queue", input: verb("add"), versionExempt: true,
                   schema: queueAddSchema),
-        AppAction("queue.update", "desk", "Edit a carried step or bind/drop its habit", [.required("id"), .optional("action", .any), .optional("say", .any), .optional("when", .any), .optional("until", .any)],
+        AppAction("queue.update", "desk", "Edit a carried step, bind its habit, or declare what a pursuit waits for", [.required("id"), .optional("action", .any), .optional("say", .any), .optional("when", .any), .optional("until", .any), .optional("wait_for", .any)],
             subject: ["id"],
                   warn: """
                       Only named fields change. action:{action:\"authored.<id>\",args:{…}} binds a habit; action:null drops it. \
                       say is said at its moment and the step still comes back to you; say:null clears it. \
                       when and until use queue.add's grammar. The receipt names the stored habit.
+                      With id and wait_for alone, park an open pursuit or carried work step until {at:"<ISO 8601 instant>"},
+                      {happening:{kind:"returned",subject:"<exact subject>"}}, or {desk:"<desk.N or exact handle>"}.
+                      The cause comes back once in your own Thoughts. wait_for:null clears the declaration.
                       """,
                   tool: "my_queue", input: verb("update"), versionExempt: true, schema: queueUpdateSchema),
         AppAction("queue.done", "desk", "Mark a MY QUEUE step done; put why it is done in reason", [.required("id"), .optional("reason")], subject: ["id"],tool: "my_queue",

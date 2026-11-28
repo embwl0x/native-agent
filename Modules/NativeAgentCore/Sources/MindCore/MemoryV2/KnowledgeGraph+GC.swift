@@ -23,13 +23,10 @@ public struct KnowledgeGraphGCCandidate: Sendable, Equatable {
 
 public struct KnowledgeGraphGCReport: Sendable, Equatable {
     public var candidates: [KnowledgeGraphGCCandidate]
-    /// Entities without creation ownership evidence; reported, never swept.
-    public var untrackedEntities: Int
     public var applied: Bool
     public var candidateSetDiverged: Bool
     public var entitiesDeleted: Int
     public var edgesDeleted: Int
-    public var staleIndexRowsDeleted: Int
 }
 
 extension SwiftNativeKnowledgeGraphIndexer {
@@ -52,12 +49,10 @@ extension SwiftNativeKnowledgeGraphIndexer {
                 )
                 return KnowledgeGraphGCReport(
                     candidates: scan.candidates,
-                    untrackedEntities: scan.untracked,
                     applied: false,
                     candidateSetDiverged: false,
                     entitiesDeleted: 0,
-                    edgesDeleted: 0,
-                    staleIndexRowsDeleted: 0
+                    edgesDeleted: 0
                 )
             }
         }
@@ -70,23 +65,19 @@ extension SwiftNativeKnowledgeGraphIndexer {
                Set(scan.candidates.map(\.id)) != expectedCandidateIDs {
                 return KnowledgeGraphGCReport(
                     candidates: scan.candidates,
-                    untrackedEntities: scan.untracked,
                     applied: false,
                     candidateSetDiverged: true,
                     entitiesDeleted: 0,
-                    edgesDeleted: 0,
-                    staleIndexRowsDeleted: 0
+                    edgesDeleted: 0
                 )
             }
             var edgesDeleted = 0
-            var staleDeleted = 0
             for chunk in Self.gcChunks(scan.staleIndexIDs) {
                 let qs = Array(repeating: "?", count: chunk.count).joined(separator: ",")
                 try db.execute(
                     sql: "DELETE FROM kg_memory_index WHERE memory_id IN (\(qs))",
                     arguments: StatementArguments(chunk)
                 )
-                staleDeleted += db.changesCount
             }
             let orphanIDs = scan.candidates.map { $0.id }
             for chunk in Self.gcChunks(orphanIDs) {
@@ -109,19 +100,16 @@ extension SwiftNativeKnowledgeGraphIndexer {
             edgesDeleted += db.changesCount
             return KnowledgeGraphGCReport(
                 candidates: scan.candidates,
-                untrackedEntities: scan.untracked,
                 applied: true,
                 candidateSetDiverged: false,
                 entitiesDeleted: orphanIDs.count,
-                edgesDeleted: edgesDeleted,
-                staleIndexRowsDeleted: staleDeleted
+                edgesDeleted: edgesDeleted
             )
         }
     }
 
     private struct OrphanScan {
         var candidates: [KnowledgeGraphGCCandidate]
-        var untracked: Int
         var staleIndexIDs: [String]
     }
 
@@ -134,24 +122,28 @@ extension SwiftNativeKnowledgeGraphIndexer {
         let rows = try Row.fetchAll(
             db,
             sql: """
-                SELECT id, content FROM memories
+                SELECT id, content
+                FROM memories
                 WHERE status = 'active'
                   AND TRIM(COALESCE(content, '')) <> ''
+                  AND lower(COALESCE(NULLIF(TRIM(lifecycle), ''), 'confirmed'))
+                        NOT IN \(MemoryLifecycle.recallExcludedSQL)
+                  AND json_extract(metadata_json, '$.admission_pending') IS NOT 1
                 """
         )
-        let active = try rows.map { row in
+        let support = try rows.map { row in
             (id: try row.decode(String.self, forColumn: "id").trimmingCharacters(in: .whitespacesAndNewlines),
              content: try row.decode(String.self, forColumn: "content").trimmingCharacters(in: .whitespacesAndNewlines))
         }.filter { !$0.content.isEmpty }
-        let liveIDs = Set(active.map(\.id).filter { !$0.isEmpty })
+        let liveIDs = Set(support.map(\.id).filter { !$0.isEmpty })
         // Support uses the indexer's exact extractor and known-person vocabulary.
         var liveKeys = Set<String>()
-        for entities in Self.extractCorpus(active.map { $0.content }, knownPeople: knownPeople, knownAgents: knownAgents) {
+        for entities in Self.extractCorpus(support.map { $0.content }, knownPeople: knownPeople, knownAgents: knownAgents) {
             for entity in entities {
                 liveKeys.insert("\(entity.type.lowercased())|\(entity.name.lowercased())")
             }
         }
-        if !active.isEmpty { liveKeys.insert("person|\(primaryUserName.lowercased())") }
+        if !support.isEmpty { liveKeys.insert("person|\(primaryUserName.lowercased())") }
 
         let idxRows = try Row.fetchAll(
             db, sql: "SELECT memory_id FROM kg_memory_index"
@@ -165,7 +157,6 @@ extension SwiftNativeKnowledgeGraphIndexer {
             SELECT id, name, type, mention_count, metadata_json FROM kg_entities
             """)
         var candidates: [KnowledgeGraphGCCandidate] = []
-        var untracked = 0
         for r in entityRows {
             let id: String = r["id"] ?? ""
             let name: String = r["name"] ?? ""
@@ -176,10 +167,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
             if case .string(let role)? = meta["role"], role == "primary_user" {
                 continue
             }
-            guard meta[createdByKey] != nil else {
-                untracked += 1
-                continue
-            }
+            guard meta[createdByKey] != nil else { continue }
             guard case .string(let lastID)? = meta["last_memory_id"],
                   !lastID.isEmpty else { continue }
             if liveIDs.contains(lastID) { continue }
@@ -194,7 +182,6 @@ extension SwiftNativeKnowledgeGraphIndexer {
         }
         return OrphanScan(
             candidates: candidates,
-            untracked: untracked,
             staleIndexIDs: staleIndexIDs
         )
     }

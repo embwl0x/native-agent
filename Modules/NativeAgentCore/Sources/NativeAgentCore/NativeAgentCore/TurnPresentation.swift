@@ -23,7 +23,7 @@ public enum TurnPresentationLifecycleEvent: Sendable, Equatable {
 }
 
 /// One step of the turn, from its start to its end: one identity, its words now, and how it ended. It intentionally contains no tool arguments,
-/// provider payload, model output, hidden reasoning, or transport identity.
+/// provider payload, model output or hidden reasoning.
 public struct TurnPresentationActivity: Sendable, Equatable {
     /// How a tool step ended, read from its own result. Nil for a step that is not a settled tool result.
     public enum Outcome: Sendable, Equatable {
@@ -38,6 +38,8 @@ public struct TurnPresentationActivity: Sendable, Equatable {
     public internal(set) var detail: String?
     public let delegateName: String?
     public internal(set) var outcome: Outcome?
+    public internal(set) var disposition: TurnFace.Step.Disposition?
+    public let unstartedID: String?
     public let occurredAt: Date
     /// The call this step is running, until its result ends it.
     public internal(set) var runningCall: String?
@@ -48,6 +50,8 @@ public struct TurnPresentationActivity: Sendable, Equatable {
         detail: String?,
         delegateName: String?,
         outcome: Outcome?,
+        disposition: TurnFace.Step.Disposition?,
+        unstartedID: String?,
         occurredAt: Date,
         runningCall: String?
     ) {
@@ -56,6 +60,8 @@ public struct TurnPresentationActivity: Sendable, Equatable {
         self.detail = detail
         self.delegateName = delegateName
         self.outcome = outcome
+        self.disposition = disposition
+        self.unstartedID = unstartedID
         self.occurredAt = occurredAt
         self.runningCall = runningCall
     }
@@ -245,6 +251,8 @@ public enum TurnPresentationReducer {
         outcome: TurnPresentationActivity.Outcome? = nil,
         callName: String? = nil,
         endsCall: String? = nil,
+        disposition: TurnFace.Step.Disposition? = nil,
+        unstartedID: String? = nil,
         at instant: Date,
         resetStreamLength: Bool = false,
         additionalRedactor: AdditionalRedactor? = nil
@@ -258,6 +266,8 @@ public enum TurnPresentationReducer {
             outcome: outcome,
             callName: callName,
             endsCall: endsCall,
+            disposition: disposition,
+            unstartedID: unstartedID,
             at: instant,
             resetStreamLength: resetStreamLength,
             additionalRedactor: additionalRedactor
@@ -289,6 +299,8 @@ public enum TurnPresentationReducer {
         outcome: TurnPresentationActivity.Outcome? = nil,
         callName: String? = nil,
         endsCall: String? = nil,
+        disposition: TurnFace.Step.Disposition? = nil,
+        unstartedID: String? = nil,
         at instant: Date,
         streamedTextLength: Int? = nil,
         resetStreamLength: Bool = false,
@@ -309,7 +321,7 @@ public enum TurnPresentationReducer {
         }
 
         // Every call and every result is movement; any other step that changes nothing is none, and only ends the line of a call being written.
-        guard safeCall != nil || safeEnd != nil
+        guard safeCall != nil || safeEnd != nil || unstartedID != nil
                 || phase != state.phase
                 || safeAction != state.currentAction
                 || safeDelegate != state.delegateName
@@ -321,14 +333,12 @@ public enum TurnPresentationReducer {
 
         var next = state
         let movementAt = max(instant, state.lastMovementAt)
-        // Only her acts are steps. A step is one thing from its start to its end: a call starts its own step and its result ends that same
-        // step; a result whose start is not kept stands as one finished step. Waits, notices, retries and thinking are states of the turn:
-        // they move its words and phase, never its steps.
         if let safeEnd, let index = next.activities.firstIndex(where: { $0.runningCall == safeEnd }) {
             next.activities[index].detail = safeAction ?? next.activities[index].detail
             next.activities[index].outcome = outcome
+            next.activities[index].disposition = disposition
             next.activities[index].runningCall = nil
-        } else if safeCall != nil || safeEnd != nil {
+        } else if safeCall != nil || safeEnd != nil || unstartedID != nil {
             next.stepCount += 1
             next.activities.append(TurnPresentationActivity(
                 id: next.stepCount,
@@ -336,6 +346,8 @@ public enum TurnPresentationReducer {
                 detail: safeAction,
                 delegateName: safeDelegate,
                 outcome: outcome,
+                disposition: disposition,
+                unstartedID: unstartedID,
                 occurredAt: movementAt,
                 runningCall: safeCall
             ))

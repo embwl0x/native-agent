@@ -27,7 +27,7 @@ extension TranscriptLook {
             body: font(ShellType.bodySize), quiet: font(ShellType.labelSize), heading: font(ShellType.bodySize, .semibold),
             code: .monospacedSystemFont(ofSize: (ShellType.labelSize * scale).rounded(), weight: .regular),
             caption: font(ShellType.captionSize), foldHeadline: font(ShellType.labelSize, .medium),
-            codeLabel: font(NSFont.preferredFont(forTextStyle: .caption2).pointSize, .medium),
+            codeLabel: font(ShellType.captionSize, .medium),
             label: .labelColor, secondary: .secondaryLabelColor, listMarker: .labelColor, trouble: { NSColor(NativeAgentShell.trouble) },
             styleLink: { _, _, attributes in attributes[.foregroundColor] = NSColor.controlAccentColor },
             foldLink: { group in TranscriptFoldLink.url(group) })

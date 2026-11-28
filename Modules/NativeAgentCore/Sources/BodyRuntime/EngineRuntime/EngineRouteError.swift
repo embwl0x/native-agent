@@ -25,25 +25,7 @@ public enum UserFacingError {
         return advice(for: error)
     }
 
-    /// Service reason strings stay in logs rather than raw user-facing copy.
-    public static func message(detail: String, action: String) -> String {
-        logger("\(action) failed: \(detail)", level: .error)
-        return "Couldn't \(action). " + fallback
-    }
-
     private static let fallback = "Something went wrong. Try again; if it keeps happening, the details are in the log."
-
-    public static func iCloudAccount(_ status: CKAccountStatus) -> String {
-        switch status {
-        case .available: return iCloudSignedIn
-        case .noAccount: return "Not signed in to iCloud"
-        case .restricted: return "iCloud is restricted on this Mac"
-        case .temporarilyUnavailable: return "iCloud needs you to confirm your account"
-        case .couldNotDetermine: return "Couldn't check iCloud"
-        @unknown default: return "Couldn't check iCloud"
-        }
-    }
-    public static let iCloudSignedIn = "Signed in to iCloud"
 
     /// Use authored localized errors as written; system NSError bridges and wrapped underlying errors can contain raw diagnostic text.
     public static func ownSentence(_ error: Error) -> String? {

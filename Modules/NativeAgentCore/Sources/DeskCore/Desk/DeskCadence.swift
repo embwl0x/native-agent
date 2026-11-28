@@ -26,17 +26,86 @@ public struct DeskStep: Sendable, Equatable {
     public var promiseCaptures: [String]
     public var peers: [String]
     public var elevated: [String]
+    public var fileAccessCeiling: ICloudChatFileAccessPolicy.Ceiling?
     /// Resume with the originating conversation's context, never a later message's door.
     public var session: String?
     public var origin: String?
     public var filedAt: String?
     /// Keep the originating turn's durable route so later messages cannot redirect carried work.
     public var replyRoute: JSONValue?
+    package var causalWait: CausalWait?
+
+    package struct CausalWait: Sendable, Equatable {
+        package enum Trigger: Sendable, Equatable {
+            case at(Date)
+            case happening(Happening.Kind, subject: String)
+            case desk(String)
+
+            package init?(_ value: JSONValue) {
+                guard let fields = value.objectValue, fields.count == 1 else { return nil }
+                if let at = fields["at"]?.stringValue, let date = DeskClock.parseISO(at) {
+                    self = .at(date)
+                } else if let signal = fields["happening"]?.objectValue, signal.count == 2,
+                          let name = signal["kind"]?.stringValue, let kind = Happening.Kind(rawValue: name),
+                          let subject = Self.address(signal["subject"]) {
+                    self = .happening(kind, subject: subject)
+                } else if let handle = Self.address(fields["desk"]) {
+                    self = .desk(handle)
+                } else { return nil }
+            }
+
+            private static func address(_ value: JSONValue?) -> String? {
+                guard let text = value?.stringValue, !text.isEmpty, text.count <= 4096,
+                      text == text.trimmingCharacters(in: .whitespacesAndNewlines), !text.contains("\u{0}") else { return nil }
+                return text
+            }
+
+            package var json: JSONValue {
+                switch self {
+                case .at(let date): .object(["at": .string(DeskClock.nowISO(date))])
+                case .happening(let kind, let subject): .object(["happening": .object(["kind": .string(kind.rawValue), "subject": .string(subject)])])
+                case .desk(let handle): .object(["desk": .string(handle)])
+                }
+            }
+
+            package var words: String {
+                switch self {
+                case .at(let date): "the time " + MyQueue.shown(date)
+                case .happening(let kind, let subject): kind.rawValue + " happening " + subject
+                case .desk(let handle): "a change to Desk item " + handle
+                }
+            }
+        }
+
+        package let trigger: Trigger
+        package let since: String
+        package let baseline: String?
+
+        init(trigger: Trigger, since: String, baseline: String?) {
+            self.trigger = trigger
+            self.since = since
+            self.baseline = baseline
+        }
+
+        init?(_ json: JSONValue) {
+            guard let fields = json.objectValue, let value = fields["trigger"], let trigger = Trigger(value),
+                  let since = fields["since"]?.stringValue, DeskClock.parseISO(since) != nil,
+                  DeskJSON.optionalStringsAreValid(fields, keys: ["baseline"]) else { return nil }
+            self.init(trigger: trigger, since: since, baseline: fields["baseline"]?.stringValue)
+        }
+
+        var json: JSONValue {
+            var fields: [String: JSONValue] = ["trigger": trigger.json, "since": .string(since)]
+            if let baseline { fields["baseline"] = .string(baseline) }
+            return .object(fields)
+        }
+    }
 
     public init(words: String, when: String, card: String? = nil, action: JSONValue? = nil, source: String? = nil,
                 peers: [String] = [], elevated: [String] = [], session: String? = nil, origin: String? = nil, filedAt: String? = nil,
                 replyRoute: JSONValue? = nil, rhythm: JSONValue? = nil, until: String? = nil, say: String? = nil,
-                clockStart: String? = nil, scheduledJobID: String? = nil, promiseCaptures: [String] = []) {
+                clockStart: String? = nil, scheduledJobID: String? = nil, promiseCaptures: [String] = [],
+                fileAccessCeiling: ICloudChatFileAccessPolicy.Ceiling? = nil) {
         self.words = words; self.when = when; self.card = card
         self.action = action.flatMap { $0 == .null ? nil : Self.plannedAction($0) ?? $0 }
         self.source = source
@@ -44,6 +113,7 @@ public struct DeskStep: Sendable, Equatable {
         self.rhythm = rhythm; self.until = until; self.say = say
         self.clockStart = clockStart; self.scheduledJobID = scheduledJobID
         self.peers = peers; self.elevated = elevated; self.session = session
+        self.fileAccessCeiling = fileAccessCeiling
         self.origin = origin
         self.filedAt = filedAt
         self.replyRoute = replyRoute
@@ -66,8 +136,16 @@ public struct DeskStep: Sendable, Equatable {
         }
         if let filed = obj["filedAt"]?.stringValue, DeskClock.parseISO(filed) == nil { return nil }
         if let value = obj["rhythm"], value.objectValue == nil { return nil }
+        if let value = obj["causalWait"] {
+            guard CausalWait(value) != nil, obj["action"] == nil, obj["say"] == nil, obj["rhythm"] == nil else { return nil }
+        }
         if let value = obj["action"] {
             guard value.objectValue != nil, Self.plannedAction(value) == value else { return nil }
+        }
+        var ceiling: ICloudChatFileAccessPolicy.Ceiling?
+        if let value = obj["fileAccessCeiling"] {
+            guard let modes = DeskJSON.strings(value), modes.allSatisfy(ICloudChatFileAccessPolicy.acceptedIDs.contains) else { return nil }
+            ceiling = modes.reduce(.init()) { $0.intersecting(.init($1)) }
         }
         self.init(words: words, when: when, card: obj["card"]?.stringValue, action: obj["action"],
                   source: obj["source"]?.stringValue, peers: peers,
@@ -75,26 +153,27 @@ public struct DeskStep: Sendable, Equatable {
                   origin: obj["origin"]?.stringValue, filedAt: obj["filedAt"]?.stringValue, replyRoute: obj["replyRoute"],
                   rhythm: obj["rhythm"], until: obj["until"]?.stringValue, say: obj["say"]?.stringValue,
                   clockStart: obj["clockStart"]?.stringValue, scheduledJobID: obj["scheduledJobID"]?.stringValue,
-                  promiseCaptures: promiseCaptures)
+                  promiseCaptures: promiseCaptures, fileAccessCeiling: ceiling)
         lifeID = obj["lifeID"]?.stringValue
         status = obj["status"]?.stringValue
         reason = obj["reason"]?.stringValue
         habitRevision = obj["habitRevision"]?.stringValue
+        causalWait = obj["causalWait"].flatMap(CausalWait.init)
     }
 
     var fields: [String: JSONValue] {
         var obj: [String: JSONValue] = ["words": .string(words), "when": .string(when)]
-        for (key, value) in [("card", card), ("source", source), ("session", session), ("origin", origin), ("filedAt",
-            filedAt), ("lifeID", lifeID), ("status", status), ("reason", reason), ("until", until), ("say",
-            say), ("clockStart", clockStart), ("scheduledJobID", scheduledJobID), ("habitRevision", habitRevision)] {
-            if let value, !value.isEmpty { obj[key] = .string(value) }
-        }
+        DeskJSON.put(("card", card), ("source", source), ("session", session), ("origin", origin), ("filedAt", filedAt),
+                     ("lifeID", lifeID), ("status", status), ("reason", reason), ("until", until), ("say", say),
+                     ("clockStart", clockStart), ("scheduledJobID", scheduledJobID), ("habitRevision", habitRevision), in: &obj)
         if !peers.isEmpty { obj["peers"] = .array(peers.map(JSONValue.string)) }
         if !promiseCaptures.isEmpty { obj["promiseCaptures"] = .array(promiseCaptures.map(JSONValue.string)) }
         if !elevated.isEmpty { obj["elevated"] = .array(elevated.map(JSONValue.string)) }
+        if let fileAccessCeiling { obj["fileAccessCeiling"] = .array(fileAccessCeiling.modes.map(JSONValue.string)) }
         if let replyRoute { obj["replyRoute"] = replyRoute }
         if let rhythm { obj["rhythm"] = rhythm }
         if let action { obj["action"] = action }
+        if let causalWait { obj["causalWait"] = causalWait.json }
         return obj
     }
 
@@ -128,11 +207,15 @@ public struct DeskStep: Sendable, Equatable {
         promiseCaptures = previous.promiseCaptures + promiseCaptures.filter { !previous.promiseCaptures.contains($0) }
         peers = previous.peers + peers.filter { !previous.peers.contains($0) }
         elevated = previous.elevated + elevated.filter { !previous.elevated.contains($0) }
+        if let ceiling = previous.fileAccessCeiling {
+            fileAccessCeiling = ceiling.intersecting(fileAccessCeiling ?? .init())
+        }
         session = previous.session
         origin = previous.origin
         filedAt = previous.filedAt
         replyRoute = previous.replyRoute
         scheduledJobID = previous.scheduledJobID
+        causalWait = previous.causalWait
         // Only a new action is a new habit; dropping the action keeps the occurrence its words were already said for.
         habitRevision = action == previous.action || action == nil ? previous.habitRevision : DeskClock.newRefId()
     }

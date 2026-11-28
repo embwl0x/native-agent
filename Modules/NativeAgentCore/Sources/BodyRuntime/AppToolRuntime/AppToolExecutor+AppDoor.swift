@@ -668,16 +668,16 @@ extension AppToolExecutor {
         let action = route.action, surface = route.surface, turn = route.turn, execution = route.execution
         // Other keys app does not take still fail loudly; a deed key sent as null was omitted.
         for key in ToolNameAliases.appDeedKeys where input[key] == .null { input.removeValue(forKey: key) }
-        if input["expect"] == .null { input.removeValue(forKey: "expect") }
         // A deed beside one action is a batch of one; a find beside actions is one more step of it.
         if input["actions"] == nil || input["actions"] == .null, !action.isEmpty,
            ToolNameAliases.appDeedKeys.contains(where: { input[$0] != nil }) {
             var step: [String: JSONValue] = [:]
             for key in ["action", "args", "page", "item", "expect"] {
-                if let value = input.removeValue(forKey: key), value != .null { step[key] = value }
+                if let value = input.removeValue(forKey: key), key == "expect" || value != .null { step[key] = value }
             }
             input["actions"] = .array([.object(step)])
         }
+        if input["expect"] == .null { input.removeValue(forKey: "expect") }
         if case .array(let steps)? = input["actions"], let found = input["find"], found != .null {
             input["actions"] = .array(steps + [.object(["find": found])])
             input.removeValue(forKey: "find")
@@ -829,9 +829,6 @@ extension AppToolExecutor {
             return Self.previewPage(page, item: item)
         }
         if homeItem || page.lowercased() == "home" {
-            if input[Self.doorScriptKey] != .bool(true), !scope.isEmpty {
-                try await AgentWorkspaceNavigation.shared.rememberDoorPage(nil, dataRoot: root, scope: scope)
-            }
             var call: [String: JSONValue] = [:]
             if !item.isEmpty { call["action"] = .string(item) }
             if case .object(let args)? = input["args"] {
@@ -843,6 +840,9 @@ extension AppToolExecutor {
                             """), "next_call": .null])])
                 }
                 for (key, value) in args where value != .null { call[key] = value }
+            }
+            if input[Self.doorScriptKey] != .bool(true), !scope.isEmpty {
+                try await AgentWorkspaceNavigation.shared.rememberDoorPage(nil, dataRoot: root, scope: scope)
             }
             return await doorHome(call, turn: turn, execution: execution)
         }

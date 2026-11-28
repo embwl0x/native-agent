@@ -425,7 +425,11 @@ extension MemoryStorage {
                 throw MemoryV2Error.staleSupersession("A newer ruling owns this pin; the older replacement was not admitted.")
             }
         }
-        let now = NativeTimestampFormat.fractionalZulu(Date())
+        let committedAt = Date()
+        let now = NativeTimestampFormat.fractionalZulu(committedAt)
+        if !MemoryRecallScoring.hasStarted(validFrom: replacement.validFrom, at: committedAt) {
+            throw MemoryStorageError.invalidTemporalEvidence("replacement validity must have begun before it can supersede a memory")
+        }
         // The target's roots are read under the same transaction that retires it. A metadata-only change while the writer embedded must reach
         // the surviving memory too; a pre-insertion read cannot attest the roots present at this landing.
         let heldRoots = try MemoryRoot.roots(in: replacement.metadata)
@@ -472,12 +476,14 @@ extension MemoryStorage {
         row.metadata = .object(meta)
         row.lifecycle = MemoryLifecycle.corrected
         row.updatedAt = now
-        // It was true until its replacement became true; the row stays. A replacement known since before this row began ends it where it began.
-        let ends = replacement.validFrom ?? now
-        if let end = MemoryRecallScoring.parseTimestamp(ends), let begun = row.validFrom.flatMap(MemoryRecallScoring.parseTimestamp), end < begun {
+        let replacementStart = replacement.validFrom ?? now
+        let end = replacement.validFrom.flatMap(MemoryRecallScoring.parseTimestamp) ?? committedAt
+        let begun = row.validFrom.flatMap(MemoryRecallScoring.parseTimestamp)
+        let priorEnd = row.validTo.flatMap(MemoryRecallScoring.parseTimestamp)
+        if let begun, end < begun {
             row.validTo = row.validFrom
-        } else {
-            row.validTo = ends
+        } else if priorEnd.map({ end < $0 }) ?? true {
+            row.validTo = replacementStart
         }
         try db.execute(sql: """
             UPDATE memories SET lifecycle = ?, updated_at = ?, metadata_json = ?, valid_to = ?

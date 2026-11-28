@@ -257,7 +257,7 @@ public enum AgentContactThreads {
     }
 
     public static func mobileThreads(root: URL, contacts: ContactListFacade) async throws -> [MobileAgentThread] {
-        let snapshot = try await read(root: root, contacts: contacts, includeHelpers: false, refreshDoors: false)
+        let snapshot = try await read(root: root, contacts: contacts, refreshDoors: false)
         return try mobileThreads(snapshot: snapshot)
     }
 
@@ -307,7 +307,7 @@ public enum AgentContactThreads {
     }
 
     public static func read(root: URL, contacts contactOwner: ContactListFacade,
-                            includeHelpers: Bool = true, refreshDoors: Bool = true) async throws -> Snapshot {
+                            refreshDoors: Bool = true) async throws -> Snapshot {
         let recordsStamp = try threadStamp(root: root)
         let doors: [AgentContactRow]
         let recordRead: Result<[AgentConversationRecord], Error>
@@ -435,7 +435,7 @@ public enum AgentContactThreads {
             }
             // A contact that has spoken since the send answered it, whatever its record says.
             if record.phase != "attention", !id.hasPrefix("bot:"), lines[id]?.last.map({ !$0.fromAgent }) == true { continue }
-            switch AgentConversationDelivery.of(record, read: false) {
+            switch AgentConversationDelivery.of(record) {
             case .sending, .waiting: waiting.insert(id)
             case .answered: break
             case let state: status[id] = state
@@ -463,10 +463,9 @@ public enum AgentContactThreads {
             case (nil, nil): return a.offset < b.offset
             }
         }.map(\.element)
-        let helpers = includeHelpers ? try await NativeAgentEngine.forRoot(root).botsShelfRead() : []
         let running = try BotRunQueue(dataRoot: root).activeOrQueuedIDs()
         return Snapshot(contacts: ordered, lines: lines, waiting: waiting, status: status, flights: flights,
-                         helpers: helpers, running: running, flightRecords: latest.mapValues(\.id),
+                         helpers: [], running: running, flightRecords: latest.mapValues(\.id),
                          recordsStamp: recordsStamp,
                          otherRooms: try AgentScreen.otherRoomExchanges(dataRoot: root, identity: identity, since: .distantPast).map {
                              var event = $0

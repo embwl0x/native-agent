@@ -101,45 +101,28 @@ extension SwiftNativeChatOrchestrationClient {
     /// Request-scoped tool schemas and the caller's restricted dispatcher let this turn run without owning a chat transcript.
     public func runEphemeralToolTurn(
         message: String,
-        model: String = "",
-        reasoningEffort: String = "",
         fileAccess: String = "read_only",
-        attachments: [MultimodalAttachment] = [],
         persona: String? = nil,
-        providerID: String? = nil,
-        verifiedSessionId: String? = nil,
-        requireCompleted: Bool = false,
         surface: String,
         providerAdmission: (@Sendable () async throws -> Void)? = nil,
         purpose: String = "other",
         turn: Turn, work: ChatTurnWork
     ) async throws -> ChatResponse {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty && attachments.isEmpty {
+        if trimmed.isEmpty {
             throw ChatOrchestrationError.emptyMessage
         }
 
         let runId = Turn.mintID()
         let parentID = turn.id
         let thoughtTurn = turn.derived(id: runId, run: runId).with(\.session, nil)
-        // Trust's multimodal gates apply to every surface that carries attachments.
-        let attachmentInput = try Self.turnAttachmentInput(
-            message: message, attachments: attachments, dataRoot: dataRoot)
-        let imageBlocks = attachmentInput.imageBlocks
-        let modelOverride = model.trimmingCharacters(in: .whitespacesAndNewlines)
-        let effortOverride = reasoningEffort.trimmingCharacters(in: .whitespacesAndNewlines)
-        let providerOverride = providerID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         // Freeze and commit one cognitive projection for the turn; request-scoped identity creates no session or transcript owner.
         let projectionSessionId = "ephemeral:\(surface):\(runId)"
-        // Native tools require verified request identity even without a session row; it expires with the request and widens no authority.
-        let toolSessionId = verifiedSessionId ?? projectionSessionId
         let prepare = { [self] (turn: Turn) async throws in
             let context = try await engine.buildTurnContext(
                 surface: surface,
-                userMessage: attachmentInput.userMessage,
+                userMessage: message,
                 personaOverride: persona,
-                imageBlocks: imageBlocks,
-                sessionID: verifiedSessionId,
              turn: turn, work: work)
             let fromUser = Self.isUsersTurn(surface: surface, sessionId: projectionSessionId, dataRoot: dataRoot, turn: turn)
             if fromUser { UserTurnStamp.record(dataRoot: dataRoot, key: runId, door: surface) }
@@ -155,19 +138,9 @@ extension SwiftNativeChatOrchestrationClient {
             )
             return (turn, contextWithCognition, cognitiveProjection)
         }
-        // Admit any explicitly supplied route before sizing context; preserve every supplied field and resolve the rest from its surface.
         // An unadmitted thought obtains its route here; preparation never chooses a model.
         var route: TurnRouteAdmission?
-        if !modelOverride.isEmpty || !effortOverride.isEmpty || !providerOverride.isEmpty {
-            let surfaceRoute = try await engine.router.checkedRouteAdmission(for: surface, suppliedModel: modelOverride)
-            route = TurnRouteAdmission(
-                routingSurface: surfaceRoute.routingSurface,
-                modelId: modelOverride.isEmpty ? surfaceRoute.modelId : modelOverride,
-                reasoningEffort: effortOverride.isEmpty ? surfaceRoute.reasoningEffort : effortOverride,
-                providerId: providerOverride.isEmpty ? surfaceRoute.providerId : providerOverride,
-                serviceTier: surfaceRoute.serviceTier
-            )
-        } else if thoughtTurn.admission == nil {
+        if thoughtTurn.admission == nil {
             route = try await engine.router.checkedRoutingSnapshot().routeAdmission(
                 for: surface, choice: thoughtTurn.providerChoice)
         }
@@ -185,7 +158,7 @@ extension SwiftNativeChatOrchestrationClient {
             approvalFiler: approvalFiler,
             approvalTimeoutSeconds: approvalTimeoutSeconds,
             dataRoot: dataRoot,
-            verifiedSessionId: toolSessionId,
+            verifiedSessionId: projectionSessionId,
             tracePeerTurn: true,
             work: work
         )
@@ -202,8 +175,6 @@ extension SwiftNativeChatOrchestrationClient {
         let observation = ToolLoopTraceObservation()
         let result: TurnEngineResult
         do {
-            // Images and pending tool state belong to this worker's context,
-            // never the parent turn or another worker that inherited it.
             result = try await holding(turn.with(\.observation, observation)) { turn in
             try await holding(turn.with(\.execution, ChatTurnExecution())) { turn in
             try await holding(turn.with(\.peerSteering, turn.peerSteering ?? PeerDataTaint())) { turn in
@@ -216,7 +187,7 @@ extension SwiftNativeChatOrchestrationClient {
                     surface: surface,
                     userMessage: message,
                     sessionId: nil,
-                    toolSessionId: toolSessionId,
+                    toolSessionId: projectionSessionId,
                     runId: runId,
                     llm: llm,
                     tools: gated,
@@ -245,7 +216,7 @@ extension SwiftNativeChatOrchestrationClient {
         if state == .stopped {
             throw TurnEngineError.streamCancelled(partial: result.reply, underlying: CancellationError())
         }
-        if requireCompleted, result.completionState != .completed {
+        if result.completionState != .completed {
             throw EphemeralToolTurnIncomplete(
                 output: result.reply,
                 reason: "worker turn ended without a completed final reply; retained output is partial and attempted effects remain unverified"
@@ -255,7 +226,6 @@ extension SwiftNativeChatOrchestrationClient {
         let response = ChatResponse(
             runId: runId,
             model: result.modelUsed,
-            requestedModel: modelOverride.isEmpty ? nil : modelOverride,
             reasoningEffort: projectedContext.reasoningEffort,
             output: result.reply,
             sessionId: nil,

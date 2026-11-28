@@ -18,8 +18,7 @@ let libraries = [
 let package = Package(
     name: "NativeAgentCore",
     platforms: [.macOS("26.0")],  // Liquid Glass floor
-    products: libraries.map { .library(name: $0, targets: [$0]) }
-        + [.executable(name: "task-ledger", targets: ["TaskLedgerCLI"])],
+    products: libraries.map { .library(name: $0, targets: [$0]) },
     dependencies: [
         .package(url: "https://github.com/jpsim/Yams.git", from: "6.2.2"),
         .package(url: "https://github.com/groue/GRDB.swift.git", from: "7.0.0"),
@@ -116,14 +115,6 @@ let package = Package(
             resources: [
                 .copy("AgentConversations/Resources/grok-routine.json"),
                 .copy("AgentConversations/Resources/agent-hosts.json"),
-            ]
-        ),
-        .executableTarget(
-            name: "TaskLedgerCLI",
-            dependencies: [
-                .target(name: "NativeAgentCore"),
-                .target(name: "PersistenceCore"),
-                .target(name: "DeskCore"),
             ]
         ),
     ]

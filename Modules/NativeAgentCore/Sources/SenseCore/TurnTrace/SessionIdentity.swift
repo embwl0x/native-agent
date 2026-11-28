@@ -179,9 +179,7 @@ public enum SessionIdentityLedger {
 
     /// Compare index and creation sources; mixed-source and continued-elsewhere transcripts are informational.
     public static func flappingReport(dataRoot: URL) -> FlappingReport {
-        let sessionsPath = dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("sessions.json")
+        let sessionsPath = DataRootPaths.chatSessionIndex(in: dataRoot)
         guard let data = try? Data(contentsOf: sessionsPath),
               let rows = try? JSONDecoder().decode([ChatSession].self, from: data) else {
             return FlappingReport(
@@ -217,8 +215,7 @@ public enum SessionIdentityLedger {
                 unreadable += 1
                 continue
             }
-            let transcript = dataRoot
-                .appendingPathComponent("chat", isDirectory: true)
+            let transcript = DataRootPaths.chatDirectory(in: dataRoot)
                 .appendingPathComponent("messages", isDirectory: true)
                 .appendingPathComponent("\(safeId).jsonl")
             let size = (try? FileManager.default.attributesOfItem(atPath: transcript.path))

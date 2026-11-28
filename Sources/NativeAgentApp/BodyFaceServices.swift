@@ -66,9 +66,6 @@ final class BodyFaceServices {
                 throw Self.failure("contact_stop_unconfirmed", cause, effects: .unknown)
             }
             return Self.committed(.string("Stop recorded."), identities: [contact, record])
-        case .withdrawContactMessage(let item, let record):
-            let saved = try await engine.withdrawContactMessage(item, record: record, root: engine.dataRoot)
-            return Self.committed(.string("Held message withdrawn."), identities: [saved.id, item])
         case .resendContactMessage(let contact, let item, let session):
             return try await resend(contact: contact, item: item, session: session)
         case .exportMake(let request):
@@ -88,9 +85,6 @@ final class BodyFaceServices {
         case .reportOverlayWindow(let number):
             guard let connection else { throw FaceWireError.disconnected }
             await Self.overlay(number, connection: connection)
-            return .acknowledged
-        case .reportRendererDiagnostic(let diagnostic):
-            ModuleLog.app("[face:%@] %@", diagnostic.kind, diagnostic.message)
             return .acknowledged
         case .quitBody:
             AppDelegate.terminateFromRunLoop()

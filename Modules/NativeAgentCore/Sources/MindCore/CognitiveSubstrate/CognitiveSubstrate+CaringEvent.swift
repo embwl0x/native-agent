@@ -327,6 +327,8 @@ extension CognitiveSubstrate {
             weighted.arousal *= weight
             weighted.warmthBoost *= weight
             weighted.affectionWeight = weight
+            if weight > 0 { weighted.feeling?.strength *= weight }
+            else { weighted.feeling = nil }
             // ONE await-free segment: affect, tag and reconsolidation, each stamped at its own last mutation.
             var updated = affect
             if affect.lived < seq {
@@ -369,7 +371,7 @@ extension CognitiveSubstrate {
         }
         if !judgments.isEmpty {
             do {
-                _ = try await applyCares(
+                _ = try await applyCareJudgments(
                     judgments, provenance: careProvenance(for: event, appAuthored: appAuthored),
                     generation: caringAppraisalGeneration, seq: seq, momentID: momentID)
             } catch {
@@ -439,7 +441,7 @@ extension CognitiveSubstrate {
 
     /// The body's recently-dosed encounters, adopted from the body (which keeps them with its chemistry) after the opening and after each body fold.
     public func adoptRecentDoses(_ doses: [CaringAppraisalRequest.RecentEncounter]) {
-        recentCaringEncounters = Array(doses.suffix(Self.recentCaringEncounterCap))
+        recentCaringEncounters = Array(doses.suffix(OrganismCaringEvent.recentDoseCap))
     }
 
     /// A retelling verdict identifies no particular prior dose. Name the whole supplied candidate set, or state that no prior dose is on record.
@@ -482,8 +484,6 @@ extension CognitiveSubstrate {
     }
 
     static let caringContextSessionCap = 32
-    /// Six recent encounters exceed the relay-floor overlap while keeping judgment to one small call.
-    public static let recentCaringEncounterCap = 6
 }
 
 extension CognitiveDeferredTurnRecord {

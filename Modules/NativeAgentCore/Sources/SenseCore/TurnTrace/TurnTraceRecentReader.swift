@@ -121,7 +121,8 @@ public struct TurnTraceRecentReader: Sendable {
 
     @concurrent public func modelCalls(now: Date = Date()) async throws -> JSONValue {
         let weekAgo = now.addingTimeInterval(-7 * 86_400)
-        let evidence = try await traceEvidence(now: now, since: weekAgo)
+        let evidence = try await traceEvidence(now: now, since: weekAgo,
+                                               kinds: ["llm.call", "turn.terminal", "work.identified", "tool.dispatch"])
         var calls: [(Date, String, String, Int64?)] = []
         for row in evidence.rows {
             guard case .object(let object) = row,
@@ -236,7 +237,7 @@ public struct TurnTraceRecentReader: Sendable {
     }
 
     @concurrent public func usage(since: Date, now: Date = Date(), by: String = "model") async throws -> JSONValue {
-        let evidence = try await traceEvidence(now: now, since: since)
+        let evidence = try await traceEvidence(now: now, since: since, kinds: ["llm.call"])
         let snapshot = evidence.turns
         let metrics = ["inputTokens", "cacheReadInputTokens", "cacheCreationInputTokens", "cacheWriteInputTokens",
                        "cacheWrite5mInputTokens", "cacheWrite1hInputTokens", "cacheWrite30mInputTokens", "cacheWrite12hInputTokens",

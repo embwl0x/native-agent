@@ -42,7 +42,7 @@ public enum ContextSelectionLatencyProvenance: String, Codable, Equatable, Senda
     case unavailable
 }
 public struct ContextSelectionReceipt: Equatable, Sendable {
-    public let id: String
+    public internal(set) var id: String
     public let needFingerprint: String
     public let generationID: Int64
     public let sourceFingerprint: String
@@ -50,11 +50,11 @@ public struct ContextSelectionReceipt: Equatable, Sendable {
     public let eligibility: [ContextEligibilityDecision]
     public let candidateScores: [ContextCandidateScore]
     public let selectedAtomIDs: [ContextAtomID]
-    public let pointerAtomIDs: [ContextAtomID]
+    public internal(set) var pointerAtomIDs: [ContextAtomID]
     public let mandatoryAtomIDs: [ContextAtomID]
     public let coveredMandatoryAtomIDs: [ContextAtomID]
     public let mandatoryCoverage: Double
-    public let budget: ContextBudgetUsage
+    public internal(set) var budget: ContextBudgetUsage
     public let degradedSources: [ContextDegradedSourceNotice]
     public let cacheState: ContextSelectionCacheState
     public let measuredSelectionMicroseconds: Int?
@@ -63,7 +63,7 @@ public struct ContextSelectionReceipt: Equatable, Sendable {
     /// Comparable memories × query readings, diagnostic population only; never changes the floor.
     public let memoryPopulation: Int
     public let memoryFloorDroppedCount: Int
-    public let memoryRecall: [ContextMemoryRecallScore]
+    public internal(set) var memoryRecall: [ContextMemoryRecallScore]
 }
 extension ContextSelectionReceipt: Codable {
     private enum CodingKeys: String, CodingKey {
@@ -139,6 +139,7 @@ public struct ContextMemoryRecallScore: Codable, Equatable, Sendable {
     public let relevance: Double?
     public let reachability: Double
     public let rested: Bool
+    public internal(set) var associationSeed: ContextAtomID?
 
     public init(atomID: ContextAtomID, relevance: Double?, reachability: Double, rested: Bool) {
         self.atomID = atomID

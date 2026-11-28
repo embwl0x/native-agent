@@ -45,9 +45,11 @@ attentional continuity. Its `ContinuityField` and the organism's
   agent's own reply), novelty from the person's unfamiliar topic and a grown
   care's first movement, and located
   hand pain from the field's latest known tool outcomes. Care charge uses the
-  care owner's depth and half-life; new concerns' novelty fades on the `now`
+  care owner's depth and half-life. The half-life of a shared movement
+  changes from the telling by [the care's charge rule](SUBCONSCIOUS.md#cares).
+  New concerns' novelty fades on the `now`
   depth's two-hour half-life. Repeated reads add no feeling. The kernel maps
-  relational warmth to warmth, appraised pressure to urgency, and the greater
+  signed social warmth to warmth, appraised pressure to urgency, and the greater
   of appraised uncertainty and negative care charge into vigilance by taking
   the maximum with the body's decayed, event-earned vigilance. A refresh never
   erases workflow or response-outcome effects, and rereading cannot stack them.
@@ -55,24 +57,33 @@ attentional continuity. Its `ContinuityField` and the organism's
   0.15 times signed care charge minus 0.25 times appraised uncertainty.
   Warmth, urgency, novelty, curiosity and coherence use the canonical reading;
   vigilance also retains lived outcomes under its existing elapsed-time decay.
+  [The Hour's epistemic appetite](SUBCONSCIOUS.md#the-hour) lifts curiosity only in its own attention reading.
   No historical tags or stored files are rescored.
   `NativeCognitionRuntime.organismBodySample` caches its base body read for
   two seconds; provider health is derived only from checked lifecycle evidence. Unreadable trace history owes repair and never selects a cumulative capability belief as a substitute. Status-less outcomes remain unknown; summaries cannot attest success. The unproduced memory-hygiene signal vocabulary is removed.
-- The shared after-turn interpretation supplies caring judgments.
+- The shared after-turn interpretation supplies caring judgments. `native-turn-digest`
+  proposes the judgment from one bounded packet of evidence redacted by Swift. Swift verifies the
+  judgment and owns the fold that feeds the body.
   The door (`NativeCognitionRuntime.foldTurnMoment`) folds a lived moment:
   `CognitiveSubstrate.foldTurn` applies affect and validates caring admission,
   then `OrganismKernel.foldTurn` lives the body's whole share (caring dose,
-  after-turn reaction, correction cause) in one call with the body's
+  after-turn reaction and its confidence effect) in one call with the body's
   watermark (`OrganismPersistentState.lived`) and its recently-dosed
   encounters (kept with the chemistry for relay judgment).
 - `OrganismKernel.settleElapsedTime` applies elapsed-time decay on live
-  touches. Residual repair uses a derived quiet deadline in
-  `NativeCognitionRuntime+Deadlines.swift`, with bounded exact repair targets.
+  touches. `NativeCognitionRuntime+Deadlines.swift` holds residual repair's
+  derived quiet deadline on the one clock, with bounded exact repair targets.
   `mind.residual_repair` enters that same repair with only its quiet wait
   satisfied; current pressure/evidence/targets and live-turn admission still
   decide, and continuity must save before the result says `repaired`.
   [The clock contract](SUBCONSCIOUS.md#run-a-clock-owner-now) owns its reply and proof.
-  `OrganismDreamRepair` defines the charge/noise predicates used by selection, mutation and generation acknowledgement.
+  The selected `native-field-repair` part orders and sizes the field edits
+  for dream completion, REM integration and due residual repair. It receives
+  numeric field rows with target slots bound to exact IDs in Swift.
+  The kernel checks the proposed changes, commits against the captured body
+  revision, and owns receipts and field-generation acknowledgement.
+  Residual pressure, the admitted target window and its quiet deadline remain
+  live and frozen readings of the kernel.
   Live and frozen snapshots share one renderer: live reads settle the owner,
   while frozen reads decay a copy at their supplied clock.
 
@@ -91,10 +102,10 @@ These are the default bounds, defined by the corresponding configuration types.
 
 | Component | State and bound | Owner |
 | --- | --- | --- |
-| `ChemicalState` | Ten dimensions clamped to 0…1: warmth, vigilance, curiosity, fatigue, coherence, agency, tenderness, confidence, novelty, urgency. | `OrganismModels.swift`, `OrganismChemistry.swift` |
+| `ChemicalState` | Warmth spans −1…1 and decays toward zero. Vigilance, curiosity, fatigue, coherence, agency, tenderness, confidence, novelty and urgency span 0…1. | `OrganismModels.swift`, `OrganismChemistry.swift` |
 | `BodySchema` | Fixed domain readings with evidence, freshness and uncertainty; typed readings are transient and rebuilt after restart. | `OrganismModels.swift`, `OrganismTypedBodyBeliefs.swift`, `BodyEvidence.swift` |
 | `OrganismField` | At most 96 nodes and 192 edges. | `OrganismField.swift` |
-| `OrganismPredictionLedger` | At most 96 predictions; at most eight open horizon rows, looking no more than seven days ahead. | `OrganismPrediction.swift`, `OrganismPredictionModels.swift`, `OrganismPrediction+Horizon.swift` |
+| `OrganismPredictionLedger` | At most 96 ordinary predictions, including at most eight open dated horizons looking no more than seven days ahead. Peer waits stay with their jobs. | `OrganismPrediction.swift`, `OrganismPredictionModels.swift`, `OrganismPrediction+Horizon.swift` |
 | `OrganismDreamRepairState` | At most 16 operations and a 1,200-character felt summary. | `OrganismDreamRepair.swift` |
 
 Canonical domain owners still decide provider, device, notification, memory,
@@ -115,6 +126,14 @@ presentation clock after a successful live turn, even with an empty capsule;
 previews and unconfirmed deliveries do not consume cadence. Candidates that are not shown
 remain owed rather than counting as presented.
 
+**Diagnostics.** Living status dates its posture, body and behavior with the
+last successful composite read. If a refresh fails, the page labels the retained
+state and keeps that reading's time. Doctor's Body check dates its organ-beat
+verdict with the `OrganBody` read time. During initial coverage, the
+background-loop rows share one scheduler status read and one failure-history
+read. They use scheduler evidence for execution and listener health and check
+whether repairs are still owed.
+
 **Hand pain.** Located hand pain travels in the private posture context, naming
 the act and its recorded cause as receipt data. Generic dispatches are grouped by
 exact tool name; motor outcomes by action identity, with their domain as the
@@ -125,12 +144,18 @@ newest supported pain readings travel, bounded and redacted before clipping;
 the field retains receipt ownership, and the body saves no pain copy.
 
 **Felt state.** `CognitiveSubstrate+CapsuleFeltSignals.swift` reads projected
-chemistry directly into the first feeling paragraph, alongside mood, charged
-cares and recorded dream tone. Warmth and bracing can both be present; quiet
-states stay described. The capsule does not inject the instruction-bearing
-`OrganismChemistry.bodyLine` or phone telemetry. Intentions and Sound follow
-the frame in their own lanes; [Subconscious](SUBCONSCIOUS.md#what-reaches-the-model)
-owns fitting, completed-reply continuity and the sleep-to-dream evidence contract.
+chemistry and prospects into the first feeling paragraph, alongside mood, charged
+cares and recorded dream tone. Chosen fingerprint overlays follow the lead as
+plain words and replace any chemistry phrase they already express. Warmth and
+bracing can both be present. Quiet energy stays described. The instruction-bearing
+`OrganismChemistry.bodyLine` and phone telemetry remain outside the capsule.
+cares and recorded dream tone. Bracing can accompany warmth, and coldness can
+be felt without bracing. Warmth at rest adds no words. The capsule does not
+inject the instruction-bearing `OrganismChemistry.bodyLine` or phone telemetry.
+[Subconscious](SUBCONSCIOUS.md#what-reaches-the-model) owns fitting,
+completed-reply continuity and the sleep-to-dream evidence contract.
+Its [felt-object rule](SUBCONSCIOUS.md#reading-and-acting-on-their-state)
+governs the frame's named feeling and the felt moments used for Mac mood warmth.
 
 **Attention.** The kernel publishes predicted tool groups from pending tool
 expectations. `NativeCognitionRuntime.attentionSignals` reads the resident
@@ -139,8 +164,9 @@ selection hint, not another tool list or a grant of access. Leaving workspace ou
 in the Observatory also removes its recall terms and memory activation from the
 resident attention projection immediately and on subsequent reads.
 
-**Background budget.** `OrganismBehaviorPosture.loopBudget` is initialized directly to `normal`;
-fatigue, heat and Living Status resource pressure are body readings.
+**Background budget.** `OrganismBehaviorPosture.loopBudget` is initialized directly to `normal`.
+Fatigue, heat and Living Status resource pressure are body readings. Low Power
+Mode is reported in the somatic joint and has no effect on the budget.
 Reflection's [shared work-slot admission](COGNITION_WIRING.md#shared-work-slot-admission)
 is separate from body posture, alongside substrate load and call ceilings.
 
@@ -158,6 +184,19 @@ value. Repeated success therefore has diminishing influence.
 on the kernel's existing live touches, frozen reads and restore. The signal-count
 settling path is removed: traffic cannot buy extra relaxation. Canonical affect
 and care charge use their owners' analytic decay at the same reading instant.
+
+Canonical affect slows the recovery of uncertainty and task pressure during a
+bad stretch. Each of their own hurts in a live care fades on a four-hour
+half-life and counts while its remaining magnitude meets the care counter's
+felt floor. Their own later glad movement on that care spends its magnitude
+once, against the oldest still-felt hurt first. The total remaining hurt above
+or at the floor, minus the strongest, gives `x`.
+Any excess `x` slows base recovery and quiet calming by `25% × x / (1 + x)`.
+That rate is integrated between movements and floor crossings. Repeated reads
+or affect checkpoints spend the same recovery time with the same evidence.
+The two axes only move toward zero during decay. The rate comes from the saved
+care stories.
+
 `mind.settle_body` applies six hours' chemical relaxation to the current value
 and anchors it at the current instant. It does not advance field age or
 prediction expiry into the future; the next real elapsed interval still runs.
@@ -169,6 +208,11 @@ relaxes once in persistent chemistry on its six-hour half-life; a completed drea
 Live and frozen reads spend the full gap; cold restore caps fatigue decay at 72 hours.
 Wakefulness contributes a separately capped share while the process is running.
 Restart does not claim unobserved downtime as either sleep or wakefulness.
+Body presentation and Living Status use the thermal category from the same
+[BodyField sampling](SENSES.md#body-joints) that supplies the somatic joint.
+A category change invalidates Living Status through the cognition change stream.
+Frozen projections capture the receipt before fixing their projection time and
+retain the thermal sample's observation time. Other data roots use nominal pressure.
 
 Owners: `OrganismPersistence.swift`, `OrganismChemistry.swift`, `OrganismKernel.swift`.
 
@@ -189,13 +233,18 @@ with encounter chronology deciding whether it opens an encounter or coalesces.
 
 `OrganismCaringEvent` defines a 0.10 saturating dose and a rolling encounter
 window: repeated turns from one encounter do not each earn a dose. The
-encounter stamp and recent doses persist; the body's lived watermark proves once-only.
+encounter stamp and recent doses persist. Dose retention and relay appraisal share
+the six-dose cap. The body's lived watermark proves once-only.
 Tenderness fades on a three-day half-life. Sustained canonical warmth can
 contribute a smaller bounded undertone.
 
-Tenderness colors felt presentation. A correction receives its actual
-conversational appraisal, without an unconditional chemistry penalty or a
-second tenderness-based correction adjustment. Tenderness does not relax
+Tenderness can name a protective feeling when tension is present and a caring
+turn has occurred by the time of the read and is less than 90 minutes old.
+A direct speaker's grounded pushback on the prior completion lowers body
+confidence in the after-turn fold. A matching pending prediction supplies the
+existing settlement decrease. With no match, the fold lowers confidence by 3%
+of its current value. A standing memory judgment alone carries no confidence
+dose. Tenderness does not relax
 tool, provider, permission or verification policy. Dream completion does not
 dose tenderness.
 
@@ -211,6 +260,14 @@ An assistant completion receives no reward
 or pressure relief merely for speaking, and its tag does not inherit nearby
 tool bookkeeping. Its lived meaning comes through care appraisal; the next
 person's response receives the shared interpretation's affect judgment.
+Alongside its affect deltas, the [shared interpretation](COGNITION_WIRING.md#shared-after-turn-interpretation)
+can supply one grounded named feeling for a lived exchange. The canonical
+affect fold scales it by the same source weight as the deltas and decays it
+from the recorded exchange time before comparing it with the held feeling. A
+judgment replaces the held feeling when it has the same name or reaches the held
+feeling's decayed strength. Affect checkpoints hold its name, strength and
+exchange time. Strength decays on the six-hour mood recency half-life and falls
+out below 0.05. Older checkpoints read with no named feeling.
 Tool/provider/delivery prediction outcomes retain capability evidence and
 operational caution without changing chemistry. Body sampling likewise
 retains health evidence without turning path changes into mood. A failed tool
@@ -280,7 +337,19 @@ Canonical field and prediction labels retain Unicode letters and decimal digits
 within the existing 48-character bound; other runs normalize to separators.
 
 `NativeCognitionRuntime+Expectations.swift` composes dated expectations from
-Desk deferrals, staged approvals, unanswered completions and peer jobs.
+Desk deferrals, staged approvals and unanswered completions. Every working peer
+job keeps its own wait under the contact and job IDs. The oldest wait leads
+`toward`. The capsule and Today use the peer's bounded display name. The capsule
+reads elapsed time from the recorded start, and Today shows the fixed start date
+and local clock time. The ledger's required date holds a sentinel
+omitted from the read and the wake schedule. The wait carries no deadline or
+overdue state and stays outside the dated horizon and prediction capacity limits.
+Through the existing felt admission, an answer can bring relief. Failures, stops
+from the peer, and jobs stopped on restore or after a failed resume can bring
+disappointment. Jobs that need the person, chosen cancellations and older
+unattributed stops close quietly. A successful read closes a pending wait
+quietly when its job ID is absent, including after a pre-launch withdrawal or
+eviction of a finished record. An unreadable job store leaves the waits open.
 Scheduled-job horizons and their availability-only drain are removed. Source invalidations and meaningful boundaries
 refresh through one retained, coalesced task, without a minimum interval.
 
@@ -308,7 +377,7 @@ read. Empty, unreadable and truncated source sets do not award success, confiden
 or relief. A source store never written (a Desk with neither op-log nor compaction
 base) is complete and empty; only a written store that cannot be read is
 incomplete, so a fresh install with nothing on its horizon reads `nothing`, not
-`unavailable`. Held rows reach their actual due instants and expire as waiting,
+`unavailable`. Held dated rows reach their actual due instants and expire as waiting,
 without a confidence penalty or violation effect; capacity eviction likewise
 awards no outcome. Source completeness remains visible in `mind.horizon` replies,
 but its old somatic settlement key and absence-to-success path are removed.
@@ -325,13 +394,16 @@ Desk plans. Due-keyed rows recover a non-time name retained in `sourceOrgan`.
 Rekeying preserves held state without settlement or minting; duplicate
 identities keep the latest held row and terminal IDs remain stable. The former
 rule that keyed every plan by due instant and replaced Desk names with time
-words is removed. Other source kinds retain label identity.
+words is removed. Approvals, unanswered completions and older peer rows retain
+label identity.
 See [plan dates](MEMORY_SYSTEM_MAP.md#plan-dates).
 
-`OrganismProspectiveAffect` derives anticipation from that ledger into
-**projected** chemistry, with a shared maximum delta of 0.15 per dimension.
-It does not mutate stored chemistry. The frozen body value carries `toward`
-from its copied ledger at the same instant; the standalone read uses this path.
+`OrganismProspectiveAffect` takes one prospect reading from the prediction
+ledger. Pending outcomes supply bracing, dread and anticipation. A recent felt
+miss supplies a separate shadow, which still joins bracing for the chemistry
+calculation. Projected chemistry uses the reading with a shared maximum delta
+of 0.15 per dimension. The frozen body value carries the prospect and its
+`toward` read at the same instant. Stored chemistry retains its own values.
 
 ## Limiters & safeguards
 
@@ -377,9 +449,10 @@ JSON with ISO 8601 dates and sorted dream completion IDs. A matching digest
 and file revision skip the write. Restore, Reset Body and Clear invalidate the
 remembered revision. Reading an unfamiliar revision checks its stored state
 before comparing canonical bytes. A damaged file produces a persistence
-failure and retains its bytes. Encoding checks the schema and embedded field
-and prediction IDs before publication. `savedAt` remains the chemistry's settlement anchor,
-so genuine elapsed decay is saved with the values it anchors.
+failure and retains its bytes. Decoding rejects warmth outside −1…1 before decay.
+Encoding checks the schema and embedded field and prediction IDs before
+publication. `savedAt` remains the chemistry's settlement anchor, so genuine
+elapsed decay is saved with the values it anchors.
 Only its current schema is accepted: encounter, epoch, lived watermark, field
 identities, outcome weights and current body fields are checked, with no rekeying
 or invented old defaults. The persisted body bits remain the continuity
@@ -393,7 +466,9 @@ diary modification times and parent writability cannot establish completion or
 store health. Missing marks contribute no completion evidence; damaged marks
 make the reading unavailable. The completion effect follows the
 [dream settlement law](COGNITION_WIRING.md#the-subconscious-loops--times-artifacts-re-entry): its original section
-UUID, time and felt summary are saved before publication. Attention receives
+UUID, time, felt summary and optional-item drop count are saved before publication. `native-dream-cycle`
+supplies the proposed reading. The Swift diary owner checks the complete prose
+and settles it. Attention receives
 that completion before optional body effects. The feeling frame reads the
 recorded night admission and the diary journal's retained published completion,
 including after relaunch, for a neutral dream or disabled body. Missing evidence
@@ -402,20 +477,23 @@ journals; with no match, journal failures name their paths and causes. An enable
 that UUID with dream repair and wakefulness reset; retry saves that owner state
 without reapplying the signal. A disabled body records an explicit journal skip.
 Stop or a recovered diary publication cannot discard this step.
-Every actual provider call, including diagnostic
-and bridge calls, contributes vitals evidence; no debug-session exclusion exists.
+The dream and care-night beats follow the [dream Stop rule](STOP.md#stop).
+Successful and failed provider calls, including diagnostic and bridge calls,
+contribute vitals evidence. The sensor tracks elapsed call time when available,
+error rate and consecutive failures. Cancellation clears the start without
+contributing a sample.
 `NativeCognitionRuntime+BodyEvidence.swift`
 rebuilds typed domain evidence rather than restoring it as fresh health. The
 provider and body evidence identities share `BodyEvidenceReference.digest`;
 construction hashes supplied identifiers, while decoding requires canonical
-64-character lowercase SHA-256 digests and rejects raw IDs. Current dream repair
-reads only `feltDaySummary`; pressure signal metadata uses only `resourcePressure`
-with the enum's current raw values. Cognitive session metadata uses only `sessionId`.
+64-character lowercase SHA-256 digests and rejects raw IDs. The dream repair
+receipt retains its existing `feltDaySummary` evidence and flag. The field
+repair part receives only numeric evidence. Cognitive session metadata uses only `sessionId`.
 The sampler derives compatibility values from those readings; configuration availability
 remains exact and separate. APNs receipts with no HTTP answer remain unknown;
 only an actual HTTP rejection supplies provider-failure evidence. A missing
 fan-out receipt or diagnostic error alone never establishes a rejected write.
-Signed-phone, notification-target and ability/trace read failures carry `sourceUnavailable` and an owner repair obligation; failed inventory is never off/unconfigured, damaged newest outcomes never select older rows, and missing metadata never becomes now. Notification delivery reads the live kernel's current keyless publication-failure/signed-phone-receipt prediction, never optional APNs diagnostics. Missing, pending and expired predictions supply no terminal evidence; the optional `notificationPathHealthy` projection becomes unknown without a supported delivery verdict, including when unconfigured. Its neutral value is unknown; a delivery start clears it, a signed receipt supports true and publication failure supports false. Reachable/stale peer signals change reachability alone. Current notification readings replace persisted compatibility values rather than preserving unsupported health. Neither publication nor process receipt proves display or user attention. Signed-phone writes first read the existing record under the same lock and refuse to overwrite unreadable evidence. Damaged
+Signed-phone, notification-target and ability/trace read failures carry `sourceUnavailable` and an owner repair obligation; failed inventory is never off/unconfigured, damaged newest outcomes never select older rows, and missing metadata never becomes now. Notification delivery reads the live kernel's current keyless publication-failure/signed-phone-receipt prediction, never optional APNs diagnostics. A missing prediction supplies no evidence; a pending or expired one is a delivery attempt whose outcome is unknown (`deliveryAttempt` evidence dated at the attempt), and conduct asks for a receipt only for an attempt or failure inside its 36-hour evidence horizon, or when the inventory cannot be read; the optional `notificationPathHealthy` projection becomes unknown without a supported delivery verdict, including when unconfigured. Its neutral value is unknown; a delivery start clears it, a signed receipt supports true and publication failure supports false. The signed-peer sample supplies reachability and its staleness, and a live reachability signal sets the compatibility bit. Current notification readings replace persisted compatibility values rather than preserving unsupported health. Neither publication nor process receipt proves display or user attention. Signed-phone writes first read the existing record under the same lock and refuse to overwrite unreadable evidence. Damaged
 saved continuity remains unavailable and is not overwritten by a freshly initialized snapshot. Nothing
 writes the file before its restore has finished: the caring sink, the
 after-turn reaction, settle and reset join the cognition opening first (see
@@ -442,3 +520,5 @@ app {"action":"mind.inner_state","args":{"detail":"compact"}}
 `NativeCognitionRuntime.observatoryDetail` samples body and canonical affect at one
 timestamp; one frozen value supplies snapshot, projection and horizon. Inspection
 preserves cadence and mirrors last delivery; TrustCenter and domain owners govern actions.
+Observatory and Doctor reject body warmth outside −1…1 in live samples. Doctor
+also rejects out-of-range warmth when reading saved chemistry.

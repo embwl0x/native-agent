@@ -3,6 +3,7 @@ import Foundation
 import GRDB
 import NativeAgentCore
 import NativeAgentShared
+import PersistenceCore
 // Blueprint: | `Attention.swift` | Committed happening intake and settled thoughts carry birth steering in the one record |
 
 /// What takes a written happening into the agent's attention: the cognition runtime, installed at launch. A happening written before it is installed
@@ -15,6 +16,45 @@ public protocol AttentionIntake: Sendable {
 }
 
 extension ExperienceStore {
+    package func committedHappenings(matching waits: [(kind: Happening.Kind, subject: String, since: String)]) throws -> [Experience] {
+        guard let earliest = waits.map({ $0.since }).min() else { return [] }
+        let selectors = try JSONValue.array(waits.map {
+            .object(["kind": .string($0.kind.rawValue), "subject": .string($0.subject), "since": .string($0.since)])
+        }).serialize(pretty: false)
+        let ids = try database().read { db in
+            try String.fetchAll(db, sql: """
+                SELECT e.id FROM experience e
+                WHERE e.kind = 'happening' AND e.at > ? AND EXISTS (
+                    SELECT 1 FROM json_each(?) AS wait
+                    WHERE json_extract(e.born, '$.happening.kind') = json_extract(wait.value, '$.kind')
+                      AND json_extract(e.born, '$.happening.subject') = json_extract(wait.value, '$.subject')
+                      AND e.at > json_extract(wait.value, '$.since')
+                ) ORDER BY e.at, e.rowid
+                """, arguments: [earliest, selectors])
+        }
+        return try ids.map { id in
+            guard let row = try experience(id) else { throw Attention.RecordError.missingHappening(id) }
+            return row
+        }
+    }
+
+    fileprivate func beginCausalMoment(_ born: Experience, prefix: String, result: String, baseline: String?) throws -> Bool {
+        let previous = try recordedExperiences(idPrefix: prefix, kind: .happening, limit: 1)
+        if let unread = previous.unreadable.first { throw unread.cause }
+        let last = previous.items.first?.evidence.first { $0.source == "causal-result" }?.id
+        guard result != (last ?? baseline) else { return false }
+        return try begin(born, durable: true)
+    }
+
+    package func consumeCausalMoment(_ moment: Experience, thought: String) throws -> Bool {
+        try Task.checkCancellation()
+        guard let route = moment.happening?.destination,
+              let live = try experience(moment.id), live.owes[route]?.phase == .owed else { return false }
+        try append([.obligation(key: route, phase: .accepted, evidence: .init(source: "thought", id: thought))],
+                   to: live.id, durable: true)
+        return true
+    }
+
     /// Only committed weighing of this watch on this subject consumes its first-news floor.
     public func weighed(watch: String, subject: String) throws -> Bool {
         try database().read { db in
@@ -68,14 +108,29 @@ public enum Attention {
         try await commit(happening, dataRoot: dataRoot, checked: true)
     }
 
-    @concurrent private static func commit(_ happening: Happening, dataRoot: URL, checked: Bool) async throws {
+    package static func postCausalMoment(_ happening: Happening, prefix: String, result: String, baseline: String?,
+                                         source: String?, dataRoot: URL) -> Task<Void, Never> {
+        pendingPosts.launch {
+            _ = try? await commit(happening, dataRoot: dataRoot, checked: false, causal: (prefix, result, baseline, source))
+        }
+    }
+
+    @concurrent private static func commit(_ happening: Happening, dataRoot: URL, checked: Bool,
+                                           causal: (prefix: String, result: String, baseline: String?, source: String?)? = nil) async throws {
         let store = ExperienceStore.at(dataRoot)
         let operation = "attention.post:" + happening.id
-        let born = Experience(id: happening.id, kind: .happening, cause: [happening.door], addressedTo: [happening.destination],
+        let born = Experience(id: happening.id, kind: .happening, cause: [happening.door] + (causal?.source.map { [$0] } ?? []),
+            evidence: causal.map { [.init(source: "causal-result", id: $0.result)] } ?? [], addressedTo: [happening.destination],
             owes: happening.owed ? [happening.destination: .init(to: happening.destination)] : [:], happening: happening,
             steeredBy: Array(Set((happening.peers ?? []) + (happening.elevated ?? []))).sorted())
         do {
-            let inserted = try await store.begin(born, durable: checked)
+            let inserted: Bool
+            if let causal {
+                inserted = try await store.beginCausalMoment(born, prefix: "happening:" + causal.prefix, result: causal.result,
+                                                             baseline: causal.baseline)
+            } else {
+                inserted = try await store.begin(born, durable: checked)
+            }
             guard inserted || checked else { return }
             guard let saved = try await store.experience(happening.id), let committed = saved.happening else {
                 throw RecordError.missingHappening(happening.id)

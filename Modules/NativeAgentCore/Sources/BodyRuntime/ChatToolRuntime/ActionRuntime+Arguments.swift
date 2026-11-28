@@ -1,7 +1,7 @@
+import PersistenceCore
 import Foundation
 import NativeAgentCore
-import PersistenceCore
-// Blueprint: | `ActionRuntime+Arguments.swift` | `SwiftToolDispatcher`: exact `jsonInt` |
+// Blueprint: | `ActionRuntime+Arguments.swift` | `SwiftToolDispatcher`: Boolean flag coercion |
 
 // MARK: - Shared tool implementation helpers
 
@@ -12,10 +12,5 @@ extension SwiftToolDispatcher {
         case .some(.string(let s)): return ["true", "1", "yes", "y", "on"].contains(s.lowercased())
         default: return false
         }
-    }
-
-    static func jsonInt(_ value: JSONValue?) -> Int? {
-        if case .double(let number)? = value, number != number.rounded() { return nil }
-        return value?.integerValue.flatMap(Int.init(exactly:))
     }
 }

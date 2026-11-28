@@ -20,8 +20,7 @@ extension NativeOAuthFlow {
 
     /// Endpoint text can echo secrets: redact every typed value into local logs only, and use fixed recovery words in cards, transcripts and model results.
     public nonisolated static func inlineSetupFailureReason(
-        _ raw: String, service: String, secret: String = "token", typed: [String] = [],
-        otherwise: String? = nil
+        _ raw: String, service: String, secret: String = "token", typed: [String] = []
     ) -> String {
         var logged = TurnTraceRedactor.redactText(raw)
         for value in typed where value.count >= 6 {
@@ -48,7 +47,7 @@ extension NativeOAuthFlow {
         if has("scope", "permission", "forbidden", "403", "not accessible") {
             return "\(service) is missing a permission or scope this needs. Add it in \(service), then try again."
         }
-        return otherwise ?? "\(service): other error (details in the app log)."
+        return "\(service): other error (details in the app log)."
     }
 
 }
@@ -177,8 +176,7 @@ public enum OAuthGrantOperations {
     /// Shared transport for sign-in and adapter refresh. Adapters keep their session, encoding and error classification; every grant refuses redirects.
     public static func post(
         _ url: URL, _ body: [String: String], json: Bool = false, basic: Bool = false,
-        session suppliedSession: URLSession? = nil,
-        encodeForm: ([String: String]) -> String = formEncode
+        session suppliedSession: URLSession? = nil
     ) async throws -> (data: Data, response: URLResponse) {
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
@@ -194,7 +192,7 @@ public enum OAuthGrantOperations {
             req.httpBody = try JSONSerialization.data(withJSONObject: body)
         } else {
             req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-            req.httpBody = Data(encodeForm(body).utf8)
+            req.httpBody = Data(formEncode(body).utf8)
         }
         let session = suppliedSession ?? ProviderHTTP.makeSession()
         defer { if suppliedSession == nil { session.invalidateAndCancel() } }
@@ -330,7 +328,7 @@ public enum OAuthGrantOperations {
         }
     }
 
-    public static func formEncode(_ params: [String: String]) -> String {
+    private static func formEncode(_ params: [String: String]) -> String {
         params.map { "\(formComponent($0.key))=\(formComponent($0.value))" }.joined(separator: "&")
     }
 
@@ -379,18 +377,18 @@ public enum OAuthGrantOperations {
         }
     }
 
-    public static func redact(_ s: String, bearerReplacement: String = "Bearer ***REDACTED***") -> String {
+    public static func redact(_ s: String) -> String {
         var out = NativeAgentSecretRedactor.redactText(s) { kind, value in
             switch kind {
             case "GITHUB_TOKEN": return value.hasPrefix("github_pat_") ? "github_pat_***REDACTED***" : "gh***REDACTED***"
             case "SLACK_TOKEN": return "xox***REDACTED***"
-            case "BEARER_TOKEN": return bearerReplacement
+            case "BEARER_TOKEN": return "Bearer ***REDACTED***"
             default: return "***REDACTED***"
             }
         }
         let patterns: [(String, String)] = [
             // Short bearer values and PATs, JWTs and refresh tokens are stricter OAuth-boundary additions to the shared baseline.
-            ("Bearer [A-Za-z0-9._-]+",                               bearerReplacement),
+            ("Bearer [A-Za-z0-9._-]+",                               "Bearer ***REDACTED***"),
             ("github_pat_[A-Za-z0-9_]{20,}",                          "github_pat_***REDACTED***"),
             ("eyJ[A-Za-z0-9._-]+\\.[A-Za-z0-9._-]+\\.[A-Za-z0-9._-]+", "***REDACTED***"),
             ("rt_[A-Za-z0-9._-]{16,}",                               "rt_***REDACTED***"),

@@ -38,7 +38,6 @@ enum NativeAgentMobileTheme {
     typealias Radius = NativeAgentRadius
 
     enum Layout {
-        static let roomColumn: CGFloat = 740
         static let controlHeight: CGFloat = 44
         static let hairline: CGFloat = 1
     }

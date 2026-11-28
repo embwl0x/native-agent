@@ -3,14 +3,13 @@ import Darwin
 @_exported import NativeAgentShared
 import PersistenceCore
 import NativeAgentCore
+import SenseCore
 import ProviderRouting
 import CloudKit
 import MindCore
 import Observation
 import MacNerves
 import DeskCore
-import SenseCore
-@unsafe @preconcurrency import EventKit
 import Synchronization
 import os
 import OSLog
@@ -50,6 +49,8 @@ public actor ChatTranscriptCache {
             } else {
                 do {
                     var projection = try ChatShellOpeningLine.read(sessionID: session.id, dataRoot: dataRoot)
+                    // A conversation with no messages has no transcript yet; only one that has spoken can be missing it.
+                    if session.messageCount == 0 { projection.issue = nil }
                     projection.revision = revision
                     projection.lastTurn = try ChatShellOpeningLine.readLastTurn(sessionID: session.id, dataRoot: dataRoot)
                     projections[session.id] = projection
@@ -67,7 +68,7 @@ public actor ChatTranscriptCache {
     func history(at path: URL, cached: Bool = true, limit: Int? = nil) async throws
         -> (history: SessionHistoryReadResult, cacheHit: Bool) {
         let key = path.path
-        let before = Self.identity(at: path)
+        let before = ContactThread.regularFileRevision(at: path)
         // Taking the entry lets an unshared message array grow in place.
         var entry = entries.removeValue(forKey: key)
         recentPaths.removeAll { $0 == key }
@@ -88,12 +89,12 @@ public actor ChatTranscriptCache {
         let history = try await SessionHistoryReader(dataRoot: root).messagesWithStats(
             forSessionId: path.deletingPathExtension().lastPathComponent, limit: limit)
         // Retention inspects only the boundary; the owner's full/limited read above is returned unchanged.
-        if !history.stats.truncated, let before, Self.identity(at: path) == before, history.stats.mode != "read_failed",
+        if !history.stats.truncated, let before, ContactThread.regularFileRevision(at: path) == before, history.stats.mode != "read_failed",
            case .present(_, _, let size, _, _, _, _) = before {
             let boundary: Data?
             do { boundary = try Self.boundary(at: path, identity: before) }
             catch { return (history, false) } // Unreadable cache metadata cannot certify a held revision.
-            if let boundary, Self.identity(at: path) == before {
+            if let boundary, ContactThread.regularFileRevision(at: path) == before {
                 let offset: Int64? = limit == nil && ["full", "damaged_history"].contains(history.stats.mode) ? size : nil
                 store(Entry(identity: before, history: history, offset: offset, boundary: boundary), for: key)
             }
@@ -143,7 +144,7 @@ public actor ChatTranscriptCache {
                     try SessionHistoryReader.appendCompleteMessages(from: appended, sourceBytes: Int64(size), to: &held.history)
                     let history = held.history
                     if ["full", "damaged_history"].contains(history.stats.mode) {
-                        if appended.dropLast().last != 0x0D, Self.identity(at: source) == identity {
+                        if appended.dropLast().last != 0x0D, ContactThread.regularFileRevision(at: source) == identity {
                             store(Entry(identity: identity, history: history, offset: Int64(size), boundary: Self.boundary(in: appended)), for: key)
                         }
                         ModuleLog.app("[transcript-tail] session=%@ prefix=%lld appended=%ld rows=%ld", id, offset,
@@ -209,13 +210,5 @@ public actor ChatTranscriptCache {
     private func touch(_ key: String) {
         recentPaths.removeAll { $0 == key }
         recentPaths.append(key)
-    }
-
-    private static func identity(at path: URL) -> SnapshotTailOpLog.FileStamp? {
-        var info = stat()
-        // Cache only inspected regular files. ctime catches restored-mtime rewrites and permission changes; inode catches replacement.
-        guard unsafe lstat(path.path, &info) == 0,
-              (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG) else { return nil }
-        return SnapshotTailOpLog.FileStamp(info)
     }
 }

@@ -5,6 +5,81 @@ import PersistenceCore
 import NativeAgentShared
 // Blueprint: | `AbilityAccounting.swift` | Locked terminal evidence and learned-use accounting |
 extension AbilityStore {
+    public enum WakeOrigin: String, Codable, Sendable { case schedule, signal }
+
+    public enum RunSource: Sendable {
+        case personTap
+        case wake(part: String, origin: WakeOrigin, delivery: UUID)
+    }
+
+    private enum RunOrigin: String, Codable, Sendable {
+        case agent, person, schedule, signal
+    }
+
+    private struct RunDetail: Codable, Sendable {
+        let origin: RunOrigin?
+        let wake: UUID?
+        let effects: Experience.Effects
+    }
+
+    public struct WakeUsage: Sendable {
+        public static let didChange = Notification.Name("NativeAgent.AbilityStore.WakeUsageDidChange")
+
+        public fileprivate(set) var wakes = 0
+        public fileprivate(set) var withEffects = 0
+        public fileprivate(set) var unconfirmed = 0
+        public fileprivate(set) var lastRunOrigin: String?
+
+        public init() {}
+
+        public var counts: JSONValue {
+            .object(["days": .int(14), "wakes": .int(Int64(wakes)), "with_effects": .int(Int64(withEffects)),
+                     "unconfirmed": .int(Int64(unconfirmed))])
+        }
+
+        public var line: String {
+            var line = "Last 14 days · \(wakes) recorded unasked wakes · \(withEffects) with effects"
+            if unconfirmed > 0 { line += " · \(unconfirmed) unconfirmed" }
+            return line
+        }
+    }
+
+    private static let runDetailSource = "ability.accounting"
+    private static let runDetailKind = "ability.run"
+    private static let wakeRunDetailKind = "ability.wake_run"
+
+    @concurrent public static func wakeUsage(dataRoot: URL, part: String? = nil, now: Date = Date()) async throws -> [String: WakeUsage] {
+        let kinds = part == nil ? [wakeRunDetailKind] : [wakeRunDetailKind, runDetailKind]
+        let rows: [ExperienceStore.Detail]
+        do {
+            rows = try await ExperienceStore.at(dataRoot).recordedDetails(.init(sources: [runDetailSource], subjects: part.map { [$0] },
+                kinds: kinds, from: now.addingTimeInterval(-ExperienceStore.detailHorizon), through: now)).items
+        } catch CocoaError.fileReadNoSuchFile { return [:] }
+        let decoder = JSONDecoder()
+        var latest: [String: Date] = [:]
+        var usage: [String: WakeUsage] = [:]
+        var wakes: [String: [UUID: Experience.Effects]] = [:]
+        for row in rows {
+            let run = try decoder.decode(RunDetail.self, from: row.row)
+            if let wake = run.wake, run.origin == .schedule || run.origin == .signal {
+                let prior = wakes[row.subject]?[wake]
+                let effects: Experience.Effects = if prior == .occurred || run.effects == .occurred { .occurred }
+                    else if prior == .unknown || run.effects == .unknown { .unknown } else { .none }
+                wakes[row.subject, default: [:]][wake] = effects
+            }
+            if row.at >= (latest[row.subject] ?? .distantPast) {
+                latest[row.subject] = row.at
+                usage[row.subject, default: .init()].lastRunOrigin = run.origin?.rawValue
+            }
+        }
+        for (id, runs) in wakes {
+            usage[id, default: .init()].wakes = runs.count
+            usage[id, default: .init()].withEffects = runs.values.filter { $0 == .occurred }.count
+            usage[id, default: .init()].unconfirmed = runs.values.filter { $0 == .unknown }.count
+        }
+        return usage
+    }
+
     /// Terminal accounting survives caller cancellation with its causal act. A run owns this once; projections do not manufacture run evidence.
     @concurrent public func settleRun(id: String, version: String, receipt: JSONValue, input: JSONValue?, dependencySnapshot: JSONValue? = nil,
         turn: Turn?, at: Date = Date()) async -> JSONValue {
@@ -13,7 +88,7 @@ extension AbilityStore {
             fields["ability_run"] = .object(["id": .string(id), "version": .string(version),
                 "at": .string(NativeTimestampFormat.fractionalZulu(at))])
             do {
-                try Self.withLock {
+                let recorded = try Self.withLock {
                     let recorded = try accounting(id: id, turn: turn) {
                         // Observed contracts are evidence of this invocation, not a replacement for the candidate's sealed inputs.
                         if let snapshot = dependencySnapshot?.objectValue, try readFile(id: id, slot: .current) != nil,
@@ -46,6 +121,13 @@ extension AbilityStore {
                     if let upgrade = recorded.upgrade {
                         fields["upgrade"] = .string(upgrade)
                     }
+                    return recorded
+                }
+                if recorded.part {
+                    do { try await retainPartRun(id, turn: turn, fields: fields, at: at) }
+                    catch {
+                        nativeLog("[ability] Recorded run detail unavailable for %@: %@", id, TurnSecretRedactor.redactText(error.localizedDescription))
+                    }
                 }
             } catch {
                 fields.removeValue(forKey: "refreshed"); fields.removeValue(forKey: "dependencySnapshot")
@@ -53,6 +135,34 @@ extension AbilityStore {
             }
             return .object(fields)
         }
+    }
+
+    private func retainPartRun(_ id: String, turn: Turn?, fields: [String: JSONValue], at: Date) async throws {
+        let origin: RunOrigin?
+        let wake: UUID?
+        switch turn?.abilityRunSource {
+        case .wake(let part, let source, let delivery)? where part == id:
+            origin = source == .schedule ? .schedule : .signal
+            wake = delivery
+        case .personTap?:
+            origin = .person
+            wake = nil
+        default:
+            origin = turn.map { $0.personAct == nil ? .agent : .person }
+            wake = nil
+        }
+        let reported = fields["effects"]?.stringValue.flatMap(ToolFailureError.Effects.init(rawValue:))
+        let effects: Experience.Effects = switch reported {
+        case .occurred?, .partial?: .occurred
+        case .some(.none): .none
+        default: .unknown
+        }
+        let detail = RunDetail(origin: origin, wake: wake, effects: effects)
+        defer {
+            if wake != nil { NotificationCenter.default.post(name: WakeUsage.didChange, object: nil) }
+        }
+        try await ExperienceStore.at(dataRoot).note([.init(source: Self.runDetailSource, at: at, subject: id,
+            kind: wake == nil ? Self.runDetailKind : Self.wakeRunDetailKind, row: JSONEncoder().encode(detail))])
     }
     /// The stem alone records terminal evidence, including peer-steered runs; repeated world stops signal reason@step once per upgrade.
     @discardableResult
@@ -314,18 +424,19 @@ extension AbilityStore {
     /// Not written when the run's part or version is gone.
     private func recordRunEvidence(id: String, version: String, receipt: JSONValue, input: JSONValue?, nativeSense: JSONValue?, turn: Turn?) throws -> (
         written: Bool,
-        upgrade: String?) {
+        upgrade: String?,
+        part: Bool) {
         return try Self.withLock {
             // Native/bundled reads have a registry record but no executable file.
             guard let current = try readFile(id: id, slot: .current) ?? nativeSense.map({
                 try File(id: id, kind: .sense, metadata: ["record": $0, "version": $0.objectValue?["version"] ?? .int(1)], body: "", pathExtension: "js")
-            }) else { return (false, nil) }
+            }) else { return (false, nil, false) }
             let previous = try readFile(id: id, slot: .previous)
             let currentIdentity = identity(current), previousIdentity = previous.flatMap(identity)
             let file: File
             if currentIdentity == version { file = current }
             else if previousIdentity == version, let previous { file = previous }
-            else { return (false, nil) }
+            else { return (false, nil, false) }
             var state = try readState(), row = state[id]?.objectValue ?? [:]
             var runs = row["runs"]?.objectValue ?? [:], versions = runs["versions"]?.objectValue ?? [:]
             let currentKey = versionKey(current), previousKey = previous.map(versionKey)
@@ -453,7 +564,7 @@ extension AbilityStore {
                         count)))
                 }
             }
-            return (true, upgrade)
+            return (true, upgrade, file.kind == .part)
         }
     }
     private static func runTime(_ value: JSONValue?, field: String) throws -> Date? {
@@ -502,5 +613,16 @@ extension AbilityStore {
             change(&fields); stats[id] = .object(fields)
             if stats[id] != before { try writeState(stats) }
         }
+    }
+}
+
+private enum AbilityRunSourcePart: TurnPart {
+    static let unset: AbilityStore.RunSource? = nil
+}
+
+extension Turn {
+    public var abilityRunSource: AbilityStore.RunSource? {
+        get { self[AbilityRunSourcePart.self] }
+        set { self[AbilityRunSourcePart.self] = newValue }
     }
 }

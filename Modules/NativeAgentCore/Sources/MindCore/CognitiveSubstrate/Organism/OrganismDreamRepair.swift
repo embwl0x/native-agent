@@ -1,6 +1,7 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `OrganismDreamRepair.swift` | `OrganismDreamRepair` enum; `applying`, `applyingResidualPressure` |
+import NativeAgentShared
+// Blueprint: | `OrganismDreamRepair.swift` | Typed field repair readings, plan validation and durable receipts |
 
 public enum OrganismRepairOperationKind: String, Codable, Sendable, Equatable, CaseIterable {
     case softenHighArousal
@@ -215,209 +216,126 @@ public enum OrganismDreamRepair {
         edge.uncertainty >= 0.18 || (edge.eligibility >= 0.45 && edge.weight >= 0.12)
     }
 
-    public static func applying(
-        signal: SomaticSignal,
-        to field: OrganismField,
-        state: OrganismDreamRepairState,
-        makeUUID: () -> UUID = { UUID() }
-    ) -> (field: OrganismField, state: OrganismDreamRepairState) {
-        guard signal.kind == .dreamCompleted || signal.kind == .remIntegrated else {
-            return (field, state)
+    package struct Plan: Sendable {
+        var field: OrganismField
+        var operations: [OrganismRepairOperation]
+    }
+
+    package struct Reading: Sendable {
+        private let field: OrganismField
+        private let nodes: [OrganismNode]
+        private let edges: [OrganismEdge]
+        private let residual: Bool
+
+        init(field: OrganismField, opportunity: OrganismResidualRepairOpportunity? = nil) {
+            self.field = field
+            residual = opportunity != nil
+            nodes = (opportunity.map { $0.chargedNodeIDs.compactMap { field.nodes[$0] } } ?? Array(field.nodes.values))
+                .sorted { $0.id < $1.id }
+            edges = (opportunity.map { $0.noisyEdgeIDs.compactMap { field.edges[$0] } } ?? Array(field.edges.values))
+                .sorted { $0.id < $1.id }
         }
 
-        let feltSummary = feltDaySummary(from: signal.metadata, limit: maximumFeltSummaryCharacters)
-        var nextField = field
-        var operations: [OrganismRepairOperation] = []
-
-        repairResidualCharge(
-            ids: nextField.nodes.values.filter(hasRepairableCharge).sorted {
-                if $0.charge != $1.charge { return $0.charge > $1.charge }
-                return $0.id < $1.id
-            }.map(\.id),
-            in: &nextField, operations: &operations, limit: maximumOperations
-        )
-        strengthenWarmAssociations(in: &nextField, operations: &operations, limit: maximumOperations)
-        let noiseLimit = min(maximumOperations, operations.count + 4)
-        repairResidualNoise(
-            ids: nextField.edges.values.filter(hasRepairableNoise).sorted {
-                if $0.uncertainty != $1.uncertainty { return $0.uncertainty > $1.uncertainty }
-                if $0.eligibility != $1.eligibility { return $0.eligibility > $1.eligibility }
-                return $0.id < $1.id
-            }.map(\.id),
-            in: &nextField, operations: &operations, limit: noiseLimit
-        )
-
-        let flags = contradictionFlags(in: feltSummary, remaining: max(0, maximumOperations - operations.count))
-        operations.append(contentsOf: flags)
-        let evidence = evidenceLinks(
-            feltSummary: feltSummary,
-            operations: operations,
-            flags: flags
-        )
-
-        let receipt = OrganismDreamRepairReceipt(
-            id: makeUUID(),
-            generatedAt: signal.occurredAt,
-            reason: signal.kind.rawValue,
-            feltDaySummaryCharacters: feltSummary.count,
-            operations: operations,
-            evidence: evidence,
-            flagCount: flags.count,
-            sourceFieldGeneration: acknowledgedGeneration(
-                after: nextField,
-                currentGeneration: nextField.mutationGeneration,
-                previousGeneration: state.lastReceipt?.sourceFieldGeneration ?? 0
-            )
-        )
-        nextField.lastUpdatedAt = signal.occurredAt
-        return (
-            nextField,
-            OrganismDreamRepairState(
-                receiptCount: min(state.receiptCount, Int.max - 1) + 1,
-                lastReceipt: receipt
-            )
-        )
-    }
-
-    /// Repair only a current due opportunity using exact residual evidence; field maintenance creates no model call, prompt, memory or action.
-    public static func applyingResidualPressure(
-        _ opportunity: OrganismResidualRepairOpportunity,
-        at date: Date,
-        to field: OrganismField,
-        state: OrganismDreamRepairState,
-        makeUUID: () -> UUID = { UUID() }
-    ) -> (field: OrganismField, state: OrganismDreamRepairState) {
-        guard opportunity.ready,
-              opportunity.localRepairPressure >= OrganismResidualRepair.minimumPressure,
-              opportunity.evidenceCount > 0 else { return (field, state) }
-
-        var nextField = field
-        var operations: [OrganismRepairOperation] = []
-        repairResidualCharge(
-            ids: opportunity.chargedNodeIDs,
-            in: &nextField,
-            operations: &operations,
-            limit: maximumOperations
-        )
-        repairResidualNoise(
-            ids: opportunity.noisyEdgeIDs,
-            in: &nextField,
-            operations: &operations,
-            limit: maximumOperations
-        )
-        guard !operations.isEmpty else { return (field, state) }
-
-        let evidence = [OrganismDreamRepairEvidence(
-            id: "evidence:residual-pressure",
-            label: "Prediction and field residuals",
-            summary: "Local residual repair used \(opportunity.evidenceCount) bounded evidence signal(s)."
-        )]
-        let receipt = OrganismDreamRepairReceipt(
-            id: makeUUID(),
-            generatedAt: date,
-            reason: "residual_pressure",
-            feltDaySummaryCharacters: 0,
-            operations: operations,
-            evidence: evidence,
-            flagCount: 0,
-            sourceFieldGeneration: acknowledgedGeneration(
-                after: nextField,
-                currentGeneration: nextField.mutationGeneration,
-                previousGeneration: state.lastReceipt?.sourceFieldGeneration ?? 0
-            )
-        )
-        nextField.lastUpdatedAt = date
-        return (
-            nextField,
-            OrganismDreamRepairState(
-                receiptCount: min(state.receiptCount, Int.max - 1) + 1,
-                lastReceipt: receipt
-            )
-        )
-    }
-
-    private static func repairResidualCharge(
-        ids: [String],
-        in field: inout OrganismField,
-        operations: inout [OrganismRepairOperation],
-        limit: Int
-    ) {
-        for id in ids.prefix(max(0, limit - operations.count)) {
-            guard var node = field.nodes[id], hasRepairableCharge(node) else { continue }
-            let before = node.charge
-            node.charge = OrganismNode.clamp01(node.charge * 0.52)
-            node.activation = max(0.05, OrganismNode.clamp01(node.activation * 0.82))
-            field.nodes[id] = node
-            operations.append(OrganismRepairOperation(
-                id: "soften:\(id)",
-                kind: .softenHighArousal,
-                targetID: id,
-                delta: node.charge - before
-            ))
+        package var input: JSONValue {
+            .object([
+                "residual": .bool(residual),
+                "nodes": .array(nodes.map { .array([.double($0.charge), .double($0.activation)]) }),
+                "edges": .array(edges.map { .array([.double($0.weight), .double($0.uncertainty), .double($0.eligibility)]) }),
+            ])
         }
-    }
 
-    /// A generation is acknowledged only when no repairable charge or noisy-loop target remains.
-    private static func acknowledgedGeneration(
-        after field: OrganismField,
-        currentGeneration: UInt64,
-        previousGeneration: UInt64
-    ) -> UInt64 {
-        let hasChargedNode = field.nodes.values.contains(where: hasRepairableCharge)
-        let hasNoisyEdge = field.edges.values.contains(where: hasRepairableNoise)
-        return hasChargedNode || hasNoisyEdge
-            ? min(previousGeneration, currentGeneration)
-            : currentGeneration
-    }
-
-    private static func repairResidualNoise(
-        ids: [String],
-        in field: inout OrganismField,
-        operations: inout [OrganismRepairOperation],
-        limit: Int
-    ) {
-        for id in ids.prefix(max(0, limit - operations.count)) {
-            guard var edge = field.edges[id], hasRepairableNoise(edge) else { continue }
-            let before = edge.weight
-            edge.weight = max(0.01, OrganismNode.clamp01(edge.weight * 0.76))
-            edge.uncertainty = OrganismNode.clamp01(edge.uncertainty * 0.62)
-            edge.eligibility = OrganismNode.clamp01(edge.eligibility * 0.50)
-            field.edges[id] = edge
-            operations.append(OrganismRepairOperation(
-                id: "weaken:\(id)",
-                kind: .weakenNoisyLoop,
-                targetID: id,
-                delta: edge.weight - before
-            ))
+        private struct Edit: Decodable {
+            var kind: OrganismRepairOperationKind
+            var target: Int
+            var values: [Double]
         }
-    }
 
-    private static func strengthenWarmAssociations(
-        in field: inout OrganismField,
-        operations: inout [OrganismRepairOperation],
-        limit: Int
-    ) {
-        guard operations.count < limit else { return }
-        let targets = field.edges.values
-            .filter { $0.uncertainty <= 0.12 && $0.weight > 0 }
-            .sorted {
-                if $0.weight != $1.weight { return $0.weight > $1.weight }
-                return $0.id < $1.id
+        package func verify(_ answer: JSONValue) throws -> Plan {
+            let edits = try JSONDecoder().decode([Edit].self, from: answer.serializedData(pretty: false))
+            guard edits.count <= maximumOperations else { throw invalidPlan }
+            var plan = Plan(field: field, operations: [])
+            var seen: [OrganismRepairOperationKind: Set<Int>] = [:]
+            for edit in edits {
+                guard seen[edit.kind, default: []].insert(edit.target).inserted,
+                      edit.values.enumerated().allSatisfy({ index, value in
+                          (0...1).contains(value) || (edit.kind == .strengthenWarmAssociation && index == 1 && value.isFinite)
+                      }) else { throw invalidPlan }
+                let id: String, delta: Double, verb: String
+                switch edit.kind {
+                case .softenHighArousal:
+                    guard nodes.indices.contains(edit.target), edit.values.count == 2,
+                          var node = plan.field.nodes[nodes[edit.target].id], hasRepairableCharge(node),
+                          edit.values[0] < node.charge, edit.values[1] >= 0.05,
+                          edit.values[1] <= max(0.05, node.activation) else { throw invalidPlan }
+                    id = node.id; delta = edit.values[0] - node.charge; verb = "soften"
+                    node.charge = edit.values[0]
+                    node.activation = edit.values[1]
+                    plan.field.nodes[id] = node
+                case .strengthenWarmAssociation, .weakenNoisyLoop:
+                    guard edges.indices.contains(edit.target), edit.values.count == 3,
+                          var edge = plan.field.edges[edges[edit.target].id],
+                          edit.values[2] <= edge.eligibility.clamped01() else { throw invalidPlan }
+                    id = edge.id; delta = edit.values[0] - edge.weight
+                    if edit.kind == .weakenNoisyLoop {
+                        guard hasRepairableNoise(edge), edit.values[0] >= 0.01, edit.values[0] <= max(0.01, edge.weight),
+                              edit.values[1] <= edge.uncertainty.clamped01() else { throw invalidPlan }
+                        verb = "weaken"
+                    } else {
+                        guard !residual, edit.values[0] >= edge.weight.clamped01(),
+                              edit.values[1] == edge.uncertainty else { throw invalidPlan }
+                        verb = "warm"
+                    }
+                    edge.weight = edit.values[0]
+                    edge.uncertainty = edit.values[1]
+                    edge.eligibility = edit.values[2]
+                    plan.field.edges[id] = edge
+                case .flagContradiction:
+                    throw invalidPlan
+                }
+                plan.operations.append(.init(id: "\(verb):\(id)", kind: edit.kind, targetID: id, delta: delta))
             }
-            .prefix(min(3, max(0, limit - operations.count)))
-        for edge in targets {
-            guard var copy = field.edges[edge.id] else { continue }
-            let before = copy.weight
-            copy.weight = OrganismNode.clamp01(copy.weight + 0.035)
-            copy.eligibility = OrganismNode.clamp01(copy.eligibility * 0.65)
-            field.edges[edge.id] = copy
-            operations.append(OrganismRepairOperation(
-                id: "warm:\(edge.id)",
-                kind: .strengthenWarmAssociation,
-                targetID: edge.id,
-                delta: copy.weight - before
-            ))
+            return plan
         }
+
+        private var invalidPlan: PartCallError {
+            .init(code: "bad_field_repair", message: "The field repair returned an invalid operation for its captured evidence.")
+        }
+    }
+
+    static func record(
+        _ plan: Plan,
+        into body: inout OrganismPersistentState,
+        at date: Date,
+        signal: SomaticSignal? = nil,
+        residualEvidenceCount: Int = 0,
+        makeUUID: () -> UUID
+    ) {
+        let state = body.dreamRepairState
+        var field = plan.field
+        var operations = plan.operations
+        let feltSummary = signal.map { feltDaySummary(from: $0.metadata, limit: maximumFeltSummaryCharacters) } ?? ""
+        let flags = contradictionFlags(in: feltSummary, remaining: maximumOperations - operations.count)
+        operations.append(contentsOf: flags)
+        let evidence = if signal != nil {
+            evidenceLinks(feltSummary: feltSummary, operations: operations, flags: flags)
+        } else {
+            [OrganismDreamRepairEvidence(
+                id: "evidence:residual-pressure",
+                label: "Prediction and field residuals",
+                summary: "Local residual repair used \(residualEvidenceCount) bounded evidence signal(s)."
+            )]
+        }
+        let generation = field.mutationGeneration
+        let hasTargets = field.nodes.values.contains(where: hasRepairableCharge)
+            || field.edges.values.contains(where: hasRepairableNoise)
+        let receipt = OrganismDreamRepairReceipt(
+            id: makeUUID(), generatedAt: date, reason: signal?.kind.rawValue ?? "residual_pressure",
+            feltDaySummaryCharacters: feltSummary.count, operations: operations, evidence: evidence, flagCount: flags.count,
+            sourceFieldGeneration: hasTargets ? min(state.lastReceipt?.sourceFieldGeneration ?? 0, generation) : generation
+        )
+        field.lastUpdatedAt = date
+        body.field = field
+        body.dreamRepairState = .init(receiptCount: min(state.receiptCount, Int.max - 1) + 1, lastReceipt: receipt)
     }
 
     private static func contradictionFlags(in feltSummary: String, remaining: Int) -> [OrganismRepairOperation] {

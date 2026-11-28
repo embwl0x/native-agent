@@ -6,7 +6,7 @@ import PersistenceCore
 import DeskCore
 import ProviderRouting
 import MindCore
-// Blueprint: | `REMConsolidator.swift` | `REMConsolidator`, `runWeeklyREM`, `rankedByRecurrence`. |
+// Blueprint: | `REMConsolidator.swift` | `REMConsolidator`, `runWeeklyREM`: weekly claim, verified proposals and settlement |
 
 // MemoryV2 owns USER; REM reads persona context but proposes only compact GROWTH reflexes.
 
@@ -260,6 +260,8 @@ public actor REMConsolidator {
         let resolver = ConversationHistory.ExperienceResolver(dataRoot: dataRoot)
         let resolved = try await resolver.resolve(for: Array(sourceRefs), includingSourceRows: true)
         let identities = resolved.identities
+        // A diary's source is what its own marker says; the rows it cites are conversations she was in and name no outside source
+        // (User, 2026-11-26). An older diary keeps the mark it was written with.
         var reflectionMaterial = try await DreamEntryProvenance.resolveSources(sourceRefs, dataRoot: dataRoot,
             messages: resolved.messages)
         for entry in entries {
@@ -267,8 +269,7 @@ public actor REMConsolidator {
                 let sources = entrySources[entry.filename ?? entry.date] ?? []
                 var cause = CognitiveReflectionCause(text: content,
                     sources: sources, material: reflectionMaterial)
-                cause.sourcePeerIds = CognitiveReflectionCause.unionPeerIds([DreamEntryProvenance.peerIds(in: content)]
-                    + sources.map { reflectionMaterial[$0]?.sourcePeerIds })
+                cause.sourcePeerIds = DreamEntryProvenance.peerIds(in: content)
                 reflectionMaterial["dream_diary/\(entry.filename ?? "\(entry.date).md")"] = cause
             }
         }
@@ -288,58 +289,29 @@ public actor REMConsolidator {
             dataRoot: dataRoot, personaRoot: personaRoot, surface: "rem", preview: false
         )
         let bypassSystem = try Self.remBypassSystemPrompt(contextDocs: contextDocs)
-        var rawProposals: [REMProposalRow] = []
-        if !entries.isEmpty {
-            let distilled = try await consolidate(
-                entries: entries, growthBody: growthBody, identities: identities,
-                system: bypassSystem, surface: "rem",
-                systemGrowthBody: contextDocs["GROWTH.md"])
-            rawProposals = distilled.proposals
-            let parseErrors = distilled.parseErrors
-            let evidenceDrops = distilled.evidenceDateDrops
-            let targetDrops = distilled.targetMismatchDrops
-            let passageDrops = distilled.passageDrops
-            if !parseErrors.isEmpty || evidenceDrops > 0 || targetDrops > 0 || passageDrops > 0 {
-                let msg = "REMConsolidator: distill drops — parseErrors=\(parseErrors.count) "
-                    + "evidenceDateDrops=\(evidenceDrops) targetMismatchDrops=\(targetDrops) "
-                    + "unverifiedPassageDrops=\(passageDrops) "
-                    + "(kept \(rawProposals.count) of the LLM's output)\n"
-                    + parseErrors.map { "  parse: \($0)\n" }.joined()
-                FileHandle.standardError.write(Data(msg.utf8))
-            }
-            if rawProposals.isEmpty {
-                let zeroMsg = "REMConsolidator: LLM distillation yielded ZERO usable proposals over "
-                    + "\(entries.count) diary entries — check the drops above; an empty week "
-                    + "should be the model returning {\"proposals\": []}, not a parse casualty.\n"
-                FileHandle.standardError.write(Data(zeroMsg.utf8))
-            }
-            // Release the weekly claim on decode failure so the pass remains retryable.
-            let decodeFailures = distilled.decodeFailures
-            if decodeFailures > 0 {
-                throw DreamREMCycleError.remDecodeFailure(
-                    "REM distillation could not decode the model's reply "
-                    + "(\(decodeFailures) failure(s)): "
-                    + parseErrors.joined(separator: "; ")
-                )
-            }
+        guard !entries.isEmpty else { return ([], 0) }
+        let distilled = try await consolidate(
+            entries: entries, growthBody: growthBody, identities: identities, tombStore: tombStore,
+            system: bypassSystem, surface: "rem", systemGrowthBody: contextDocs["GROWTH.md"])
+        let parseErrors = distilled.parseErrors
+        let evidenceDrops = distilled.evidenceDateDrops
+        let targetDrops = distilled.targetMismatchDrops
+        let passageDrops = distilled.passageDrops
+        if !parseErrors.isEmpty || evidenceDrops > 0 || targetDrops > 0 || passageDrops > 0 {
+            let msg = "REMConsolidator: distill drops — parseErrors=\(parseErrors.count) "
+                + "evidenceDateDrops=\(evidenceDrops) targetMismatchDrops=\(targetDrops) "
+                + "unverifiedPassageDrops=\(passageDrops) "
+                + "(kept \(distilled.boundProposals) of the LLM's output)\n"
+                + parseErrors.map { "  parse: \($0)\n" }.joined()
+            FileHandle.standardError.write(Data(msg.utf8))
         }
-
-        // Count dates only from verified quoted support; an unbound quote cannot establish unavailable provenance.
-        var passEvidence: [REMProposalRow] = []
-        for p in rawProposals {
-            let floor = max(p.supportingExperienceCount(identities: identities) ?? 0, p.dreamDateCount)
-            if floor >= REMConstants.minimumEvidenceCount {
-                passEvidence.append(p)
-            }
+        if distilled.boundProposals == 0 {
+            let zeroMsg = "REMConsolidator: LLM distillation yielded ZERO usable proposals over "
+                + "\(entries.count) diary entries — check the drops above; an empty week "
+                + "should be the model returning {\"proposals\": []}, not a parse casualty.\n"
+            FileHandle.standardError.write(Data(zeroMsg.utf8))
         }
-
-        let passTomb = try await tombStore.filterTombstoned(passEvidence)
-        let tombSkips = passEvidence.count - passTomb.count
-
-        // Rank by supporting experiences and stable emission order while reserving a slot for labelled dwelling.
-        let kept = Self.rankedByRecurrence(passTomb, identities: identities)
-
-        return (kept, tombSkips)
+        return (distilled.proposals, distilled.tombstoneSkips)
     }
 
     private func appendREMProposals(_ kept: [REMProposalRow], store: REMProposalStore, rollback: (@Sendable () async -> Void)?) async throws
@@ -360,20 +332,25 @@ public actor REMConsolidator {
         try Task.checkCancellation()
         var stagingFailure: (any Error)?
         do { try await stagePendingUnstagedRows(store, resolver: resolver) }
+        catch let stopped as CancellationError { throw stopped }
         catch { stagingFailure = error }
 
-        // Evict only exact contiguous approved paragraphs within character bounds.
-        try Task.checkCancellation()
-        let evicted = try await runGrowthEviction(proposalRows: growthProposalRows)
+        do {
+            // Evict only exact contiguous approved paragraphs within character bounds.
+            try Task.checkCancellation()
+            let evicted = try await runGrowthEviction(proposalRows: growthProposalRows)
 
-        // Publish pins only for approved passages still live after eviction.
-        try Self.emitREMPinsIndex(dataRoot: dataRoot)
+            // Publish pins only for approved passages still live after eviction.
+            try Self.emitREMPinsIndex(dataRoot: dataRoot)
 
-        try Task.checkCancellation()
-        let moved = try await archiveDreams()
-        if let stagingFailure { throw stagingFailure }
+            try Task.checkCancellation()
+            let moved = try await archiveDreams()
+            if let stagingFailure { throw stagingFailure }
 
-        return (evicted, moved)
+            return (evicted, moved)
+        } catch let stopped as CancellationError {
+            throw stagingFailure ?? stopped
+        }
     }
 
     private func assembleREMReport(appendReceipt: REMProposalStore.AppendReceipt, tombSkips: Int, evicted: Int, moved: Int,
@@ -413,27 +390,6 @@ public actor REMConsolidator {
             report.reflectionMaterial["rem_proposal:\(row.id)"] = cause
         }
         return report
-    }
-
-    /// Rank supported recurrence first while retaining a reserved slot for a labelled dwelt-on candidate.
-    nonisolated static func rankedByRecurrence(_ proposals: [REMProposalRow], identities: [String: String]) -> [REMProposalRow] {
-        let cap = REMConstants._REM_MAX_PROPOSALS
-        guard proposals.count > cap else { return proposals }
-        let ordered = proposals.enumerated().map { (offset: $0.offset, element: $0.element,
-            count: $0.element.supportingExperienceCount(identities: identities) ?? 0)
-        }.sorted { lhs, rhs in
-            if lhs.count != rhs.count { return lhs.count > rhs.count }
-            return lhs.offset < rhs.offset
-        }.map(\.element)
-
-        var kept = Array(ordered.prefix(cap))
-        let dwelt = ordered.filter { $0.support == .dweltOn }
-        if !dwelt.isEmpty, !kept.contains(where: { $0.support == .dweltOn }),
-           let first = dwelt.first {
-            kept.removeLast()
-            kept.append(first)
-        }
-        return kept
     }
 
     /// Write a bounded counter-only run summary so a quiet completed week remains distinguishable from a missed invocation.
@@ -523,6 +479,8 @@ public actor REMConsolidator {
             await RepairOwed.settle(dataRoot, operation: "rem.archive",
                 evidence: .init(source: "dream_diary/archive", id: NativeTimestampFormat.fractionalZulu(clock()))).value
             return moved
+        } catch let stopped as CancellationError {
+            throw stopped
         } catch {
             await RepairOwed.owe(dataRoot, id: "rem-archive-repair:" + UUID().uuidString, kind: .run,
                 operation: "rem.archive", owner: "dream_diary archival",

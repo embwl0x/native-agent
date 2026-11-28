@@ -1,15 +1,7 @@
-// Blueprint: | `RunKindVocabulary.swift` | Safe display vocabulary for extensible run kinds; platforms own unknown symbols |
+// Blueprint: | `RunKindVocabulary.swift` | Safe display names for extensible run kinds |
 
 /// Unknown run-kind identifiers must never reach product text; each platform owns its display wording.
 public enum RunKindVocabulary {
-    public static func symbol(_ kind: String) -> String? {
-        switch kind.lowercased() {
-        case "codex": return "terminal"
-        case "claude": return "sparkles"
-        default: return nil
-        }
-    }
-
     public static func displayName(_ kind: String) -> String {
         switch kind.lowercased() {
         case "codex": return "Codex"

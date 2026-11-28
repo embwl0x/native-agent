@@ -34,11 +34,6 @@ extension ChatGPTTransport {
         guard let expiry, expiry > 0 else { return false }
         return TimeInterval(expiry) > Date().timeIntervalSince1970 + TimeInterval(buffer)
     }
-    /// The adapter's read verdict; CLI rotation remains owned by the CLI.
-    public static func credentialStatus(at path: URL) throws -> (usable: Bool, detail: String, health: OAuthCredentialHealth) {
-        credentialStatus(try loadAuthBlob(at: path), path: path)
-    }
-
     public static func credentialStatus(_ auth: [String: Any]?, path: URL) -> (usable: Bool, detail: String, health: OAuthCredentialHealth) {
         if let auth, OAuthRefreshBinding.hasInvalidExpiry(auth, provider: "openai_oauth_direct") {
             return (false, "Saved expires_at is invalid — repair the credential or sign in again",

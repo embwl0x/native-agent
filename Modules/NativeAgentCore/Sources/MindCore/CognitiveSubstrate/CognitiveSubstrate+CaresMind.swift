@@ -2,21 +2,11 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import SenseCore
-// Blueprint: | `CognitiveSubstrate+CaresMind.swift` | `CognitiveSubstrate`: care pressure, turn cues, the stories attention reads and the hour's wondering |
-
-// One story-derived pressure must serve cues, intentions and the hour.
-
-/// The cares still pulling at this moment, read from the frozen story.
-struct CognitiveCareCue: Sendable {
-    var pulls: [CognitiveCare]
-}
+// Blueprint: | `CognitiveSubstrate+CaresMind.swift` | `CognitiveSubstrate`: care pressure, meaning comparisons, the stories attention reads and the hour's wondering |
 
 extension CognitiveSubstrate {
     public static let careReleasePressure = 0.35
     static let dateLedgerCapacity = 16
-    static let careLineRestTurns = 6
-    static let careMindPrefix = "- On your mind:"
-    static let careIntentionPrefix = "- You've been wanting to bring up"
     static let caresForHourLimit = 3
 
     // MARK: - Pressure
@@ -123,59 +113,6 @@ extension CognitiveSubstrate {
         }.sorted { $0.deviation != $1.deviation ? $0.deviation > $1.deviation : $0.care.id.uuidString < $1.care.id.uuidString }
     }
 
-    // MARK: - The turn
-
-    /// Recent charge is enough to be on her mind. Reachability is supplied by the turn's privacy and suppression owner.
-    func careCue(for request: CognitiveCapsuleRequest, from read: CognitiveFrozenRead,
-                 among reachable: [CognitiveCare], unreadable _: inout [String], turn _: Turn) async -> CognitiveCareCue? {
-        guard read.configuration.enabled,
-              read.configuration.capsuleInjectionEnabled,
-              request.mode == .inject,
-              request.resolvedTurnKind == .live,
-              !reachable.isEmpty else { return nil }
-        let pulls = reachable.filter { Self.carePull($0) != nil }.sorted {
-            let left = abs($0.charge(at: read.fixedAt)), right = abs($1.charge(at: read.fixedAt))
-            if left != right { return left > right }
-            return $0.updatedAt != $1.updatedAt ? $0.updatedAt > $1.updatedAt : $0.id.uuidString < $1.id.uuidString
-        }
-        return pulls.isEmpty ? nil : CognitiveCareCue(pulls: Array(pulls.prefix(2)))
-    }
-
-    /// A judged response eases a pull; showing it is not evidence she acted on it.
-    func careCueLines(
-        _ cue: CognitiveCareCue,
-        message _: String,
-        gapOpened _: Date?,
-        resting _: [String: CognitiveCapsulePresentationState.CareLineRest],
-        at now: Date,
-        presentationState _: inout CognitiveCapsulePresentationState,
-        why: inout CapsuleCueWhy
-    ) -> [String] {
-        return cue.pulls.compactMap { care in
-            guard let moment = Self.carePull(care) else { return nil }
-            let line = careMindLine(care, moment: moment)
-            why.sources[line] = "care:" + care.id.uuidString
-            why.scores[line] = abs(care.charge(at: now))
-            return line
-        }
-    }
-
-    /// Only a subsequent lived response spends a movement. Missing interpretation leaves it open.
-    static func carePull(_ care: CognitiveCare) -> CognitiveCare.Moment? {
-        guard let movement = care.story.last(where: { $0.moved != 0 }) else { return nil }
-        let answered = care.story.contains {
-            $0.by == .her && ($0.at > movement.at || ($0.at == movement.at && $0.source == movement.source))
-                && ($0.answered == true || $0.closedGap == true)
-        }
-        return answered ? nil : movement
-    }
-
-    func careMindLine(_ care: CognitiveCare, moment: CognitiveCare.Moment) -> String {
-        let subject = care.origin == .seed ? moment.note : care.about
-        let line = Self.careMindPrefix + " Under this moment, \(moment.felt): \(subject)"
-        return capsuleLineText(line, maxCharacters: 280)
-    }
-
     /// Use relative cosine standing, not an absolute floor: high shared similarity moves the mean. All candidates count; eligibility only limits selection.
     static func caresStandingOut(_ cosines: [UUID: Double], among candidates: [CognitiveCare],
                                  eligible: (CognitiveCare) -> Bool = { _ in true })
@@ -188,7 +125,7 @@ extension CognitiveSubstrate {
 
     /// The one attention law for cares and world-moment intentions. No absolute cosine floor: each must stand out from the others past chance.
     private static func standingOut(_ cosines: [Double]) -> [Int] {
-        let bar = VectorMath.chanceBar(.attention, among: cosines.count)
+        let bar = VectorMath.chanceBar(among: cosines.count)
         let standing = VectorMath.standout(cosines)
         return cosines.indices.filter { standing[$0].map { $0 >= bar } ?? false }
             .sorted { cosines[$0] > cosines[$1] }
@@ -225,21 +162,6 @@ extension CognitiveSubstrate {
         }
     }
 
-    static func isCareCueLine(_ line: String) -> Bool {
-        line.hasPrefix(careMindPrefix) || line.hasPrefix(careIntentionPrefix)
-    }
-
-    /// One accepted turn of rest for every plain care line; returns the rests as they stood before this turn.
-    static func advanceCareLineRest(
-        _ rests: inout [String: CognitiveCapsulePresentationState.CareLineRest]
-    ) -> [String: CognitiveCapsulePresentationState.CareLineRest] {
-        let before = rests
-        for (key, rest) in before {
-            rests[key] = rest.turnsLeft > 1 ? .init(shownAt: rest.shownAt, turnsLeft: rest.turnsLeft - 1) : nil
-        }
-        return before
-    }
-
     static func boundDateLedger(_ ledger: inout [String: Date]) {
         guard ledger.count > dateLedgerCapacity else { return }
         for key in ledger.sorted(by: { $0.value < $1.value }).prefix(ledger.count - dateLedgerCapacity).map(\.key) {
@@ -254,8 +176,7 @@ extension CognitiveSubstrate {
         configuration.enabled ? Array(cares.values) : nil
     }
 
-    /// A care wake lives only the agent's side against the care(s) that woke the agent. Meaning is already journaled; applyCares keeps the fold's
-    /// watermark, so its save can be finished after a crash.
+    /// A care wake lives only the agent's side against the care(s) that woke the agent. Meaning is already journaled.
     func foldCareWake(_ context: AfterTurnContext, judgments: [CognitiveCareJudgment],
                       seq: UInt64, momentID: String) async throws {
         await waitForMaintenanceTransition()
@@ -270,7 +191,7 @@ extension CognitiveSubstrate {
         let provenance = CognitiveCareProvenance(speaker: "self", trusted: true, appAuthored: true,
             source: "exchange:\(event.sessionId ?? "")/\(event.metadata["messageId"]?.stringValue ?? event.subject.id)",
             at: event.occurredAt)
-        _ = try await applyCares(admitted, provenance: provenance,
+        _ = try await applyCareJudgments(admitted, provenance: provenance,
             generation: caringAppraisalGeneration, seq: seq, momentID: momentID)
     }
 
@@ -295,7 +216,7 @@ extension CognitiveSubstrate {
         }
         let target: CognitiveCareJudgment.Target = holder.map { .existing($0.id) }
             ?? .new(about: String((words ?? careTitle(from: concern)).prefix(CognitiveCare.aboutCharacters)), between: false)
-        let saved = try await applyCares([
+        let saved = try await applyCareJudgments([
             .init(target: target, moved: 0, by: .her, felt: "kept open", note: "pinned concern", open: concern)
         ], provenance: .init(speaker: CognitiveCare.ownerKey, trusted: true, appAuthored: true,
                             source: source, at: dependencies.now()), generation: generation)
@@ -323,7 +244,7 @@ extension CognitiveSubstrate {
                                              felt: "noticed", note: event.summary)
         let provenance = CognitiveCareProvenance(speaker: CognitiveCare.ownerKey, trusted: true,
             appAuthored: true, source: event.id, at: event.occurredAt)
-        _ = try await applyCares([judgment], provenance: provenance, generation: caringAppraisalGeneration)
+        _ = try await applyCareJudgments([judgment], provenance: provenance, generation: caringAppraisalGeneration)
         return true
     }
 
@@ -335,8 +256,32 @@ extension CognitiveSubstrate {
         return (offered, caringAppraisalGeneration)
     }
 
+    package func hourAppetite(meeting encounter: String, at now: Date) async throws -> (unfamiliarity: Double, closureRate: Double)? {
+        guard configuration.enabled, !forgettingInFlight else { return nil }
+        let generation = caringAppraisalGeneration
+        let own = cares.values.filter { $0.fadedAt == nil && $0.with.isEmpty && $0.depth != .life }
+        guard let cosines = try await careCosines(to: encounter, among: own, turn: nil),
+              let nearest = cosines.values.max(),
+              configuration.enabled, !forgettingInFlight, caringAppraisalGeneration == generation else { return nil }
+
+        var lived = Set<String>()
+        var closed = Set<String>()
+        for care in own {
+            for moment in care.story where Self.feltOwnMovement(moment) {
+                let age = now.timeIntervalSince(moment.at)
+                guard (0...Self.moodActivationWindow).contains(age) else { continue }
+                guard moment.moved != 0 || moment.answered == true || moment.stanceChange != nil
+                    || moment.closedGap == true else { continue }
+                lived.insert(moment.source)
+                if moment.closedGap == true { closed.insert(moment.source) }
+            }
+        }
+        let rate = lived.isEmpty ? 0 : Double(closed.count) / Double(lived.count)
+        return ((1 - nearest).clamped01(), rate)
+    }
+
     /// The hour names the care it continues; otherwise its question starts a care. Both paths retain the hour as a story source.
-    public func noteHourWondering(_ question: String, topic: String?, continuing: UUID?, generation: UInt64, source: String) async throws -> Bool {
+    public func noteHourWondering(_ question: String, continuing: UUID?, generation: UInt64, source: String) async throws -> Bool {
         guard configuration.enabled else { throw CognitiveCareNotSaved(detail: "the inner life is off") }
         await waitForMaintenanceTransition()
         // Save a repeated hour's resident story entry before acknowledging durability.
@@ -347,14 +292,14 @@ extension CognitiveSubstrate {
         var match: CognitiveCare?
         if let continuing, let care = cares[continuing], care.origin != .seed { match = care }
         let target: CognitiveCareJudgment.Target = match.map { .existing($0.id) }
-            ?? .new(about: String((topic ?? careTitle(from: question)).prefix(CognitiveCare.aboutCharacters)),
+            ?? .new(about: String(careTitle(from: question).prefix(CognitiveCare.aboutCharacters)),
                     between: false)
         let judgment = CognitiveCareJudgment(
             target: target, moved: 0.5, by: .her, felt: "curious",
-            note: "my hour" + (topic.map { ": \($0)" } ?? ""), open: question)
+            note: "my hour", open: question)
         let provenance = CognitiveCareProvenance(
             speaker: CognitiveCare.ownerKey, trusted: true, appAuthored: true, source: source, at: dependencies.now())
-        let saved = try await applyCares([judgment], provenance: provenance, generation: generation)
+        let saved = try await applyCareJudgments([judgment], provenance: provenance, generation: generation)
         return !saved.isEmpty
     }
 }

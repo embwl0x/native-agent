@@ -601,13 +601,14 @@ private actor SessionFaceProjection {
         searchObservers[viewID] = SearchObserver(lease: id, query: query)
         await postSearch(viewID)
         for await _ in lifetime {}
-        endSearch(viewID, lease: id)
+        await endSearch(viewID, lease: id)
     }
 
-    private func endSearch(_ viewID: UUID, lease: UUID) {
+    private func endSearch(_ viewID: UUID, lease: UUID) async {
         guard searchObservers[viewID]?.lease == lease else { return }
         searchObservers[viewID] = nil
         searchLists[viewID] = nil
+        await source.remove(.sessionSearch(viewID))
     }
 
     private func postSearch(_ viewID: UUID) async {

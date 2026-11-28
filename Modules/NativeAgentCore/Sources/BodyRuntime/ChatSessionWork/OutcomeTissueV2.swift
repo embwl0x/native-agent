@@ -74,7 +74,6 @@ public struct ResponseOutcomeObservationV2: Codable, Sendable, Equatable {
     public let tools: [ResponseOutcomeToolReference]
     public let motorActions: [ResponseOutcomeMotorReference]
     public private(set) var dimensionStates: [String: OutcomeEvidenceState]
-    public let interventionAssignment: CausalInterventionAssignment?
 
     public init(
         turnID: String,
@@ -91,8 +90,7 @@ public struct ResponseOutcomeObservationV2: Codable, Sendable, Equatable {
         turnElapsedMs: Int?,
         tools: [ResponseOutcomeToolReference],
         motorActions: [ResponseOutcomeMotorReference],
-        dimensionStates: [String: OutcomeEvidenceState],
-        interventionAssignment: CausalInterventionAssignment?
+        dimensionStates: [String: OutcomeEvidenceState]
     ) {
         self.schema = Self.schema
         self.turnID = turnID
@@ -110,7 +108,6 @@ public struct ResponseOutcomeObservationV2: Codable, Sendable, Equatable {
         self.tools = tools
         self.motorActions = motorActions
         self.dimensionStates = dimensionStates
-        self.interventionAssignment = interventionAssignment
     }
 
     public var jsonValue: JSONValue {
@@ -137,8 +134,7 @@ public struct ResponseOutcomeObservationV2: Codable, Sendable, Equatable {
               Set(decoded.dimensionStates.keys) == Self.requiredDimensionKeys,
               decoded.dimensionStates.keys.allSatisfy({ Self.closedToken($0, maximum: 64) != nil }),
               decoded.tools.allSatisfy(Self.validTool),
-              decoded.motorActions.allSatisfy(Self.validMotor),
-              Self.validAssignment(decoded.interventionAssignment)
+              decoded.motorActions.allSatisfy(Self.validMotor)
         else { return nil }
         self = decoded
     }
@@ -182,61 +178,6 @@ public struct ResponseOutcomeObservationV2: Codable, Sendable, Equatable {
         raw.count == 64 && raw.unicodeScalars.allSatisfy(
             CharacterSet(charactersIn: "0123456789abcdef").contains
         )
-    }
-
-    package static func validAssignment(_ value: CausalInterventionAssignment?) -> Bool {
-        guard let value else { return true }
-        guard assignmentToken(value.assignmentID, maximum: 128),
-              assignmentToken(value.intervention, maximum: 128),
-              optionalAssignmentToken(value.experimentID, maximum: 128),
-              optionalAssignmentToken(value.taskScenarioFamily, maximum: 128),
-              optionalAssignmentToken(value.treatment, maximum: 64),
-              optionalAssignmentToken(value.baseline, maximum: 64),
-              optionalAssignmentToken(value.chosenAlternative, maximum: 64),
-              validAssignmentTokens(value.eligibleAlternatives, maximumCount: 8, maximum: 64),
-              validAssignmentTokens(value.confounderFlags, maximumCount: 16, maximum: 128),
-              validAssignmentTokens(value.coverageFlags, maximumCount: 16, maximum: 128) else {
-            return false
-        }
-        if let eligible = value.eligibleAlternatives {
-            guard Set(eligible).count == eligible.count,
-                  value.chosenAlternative.map(eligible.contains) ?? true,
-                  value.treatment.map(eligible.contains) ?? true,
-                  value.baseline.map(eligible.contains) ?? true else { return false }
-        } else if value.chosenAlternative != nil {
-            return false
-        }
-        if value.evidenceClass == .controlledProduction {
-            guard value.intervention == "reasoning_effort",
-                  value.experimentID != nil,
-                  value.taskScenarioFamily != nil,
-                  let treatment = value.treatment,
-                  value.baseline != nil,
-                  value.chosenAlternative == treatment,
-                  value.eligibleAlternatives != nil,
-                  value.confounderFlags != nil,
-                  value.coverageFlags?.count == 2 else { return false }
-        }
-        return true
-    }
-
-    private static func optionalAssignmentToken(_ raw: String?, maximum: Int) -> Bool {
-        raw.map { assignmentToken($0, maximum: maximum) } ?? true
-    }
-
-    private static func validAssignmentTokens(
-        _ values: [String]?, maximumCount: Int, maximum: Int
-    ) -> Bool {
-        guard let values else { return true }
-        return values.count <= maximumCount
-            && values.allSatisfy { assignmentToken($0, maximum: maximum) }
-    }
-
-    private static func assignmentToken(_ raw: String, maximum: Int) -> Bool {
-        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._:"))
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        return raw == trimmed && !raw.isEmpty && raw.count <= maximum
-            && raw.unicodeScalars.allSatisfy { allowed.contains($0) }
     }
 
     package static func closedToken(_ raw: String?, maximum: Int) -> String? {
@@ -401,8 +342,7 @@ public struct OutcomeDimensionStatePopulationReader: Sendable {
     }
 
     public func read() async throws -> OutcomeDimensionStateAudit {
-        let directory = dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
+        let directory = DataRootPaths.chatDirectory(in: dataRoot)
             .appendingPathComponent("messages", isDirectory: true)
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory) else {

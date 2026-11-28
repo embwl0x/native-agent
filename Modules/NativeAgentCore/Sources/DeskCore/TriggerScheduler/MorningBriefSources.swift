@@ -26,7 +26,7 @@ public struct MorningBriefSources: Sendable {
         guard let yesterday = calendar.date(byAdding: .day, value: -1, to: calendar.startOfDay(for: now)) else {
             throw TriggerSchedulerError.persistenceFailure("brief_calendar_unavailable: cannot determine the previous local day")
         }
-        return .object([
+        let packet = JSONValue.object([
             "operation": .string("brief"), "dayLabel": .string(formatter.string(from: now)),
             "now": .string(NativeTimestampFormat.fractionalUTCOffset(now)),
             "yesterday": .string(NativeTimestampFormat.fractionalUTCOffset(yesterday)),
@@ -34,6 +34,8 @@ public struct MorningBriefSources: Sendable {
             "inbox": await inbox(),
             "sessions": jsonArray(root.appendingPathComponent("chat/sessions.json")),
         ])
+        try Task.checkCancellation()
+        return packet
     }
 
     private func desk() async -> JSONValue {

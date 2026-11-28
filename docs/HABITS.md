@@ -157,7 +157,7 @@ Keeping happens inside the turn. After each tool round the native stem meets
 the turn's hand work so far, once per route per turn. The first meeting only
 records its `practice: ` line through `FamiliarLines.firstMet` in
 `mind/familiar.bin`. On the **second** and later meetings the round's last
-result carries `practice: {route, hand, loop?, ability?}`, at most once a turn,
+result carries `practice: {route, hand, loop?}`, at most once a turn,
 and the shipped turn makes it the note of their next `model.call`. There is no private call after the reply.
 
 A practice is the ordered tool/action ids of the turn's landed writes or
@@ -165,21 +165,13 @@ irreversible non-ability calls, without arguments or incidental reads. When
 there is no such hand work, it is the one call repeated 3+ rounds, counted
 once. A practice worth keeping replaces at least two calls (or is that one
 call looped 3+ rounds): a lone write, however often they makes it, is just
-using the tool. When an active ability's current learned-use or validation
-route makes exactly those ids in order (its other steps only reads: a call
-recorded with no effect, or a read verb such as `.read`, `.query`, `.list`),
-the note names it instead of asking for a new one:
-`ability: {id, description, worked: true}` when its newest covering run's own
-outcome (`last`, beside its time) completed or it passed validation, so they
-uses it next time; otherwise `ability: {id, description, failed}` with the step
-that run failed at, so they repairs it under its id. The note never asks their to
-redo work that has landed. Declared reach proves no route.
+using the tool. The note invites their to keep the route for next time.
 
-`practice.keep` traces `{practice, met: "first"|"again", noted: bool, ability?}`, or
-`failed` with the cause when familiarity or the ability index cannot be read
-(the turn goes on without the note). `noted` says the note was sent, not that
-they saved an ability. Familiarity uses the existing bounded line record; it is
-not a lifetime count. A one-off sends no note; a repeat can become an ability.
+`practice.keep` traces `{practice, met: "first"|"again", noted: bool}`, or
+`failed` with the cause if encoding the route or accessing familiarity fails.
+The turn continues without the note on failure. `noted` records whether the
+signal was produced. Familiarity uses the existing bounded line record. A
+repeat can become an ability.
 
 ### H4 — one crystallizer
 
@@ -213,8 +205,7 @@ The `compiled` manifest field has no reader or producer.
 - The habit line appears on a step they have handled the same way ≥ standing.
 - H3: first hand-work meeting traces `met:first, noted:false`; a later meeting
   traces `met:again, noted:true`, and the turn's next `llm.call` carries the
-  note, naming the covering ability (to run, or with its failed step to
-  repair) when an active recorded route covers it. Installed proof belongs to
+  ordinary practice note without an ability recommendation. Installed proof belongs to
   the release lead; lanes run no separate tests or builds.
 
 ## Lanes

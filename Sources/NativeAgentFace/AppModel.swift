@@ -20,6 +20,7 @@ final class AppModel {
     @ObservationIgnored var chatComposerDrafts: [String: ChatComposerDraft] = [:]
     var chatPendingAttachments: [String: [FaceAttachment]] = [:]
     var pendingChatMessageID: String?
+    var tableFocus: (id: UUID, elements: [String]?, version: String)?
     var pendingMemoryFaceTarget: FaceDestination?
     var pendingPaletteDestination: PaletteSavedDestination?
     var pendingActivitySectionRaw: String?

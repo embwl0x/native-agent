@@ -366,10 +366,11 @@ function face(input) {
     sections.push({id: "mac", title: "This Mac", style: "values", rows: mac});
 
     const living = input.living, snapshot = living.snapshot;
+    const observed = snapshot?.at ?? undefined;
     const livingRows = snapshot !== null ? [
-        {id: "living.posture", title: "Posture", value: snapshot.posture, tone: tone(snapshot.postureStatus, snapshot.postureBucket)},
-        {id: "living.body", title: "Body", value: snapshot.bodyState},
-        {id: "living.behavior", title: "Behavior", value: snapshot.behaviorLine},
+        {id: "living.posture", title: "Posture", value: snapshot.posture, at: observed, tone: tone(snapshot.postureStatus, snapshot.postureBucket)},
+        {id: "living.body", title: "Body", value: snapshot.bodyState, detail: observed ? "Last read" : "Reading time unavailable", at: observed},
+        {id: "living.behavior", title: "Behavior", value: snapshot.behaviorLine, at: observed},
         {id: "living.desk", title: "Desk", value: snapshot.deskSummary},
         {id: "living.approvals", title: "Approvals", value: snapshot.approvalsSummary},
         {id: "living.dream", title: "Dream", value: snapshot.lastDreamSummary}

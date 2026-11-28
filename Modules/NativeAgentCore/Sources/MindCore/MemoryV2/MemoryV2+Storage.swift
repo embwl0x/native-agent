@@ -182,30 +182,30 @@ public actor MemoryStorage {
         _ memory: StoredMemory, insertIfMissing: Bool, preserveID: Bool,
         superseding: [SupersedingAcceptance] = []
     ) async throws -> StoredMemory? {
+        try Self.validateTemporalEvidence(memory)
         _ = try MemoryRoot.roots(in: memory.metadata)
         let tombstones = try await readTombstoneIndex()
         let (saved, evicted, demoted) = try await dbPool.write { db -> (StoredMemory?, [StoredMemory], [StoredMemory]) in
             try Self.requireWritableEpoch(in: db, vector: memory.embedding, epoch: memory.embeddingEpoch)
             try Self.requireNotTombstoned(memory, in: db, cached: tombstones)
-            if let row = try Self.admissionDuplicate(of: memory, requiredID: preserveID ? memory.id : nil, in: db) {
+            if let row = try Self.admissionDuplicate(of: memory, requiredID: preserveID ? memory.id : nil,
+                                                     excludingIDs: superseding.map(\.targetId), in: db) {
                 try Self.recordCorrectionOccurrence(metadata: memory.metadata, rowID: memory.id, createdAt: memory.createdAt, on: row.id, in: db)
                 var saved = try Self.foldDuplicate(dataRoot: self.dataRoot, memory, into: row, in: db, tombstones: tombstones)
                 // A still-pending replacement is not recallable yet: its targets retire when its own vector lands, not now.
                 if Self.metadataFlag(saved.metadata, Self.pendingAdmissionKey), !superseding.isEmpty {
                     let owed = try Self.owedSupersessions(saved.metadata)
-                    let added = superseding.filter { new in new.targetId != saved.id && !owed.contains { $0.targetId == new.targetId } }
+                    let added = superseding.filter { new in !owed.contains { $0.targetId == new.targetId } }
                     saved.metadata = Self.owingAdmission(saved.metadata, preservingID: Self.metadataFlag(saved.metadata, Self.preservesIDKey),
                                                          superseding: owed + added)
                     try db.execute(sql: "UPDATE memories SET metadata_json = ? WHERE id = ?",
                                    arguments: [try Self.encodeMetadata(saved.metadata), saved.id])
                     return (saved, [], [])
                 }
-                let demoted = try superseding.filter { $0.targetId != saved.id }
-                    .map { try Self.demoteSuperseded(dataRoot: self.dataRoot, $0, by: &saved, in: db) }
+                let demoted = try superseding.map { try Self.demoteSuperseded(dataRoot: self.dataRoot, $0, by: &saved, in: db) }
                 return (saved, [], demoted)
             }
             guard insertIfMissing else { return (nil, [], []) }
-            try Self.validateTemporalEvidence(memory)
             try Self.executeMemoryInsert(memory, in: db)
             var replacement = memory
             let demoted = try superseding.map { try Self.demoteSuperseded(dataRoot: self.dataRoot, $0, by: &replacement, in: db) }
@@ -227,29 +227,49 @@ public actor MemoryStorage {
     }
 
     static func admissionDuplicate(of memory: StoredMemory, requiredID: String? = nil,
-                                   excludingID: String? = nil, in db: Database) throws -> StoredMemory? {
-        guard MemoryRecordDisclosurePolicy.classify(MemoryRecord(stored: memory)) != nil else { return nil }
+                                   excludingIDs: [String] = [], in db: Database) throws -> StoredMemory? {
         let now = Date()
+        let start = memory.validFrom.flatMap(MemoryRecallScoring.parseTimestamp)
+        let end = memory.validTo.flatMap(MemoryRecallScoring.parseTimestamp)
+        let started = start.map { $0 <= now } ?? true
+        let explicitValidity = metadataFlag(memory.metadata, explicitValidityKey)
+        let historical = explicitValidity && end.map { $0 <= now } == true
+        let record = MemoryRecord(stored: memory)
+        guard historical || MemoryRecordDisclosurePolicy.isTemporallyEligible(validTo: memory.validTo, at: now),
+              MemoryRecordDisclosurePolicy.classify(personaID: record.personaId, status: record.status,
+                  lifecycle: record.lifecycle, tags: record.tags, metadata: record.extras) != nil
+        else { return nil }
         let scope = disclosureScopeKey(personaId: memory.personaId, metadata: memory.metadata)
         func candidates(_ predicate: String, arguments: StatementArguments) throws -> [StoredMemory] {
+            let statuses = historical ? "('active', 'archived')" : "('active')"
             var sql = """
-                SELECT * FROM memories WHERE status = 'active' AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
+                SELECT * FROM memories WHERE status IN \(statuses) AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
                     AND \(predicate)
                 """
             var arguments = arguments
             if let requiredID { sql += " AND id = ?"; arguments += [requiredID] }
-            if let excludingID { sql += " AND id <> ?"; arguments += [excludingID] }
-            return try Row.fetchAll(db, sql: sql + " ORDER BY rowid", arguments: arguments).map(decodeMemory).filter {
-                MemoryRecordDisclosurePolicy.isTemporallyEligible(validTo: $0.validTo, at: now)
-                    && disclosureScopeKey(personaId: $0.personaId, metadata: $0.metadata) == scope
+            if !excludingIDs.isEmpty {
+                let placeholders = excludingIDs.map { _ in "?" }.joined(separator: ", ")
+                sql += " AND id NOT IN (\(placeholders))"
+                arguments += StatementArguments(excludingIDs)
+            }
+            return try Row.fetchAll(db, sql: sql + " ORDER BY rowid", arguments: arguments).map(decodeMemory).filter { row in
+                let rowStart = row.validFrom.flatMap(MemoryRecallScoring.parseTimestamp)
+                let rowEnd = row.validTo.flatMap(MemoryRecallScoring.parseTimestamp)
+                let rowExplicit = metadataFlag(row.metadata, explicitValidityKey)
+                return rowEnd == end && (historical || MemoryRecordDisclosurePolicy.isTemporallyEligible(validTo: row.validTo, at: now))
+                    && (rowStart.map { $0 <= now } ?? true) == started
+                    && (!(explicitValidity || rowExplicit) || rowStart == start)
+                    && disclosureScopeKey(personaId: row.personaId, metadata: row.metadata) == scope
             }
         }
         let key = comparisonKey(memory.content, mode: .canonical)
         let matches = try candidates("canonical_hash(content) = ?", arguments: [canonicalHash(memory.content)])
-        if let exact = matches.sorted(by: { $0.createdAt > $1.createdAt }).first(where: { comparisonKey($0.content, mode: .canonical) == key }) {
+        let ordered = historical ? matches : matches.sorted { $0.createdAt > $1.createdAt }
+        if let exact = ordered.first(where: { comparisonKey($0.content, mode: .canonical) == key }) {
             return exact
         }
-        guard !MemoryRecallScoring.isExplicitCorrection(memory.metadata),
+        guard !historical, !MemoryRecallScoring.isExplicitCorrection(memory.metadata),
               let vector = memory.embedding, let epoch = memory.embeddingEpoch, !epoch.isEmpty else { return nil }
         let activeEpoch = try embeddingEpochState(in: db).activeEpoch
         guard activeEpoch == nil || activeEpoch == epoch else { return nil }
@@ -268,6 +288,7 @@ public actor MemoryStorage {
     public static let pendingAdmissionKey = "admission_pending"
     /// Cold replacements leave their targets intact until admission.
     static let pendingSupersedesKey = "admission_supersedes"
+    package static let explicitValidityKey = "explicit_validity"
 
     static func owingAdmission(_ metadata: JSONValue?, preservingID: Bool,
                                superseding: [SupersedingAcceptance] = []) -> JSONValue {
@@ -332,6 +353,9 @@ public actor MemoryStorage {
            case .object(let incoming)? = memory.metadata,
            case .array(let topics)? = incoming["context_topics"], !topics.isEmpty {
             patch["context_topics"] = .array(topics)
+        }
+        if Self.metadataFlag(memory.metadata, Self.explicitValidityKey) {
+            patch[Self.explicitValidityKey] = .bool(true)
         }
         for (key, value) in patch {
             if key == "observed_at", case .string(let observed) = value {
@@ -509,7 +533,7 @@ public actor MemoryStorage {
                 reason = "a rejected claim, found when its owed vector landed"
             }
             if reason == nil, !preservesID {
-                if let duplicate = try Self.admissionDuplicate(of: owed, excludingID: id, in: db) {
+                if let duplicate = try Self.admissionDuplicate(of: owed, excludingIDs: [id] + supersessions.map(\.targetId), in: db) {
                     try Self.recordCorrectionOccurrence(metadata: owed.metadata, rowID: owed.id, createdAt: owed.createdAt, on: duplicate.id, in: db)
                     folded = try Self.foldDuplicate(dataRoot: self.dataRoot, owed, into: duplicate, in: db, tombstones: tombstones, carryingHistory: true)
                     reason = "folded into \(duplicate.id), a duplicate found when its owed vector landed"
@@ -520,8 +544,7 @@ public actor MemoryStorage {
                 var replacement = folded ?? owed
                 do {
                     try db.inSavepoint {
-                        demoted = try supersessions.filter { $0.targetId != replacement.id }
-                            .map { try Self.demoteSuperseded(dataRoot: self.dataRoot, $0, by: &replacement, in: db) }
+                        demoted = try supersessions.map { try Self.demoteSuperseded(dataRoot: self.dataRoot, $0, by: &replacement, in: db) }
                         return .commit
                     }
                     if folded != nil { folded = replacement } else { owed = replacement }
@@ -662,8 +685,7 @@ public actor MemoryStorage {
             let roots = try Self.rewrittenRoots(dataRoot: self.dataRoot, prior: priorRoots, patch: patch, contentChanged: contentChanged, context: context)
             existing.metadata = MemoryRoot.setting(roots, in: existing.metadata)
             if patch.restating != nil, roots != priorRoots, let first = MemoryRoot.firstKnown(roots)?.at {
-                // A restatement that changes the roots moves the memory's truth start and observation to when the agent first knew it.
-                existing.validFrom = first
+                if !Self.metadataFlag(priorMetadata, Self.explicitValidityKey) { existing.validFrom = first }
                 existing.observedAt = first
             }
             let provenance = MemorySenseProvenance.merging(existing: existing.metadata, incoming: turnProvenance)
@@ -741,7 +763,13 @@ public actor MemoryStorage {
                                context: MemoryWriteContext) throws -> [MemoryRoot] {
         var roots = held
         if let restating = patch.restating {
-            let restated = restating.map { telling in held.first { Self.restates(telling, $0) } ?? context.rooting(telling, dataRoot: dataRoot) }
+            let restated = restating.map { telling in
+                let proposed = context.rooting(telling, dataRoot: dataRoot)
+                if let teller = proposed.teller {
+                    return held.first { $0.how == proposed.how && $0.teller == teller && Set($0.through) == Set(proposed.through) } ?? proposed
+                }
+                return held.first { Self.restates(telling, $0) } ?? proposed
+            }
             let turnSteered = !MemoryDataProvenance.steering(context.through, dataRoot: dataRoot).isEmpty
             let kept = turnSteered ? held : held.filter { !$0.through.isEmpty }
             roots = MemoryRoot.union([kept, restated])
@@ -785,7 +813,8 @@ public actor MemoryStorage {
                     // Only the teller's own spelling is renamed: a told root by someone else (the person's words relayed) keeps its teller.
                     let renamed = root.how == .told && root.by?.caseInsensitiveCompare(from) == .orderedSame ? teller : nil
                     return MemoryRoot(how: root.how, by: renamed ?? root.by, at: root.at,
-                                      written: root.written, through: root.through.map { $0 == from ? to : $0 })
+                                      written: root.written, through: root.through.map { $0 == from ? to : $0 },
+                                      teller: root.teller == from ? to : root.teller)
                 }
                 try db.execute(sql: "UPDATE memories SET metadata_json = ? WHERE id = ?",
                                arguments: [Self.encodeMetadata(MemoryRoot.setting(roots, in: row.metadata)), row.id])
@@ -871,11 +900,12 @@ public actor MemoryStorage {
         afterKey: (String, String)?, offset: Int, limit: Int
     ) async throws -> (records: [MemoryRecord], total: Int, nextOffset: Int) {
         try await dbPool.read { db in
+            let now = Date()
             let direction = newestFirst ? "DESC" : "ASC"
             let order = "created_at COLLATE memory_curation_order \(direction), id COLLATE memory_curation_order \(direction)"
             let pinFilter = pinned == true ? "WHERE json_type(metadata_json, '$.pinned') = 'true'" : ""
             let cursor = try Row.fetchCursor(db, sql: """
-                SELECT id, persona_id, created_at, status, lifecycle, metadata_json, valid_to
+                SELECT id, persona_id, created_at, status, lifecycle, metadata_json, valid_from, valid_to
                 FROM memories \(pinFilter) ORDER BY \(order)
                 """)
             var ids: [String] = []
@@ -888,6 +918,7 @@ public actor MemoryStorage {
                     createdAt: row.decode(forColumn: "created_at"),
                     status: row.decode(forColumn: "status"),
                     lifecycle: row.decode(forColumn: "lifecycle") ?? MemoryLifecycle.confirmed,
+                    validFrom: row.decode(forColumn: "valid_from"),
                     validTo: row.decode(forColumn: "valid_to"),
                     metadata: Self.decodeMetadata(row.decode(forColumn: "metadata_json"))
                 )
@@ -896,7 +927,8 @@ public actor MemoryStorage {
                 guard archived ? Self.isRecoverable(record)
                     : record.status == "active" && MemoryLifecycle.isRecallEligible(record.lifecycle)
                         && !Self.metadataFlag(record.extras, Self.pendingAdmissionKey)
-                        && MemoryRecordDisclosurePolicy.isTemporallyEligible(validTo: record.validTo, at: Date()),
+                        && MemoryRecallScoring.hasStarted(validFrom: record.validFrom, at: now)
+                        && MemoryRecordDisclosurePolicy.isTemporallyEligible(validTo: record.validTo, at: now),
                     kind == nil || record.memoryKind == kind,
                     pinned == nil || (record.pinned == true) == pinned,
                     MemoryRecordDisclosurePolicy.classify(
@@ -938,25 +970,25 @@ public actor MemoryStorage {
         }
     }
 
-    /// Atomically increment use_count and stamp last_used_at for returned recall hits. Usage is access, not content: updated_at and recall_generation stay
-    /// unchanged.
+    /// Stamp last_used_at for returned recall hits: eviction keeps what was used most recently. Usage is access, not content: updated_at and
+    /// recall_generation stay unchanged.
     public func recordRecallHits(ids: [String], at when: String = NativeTimestampFormat.fractionalZulu(Date())) async throws {
         guard !ids.isEmpty else { return }
         try await dbPool.write { db in
-            let placeholders = Array(repeating: "?", count: ids.count).joined(separator: ", ")
-            if let id = try String.fetchOne(db, sql:
-                "SELECT id FROM memories WHERE id IN (\(placeholders)) AND (typeof(use_count) != 'integer' OR use_count = ?) LIMIT 1",
-                arguments: StatementArguments(ids.map { $0.databaseValue } + [Int64.max.databaseValue])) {
-                throw MemoryStorageError.databaseUnavailable("memories use_count overflow or invalid counter for row \(id)")
-            }
-            var args: [DatabaseValueConvertible] = [when]
-            args.append(contentsOf: ids)
-            try db.execute(
-                sql: "UPDATE memories SET use_count = use_count + 1, last_used_at = ? WHERE id IN (\(placeholders))",
-                arguments: StatementArguments(args)
-            )
+            try Self.recordRecallHits(ids: ids, at: when, in: db)
         }
         // Candidate reuse returns its cached snapshot without refreshing usage columns.
+    }
+
+    static func recordRecallHits(ids: [String], at when: String, in db: Database) throws {
+        guard !ids.isEmpty else { return }
+        let placeholders = Array(repeating: "?", count: ids.count).joined(separator: ", ")
+        var args: [DatabaseValueConvertible] = [when]
+        args.append(contentsOf: ids)
+        try db.execute(
+            sql: "UPDATE memories SET last_used_at = ? WHERE id IN (\(placeholders))",
+            arguments: StatementArguments(args)
+        )
     }
 
 }

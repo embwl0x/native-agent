@@ -140,7 +140,7 @@ public struct NotificationDeliveryBelief: Codable, Sendable, Equatable {
             if supportedDisplayed { return $0.evidenceClass == .displayReceipt }
             if supportedReceived { return $0.evidenceClass == .deviceProcessReceipt }
             if supportedAccepted { return $0.evidenceClass == .apnsAcceptance }
-            return false
+            return $0.evidenceClass == .deliveryAttempt
         }?.receivedAt
         let freshness = BodyBeliefMetrics.freshness(
             receivedAt: receivedAt,
@@ -273,8 +273,8 @@ public struct MemoryIntegrityReading: Codable, Sendable, Equatable {
         evidence: [BodyEvidenceReference]
     ) {
         let estimate = storeAvailable ? (maintenanceSucceeded == false ? 0.25 : 1) : 0
-        // A successful canonical read proves readability, not successful maintenance. Presence alone supplies neither proof.
-        let uncertainty = storeAvailable && maintenanceSucceeded == nil ? 1.0 : 0
+        // A store that reads is healthy until maintenance is known to have failed.
+        let uncertainty = 0.0
         self.metrics = BodyBeliefMetrics(
             generatedAt: generatedAt,
             estimate: estimate,

@@ -5,32 +5,16 @@ import ProviderRouting
 import SenseCore
 import NativeAgentCore
 import NativeAgentShared
-// Blueprint: | `EngineTelegram.swift` | `TelegramFacade.loadStatus`, `load`, `refresh`, `LatestRead`; Checked transport and diagnostic publication |
+// Blueprint: | `EngineTelegram.swift` | `TelegramFacade.loadStatus`, `load`, `refresh`; Checked transport and diagnostic reads |
 
 /// Core owns Telegram config and transport; this projection adds bounded diagnostics and routing selection.
 @MainActor
-@Observable
 public final class TelegramFacade {
     public nonisolated let dataRoot: URL
-    public var status: TelegramPresentationSnapshot?
-    public private(set) var statusIssue: String?
-    @ObservationIgnored private let statusRead = LatestRead()
 
     @discardableResult
     public func refresh(manager: BackgroundLoopLifetimes = .shared) async throws -> TelegramPresentationSnapshot {
-        let result: Result<TelegramPresentationSnapshot, Error> = await statusRead.read({
-            do { return .success(try await load(manager: manager)) }
-            catch { return .failure(error) }
-        }, publish: { result in
-            switch result {
-            case .success(let loaded):
-                status = loaded
-                statusIssue = nil
-            case .failure(let error):
-                statusIssue = error.localizedDescription
-            }
-        })
-        return try result.get()
+        try await load(manager: manager)
     }
 
     public nonisolated init(dataRoot: URL) { self.dataRoot = dataRoot }

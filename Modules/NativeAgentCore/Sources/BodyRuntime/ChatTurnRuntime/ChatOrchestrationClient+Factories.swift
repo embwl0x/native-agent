@@ -12,7 +12,6 @@ import ProviderRouting
 // MARK: - Factory
 
 /// Routing and credentials use `providersRoot`; all other state uses `dataRoot` to preserve isolation.
-/// Credential writes refresh tokens only. Nil overrides use canonical routing paths and adapter credential selection.
 /// The engine and client share the injected clock.
 public func makeChatOrchestrationClient(
     tools: any ToolDispatchClient,
@@ -24,8 +23,6 @@ public func makeChatOrchestrationClient(
     liveTurns: ChatLiveTap?,
     continuationCapabilityProfile: String? = nil,
     providersRoot: URL? = nil,
-    activeProviderPathOverride: URL? = nil,
-    surfacesPathOverride: URL? = nil,
     approvalFiler: (any ApprovalFiler)? = nil,
     cognitiveRuntime: (any CognitiveRuntimeProviding)? = nil,
     providerLifecycleObserver: (any LLMCallLifecycleObserving)? = nil,
@@ -41,10 +38,10 @@ public func makeChatOrchestrationClient(
     let routerRoot = credentialRoot ?? dataRoot
     let router = SwiftNativeProviderRouting(
         dataRoot: routerRoot,
-        surfacesPathOverride: surfacesPathOverride ?? routerRoot
+        surfacesPathOverride: routerRoot
             .appendingPathComponent("providers", isDirectory: true)
             .appendingPathComponent("surfaces.json"),
-        activeProviderPathOverride: activeProviderPathOverride ?? routerRoot
+        activeProviderPathOverride: routerRoot
             .appendingPathComponent("providers", isDirectory: true)
             .appendingPathComponent("active.json")
     )

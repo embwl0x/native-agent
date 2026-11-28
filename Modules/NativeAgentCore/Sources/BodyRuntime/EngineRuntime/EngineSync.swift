@@ -65,22 +65,19 @@ public final class SyncFacade {
         isCheckingPairing = true
         defer { isCheckingPairing = false }
         await owner.bridge.claimPhonePairing()
-        await loadSecret(quiet: true)
+        await loadSecret()
     }
 
-    public func loadSecret(quiet: Bool) async {
+    public func loadSecret() async {
         guard !Task.isCancelled, !isRotatingSecret else { return }
-        guard let owner else {
+        guard owner != nil else {
             secretRead.write { pairingError = "Pairing is unavailable." }
             return
         }
-        let publicationOwed = owner.bridge.pairingPublicationOwed
         _ = await secretRead.read({
         let result = await Task.detached(priority: .utility) { () -> String? in
             do {
-                if quiet { _ = try PairingSecret.existingSecretBase64() }
-                else if publicationOwed { _ = try PairingSecret.requireExistingSecret() }
-                else { _ = try PairingSecret.loadOrGenerateSecret() }
+                _ = try PairingSecret.existingSecretBase64()
                 return nil
             } catch { return error.localizedDescription }
         }.value

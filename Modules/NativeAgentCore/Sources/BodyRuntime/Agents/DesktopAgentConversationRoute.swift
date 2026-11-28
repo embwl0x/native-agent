@@ -121,7 +121,7 @@ public actor DesktopAgentConversationRoute {
             // Native serialization carries the exact recipient/message data; the editable part owns the procedure, never delivery evidence.
             let client = try engine.resolve().chatClient(tools: operatorTools)
             let prompt = instructions.procedure + "\n" + (try task.serialize(pretty: false))
-            let response = try await client.runEphemeralToolTurn(message: prompt, fileAccess: "auto", requireCompleted: true,
+            let response = try await client.runEphemeralToolTurn(message: prompt, fileAccess: "auto",
                 surface: surface, turn: turn, work: work)
             return await operatorTools.project(answer: Self.answer(response.output), agent: agent)
         } catch let incomplete as EphemeralToolTurnIncomplete {

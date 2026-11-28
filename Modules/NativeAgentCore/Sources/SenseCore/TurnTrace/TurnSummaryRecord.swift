@@ -27,12 +27,8 @@ public enum TurnSummaryComputer {
     /// Cap freeform identities so they cannot bloat snapshots or leak unbounded content.
     public static let maxIdentityFieldLength = 120
 
-    public static func compute(
-        from groups: [TurnTraceGroup],
-        encoder: JSONEncoder = TurnSummaryComputer.makeEncoder(),
-        maxTurns: Int = TurnSummaryComputer.maxTurns,
-        maxBytes: Int = TurnSummaryComputer.maxBytes
-    ) throws -> Data {
+    public static func compute(from groups: [TurnTraceGroup]) throws -> Data {
+        let encoder = makeEncoder()
         let totalTurnsSeen = groups.count
 
         func capped(_ s: String?) -> String? {
@@ -60,7 +56,7 @@ public enum TurnSummaryComputer {
             )
         }
 
-        func file(_ count: Int, truncated: Bool = true) -> TurnSummaryFile {
+        func file(_ count: Int, truncated: Bool) -> TurnSummaryFile {
             TurnSummaryFile(
                 summaries: Array(all.prefix(count)),
                 truncated: truncated,
@@ -74,7 +70,6 @@ public enum TurnSummaryComputer {
             return try encoder.encode(current)
         }
         guard let bounded else { return try encoder.encode(current) }
-        if totalTurnsSeen == 0 && bounded.data.count > maxBytes { return try encoder.encode(file(0)) }
         return bounded.data
     }
 
@@ -117,7 +112,8 @@ public enum EncodedPrefix {
 public enum TurnSummarySource {
 
     /// A clock-skewed detail is retained behind the sequence cursor but does not appear before its recorded time. No second pending-row cache.
-    public static func visibleGroups(_ groups: [TurnTraceGroup], now: Date = Date()) -> [TurnTraceGroup] {
+    public static func visibleGroups(_ groups: [TurnTraceGroup]) -> [TurnTraceGroup] {
+        let now = Date()
         guard groups.contains(where: { $0.lastAt > now }) else { return groups }
         var visible: [TurnTraceGroup] = []
         for group in groups {
@@ -129,8 +125,9 @@ public enum TurnSummarySource {
 
     /// The feed retains its grouped display and the record's sequence, not a second history cache. Only newly appended details are decoded;
     /// only turns they touch (or that cross the day boundary) are regrouped. A failed/corrupt read advances neither cursor nor display.
-    @concurrent public static func readNewGroups(root: URL, groups: [TurnTraceGroup], after: Int64?, now: Date = Date()) async throws
+    @concurrent public static func readNewGroups(root: URL, groups: [TurnTraceGroup], after: Int64?) async throws
         -> (groups: [TurnTraceGroup], lastSeq: Int64?, changed: Bool) {
+        let now = Date()
         let calendar = TurnTracePersistLane.dayCalendar
         let today = calendar.startOfDay(for: now)
         guard let from = calendar.date(byAdding: .day, value: -1, to: today) else { throw CocoaError(.fileReadUnknown) }

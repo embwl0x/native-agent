@@ -64,6 +64,7 @@ public struct CognitiveCare: Sendable, Equatable, Identifiable, Codable {
         public var answered: Bool?
         /// Actual state on either side of this mutation; absent on older evidence, never reconstructed from later state.
         public var pressure: Pressure?
+        var sharedAt: Date?
 
         public init(at: Date, moved: Double, by: Mover, who: String? = nil, felt: String, note: String,
                     source: String, depthChange: DepthChange? = nil, stancePressure: Stance? = nil,
@@ -189,10 +190,19 @@ public struct CognitiveCare: Sendable, Equatable, Identifiable, Codable {
     }
     /// Recent movement, signed, each decayed on this care's clock at read time.
     public func charge(at now: Date) -> Double {
+        story.reduce(0) { $0 + movementCharge($1, at: now) }
+    }
+
+    func movementCharge(_ moment: Moment, at now: Date) -> Double {
         let halfLife = depth.halfLife
-        return story.reduce(0) { sum, moment in
-            sum + moment.moved * pow(0.5, max(0, now.timeIntervalSince(moment.at)) / halfLife)
+        let elapsed = max(0, now.timeIntervalSince(moment.at))
+        guard let sharedAt = moment.sharedAt else {
+            return moment.moved * pow(0.5, elapsed / halfLife)
         }
+        let beforeShare = min(elapsed, max(0, sharedAt.timeIntervalSince(moment.at)))
+        let factor = moment.moved < 0 ? 0.90 : 1.05
+        let exponent = beforeShare / halfLife + (elapsed - beforeShare) / (halfLife * factor)
+        return moment.moved * pow(0.5, exponent)
     }
     public func pressure(at now: Date) -> Double {
         guard depth != .life || open != nil else { return 0 }

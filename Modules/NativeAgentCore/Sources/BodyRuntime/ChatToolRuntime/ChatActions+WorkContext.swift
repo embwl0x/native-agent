@@ -115,7 +115,7 @@ extension SwiftToolDispatcher {
                 }
                 if result["has_more"] == .bool(true) {
                     var next = continuation
-                    let returned = Self.jsonInt(result["returned_count"]) ?? 0
+                    let returned = result["returned_count"]?.exactIntegerValue ?? 0
                     if returned > 0 {
                         next["history_offset"] = .int(Int64(historyOffset + returned))
                         lane["next_read"] = Self.workContextRead("work_context", next)

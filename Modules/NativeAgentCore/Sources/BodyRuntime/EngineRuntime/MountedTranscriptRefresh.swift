@@ -1,6 +1,5 @@
 import SenseCore
 import Foundation
-import Observation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
@@ -8,6 +7,7 @@ import ProviderRouting
 import MindCore
 import MacNerves
 import Darwin
+import Observation
 // Blueprint: | `MountedTranscriptRefresh.swift` | Mounted conversations read the store when it publishes; no turn refreshes a view |
 extension NativeAgentEngine {
     @MainActor

@@ -96,6 +96,23 @@ public actor MacAppMapStore {
         MacAppMaps.fileName(bundle).map { directory.appendingPathComponent($0) }
     }
 
+    enum SnapshotFailure: String, Error {
+        case invalidBundle = "invalid_app_map_bundle_id"
+        case exceedsLimit = "app_map_exceeds_limit"
+    }
+
+    func savedSnapshot(bundle: String) throws -> MacAppMap? {
+        guard let url = url(bundle) else { throw SnapshotFailure.invalidBundle }
+        let handle: FileHandle
+        do { handle = try FileSystemActions.openRegularReadHandle(url) }
+        catch let error as FileSystemActions.FileReadFailure where error.code == "file_not_found" { return nil }
+        defer { try? handle.close() }
+        let limit = 2 * 1024 * 1024
+        let data = try handle.read(upToCount: limit + 1) ?? Data()
+        guard data.count <= limit else { throw SnapshotFailure.exceedsLimit }
+        return try JSONDecoder().decode(MacAppMap.self, from: data)
+    }
+
     /// Malformed maps remain in place and are not overwritten.
     private func load(_ bundle: String) throws -> MacAppMap {
         guard let url = url(bundle) else {

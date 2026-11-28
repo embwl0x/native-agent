@@ -58,7 +58,7 @@ extension NativeCognitionRuntime {
         do {
             let root = dataRoot, engine = rootEngine
             // Tending is the mind's own background pass: no turn holds it, and it never hands back.
-            report = try await StudioCanonTending.run(turn: nil, handsBack: false, dataRoot: root, now: now(), deadlineDate: Self.deskDate,
+            report = try await StudioCanonTending.run(dataRoot: root, now: now(), deadlineDate: Self.deskDate,
                 admitEffects: { [weak self] in
                     guard let self, await self.studioCanonAdmitted(explicit: satisfyWait) else { throw CancellationError() }
                 }) { input in
@@ -69,6 +69,8 @@ extension NativeCognitionRuntime {
                 return try await engine().callReadPart(id: "studio-canon", input: .object(facts), actions: [],
                     origin: "studio_canon:proposals")
             }
+        } catch is CancellationError {
+            return .init("stopped", "The tending pass stopped or canon admission closed.")
         } catch {
             nativeLog("[StudioCanon] Tending deferred: %@", error.localizedDescription)
             await substrate.recordReceipt(kind: "studio.canon_tending_unavailable", payload: .object([
@@ -76,7 +78,7 @@ extension NativeCognitionRuntime {
             ]))
             return .init("unavailable", error.localizedDescription)
         }
-        let stopped = isAdmissionClosed || Task.isCancelled
+        let stopped = report.stagingCancelled || !studioCanonAdmitted(explicit: satisfyWait)
         let failures = report.failures
         let result = MindClockResult(!failures.isEmpty ? "unavailable" : stopped ? "stopped" : "evaluated",
             "\(report.stagedApprovalIDs.count) proposed of \(report.evaluatedWorks) works; canonization still requires the agent's seat."

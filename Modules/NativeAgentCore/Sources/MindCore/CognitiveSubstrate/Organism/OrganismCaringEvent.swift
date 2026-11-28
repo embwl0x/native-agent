@@ -132,7 +132,6 @@ public struct OrganismTurnFold: Sendable {
     /// Retain the appraisal reason with actual doses for later relay judgment.
     public var caringWhy: String
     public var reaction: SomaticSignal?
-    /// An accepted standing correction supplies confidence evidence.
     public var correctionConfidence: Double
     public init(seq: UInt64, epoch: UInt64, caring: OrganismCaringEvent.Reading? = nil,
                 caringWindow: TimeInterval = OrganismCaringEvent.encounterWindow, caringWhy: String = "",
@@ -146,7 +145,7 @@ public struct OrganismTurnFold: Sendable {
         self.correctionConfidence = correctionConfidence
     }
 
-    public var isEmpty: Bool { caring == nil && reaction == nil && correctionConfidence <= 0 }
+    public var isEmpty: Bool { caring == nil && reaction == nil }
 }
 
 public enum OrganismTurnFoldOutcome: Sendable, Equatable {

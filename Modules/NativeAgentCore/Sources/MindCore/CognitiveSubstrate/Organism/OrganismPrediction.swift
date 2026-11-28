@@ -83,9 +83,7 @@ public enum OrganismPredictiveBody {
                 chemicalState: &nextChemistry
             )
         case .correctionReceived, .appWake, .appSleep, .horizonRefresh,
-             .providerRecovered, .iPhoneReachable, .iPhoneStale,
-             .memoryCommitted, .memoryCorrected,
-             .dreamCompleted, .remIntegrated, .resourcePressureChanged, .organDeviated:
+             .providerRecovered, .iPhoneReachable, .dreamCompleted, .remIntegrated, .organDeviated:
             break
         }
 
@@ -111,6 +109,7 @@ public enum OrganismPredictiveBody {
         for id in ledger.predictions.keys.sorted() {
             guard var prediction = ledger.predictions[id],
                   prediction.status == .pending,
+                  prediction.horizon?.peerJobID == nil,
                   prediction.dueAt < date else { continue }
             let isMiss = applyExpiryTransition(to: &prediction, at: date)
             ledger.predictions[id] = prediction
@@ -461,15 +460,17 @@ public enum OrganismPredictiveBody {
 /// Pending expectations precede recent terminal evidence, retained fairly across capability kinds without favoring any terminal status.
 enum OrganismPredictionRetention {
     static func bounded(
-        _ predictions: [OrganismPrediction],
+        _ rows: [OrganismPrediction],
         maximum: Int
     ) -> [OrganismPrediction] {
         guard maximum > 0 else { return [] }
+        let peerWaits = rows.filter { $0.horizon?.peerJobID != nil }
+        let predictions = rows.filter { $0.horizon?.peerJobID == nil }
         // Pending horizons rank after operational expectations so calendar rows cannot evict live work.
         let allPending = predictions.filter { $0.status == .pending }
         let pending = allPending.filter { $0.horizon == nil }.sorted(by: recentFirst)
             + allPending.filter { $0.horizon != nil }.sorted(by: recentFirst)
-        if pending.count >= maximum { return Array(pending.prefix(maximum)) }
+        if pending.count >= maximum { return Array(pending.prefix(maximum)) + peerWaits }
 
         var result = pending
         var buckets = Dictionary(grouping: predictions.filter { $0.status != .pending }, by: \.kind)
@@ -484,7 +485,7 @@ enum OrganismPredictionRetention {
             }
             if !appended { break }
         }
-        return result
+        return result + peerWaits
     }
 
     private static func recentFirst(_ lhs: OrganismPrediction, _ rhs: OrganismPrediction) -> Bool {

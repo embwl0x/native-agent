@@ -5,7 +5,7 @@ import SenseCore
 // Blueprint: | `SlackSocketModeLoop+Evidence.swift` | `SlackSocketModeLoop`: bounded, redacted diagnostics and envelope evidence |
 
 extension SlackSocketModeLoop {
-    func recordReceipt(kind _: String, inbound: SlackInboundMessage, reply _: String) async {
+    func recordReceipt(inbound: SlackInboundMessage) async {
         let statePatch: [String: JSONValue] = [
             "lastReplyAt": .string(NativeTimestampFormat.fractionalZulu(Date())),
             "lastReplyEventId": .string(inbound.eventId),

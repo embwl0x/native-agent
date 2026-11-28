@@ -465,7 +465,7 @@ private struct MacChatComposerSendButton: View {
         .shellKeyboardTarget(.send)
         .disabled(!lit)
         .animation(
-            NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion),
+            Animation.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion),
             value: lit
         )
         .help(isRunning ? "Stop generation" : "\(sendAction.label). \(sendAction.hint)")
@@ -541,7 +541,7 @@ struct ChatComposerTray: View {
                     .padding(.bottom, Self.gap)
             }
         }
-        .animation(NativeAgentMotion.respecting(NativeAgentMotion.glide, reduceMotion: reduceMotion),
+        .animation(Animation.respecting(NativeAgentMotion.glide, reduceMotion: reduceMotion),
                    value: contents)
     }
 

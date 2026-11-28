@@ -4,12 +4,11 @@ import SwiftUI
 
 /// Keep cached content mounted while the page read reports its status.
 struct PageReadStatus: View {
-    let isReading: Bool
     var text: String?
 
     var body: some View {
         HStack(spacing: 8) {
-            if isReading { ProgressView().controlSize(.small) }
+            ProgressView().controlSize(.small)
             if let text {
                 Text(text)
                     .font(ShellType.label)
@@ -21,24 +20,7 @@ struct PageReadStatus: View {
     }
 }
 
-/// Reserve teal for waiting on a person; calm, trouble and quiet ink distinguish the other states.
 enum AdvancedStatusWords {
-    static func color(_ status: String?) -> Color {
-        switch status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "pending", "awaiting_approval", "needs_approval":
-            return NativeAgentShell.needsYou
-        case "ok", "done", "passed", "succeeded", "active", "valid", "ready",
-             "scheduled", "granted", "installed", "approved", "trusted", "healthy":
-            return NativeAgentShell.calm
-        case "fail", "failed", "error", "timeout", "quarantined", "evidence_failed",
-             "denied", "revoked", "refused", "warn", "warning", "blocked",
-             "needs_setup", "interrupted", "disabled", "rolled_back", "stale":
-            return NativeAgentShell.trouble
-        default:
-            return NativeAgentShell.secondary
-        }
-    }
-
     /// Translate storage slugs into readable labels.
     static func label(_ raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)

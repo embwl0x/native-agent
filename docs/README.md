@@ -18,14 +18,17 @@ and [CHANGELOG.md](../CHANGELOG.md).
 
 | Document | For |
 |---|---|
-| [User and Agent Guide](USER_GUIDE.md) | Setup, main pages, the `app` door, Trust, iPhone and bridges |
-| [Desk vocabulary](DESK.md) | Work handles, paging, person and dependency waits, summaries, and the separate shared ledger |
+| [Getting started](GETTING_STARTED.md) | Install, connect a model, choose access, and start a conversation |
+| [User and Agent Guide](USER_GUIDE.md) | Mac pages, work and memory, iPhone, and connected services |
+| [Desk vocabulary](DESK.md) | Work handles, paging, waits on people and dependencies, and summaries |
 | [Siri and notification actions](siri-notification-actions.md) | Named-agent phrases, Mac Approve/Deny/Reply actions, and installed-app checks |
 | [Support](../SUPPORT.md) | Install, pairing, updates, troubleshooting |
 | [Privacy](../PRIVACY.md), [Security](../SECURITY.md), [Threat model](threat-model.md) | What leaves the Mac, what is defended, what is not |
 | [Data bounds](data-bounds.md) | Caps and retention (bundled in the app: **Settings → Show data limits**) |
 | [Mobile companion](mobile_companion.md), [iPhone approval pairing](ios-device-pairing.md), [APNS push](apns-push.md), [iOS sharing](ios-sharing.md) | The iPhone transport, pairing, and Share extension |
 | [Agent conversations](agent-communication.md), [Grok Bot connection](grok-bot-connection.md) | Talking to other agents and peers |
+| [Settings](SETTINGS.md) | Mac and iPhone settings, model accounts, permissions, pairing, and data |
+| [Where things are](WHERE_THINGS_ARE.md) | Window pages, chat controls, menus, shortcuts, and iPhone screens |
 
 ## How it works
 

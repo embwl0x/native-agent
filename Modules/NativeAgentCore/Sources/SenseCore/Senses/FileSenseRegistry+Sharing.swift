@@ -1,6 +1,6 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `FileSenseRegistry+Sharing.swift` | Approval-gated portable code/record export |
+// Blueprint: | `FileSenseRegistry+Sharing.swift` | Portable code/record export to the chosen destination |
 
 extension FileSenseRegistry {
     /// Export only explicitly manifested source and metadata; the directory and notebook are private.
@@ -10,11 +10,10 @@ extension FileSenseRegistry {
         var codeFiles: [String: Data]
     }
 
-    public func exportBundle(id: String, to destination: URL, userApproved: Bool = false) async throws -> SenseExportResult {
+    public func exportBundle(id: String, to destination: URL) async throws {
         try await withStore { store in
             let version = store.senses[try Self.index(id, in: store)].current
             guard version.record.language != .native else { throw Self.failure("Built-in native code cannot be shared as a portable sense.") }
-            guard userApproved else { return (false, .approvalNeeded(senseID: id)) }
             if let failure = version.sourceFailure { throw Self.failure(failure) }
             guard let names = version.files else { throw Self.failure("Sense source membership has not been checked.") }
             let files = try self.sourceFiles(version.record).filter { names.contains($0.key) }
@@ -52,7 +51,7 @@ extension FileSenseRegistry {
                 }
                 throw error
             }
-            return (false, .exported(target))
+            return (false, ())
         }
     }
 }

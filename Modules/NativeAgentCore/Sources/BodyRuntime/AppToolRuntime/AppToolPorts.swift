@@ -54,6 +54,7 @@ public struct AppActionExecution: Sendable {
     public var senseAct = false
     public var retainBrowserRead: (@Sendable (BrowserVisibleCapture) -> Void)?
     public var localImageSink: LocalToolImage.Sink?
+    var anatomyScrub: (@Sendable () async -> OwnedProgramExecution.AnatomyScrub)?
     public init(invocation: ChatToolInvocation, deadlines: OperationDeadlines, turnWork: ChatTurnWork) {
         self.turnWork = turnWork
         self.invocation = invocation
@@ -107,9 +108,11 @@ public struct AppActionExecution: Sendable {
     }
 
     func programExecution(turn: Turn?, surface: String, preview: Bool = false) -> OwnedProgramExecution {
-        OwnedProgramExecution(turn: turn, surface: surface, deadlines: deadlines, preview: preview, wake: wake,
+        var program = OwnedProgramExecution(turn: turn, surface: surface, deadlines: deadlines, preview: preview, wake: wake,
             options: .init(handsBack: handsBack), readContent: invocation.readContent,
             valueIdentity: valueCall, valueReach: valueReach, deadline: invocation.waitDeadline, onActivity: { deadlines.progressed() })
+        program.anatomyScrub = anatomyScrub
+        return program
     }
 
     func partInvocation(turn: Turn, surface: String, preview: Bool = false) -> Parts.Invocation {
@@ -141,6 +144,7 @@ public struct AppActionExecution: Sendable {
         execution.valueCall = program.valueIdentity
         execution.valueReach = program.valueReach
         execution.invocation.readContent = program.readContent
+        if let scrub = program.anatomyScrub { execution.anatomyScrub = scrub }
         execution.invocation.waitDeadline = program.deadline
         execution.deadlines = program.deadlines
         return execution
@@ -168,7 +172,7 @@ public struct BrowserToolPlatformPort: Sendable {
     /// The row or section the page shows under these words (its id, else its title), with where the row opens; nil when the page shows none.
     func pageItem(page: String, named: String) async -> (id: String, open: String?)?
     /// The whole reading of a section (or, with `rows`, a row) the page draws, by its id, as an open section reads; nil when it draws none.
-    func pageItemText(page: String, item: String, rows: Bool) async -> String?
+    func pageItemText(page: String, item: String, rows: Bool, turn: Turn) async -> String?
     /// Empty sessionId targets the visible conversation.
     func composerState(sessionId: String, turn: Turn) async -> [String: JSONValue]
     /// Attachments are already resolved and fenced; turnSessionId retains the asking conversation's __session_id.

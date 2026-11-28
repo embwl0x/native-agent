@@ -155,8 +155,11 @@ outcomes do not gate ordinary notification readiness. Doctor reads the same
 authority; optional wake failures remain in the sender's delivery diagnostics.
 The body's notification belief reads the live kernel's current delivery
 prediction: publication failures and signed phone receipts, never
-`mobile_push/apns_outcomes.jsonl`. No prediction, a pending publication or an
-expired receipt expectation supplies no terminal delivery evidence. The
+`mobile_push/apns_outcomes.jsonl`. No prediction supplies no delivery evidence. A pending publication or an
+expired receipt expectation is a delivery attempt whose outcome is unknown: the belief carries it as
+`deliveryAttempt` evidence dated at the attempt, and conduct asks for a receipt while that
+evidence is inside its 36-hour horizon. A transport with nothing sent, or whose last delivery
+was acknowledged, asks for none. The
 `notificationPathHealthy` projection is optional: absent delivery evidence clears
 it to unknown, including an unconfigured transport; a current signed receipt
 supports true and publication failure supports false. Peer contact changes

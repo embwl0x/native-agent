@@ -16,20 +16,14 @@ public struct AutonomyKernelSummary: Codable, Hashable, Sendable {
     public var status: String
     public var mode: String?
     public var enabled: Bool?
-    public var processEnabled: Bool?
-    public var trustEnabled: Bool?
     public var disabledReason: String?
     public var guardrails: [KernelGuardrail]
-    public var createdAt: String?
-    public init(status: String, mode: String? = nil, enabled: Bool? = nil, processEnabled: Bool? = nil, trustEnabled: Bool? = nil,
-        disabledReason: String? = nil, guardrails: [KernelGuardrail], createdAt: String? = nil) {
+    public init(status: String, mode: String? = nil, enabled: Bool? = nil,
+        disabledReason: String? = nil, guardrails: [KernelGuardrail]) {
         self.status = status
         self.mode = mode
         self.enabled = enabled
-        self.processEnabled = processEnabled
-        self.trustEnabled = trustEnabled
         self.disabledReason = disabledReason
         self.guardrails = guardrails
-        self.createdAt = createdAt
     }
 }

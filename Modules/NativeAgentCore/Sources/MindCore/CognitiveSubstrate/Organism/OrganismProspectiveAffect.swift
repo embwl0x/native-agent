@@ -4,6 +4,16 @@ import Foundation
 
 // Blueprint: | `OrganismProspectiveAffect.swift` | `OrganismProspectiveAffect`: pure prediction/horizon chemistry projection |
 
+public struct OrganismProspect: Sendable, Equatable {
+    public var bracing = 0.0, dread = 0.0, lookingForward = 0.0, toward = 0.0, missShadow = 0.0
+    var hasPending = false
+
+    /// Bracing is learned from real misses; a horizon's sign is a guess by its kind, so a waiting approval or an open question counts half and cannot
+    /// reach dread by itself.
+    var feltDread: Double { min(1, bracing + dread * 0.5) }
+    var anticipation: Double { min(1, lookingForward + toward) }
+}
+
 enum OrganismProspectiveAffect {
 
     // MARK: - Tuning knobs (the ONE prospective surface)
@@ -28,7 +38,7 @@ enum OrganismProspectiveAffect {
         _ p: OrganismPrediction,
         at now: Date
     ) -> (toward: Double, dread: Double) {
-        guard let horizon = p.horizon else { return (0, 0) }
+        guard let horizon = p.horizon, horizon.peerJobID == nil else { return (0, 0) }
         let untilDue = p.dueAt.timeIntervalSince(now)
         let nearness = untilDue <= 0 ? 1.0 : max(0, 1 - untilDue / horizonWindow)
         guard nearness > 0 else { return (0, 0) }
@@ -37,44 +47,44 @@ enum OrganismProspectiveAffect {
         return horizon.valence > 0 ? (magnitude, 0) : (0, magnitude)
     }
 
-    /// Modulate a chemical state with what's PENDING. Pure: same inputs → same output; empty/idle ledger → the input state unchanged.
+    static func prospect(ledger: OrganismPredictionLedger, at now: Date) -> OrganismProspect {
+        var read = OrganismProspect()
+        read.missShadow = violationShadow(ledger, at: now)
+        for p in ledger.predictions.values where p.status == .pending && carriesFeeling(p.kind) {
+            read.hasPending = true
+            let contribution = predictionBracingContribution(p, ledger: ledger, at: now)
+            read.bracing += contribution.bracing
+            read.lookingForward += contribution.lookingForward
+            let horizon = horizonContribution(p, at: now)
+            read.toward += horizon.toward
+            read.dread += horizon.dread
+        }
+        read.bracing = min(1, read.bracing)
+        read.lookingForward = min(1, read.lookingForward)
+        read.toward = min(1, read.toward)
+        read.dread = min(1, read.dread)
+        return read
+    }
+
     static func modulate(
         _ state: ChemicalState,
         ledger: OrganismPredictionLedger,
         at now: Date
-    ) -> ChemicalState {
-        let pending = ledger.predictions.values.filter {
-            $0.status == .pending && carriesFeeling($0.kind)
+    ) -> (state: ChemicalState, prospect: OrganismProspect) {
+        let read = prospect(ledger: ledger, at: now)
+        guard read.hasPending || read.missShadow > 0.01 else {
+            return (state, read)
         }
-        // Violation shadow: a recently violated expectation keeps a fading edge of wariness even between predictions (the body remembers the last miss).
-        let shadow = violationShadow(ledger, at: now)
-        guard !pending.isEmpty || shadow > 0.01 else { return state }
 
-        var bracing = 0.0
-        var lookingForward = 0.0
-        var horizonToward = 0.0
-        var horizonDread = 0.0
-        for p in pending {
-            let contribution = predictionBracingContribution(p, ledger: ledger, at: now)
-            bracing += contribution.bracing
-            lookingForward += contribution.lookingForward
-            let horizon = horizonContribution(p, at: now)
-            horizonToward += horizon.toward
-            horizonDread += horizon.dread
-        }
-        bracing = min(1, bracing + shadow)
-        lookingForward = min(1, lookingForward)
-        horizonToward = min(1, horizonToward)
-        horizonDread = min(1, horizonDread)
-
+        let bracing = min(1, read.bracing + read.missShadow)
         var out = state
         // Horizons share the per-axis budget; confidence and urgency remain operational so dread cannot become doubt about capability.
-        out.vigilance = (out.vigilance + maxDelta * min(1, bracing + horizonDread)).clamped01()
+        out.vigilance = (out.vigilance + maxDelta * min(1, bracing + read.dread)).clamped01()
         out.confidence = (out.confidence - maxDelta * bracing * 0.7).clamped01()
-        out.curiosity = (out.curiosity + maxDelta * min(1, lookingForward + horizonToward)).clamped01()
+        out.curiosity = (out.curiosity + maxDelta * read.anticipation).clamped01()
         out.urgency = (out.urgency + maxDelta * bracing * 0.5).clamped01()
-        out.warmth = (out.warmth + maxDelta * horizonWarmthShare * horizonToward).clamped01()
-        return out
+        out.warmth = (out.warmth + maxDelta * horizonWarmthShare * read.toward).clampedSigned()
+        return (out, read)
     }
 
     static func carriesFeeling(_ kind: OrganismPredictionKind) -> Bool {

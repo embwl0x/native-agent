@@ -72,6 +72,11 @@ template or a whitelist of generic detail words. Up to eight facts per act and
 80 characters per fact are shown, with omissions and shortening named.
 A successful call is not renamed sent or delivered.
 Successful reads, nested dispatches and previews do not occupy these lines.
+A saved late dispatch result lives in the original turn's details as
+`tool.dispatch.settled`, keyed by turn id and invocation id. Read it with
+`trace.recent` using that kind and the turn id. The closing dispatch details
+carry the invocation id. An inline replay uses the receipt saved when the card
+was first filed as its parent when present.
 An act with missing closing dispatch evidence still carries its known domain,
 authored words, status and effects, including failures and unknown effects.
 The same renderer names missing, unreadable or bounded result wording as a gap
@@ -227,11 +232,14 @@ explicit common-home location.
 
 ### Delivery and face
 
-`trace.usage` sums each recorded model-usage counter separately, including cache
-creation, cache writes and their lifetime splits. Missing measurements remain
-counted in `missing_fields`. These counters overlap: lifetime splits belong to
-their creation/write total; Anthropic input excludes cache reads and creation,
+Trace day windows and day groupings follow the Mac's current time zone.
+`trace.model_calls` reads model calls, turn terminals, work identities and tool
+dispatches. `trace.usage` reads model calls and sums each recorded model-usage
+counter separately, including cache creation, cache writes and their lifetime
+splits. Missing measurements remain counted in `missing_fields`. These counters
+overlap: lifetime splits belong to their creation/write total; Anthropic input excludes cache reads and creation,
 while OpenAI input includes cached tokens. They are not one spend total.
+Both readings measure retention from the earliest retained trace detail of any kind.
 
 - **Unchanged is no change.** Repeating an experience's current progress writes
   nothing. The experience write stream carries the committed `updatedAt`, the
@@ -266,6 +274,9 @@ while OpenAI input includes cached tokens. They are not one spend total.
 - **A delayed answer keeps its route.** Grok's request keeps the asking turn's door from the moment it is sent; the answer runs through the contacts' one answer owner (claim, turn, cache, delivery) and goes back to that door. A request with no kept door says so on its hand-over.
 - **A send's record closes when its exchange ends.** The conversation owner's recording pass reads every open experience whose evidence names that row (`agents/conversations`), not only its current operation. A send that is neither current nor still queued accepts all its unsettled keys when its retained exchange has a reply, or is delivered and the row explicitly requires no reply; otherwise those keys are let go as abandoned. A failed/not-delivered current send lets go every unsettled key as failed, including `accept`, `answer` and any queued `deliver`. A current send requiring no reply accepts its answer obligation at confirmed delivery. Queued promotion keeps the message's original id as its operation id, so that same experience follows the send through delivery and answer. Dropped/restored rows and rows for removed contacts seen by this pass abandon their remaining obligations; experiences whose row is absent are untouched. Prior settlements never change. The next normal write (or startup projection) applies this law to existing open records; there is no separate cleanup or migration.
 
+  A [send refused because the conversation advanced in another chat](agent-communication.md)
+  records an act with no effects and creates neither a send experience nor repair debt.
+
   A queued send with a saved refusal also lets go every outstanding `deliver`,
   `accept` and `answer` key as failed. Its face retains the not-sent reason;
   only a pre-Return Mac hold marked `waitingForMac: true` stays pending.
@@ -281,7 +292,12 @@ while OpenAI input includes cached tokens. They are not one spend total.
   Unread arrivals run through their own doors. Mac `intent:chat` arrivals always
   wait for their own turns. A peer's words can join across surfaces when the
   [turn's admission rules](ANATOMY_OF_A_TURN.md#1-a-surface-admits-the-turn) for
-  principal, steering sources and file access are met. A card's continuation stays hidden.
+  principal, steering sources and file access are met. A card continuation can
+  be hidden or carry the visible text of the resumed request. When a readable
+  card continuation carries the `person` principal and
+  withdraws unstarted calls, the notice calls it a card answer. The
+  [turn anatomy](ANATOMY_OF_A_TURN.md#1-a-surface-admits-the-turn) owns the
+  eligibility check and the wording for other arrivals.
 
 ### Phone projection
 
@@ -387,6 +403,8 @@ mints a fresh occurrence id beneath the caller's failure key; operation and owne
 deduplicate open debt. A failure after settlement creates a new experience,
 without reopening or rewriting the settled birth.
 Home, the agent's Desk, Doctor and the health pill project the experience face.
+Home reads the committed repair projection without joining queued writes;
+experience commits and storage gap changes invalidate that reading.
 Doctor includes every unsettled `owes.repair`, not only failures measured by Doctor;
 saved debt supplies evidence, while only a current check supplies an executable Doctor repair.
 Projecting a measured check again preserves its verdict, detail and repair fields;

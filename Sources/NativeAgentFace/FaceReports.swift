@@ -9,7 +9,6 @@ final class FaceReports {
     private weak var client: PipeFaceClient?
     private var events: AsyncStream<FaceAct>.Continuation?
     private var publication: Task<Void, Never>?
-    private var observers: [NSObjectProtocol] = []
     private var scene: SceneReport?
     private var inspector: RendererInspectorReport?
     var connectionID: UUID? { client?.connectionID }
@@ -26,11 +25,6 @@ final class FaceReports {
                 catch is CancellationError { return }
                 catch { ApplicationLifetime.shared.appModel?.setFailureStatus(error, action: "report the window state") }
             }
-        }
-        for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification] {
-            observers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { _ in
-                Task { @MainActor in FaceReports.shared.sceneChanged() }
-            })
         }
         sceneChanged()
     }
@@ -56,8 +50,6 @@ final class FaceReports {
         closing?.cancel()
         await closing?.value
         publication = nil
-        for observer in observers { NotificationCenter.default.removeObserver(observer) }
-        observers.removeAll()
         client = nil
         scene = nil; inspector = nil
     }

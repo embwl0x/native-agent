@@ -11,6 +11,7 @@ public final class PeerDataTaint: Sendable {
         var sources: [String] = []
         var line = ""
         var elevated: [String] = []
+        var taskElevationsSealed = false
     }
     private let state = Mutex(State())
 
@@ -23,7 +24,6 @@ public final class PeerDataTaint: Sendable {
         for peer in elevated { elevate(dataRoot: dataRoot, peer: peer) }
     }
 
-    /// Carry origin peers, bridge identity and elevated peers so later turns and queued steps preserve the same steering.
     public static func carried(turn: Turn, surface: String = "") -> (sources: [String], elevated: [String]) {
         var sources = Array(Set((turn.peerSteering?.checkpointSources ?? []) + abilitySources(turn: turn))).sorted()
         let envelope = TurnEnvelope.current(turn: turn, surface: surface)
@@ -48,7 +48,7 @@ public final class PeerDataTaint: Sendable {
 
     /// Restore only the complete current record. Missing provenance is not an
     /// unsteered run and cannot be repaired by inventing a principal.
-    public static func steer(dataRoot: URL, in record: JSONValue?, scope: String? = nil) throws -> (sources: [String], elevated: [String]) {
+    public static func steer(in record: JSONValue?) throws -> (sources: [String], elevated: [String]) {
         func invalid(_ detail: String) -> ToolFailureError {
             ToolFailureError("Carried steering is unavailable: \(detail). The continuation was not restored.", effects: .none,
                 owner: "Carried run provenance", code: "steering_record_invalid",
@@ -64,19 +64,26 @@ public final class PeerDataTaint: Sendable {
                 return text
             }
         }
-        let sources = try list("sources"), elevated = try list("elevated")
-        return (sources, elevated + (scope == "task" ? sources.filter { !ownerTrusts(dataRoot, $0) && !elevated.contains($0) } : []))
+        return try (list("sources"), list("elevated"))
     }
 
     public func elevate(dataRoot: URL, peer: String) {
         let name = Self.principal(dataRoot, peer.trimmingCharacters(in: .whitespacesAndNewlines))
         guard Self.steers(name) else { return }
         state.withLock { state in
-            if !state.elevated.contains(name) { state.elevated.append(name) }
+            if !state.taskElevationsSealed, !state.elevated.contains(name) { state.elevated.append(name) }
         }
     }
 
-    /// Reading peer words latches nothing; the bridge surface already identifies its initiating peer.
+    @discardableResult
+    public func sealTaskElevations(onlyIfUnelevated: Bool = false) -> Bool {
+        state.withLock { state in
+            guard !onlyIfUnelevated || state.elevated.isEmpty else { return false }
+            state.taskElevationsSealed = true
+            return true
+        }
+    }
+
     public func keep(line: String) {
         state.withLock { state in
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -198,8 +205,6 @@ public final class PeerDataTaint: Sendable {
         return CapabilityLifecycle.peerRefusal(who, tap: tap)
     }
 
-    /// Only an untrusted initiating agent or wake sender latches steering. Reading web, mail, files or memory does not.
-    /// Trusted helpers, schedules and native work use ordinary Trust gates; unrecognized external forms still steer.
     static func steers(_ source: String) -> Bool { !source.isEmpty && source != "self" && !source.hasPrefix("bot:") }
 
     /// Resolve every attested locator to its contact so aliases share one principal and one grant.

@@ -41,9 +41,8 @@ extension SwiftNativeProviderRouting {
     func nativeListProviders(
         openRouterModels: [[String: JSONValue]]? = nil,
         moonshotModels: [[String: JSONValue]]? = nil,
-        codexCacheURL: URL? = nil,
         authEnvironment: [String: String] = ProcessInfo.processInfo.environment,
-        additionalProviderIDs: Set<String> = [], savedModels: Set<String> = [], preview: Bool = false
+        additionalProviderIDs: Set<String> = [], savedModels: Set<String> = []
     ) throws -> (providers: [Provider], cache: ProviderConfigCache) {
         var byId: [String: Provider] = [:]
         for provider in try Self.loadProviderRegistryChecked(at: providersDir.appendingPathComponent("registry.json")) ?? [] {
@@ -57,7 +56,6 @@ extension SwiftNativeProviderRouting {
         for id in ids {
             var row = byId[id] ?? Provider(id: id)
             row.displayName = Self.connectableProviderIds.contains(id) ? Self.displayName(for: id) : (row.displayName ?? Self.displayName(for: id))
-            row.kind = id.contains("oauth") || id == "codex" ? "oauth" : "api_key"
             // Preserve custom registry catalogs; shipped routes always use current catalogs. A live route's list carries a note beside it (why the
             // provider's list is missing, when it was fetched, how many models were left out), shows each model once (a dated spelling only when
             // saved), and each row says whether it is offered: the build's rows standing in for a missing list are not.
@@ -70,7 +68,7 @@ extension SwiftNativeProviderRouting {
             } else if Self.connectableProviderIds.contains(id) || row.modelCatalog == nil {
                 row.modelCatalog = .array(modelsForProvider(
                     id, openRouterModels: openRouterModels, moonshotModels: moonshotModels,
-                    codexCacheURL: codexCacheURL, authEnvironment: authEnvironment, preview: preview
+                    authEnvironment: authEnvironment
                 ).map { .object($0) })
             }
             var extras: [String: JSONValue] = [:]
@@ -80,10 +78,10 @@ extension SwiftNativeProviderRouting {
                 extras["auth_modes"] = .array(authModes(for: id).map { .string($0) })
             }
             // An unreadable account catalog must retain its cause in the missing-list field.
-            if codexCacheURL == nil, CodexAccountModelCatalog.isAccountBackedProvider(id) {
-                if let fault = CodexAccountModelCatalog.cacheFault(dataRoot: dataRoot, environment: authEnvironment, preview: preview) {
+            if CodexAccountModelCatalog.isAccountBackedProvider(id) {
+                if let fault = CodexAccountModelCatalog.cacheFault(dataRoot: dataRoot, environment: authEnvironment) {
                     extras["models_note"] = .string(fault)
-                } else if let refusal = CodexAccountModelCatalog.fullListRefusal(dataRoot: dataRoot, environment: authEnvironment, preview: preview) {
+                } else if let refusal = CodexAccountModelCatalog.fullListRefusal(dataRoot: dataRoot, environment: authEnvironment) {
                     extras["models_note"] = .string(refusal)
                 } else {
                     extras["models_note"] = nil
@@ -291,7 +289,7 @@ extension SwiftNativeProviderRouting {
            let fault = CodexAccountModelCatalog.cacheFault(dataRoot: dataRoot, preview: preview) { return fault }
         if routeID == "moonshot", let fault = MoonshotModelCatalog.cacheFault(dataRoot: dataRoot) { return fault }
         let moonshotModels = routeID == "moonshot"
-            ? MoonshotModelCatalog.readCache(dataRoot: dataRoot) : nil
+            ? MoonshotModelCatalog.cache.currentModels(dataRoot: dataRoot) : nil
         let accountModels = accountBacked
             ? CodexAccountModelCatalog.load(
                 providerID: provider ?? "",
@@ -317,7 +315,6 @@ extension SwiftNativeProviderRouting {
         _ id: String,
         openRouterModels: [[String: JSONValue]]? = nil,
         moonshotModels: [[String: JSONValue]]? = nil,
-        codexCacheURL: URL? = nil,
         authEnvironment: [String: String] = ProcessInfo.processInfo.environment, preview: Bool = false
     ) -> [[String: JSONValue]] {
         // A catalog belongs to the selected route. Unknown catalogs offer no rows.
@@ -328,7 +325,7 @@ extension SwiftNativeProviderRouting {
         switch id {
         case "openai_oauth_direct", "codex":
             if CodexAccountModelCatalog.cacheFault(dataRoot: dataRoot, environment: authEnvironment, preview: preview) != nil { return [] }
-            let cacheURL = codexCacheURL ?? CodexAccountModelCatalog.chatGPTOAuthCacheCandidate(
+            let cacheURL = CodexAccountModelCatalog.chatGPTOAuthCacheCandidate(
                 dataRoot: dataRoot, environment: authEnvironment, preview: preview
             )
             // This catalog belongs to the selected credential; no second token-presence read may redirect it to the command CLI's cache.
@@ -350,22 +347,5 @@ extension SwiftNativeProviderRouting {
             }
             return []
         }
-    }
-    func modelPreferencesFromComputed() async throws -> ModelPreferences {
-        let prefs = try await computeModelPreferences()
-        var current: [String: JSONValue] = [:]
-        for surface in MODEL_SURFACES {
-            if let p = prefs[surface] {
-                current[surface] = try JSONValue.parse(JSONEncoder().encode(p))
-            }
-        }
-        return ModelPreferences(
-            surfaceModels: .object(current),
-            defaultModel: prefs["chat"]?.model,
-            extras: .object([
-                "current": .object(current),
-                "status": .string("ok"),
-            ])
-        )
     }
 }

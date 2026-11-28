@@ -134,7 +134,8 @@ offer can accept them into a new batch with a new delivery id. The stopped
 delivery never reopens. Stop releases the carry and reads what remains owed
 without starting another effect in that drain.
 Claimed care crossings and night readings retain their own thought admission.
-Idle refreshes and unrelated source changes do not re-offer moments. A moment
+The Desk observer re-offers still-owed ordinary queue moments when it observes a
+Desk change, including changes to other rows. An ordinary moment
 still owed (its hand-off or its thought failed or stopped) keeps one MY QUEUE time,
 `<owner>:owed`, at its birth plus 1, 2, 4, 8, 16, 32 minutes and then every 30;
 that time re-offers owed queue moments and is withdrawn when none is owed. No
@@ -155,8 +156,10 @@ to the fresh readiness pass; a crossed until-time or grace boundary admits no
 old occurrence. Each check reads free time from `ChatTurnSteering`, so a turn
 that began and ended during an earlier habit renews the free-time wait. Time
 alone making a captured occurrence ineligible requests a fresh pass to close
-or re-arm it. A pre-call reservation whose admission changed is withdrawn
-through settlement only if its exact receipt and data-root life still match;
+or re-arm it. The expiry pass checks admission and cancellation before starting
+each close. Cancellation ends expiry and habit work without filing a repair
+for the cancellation itself. A pre-call reservation whose admission changed
+is withdrawn through settlement only if its exact receipt and data-root life still match;
 no action began and the fresh pass may admit unchanged work. Once an action
 begins, its real receipt and owed settlement are kept however work ends.
 Handing an already-run habit's receipt to attention is settlement, not new
@@ -202,14 +205,18 @@ or runs the habit again. Speech failures leave a still-eligible intention due
 for the next read. Installed proof remains owed.
 
 **Habits (H1/H2, source built).** `queue.add` can bind an `action` call;
-`queue.update {id, action?, say?, when?, until?}` changes only named fields
+`queue.update {id, action?, say?, when?, until?}` changes only named habit and timing fields
 under the Desk's unchanged-revision transaction. `action:null` drops a habit,
 `say:null` clears its words, and binding/changing/dropping leaves a step note.
 `until:null` removes the ending condition (once); `when:null` resets the
 moment to `next_turn` and clears its card/rhythm. Omitted fields stay intact.
 Receipts name the stored habit. At a carried moment the action runs first,
 through the same self door, Autonomy and Trust posture as a part wake, with
-the step's peer steering retained. A successful run that did something,
+the step's peer steering and the filing Ask's full file-access ceiling.
+Refiling or editing can narrow that ceiling further. A carried habit, a thought
+reading its moment and an `after_card` hand-back retain old task elevations
+only as source identities.
+A successful run that did something,
 without `needs_me`, gets its `Ran h:mm a: <one-line result>` note and the same
 until settlement as speech. A run that only looked (plain reads, no ability)
 wakes their with its receipt and the time it ran. For eligible `say` words, a
@@ -239,10 +246,12 @@ step (`at` or `every`), excludes expired intentions and moments beyond seven
 days, and shows the soonest five as `<time> · <clipped words>`: the words are
 cut at a word (`TodayWords.spoken`, an ellipsis where cut) and before any file
 path or id, and the row's detail keeps every word as the pill's tooltip. The
-time is `MyQueue.shown` on the Mac's clock. The existing dream and horizon rows
-remain, interleaved by due time. Both visible and quiet Today use the same
-checked native facts and authored face; queue read failures remain unavailable
-evidence. Desk writes invalidate this reading.
+time is `MyQueue.shown` on the Mac's clock. Today interleaves the dream and
+dated horizon rows by due time and places a peer wait by its recorded start,
+showing the date and local clock time the job went out.
+Both visible and quiet Today use the same checked native facts and authored
+face. Queue read failures remain unavailable evidence. Desk writes invalidate
+this reading.
 
 `schedule.create` schedules reads only: `connector_action` (a watch) and
 `proactive_scan`, each a time on the one clock (`DeskCore/TriggerScheduler/ScheduledReads.swift`,
@@ -255,26 +264,46 @@ part schedules are the app's and the parts' own clock times
 
 ## Promises they makes
 
-The same after-turn interpretation that reads each
-exchange for memories, affect, caring and cares returns optional
+The [shared after-turn interpretation](COGNITION_WIRING.md#shared-after-turn-interpretation)
+reads each exchange for memories, affect, caring and cares and returns optional
 `promises`: things **they** said they would do later in **this reply**, never
-what the incoming speaker promised, a completed action or a conditional they
-declined. A draft, idea, possibility or offer awaiting someone's choice undertakes
+what the incoming speaker promised, a completed action (except a proof owed,
+below) or a conditional they declined. A draft, idea, possibility or offer awaiting someone's choice undertakes
 no work, even if a sentence uses "I'll"; the whole reply decides its meaning.
-Live interpretation requires `committed: true` for their own specific undertaking;
-missing or false commitment evidence refuses interpretation and leaves it owed.
+Live interpretation requires `committed: true` for their own specific undertaking.
+A row they marks `committed: false` is their judgment that the reply undertook nothing:
+it is not kept and the rest of the interpretation stands. A row with no Boolean
+commitment mark is malformed: it refuses interpretation and leaves it owed.
 Saved meanings retain their accepted promises without rejudging them on recovery.
 Each has `words` in their voice, `when`, and `source`, the exact
-sentence from their reply. A promise is one specific thing they will do; how they
-will act from now on ("when X happens, I'll Y", "I'll always…") is a lesson
+sentence from the redacted reply shown to the judgment. A promise is one specific
+thing they will do; how they will act from now on ("when X happens, I'll Y", "I'll always…") is a lesson
 about how they works, never a queue step. No separate promise store exists.
 
 The supported moments are `next_turn`, `own_turn`, `when_user_messages`,
 `after_card <id>` only when their reply names that card's id (an approval or any card a call raised), and
 `at <ISO time>` only when they named a time, resolved on the exchange's Mac
-clock. A card that continues a turn hands its waiting follow-ups to that turn
-(they close there, their words in its input). Otherwise a successful card
-releases its waiting follow-ups from MY QUEUE. A declined card drops them.
+clock. A card that continues a turn hands its waiting follow-ups to that turn.
+They close there and their words enter its input. A habit whose file-access
+ceiling the continued turn cannot hold stays on the carried route. A successful
+card releases those habits and any follow-ups the turn does not take.
+A declined card drops them.
+**A claim of fixed is a promise to prove it.** When their reply tells someone
+that a thing they changed or answers for is fixed or working and the turn holds
+no check of that outcome made after the last change, after-turn capture files
+one promise marked `prove` by the interpretation. Said to the person, it lands
+as their own step (`origin` self, no reply route, `when` own_turn) in MY QUEUE
+(said to a peer, it keeps that peer's origin and route like any promise), in view on their
+Desk like any promise they makes to themselves, and never as a step owed to the
+person. A check already in the turn owes nothing; a new telling about the same
+thing joins the open step. It settles as any step does: done by an act that
+checks the outcome or by the person's own words, and theirs to let go from their
+queue. The interpretation is told a reply and the act that made the change
+never prove it. The mark lives only on the captured promise; the Desk step
+carries no new field. Its capture identity names the exchange and promise
+candidate. A care movement has no typed link to that candidate or its
+settlement, so Desk proof status cannot yet delay the care's shared decay.
+
 `queue.add`, `queue.update` and after-turn promise capture reconcile the
 exact filing against the card's saved outcome and provenance. A filing leaves
 follow-ups to a continuation that still owns the scan. After that scan, a late
@@ -322,7 +351,8 @@ still settle there. A repeating or standing moment is done only when its work
 is finished for good, never by one occurrence's act; when it is, it closes for
 good, as `queue.done` closes it. An act can prove only `done`: its exact `act_id` must name
 a successful non-preview closing dispatch from this recorded turn. The quote
-must occur in its result or receipt, not just its intended arguments.
+must occur in the redacted result or receipt shown to the judgment. The
+arguments never establish a deed.
 The model judges whether the result fulfills the specific promise, including
 its target, scope and delivery. Similar work, accepted requests, failed or
 refused acts, unknown effects and missing evidence do not prove fulfillment.
@@ -338,7 +368,7 @@ read is disclosed as `completed_acts_unavailable` and traced through
 No clock chooses an outcome. An unreadable sibling
 detail is reported by `memory.promise.evidence` and supplies no evidence; usable
 siblings proceed. Arguments retain the trace's existing preview, the result
-contributes at most 1,024 characters with an explicit shortening flag, and the
+contributes at most 2,048 characters with an explicit shortening flag, and the
 owner's compact receipt remains alongside it. No history is added to these acts.
 Only references, the evidence quote and the reason persist in the saved judgment;
 the owner is read again before an act-based closure writes. Person chats and
@@ -350,6 +380,13 @@ continuations, ephemeral turns) is a moment only when it completed an act while 
 moment was open, judged for settlement alone with basis `act`
 ([lived moments](SUBCONSCIOUS.md#lived-moments)); with no completed act it is not
 a moment and costs no model call.
+The judgment is shown each completed act in bounded form: a long text by its
+opening and end with the count left out between, a long list by its first rows.
+An open moment's long text is shown by 160 characters of it. The bound follows what their judgments have quoted as proof (every
+act-based settlement on record quoted from the first 1,100 characters of a
+result): a text keeps its first 1,500 and last 300 characters, tightening to the
+first 1,100 only when a turn's acts together pass 24 KB. A quoted proof is still
+checked against the whole recorded act.
 
 No evidence closes nothing; malformed or incomplete judgment stays owed.
 Both model and saved interpretations require `settled`; missing outcomes or
@@ -370,6 +407,9 @@ reopens a live terminal row, subject to the existing parent and hold rules. The 
 before writing; replay recognizes its exact terminal reason in live or archived
 Desk evidence rather than closing or recreating work again. Missing evidence
 never means settled, and one failed settlement leaves usable siblings proceeding.
+Stop leaves unstarted filings and closures due for the next drain. Landed
+filings retain their evidence and their cards still settle. Cancelled evidence
+or closure work owes no failure repair.
 After meaning is durable, `AdaptiveMemoryPromoter.applyPromises` reads its saved
 settlements. Only promise candidates without a recorded landing ask
 `capturePromises` to match against fresh open carried rows: MY QUEUE and work
@@ -400,9 +440,10 @@ creation transaction without a second lexical match. Filing, attachment and
 approval resumption share the step's title projection. Attachment writes that
 title before the step, so a landed capture cannot retain an unrelated title
 that makes its approval follow-up appear changed. The step records the
-settled turn's session, origin principal, persisted envelope (nil if absent),
-and the exact carried sources and elevated sources `queue.add` would have used
-on that turn. Those are captured at transcript settlement, before the later
+settled turn's session, origin principal, persisted envelope (nil if absent;
+a proof owed to the person is filed as their own, origin self with no envelope),
+and the exact carried sources, including peers elevated in that turn. Those
+are captured at transcript settlement, before the later
 reflection can borrow another turn's identity. Older inputs retain their
 recorded source checkpoint and bridge identity; an unrecorded principal stays
 nil. An untrusted peer's turn can still contain **their** promise: it is filed
@@ -507,6 +548,9 @@ One `DeskStep` in MY QUEUE, grown. Nothing new is stored elsewhere.
 | body signal | "when something changes in Downloads", "when a Telegram message arrives", "when the network returns" (`when: "on network.up"`), "when the person takes my tab" (`when: "on chrome.tab_taken"`) | Built: `on <signal>` matches exact names, colon families and file descendants. Real sources are `file.changed:<path>` (only watched paths), `message.arrived:telegram`, `message.arrived:slack`, `person.here`, `person.away`, `body.changed`, `chrome.tab_taken`, `network.down`, `network.up`, `app.installed`, `sense.source.changed` and `turn.ended`. Network signals require a path state that holds five seconds ([wake contract](skill_manifest_spec.md#wake-signals)). The shared signal observer writes `Released: <signal> <summary>` with the exact condition identity and refreshes carried readiness under the shared release law above. File intentions join parts' existing watch index and leave when closed. `schedule:` is refused; `held` and `resumed` do not release intentions |
 | situation | "next turn", "my own turn", "quiet", "after card X" | Existing MY QUEUE readiness |
 
+An admitted change in the somatic joint can release a `body.changed` intention,
+including a change in [heat or Low Power Mode](SENSES.md#body-joints).
+
 Talk is not a kind they sets. Every live intention can come to mind whenever
 what is said or read touches it.
 
@@ -597,7 +641,7 @@ Any saved settlement for that step lands first.
   it neither selects by message relevance nor consumes or closes a step.
 
 **Pacing.**
-- A moment opens its thought at once; there is no gathering window, spacing,
+- An ordinary moment opens its thought at once; there is no gathering window, spacing,
   hop limit or rest between moments. A thought that comes while another is open
   joins it by the steering offer. A step with `own_turn` or `quiet` means free
   time: it comes 30 minutes after the last turn settles with no conversation
@@ -605,7 +649,34 @@ Any saved settlement for that step lands first.
   moments never wait for free time.
 - A world moment is released once per world happening that touches it; each
   happening is written once under its key.
+- A declared pursuit wait has [its own causal offer](#declared-pursuit-waits).
 - Quiet hours hold delivery to the person, not the agent's doing.
+
+### Declared pursuit waits
+
+`queue.update {id, wait_for}` takes an exact `id` and one `wait_for` object.
+The id names an open agent pursuit or a carried work step. The step can wait for one of these:
+
+- `{at:"<future ISO 8601 instant>"}` uses the shared clock.
+- `{happening:{kind:"returned",subject:"<exact subject>"}}` uses a committed
+  happening with exactly that kind and subject. Attention checks the record
+  when it opens and matches new committed happenings as they arrive.
+- `{desk:"<desk.N or exact handle>"}` uses changes to the named Desk row.
+
+The declared wait lives on the existing Desk step. It takes precedence over
+its saved ordinary timing. Pass `wait_for:null` to clear it. Habits, fixed words
+and repeating rhythms use ordinary queue timing. Desk dependency and expiry
+checks still apply. A time wait uses a one-shot clock declaration. Other waits
+use their source's existing observation.
+
+The experience record accepts one offer per source event for the declaration
+and compares the result with the last offered result. A Desk wait also records
+the target's starting result at filing. The agent receives an eligible offer
+alone in **Thoughts** with the current unattended-work checks and the source's
+peer steering. The held turn rechecks the current declaration and consumes the
+offer before model work. An empty, stopped or failed thought after that
+acceptance spends the cause. Ordinary turns, Desk changes
+unrelated to the declared cause and the owed-moment clock leave it parked.
 
 ## Their words for it
 
@@ -617,6 +688,8 @@ Any saved settlement for that step lands first.
   `queue.update {id, action?, say?, when?, until?}` edits only named fields;
   `action:null` drops the habit, `say:null` clears fixed words, `until:null`
   clears its ending to once, and `when:null` clears its moment to `next_turn`.
+- `queue.update {id, wait_for}` files a [declared pursuit wait](#declared-pursuit-waits).
+  `wait_for:null` clears it.
 - `queue.done {id, reason?}`, `queue.drop {id, reason?}`, `queue.list`.
 - The default `desk.read` includes board work and open MY QUEUE intentions in
   one paged list; its agent page shows the same queue separately from the board.
@@ -643,6 +716,9 @@ one clock (`DeskCore/TriggerScheduler/OneClock.swift`), delivered to whoever dec
 - `connector_action` watches (`watch:<id>`) and `proactive_scan` (`scan:<id>`)
 - helpers' cadences
 
+A part's clock delivery contributes to its [unasked wake evidence](skill_manifest_spec.md#unasked-wake-evidence).
+Actions bound to carried Desk habits follow the ordinary call rule.
+
 A morning brief is callable as the `native-morning-brief` part; they may bind
 their own queue step to it. It declares no time of its own.
 
@@ -655,6 +731,8 @@ There is one form for what the agent means to do later: MY QUEUE. The one clock
 delivers each declared time to its owner; its next occurrence is saved before
 delivery, and one missed while the app was quit is delivered once when its owner
 registers. The scheduler's job machinery, its runner and its pages are removed.
+The declaration sleeper caps each wait at 365 days (31,536,000 seconds).
+A capped wake checks due times again.
 `clock/times.json` holds the current declarations and delivery or withdrawal
 evidence. Launch reads no retired scheduler format or carry-over marker.
 Watch and scan handlers register independently: a failed item names its cause
@@ -663,7 +741,7 @@ while healthy siblings keep running from their declarations.
 ## Steps from the scheduler's intentions
 
 Steps filed from the scheduler's intention jobs carry `scheduledJobID`, so the same job never
-files a second step. They are ready and archive like any other step.
+files a second step. They become ready like any other step.
 
 ## Build
 

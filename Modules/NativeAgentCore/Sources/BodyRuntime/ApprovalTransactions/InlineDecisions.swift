@@ -41,14 +41,11 @@ public struct InlineCardChoice: Identifiable, Sendable, Equatable {
     public var title: String
     /// Consequences belong beside their option so the decision is informed.
     public var note: String?
-    /// The primary names the selected outcome; nil keeps the card's own label.
-    public var actionLabel: String?
 
-    public init(id: String, title: String, note: String? = nil, actionLabel: String? = nil) {
+    public init(id: String, title: String, note: String? = nil) {
         self.id = id
         self.title = title
         self.note = note
-        self.actionLabel = actionLabel
     }
 }
 
@@ -71,17 +68,12 @@ public struct InlineCardModel: Identifiable, Sendable, Equatable {
     public var persistenceNote: String?
     /// What the card collects, in order. Values never become transcript content.
     public var fields: [InlineCardField]
-    public var field: InlineCardField? { fields.first }
     /// An empty form may sign in; entering a value switches the primary to saving it.
     public var signInLabel: String?
     public var fullSetupLabel: String?
     public var choices: [InlineCardChoice]
     /// Keep consequential scope on the card face rather than behind disclosure.
     public var scopeLines: [String]
-    public var identifier: String?
-    public var detailsLabel: String?
-    public var detailsBody: String?
-    public var busyLabel: String?
     public var busyNote: String?
     /// The card's one restart for its launch-applied grants, said in full; nil when the card does not offer it.
     public var restartNote: String?
@@ -108,16 +100,11 @@ public struct InlineCardModel: Identifiable, Sendable, Equatable {
         consequence: String,
         state: InlineCardState = .pending,
         persistenceNote: String? = nil,
-        field: InlineCardField? = nil,
         fields: [InlineCardField] = [],
         signInLabel: String? = nil,
         fullSetupLabel: String? = nil,
         choices: [InlineCardChoice] = [],
         scopeLines: [String] = [],
-        identifier: String? = nil,
-        detailsLabel: String? = nil,
-        detailsBody: String? = nil,
-        busyLabel: String? = nil,
         busyNote: String? = nil,
         restartNote: String? = nil,
         outcome: String? = nil,
@@ -134,15 +121,11 @@ public struct InlineCardModel: Identifiable, Sendable, Equatable {
         self.consequence = consequence
         self.state = state
         self.persistenceNote = persistenceNote
-        self.fields = fields.isEmpty ? (field.map { [$0] } ?? []) : fields
+        self.fields = fields
         self.signInLabel = signInLabel
         self.fullSetupLabel = fullSetupLabel
         self.choices = choices
         self.scopeLines = scopeLines
-        self.identifier = identifier
-        self.detailsLabel = detailsLabel
-        self.detailsBody = detailsBody
-        self.busyLabel = busyLabel
         self.busyNote = busyNote
         self.restartNote = restartNote
         self.outcome = outcome
@@ -217,20 +200,9 @@ public enum InlineCards {
             // Detailed service policies belong on the full page, beyond the card's controls.
             fullSetupLabel: !continuationFailed && descriptor.control == .connectorManualToken ? "Open full setup" : nil,
             choices: interaction.options.map {
-                InlineCardChoice(
-                    id: $0.id, title: $0.label, note: $0.detail,
-                    // Model options name their outcome; the group-wide save row keeps the card label.
-                    actionLabel: $0.id == InlineInteractionRegistry.persistentChoiceOptionID
-                        ? nil : "Use \($0.label)"
-                )
+                InlineCardChoice(id: $0.id, title: $0.label, note: $0.detail)
             },
             scopeLines: scopeLines(interaction, descriptor),
-            // Receipts cannot promise a future primary action or expand beyond their outcome line.
-            detailsLabel: rendersAsReceipt(cardState)
-                ? nil : details(interaction, descriptor)?.label,
-            detailsBody: rendersAsReceipt(cardState)
-                ? nil : details(interaction, descriptor)?.body,
-            busyLabel: busyLabel(interaction.kind),
             busyNote: busyNote(interaction, descriptor.control),
             restartNote: restartNote(interaction),
             outcome: interaction.continuationFailure.map {
@@ -243,14 +215,6 @@ public enum InlineCards {
             // Retry is the shared lifecycle's; a build with no control for it cannot offer one.
             canRetry: continuationFailed || (descriptor.isActionable && interaction.state.isRetryable)
         )
-    }
-
-    /// Failures retain explanation and retry controls rather than collapsing to a receipt.
-    private static func rendersAsReceipt(_ state: InlineCardState) -> Bool {
-        switch state {
-        case .settled, .declined, .unknown, .superseded: return true
-        case .pending, .running, .failed, .stopped: return false
-        }
     }
 
     // MARK: - Parts
@@ -383,71 +347,6 @@ public enum InlineCards {
         }
     }
 
-    /// Derive the destination from the control to avoid per-service copy here.
-    private static func details(
-        _ interaction: InlineInteraction,
-        _ descriptor: InlineInteractionDescriptor
-    ) -> (label: String, body: String)? {
-        let name = descriptor.displayName
-        // Local choices stay on this card; only their explicit Providers row opens that page.
-        if interaction.kind == .modelChoice, !interaction.options.isEmpty {
-            var body = "The model you pick makes this one picture and nothing is saved."
-            if interaction.options.contains(where: { $0.id == InlineInteractionRegistry.persistentChoiceOptionID }) {
-                body += " The last row is the other choice: it opens Providers, "
-                    + "the only place the \(name) group's saved model changes."
-            }
-            return ("What happens", body)
-        }
-        switch descriptor.control {
-        case .internetAccounts:
-            return ("What happens", mailRoute)
-        case .chromeSetup:
-            return ("What happens",
-                    "Chrome control is switched on in Trust. " + chromeSteps)
-        case .pairDevice:
-            return ("What happens",
-                    "The pairing page opens. Open NativeAgent on your iPhone, then choose Pair "
-                    + "here when the codes match.")
-        case .connectorManualToken:
-            return ("What happens",
-                    "What you paste is checked with \(name) and saved by Connectors, the same "
-                    + "as its setup page does. The chat never sees it.")
-        case .macPermissionGrant where interaction.allTargets.contains(where: { $0.hasPrefix("applescript:") }):
-            return ("What happens",
-                    "macOS asks for Automation consent for each requested app; the card reports whether you allowed it.")
-        case .macPermissionGrant where interaction.allTargets.contains(where: { SystemPermissionPreflight.cardSettingsCapability($0) != nil }):
-            return ("What happens",
-                    "macOS controls this permission. You can turn it off in System Settings.")
-        case .macPermissionGrant:
-            return ("What happens",
-                    "The permission is turned on here and listed in Trust, "
-                    + "where you can turn it off again at any time.")
-        case .trustPostureRequired:
-            return ("What happens",
-                    "Trust opens. Your posture is yours to set — nothing here changes it, "
-                    + "and \(name) stays off until you do.")
-        case .providerGroupModel:
-            return ("What happens",
-                    "Providers opens on the \(name) group so you can pick the model there.")
-        case .providerAPIKey:
-            return ("What happens",
-                    "Enter the key or sign in in the protected entry on the Mac. "
-                    + "Nothing counts as done until the saved \(name) connection is verified in Providers.")
-        case .capabilityFlag:
-            return ("What happens",
-                    "\(name) is switched on in Trust, the same switch as the one on that page.")
-        case .keyring where interaction.secret?.remove == true:
-            return ("What happens", "\(name) is deleted from this Mac's Keychain. Abilities that use it stop until you grant it again.")
-        case .keyring:
-            return ("What happens",
-                    (interaction.secret?.signIn == nil ? "What you paste is kept in this Mac's Keychain. "
-                        : "Your browser opens to sign in; what the service returns is kept in this Mac's Keychain. ")
-                    + "It goes only to \(interaction.secret?.line ?? "where this card says"), and the agent uses it by name without ever seeing it.")
-        case .inlineChoice, .unavailable, .unknown:
-            return nil
-        }
-    }
-
     /// The Mail card's route in the order its tap runs it: reading on, then Check Mail, then Internet Accounts only when Mail has no account.
     public static let mailRoute = "Mail reading turns on and Mail is checked; if macOS asks to let NativeAgent control Mail, choose Allow. "
         + "Internet Accounts opens only if Mail has no account yet."
@@ -506,17 +405,6 @@ public enum InlineCards {
         }
         return "Once \(InlineInteractionRegistry.englishList(pending)) \(pending.count == 1 ? "is" : "are") on, restart NativeAgent once to finish. "
             + "Your chat stays put."
-    }
-
-    private static func busyLabel(_ kind: InlineInteraction.Kind) -> String {
-        switch kind {
-        case .connector: return "Connecting…"
-        case .permission: return "Allowing…"
-        case .modelChoice: return "Switching…"
-        case .apiKey: return "Connecting…"
-        case .capability: return "Turning on…"
-        case .choose, .unknown: return "Working…"
-        }
     }
 
     /// Receipts retain the owner's confirmed outcome or the card's promised decline consequence.

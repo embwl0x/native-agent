@@ -1,3 +1,0 @@
-import NativeAgentShared
-
-typealias UserDisplayFormatters = NativeAgentShared.UserDisplayFormatters

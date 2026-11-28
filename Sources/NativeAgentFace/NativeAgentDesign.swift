@@ -16,12 +16,7 @@ extension View {
     }
 
     func houseSheet() -> some View {
-        background {
-            ShellSheet()
-                .overlay { WindowHaze() }
-                .houseSurface(in: ConcentricRectangle())
-        }
-        .presentationBackground(.clear)
+        presentationBackground(TodayPalette.cardFill)
     }
 }
 
@@ -102,8 +97,7 @@ private struct HouseSurface<S: Shape>: ViewModifier {
 }
 
 
-/// Use glass only for floating chat chrome; content cards are fills.
-struct GlassCard<Content: View>: View {
+struct TurnCardSurface<Content: View>: View {
     var tint: Color? = nil
     @ViewBuilder var content: () -> Content
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -111,32 +105,20 @@ struct GlassCard<Content: View>: View {
     @Environment(\.quietOffscreenRead) private var quietOffscreenRead
 
     var body: some View {
-        // Use opaque fill for quiet screenshots because bitmap rendering blanks tinted glass.
         let opaque = reduceTransparency || quietOffscreenRead
+        let shape = RoundedRectangle(cornerRadius: NativeAgentRadius.card, style: .continuous)
         let edgeColor = tint ?? Color.primary
         let edgeOpacity = tint != nil
             ? (colorSchemeContrast == .increased ? 0.72 : 0.34)
             : (colorSchemeContrast == .increased ? 0.28 : 0.10)
 
-        if opaque {
-            content()
-                .padding(NativeAgentLayout.cardPadding)
-                .background {
-                    RoundedRectangle(cornerRadius: NativeAgentRadius.card, style: .continuous)
-                        .fill(Color(nsColor: .controlBackgroundColor))
-                }
-                .overlay {
-                    RoundedRectangle(cornerRadius: NativeAgentRadius.card, style: .continuous)
-                        .strokeBorder(
-                            edgeColor.opacity(edgeOpacity),
-                            lineWidth: colorSchemeContrast == .increased ? 1 : 0.75
-                        )
-                }
-        } else {
-            content()
-                .padding(NativeAgentLayout.cardPadding)
-                .houseSurface(in: RoundedRectangle(cornerRadius: NativeAgentRadius.card, style: .continuous))
-        }
+        content()
+            .padding(NativeAgentLayout.cardPadding)
+            .background(opaque ? Color(nsColor: .controlBackgroundColor) : TodayPalette.cardFill, in: shape)
+            .overlay {
+                shape.strokeBorder(edgeColor.opacity(edgeOpacity), lineWidth: colorSchemeContrast == .increased ? 1 : 0.75)
+                    .allowsHitTesting(false)
+            }
     }
 }
 
@@ -267,8 +249,6 @@ enum ShellType {
         Font.system(.body, design: design, weight: weight).scaled(by: size / labelSize)
     }
 
-    /// Reserve monospaced roles for codes, keys and paths so ordinary short labels keep the prose ramp.
-    static let code = scaled(labelSize, design: .monospaced)
     static let caption = scaled(captionSize)
     static let captionMedium = scaled(captionSize, weight: .medium)
     static let captionSemibold = scaled(captionSize, weight: .semibold)
@@ -312,7 +292,6 @@ enum NativeAgentShellLayout {
     static let railPlateInset: CGFloat = 10
     static let replyLineSpacing: CGFloat = 8
     static let hoverBarStrip: CGFloat = 30
-    static let transcriptGap: CGFloat = 16
     static let composerClearanceMargin: CGFloat = 12
     static let userBubbleCorners = RectangleCornerRadii(
         topLeading: 14, bottomLeading: 14, bottomTrailing: 4, topTrailing: 14

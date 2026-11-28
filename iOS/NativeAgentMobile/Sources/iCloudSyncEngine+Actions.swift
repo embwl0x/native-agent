@@ -16,7 +16,8 @@ extension iCloudSyncEngine {
 
     /// Capture pairing before off-main signing/I/O; unsigned actions must never enter transport.
     @discardableResult
-    func sendAction(_ action: InboxAction, intentionalNewRequest: Bool = false) async throws -> String {
+    func sendAction(_ action: InboxAction, intentionalNewRequest: Bool = false,
+                    observeDispatch: (@MainActor (String?) -> Void)? = nil) async throws -> String {
         let requestedTransaction = action.transactionId ?? action.msgId
         try beginSendAction(transaction: requestedTransaction)
         var retainedTransaction: String?
@@ -43,8 +44,9 @@ extension iCloudSyncEngine {
         let prepared = try await retainedCloudKitAction(
             deviceAction, secret: secret, intentionalNewRequest: intentionalNewRequest
         )
-        guard lifecycle == lifecycleGeneration, secret == pairingStore?.iCloudPairingSecret else { throw SyncError.notSigned }
         let (action, signedData, wasRetained) = prepared
+        if wasRetained { observeDispatch?(action.msgId) }
+        guard lifecycle == lifecycleGeneration, secret == pairingStore?.iCloudPairingSecret else { throw SyncError.notSigned }
         let transactionId = action.transactionId ?? action.msgId
         if transactionId != requestedTransaction {
             try beginSendAction(transaction: transactionId)
@@ -66,6 +68,7 @@ extension iCloudSyncEngine {
             return action.msgId
         }
         var accepted = false
+        observeDispatch?(action.msgId)
         do {
             try await iCloudBridge.shared.sendActionEnvelope(
                 signedData,
@@ -94,6 +97,7 @@ extension iCloudSyncEngine {
                 throw sendError
             }
             if !wasRetained && !accepted && !(sendError is DeviceSyncSendOutcomeUnknown) {
+                observeDispatch?(nil)
                 try await persistTerminalSendFailure(
                     transactionID: transactionId,
                     action: action.action,

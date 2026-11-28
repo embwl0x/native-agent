@@ -17,7 +17,7 @@ public enum MemoryBringBack {
     public static let defaultName = "Agent"
     static let correctionLinkKeys = ["corrected_by", "superseded_by"]
     static let carriedKeys = ["kind", "tags", "importance", "confidence", "pinned", "privacy", "permittedSurfaces",
-                              "correction_subject"] + correctionLinkKeys
+                              "correction_subject", MemoryStorage.explicitValidityKey] + correctionLinkKeys
 
     /// One old memory, ready for the write: what it says, whether it was archived, the telling its provenance names and the principals it recorded.
     public struct Memory: Sendable {
@@ -56,12 +56,6 @@ public enum MemoryBringBack {
     }
 
     public struct Outcome: Sendable {
-        public let brought: Int
-        public let archived: Int
-        /// Memories whose roots took today's identity of an archive principal, summed over the renames.
-        public let renamed: Int
-        /// Each memory that did not land, with the store's reason.
-        public let refused: [String]
         public let words: String
     }
 
@@ -455,6 +449,6 @@ public enum MemoryBringBack {
                 memory tools. Chats, diary, proposals and graph stayed behind.
                 """, once: "memories:bring_back:" + prepared.archive + ":" + NativeTimestampFormat.fractionalZulu(Date())), dataRoot: dataRoot).value
         }
-        return Outcome(brought: brought, archived: archived, renamed: renamed, refused: refused, words: words)
+        return Outcome(words: words)
     }
 }

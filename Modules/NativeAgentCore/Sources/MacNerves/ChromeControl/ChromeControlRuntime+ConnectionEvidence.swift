@@ -1,7 +1,6 @@
 import Darwin
 import AppKit
 import Foundation
-import Synchronization
 import NativeAgentChromeRelayCore
 import PersistenceCore
 import NativeAgentCore
@@ -25,29 +24,21 @@ struct ChromeConnectionFacts: Codable {
 }
 
 final class ChromeBrowserLaunchObserver: Sendable {
-    private let center: NotificationCenter
-    private let token: Mutex<NSObjectProtocol?>
+    private let observation: MacWorkspaceObservation
 
     @MainActor init(onLaunch: @escaping @Sendable (pid_t) -> Void) {
-        center = NSWorkspace.shared.notificationCenter
-        token = Mutex(center.addObserver(
+        let center = NSWorkspace.shared.notificationCenter
+        let token = center.addObserver(
             forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main
         ) { notification in
             guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
                   app.bundleIdentifier == "com.google.Chrome", !app.isTerminated else { return }
             onLaunch(app.processIdentifier)
-        })
-    }
-
-    func cancel() {
-        let live = token.withLock { token in
-            defer { token = nil }
-            return token
         }
-        if let live { center.removeObserver(live) }
+        observation = MacWorkspaceObservation(center: center, token: token)
     }
 
-    deinit { cancel() }
+    func cancel() { observation.stop() }
 }
 
 extension ChromeControlRuntime {

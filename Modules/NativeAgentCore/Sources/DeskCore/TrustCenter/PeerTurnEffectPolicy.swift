@@ -94,19 +94,10 @@ public enum PeerTurnEffectPolicy {
             self.name = name
         }
 
-        public var display: String {
-            for candidate in [name, id] {
-                let trimmed = candidate?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                if !trimmed.isEmpty { return trimmed }
-            }
-            return "a peer"
-        }
-
-        /// Only attested identity constrains provenance_by; missing attestation supplies no allowed-name evidence.
-        var acceptedAttributions: [String] {
-            [name, id]
-                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
-                .filter { !$0.isEmpty }
+        fileprivate func matches(_ by: String) -> Bool {
+            guard let id, !id.isEmpty else { return false }
+            if by.hasPrefix("peer:") { return by == "peer:" + id.lowercased() }
+            return by == id.lowercased() || by == name?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         }
     }
 
@@ -114,66 +105,57 @@ public enum PeerTurnEffectPolicy {
         ["commit_memory", "rewrite_memory"].contains(normalized(ToolNameAliases.ranCall(tool, input: input).tool))
     }
 
-    public static func provenanceRefusal(
-        tool: String,
-        input: [String: JSONValue],
-        peer: PeerIdentity,
-        readPeerData: Bool = false
-    ) -> String? {
+    public static func memoryTellers(
+        tool: String, input: [String: JSONValue], peers: [PeerIdentity], readPeerData: Bool, rewriteChangesText: Bool? = nil
+    ) throws(ToolFailureError) -> [String]? {
         let ran = ToolNameAliases.ranCall(tool, input: input)
-        switch normalized(ran.tool) {
-        case "commit_memory":
-            return tellingRefusal(how: ran.input["provenance"], by: ran.input["provenance_by"], since: ran.input["since"],
-                                  names: ("provenance", "provenance_by", "since"), peer: peer, readPeerData: readPeerData)
-        case "rewrite_memory":
-            // Every restated root is a telling: in a steered turn each one is the door's, dated now, and a rewrite there restates its roots so.
-            guard case .array(let roots)? = ran.input["roots"] else {
-                return tellingRefusal(how: nil, by: nil, since: nil, names: ("roots[0].how", "roots[0].by", "roots[0].since"),
-                                      peer: peer, readPeerData: readPeerData)
+        let action = normalized(ran.tool)
+        guard action == "commit_memory" || action == "rewrite_memory" else { return nil }
+        let hasRoots = ran.input["roots"] != nil && ran.input["roots"] != .null
+        let simple = action == "commit_memory" && !hasRoots
+        let rewriteText = action == "rewrite_memory" && (rewriteChangesText ?? (ran.input["text"]?.trimmedString != nil))
+        guard (action == "commit_memory" && hasRoots) || (!peers.isEmpty && (simple || hasRoots || rewriteText)) else { return nil }
+
+        func refusal(_ message: String, path: String) -> ToolFailureError {
+            ToolFailureError(message, argumentPath: path, effects: .none, code: "memory_teller_steered", status: .refused,
+                recovery: .correctArguments)
+        }
+
+        let roots: [JSONValue]
+        if simple {
+            roots = [.object(["how": ran.input["provenance"], "by": ran.input["provenance_by"], "since": ran.input["since"]]
+                .compactMapValues { $0 })]
+        } else {
+            guard case .array(let listed)? = ran.input["roots"], !listed.isEmpty else {
+                throw refusal("Use a nonempty roots list, with how and by for each root.", path: "args.roots")
             }
-            for (index, root) in roots.enumerated() {
-                let fields: [String: JSONValue] = if case .object(let value) = root { value } else { [:] }
-                let path = "roots[\(index)]"
-                if let refusal = tellingRefusal(how: fields["how"], by: fields["by"], since: fields["since"],
-                                                names: (path + ".how", path + ".by", path + ".since"), peer: peer, readPeerData: readPeerData) {
-                    return refusal
+            if action == "commit_memory", ["provenance", "provenance_by", "since"].contains(where: {
+                ran.input[$0] != nil && ran.input[$0] != .null
+            }) {
+                throw refusal("Use roots by itself, or use provenance, provenance_by and since.", path: "args.roots")
+            }
+            roots = listed
+        }
+
+        var tellers: [String] = []
+        for (index, root) in roots.enumerated() {
+            let path = simple ? "args.provenance_by" : "args.roots[\(index)]"
+            let fields = root.objectValue
+            let by = fields?["by"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let how = fields?["how"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let since = fields?["since"]
+            if how == "told", since == nil || since == .null, let by, !by.isEmpty, by != "user", by != "self" {
+                let matches = peers.filter { $0.matches(by) }
+                if matches.count == 1, let id = matches.first?.id {
+                    tellers.append("peer:" + id)
+                    continue
                 }
             }
-            return nil
-        default: return nil
+            let choices = peers.compactMap { $0.id.map { "peer:" + $0 } }.joined(separator: ", ")
+            let unattested = readPeerData ? "This Ask's sources attest no peer teller." : "The request's origin attests no peer teller."
+            throw refusal(choices.isEmpty ? unattested
+                : "State told without since and name one attested peer who told you (\(choices)).", path: path)
         }
-    }
-
-    /// Memory attribution must retain the telling peer rather than presenting its words as the agent's knowledge.
-    static func tellingRefusal(how: JSONValue?, by rawBy: JSONValue?, since: JSONValue?, names: (how: String, by: String, since: String),
-                               peer: PeerIdentity, readPeerData: Bool) -> String? {
-        let who = peer.display
-        let kind = how?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        // Its telling dates from now: since is the agent's own past, kept in a turn no untrusted agent started.
-        let dated = (since?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
-        let undated = dated ? " Omit \(names.since): what \(who) tells you dates from now; since is for your own past, kept in a turn no "
-            + "untrusted agent started." : ""
-        guard kind == "told" else {
-            let origin = readPeerData ? "This turn was steered by" : "The request came from"
-            return "\(origin) \(who), a peer — you can keep your own "
-                + "note about it, but a peer cannot speak for the person. Set "
-                + "\(names.how)=\"told\" and \(names.by)=\"\(who)\", so the note "
-                + "records what \(who) reported rather than established fact." + undated
-        }
-        guard !dated else { return "This turn came from \(who), a peer." + undated }
-        let by = rawBy?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !by.isEmpty else {
-            return "Set \(names.by)=\"\(who)\" — \(names.how)=\"told\" without "
-                + "who told you is the part that makes the note honest."
-        }
-        let accepted = peer.acceptedAttributions
-        // Without attestation, require honest nonempty attribution rather than inventing an identity.
-        guard !accepted.isEmpty else { return nil }
-        guard accepted.contains(by.lowercased()) else {
-            let origin = readPeerData ? "This turn was steered by" : "This turn came from"
-            return "\(origin) \(who), so \(names.by) has to be "
-                + "\(who) — a peer cannot attribute its claim to someone else."
-        }
-        return nil
+        return tellers
     }
 }

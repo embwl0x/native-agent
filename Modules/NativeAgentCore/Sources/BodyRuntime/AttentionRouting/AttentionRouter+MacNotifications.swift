@@ -115,7 +115,7 @@ public enum NativeAgentNotifications {
 
     /// Bind reply routing when posting so a later visible conversation cannot receive another turn's answer.
     public static func postMessage(title: String, subtitle: String? = nil, body: String, soundName: String? = nil, router: AttentionRouter,
-                                   turn: Turn?, deadline _: ContinuousClock.Instant?) async -> NativeAgentNotificationPostResult {
+                                   turn: Turn?) async -> NativeAgentNotificationPostResult {
         let id = "mac_notify:" + UUID().uuidString.lowercased()
         guard !Task.isCancelled else {
             return .from(.notDelivered(reason: "The notification was cancelled before admission"), id: id)
@@ -147,7 +147,7 @@ public enum NativeAgentNotifications {
             onCancel: { task.cancel() })
     }
 
-    public static func post(title: String, body: String, userInfo: [String: String] = [:], deadline _: ContinuousClock.Instant?) {
+    public static func post(title: String, body: String, userInfo: [String: String] = [:]) {
         delivery.withLock { state in
             guard !state.stopped else { return }
             let id = UUID()

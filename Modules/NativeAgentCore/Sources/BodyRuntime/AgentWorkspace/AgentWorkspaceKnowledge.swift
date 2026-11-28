@@ -13,12 +13,12 @@ enum AgentWorkspaceKnowledge {
 
     static let webSearchTool = "web_search"
 
-    static let readTools: Set<String> = ["recall_memory", "recall_search", "read_page", webSearchTool]
+    static let readTools: Set<String> = ["recall_memory", "read_page", webSearchTool]
 
     static func project(tool: String, input: [String: JSONValue], result: JSONValue) -> WorkspacePage? {
         switch tool {
         case webSearchTool: return webSearch(input: input, result: result)
-        case "recall_memory", "recall_search": return memory(input: input, result: result)
+        case "recall_memory": return memory(input: input, result: result)
         case "read_page":
             var actions: [AgentWorkspaceButton] = [
                 .init(label: "Search the web", action: .searchWeb, needsText: true),

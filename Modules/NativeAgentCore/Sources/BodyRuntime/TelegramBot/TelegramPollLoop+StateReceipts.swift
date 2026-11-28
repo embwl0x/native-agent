@@ -122,6 +122,8 @@ extension TelegramPollLoop {
                 "botUsernameAt": .string(NativeTimestampFormat.fractionalZulu(Date())),
             ])
             return trimmed
+        } catch is CancellationError {
+            return nil
         } catch {
             await recordError(context: "get_me", error: String(describing: error))
             return nil
@@ -160,6 +162,8 @@ extension TelegramPollLoop {
                     "lastSyncError": .null,
                 ]),
             ])
+        } catch is CancellationError {
+            return
         } catch {
             let retryDelay = await commandMenuBackoff.recordFailure()
             await writeStatePatch([

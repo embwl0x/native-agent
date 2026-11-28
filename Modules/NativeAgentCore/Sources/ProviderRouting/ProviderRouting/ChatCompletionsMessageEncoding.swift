@@ -32,6 +32,33 @@ func checkedProviderJSONText(_ data: Data, owner: String) throws -> String {
     return text
 }
 
+package func providerToolResultContent(_ content: String, isError: Bool) -> String {
+    guard isError else { return content }
+    return jsonToolResultContent(content, isError: true)
+}
+
+package func markerToolResultContent(_ content: String, isError: Bool) -> String {
+    jsonToolResultContent(content, isError: isError)
+        .replacingOccurrences(of: "<", with: #"\u003c"#)
+}
+
+private func jsonToolResultContent(_ content: String, isError: Bool) -> String {
+    let flag = "tool_result_is_error"
+    let prefix = "{\"\(flag)\":true"
+    if case .object(let fields)? = try? JSONValue.parse(Data(content.utf8)) {
+        let object = content.hasPrefix("\u{feff}") ? String(content.dropFirst()) : content
+        guard isError else { return object }
+        if fields[flag] != nil {
+            return prefix + ",\"result\":" + object + "}"
+        }
+        let fieldsAndClose = object.drop(while: \.isWhitespace).dropFirst()
+        return prefix + (fields.isEmpty ? "" : ",") + String(fieldsAndClose)
+    }
+    var encoded = isError ? prefix + ",\"error\":" : ""
+    JSONValue.encodeString(content, into: &encoded)
+    return isError ? encoded + "}" : encoded
+}
+
 /// Tool results follow their calls before any accompanying image message. Moonshot replays its retained reasoning with assistant calls.
 func chatCompletionsMessages(
     from message: LLMMessage,
@@ -61,8 +88,9 @@ func chatCompletionsMessages(
                     "arguments": try checkedProviderJSONText(inputJSON, owner: "Recorded tool call \(name) (\(id))"),
                 ],
             ])
-        case .toolResult(let toolUseID, let content, _):
-            toolResults.append(["role": "tool", "tool_call_id": toolUseID, "content": content])
+        case .toolResult(let toolUseID, let content, let isError):
+            toolResults.append(["role": "tool", "tool_call_id": toolUseID,
+                "content": providerToolResultContent(content, isError: isError)])
         }
     }
     var output: [[String: Any]] = []

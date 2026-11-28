@@ -1,7 +1,7 @@
+import PersistenceCore
 import NativeAgentShared
 import SenseCore
 import Foundation
-import PersistenceCore
 // Blueprint: | `DeskModels.swift` | Shared Desk enum vocabulary and JSON scalar interpretation |
 
 // MARK: - Agent Desk — durable, event-sourced user-directed tracking
@@ -50,6 +50,12 @@ func deskStoredCollection<T>(_ value: JSONValue?, decode: (JSONValue) -> T?) -> 
 }
 
 enum DeskJSON {
+    static func put(_ fields: (String, String?)..., in object: inout [String: JSONValue]) {
+        for (key, value) in fields {
+            if let value, !value.isEmpty { object[key] = .string(value) }
+        }
+    }
+
     static func optionalStringsAreValid(_ object: [String: JSONValue], keys: [String]) -> Bool {
         keys.allSatisfy { key in
             guard let value = object[key] else { return true }

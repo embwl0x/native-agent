@@ -11,14 +11,6 @@ enum NativeAgentNavigationDestination: Equatable, Sendable {
     case activity(ActivitySection)
     case chatShortcut(ChatSlashPage)
     case savedThing(PaletteSavedDestination)
-
-    static func route(_ raw: String?) -> Self? {
-        guard let raw else { return nil }
-        let name = AppDoorNames.resolve(raw.replacingOccurrences(of: "sidebar:", with: ""))
-        if name == "inbox" { return .sidebar(.inboxPolicy) }
-        guard let page = QuietPages.all.first(where: { $0.id == name }) else { return nil }
-        return .sidebar(page.item)
-    }
 }
 
 enum NativeAgentNavigationRequestReceipt { case deliveredToMountedScene, queuedForMainScene }
@@ -32,7 +24,7 @@ final class ApplicationLifetime {
     /// The body asked for the window before the opener mounted; it opens as soon as there is one.
     @ObservationIgnored private var windowOwed = false
     @ObservationIgnored private var pending: [NativeAgentNavigationDestination] = []
-    @ObservationIgnored private var mounted: (id: UUID, input: () -> [String: PartFace.Value]?,
+    @ObservationIgnored private var mounted: (id: UUID, input: () -> [String: PartFace.Value]?, chatIsVisible: () -> Bool,
         replayTour: () -> Void, deliver: (NativeAgentNavigationDestination) -> Void)?
     /// The page the window showed right after the agent last moved it; the window coming to any other page was the person's choice.
     @ObservationIgnored private var agentShown: [String: PartFace.Value]?
@@ -42,6 +34,7 @@ final class ApplicationLifetime {
     @ObservationIgnored private(set) var personMoves = 0
 
     var visiblePageInput: [String: PartFace.Value]? { mounted?.input() }
+    var chatIsVisible: Bool { mounted?.chatIsVisible() == true }
 
     /// The window shows another page. The page the agent's own move brought it to is the agent's; any other is the person's.
     /// Whatever brought the person's page back (the rail, a menu, a shortcut, the palette), its coming back is what the window learns from.
@@ -54,7 +47,10 @@ final class ApplicationLifetime {
         }
     }
     /// The person chose a place or a tab, which counts even when the page shown stays the same.
-    func personChose() { personMoves += 1 }
+    func personChose() {
+        personMoves += 1
+        FaceFollows.shared.clearChatStepsHold()
+    }
     var visiblePageID: String? {
         guard case .string(let page)? = visiblePageInput?["page"] else { return nil }
         return page
@@ -70,11 +66,11 @@ final class ApplicationLifetime {
         // This runs while SwiftUI evaluates a body, which must not open a window.
         Task { @MainActor in open() }
     }
-    func mountMainScene(visiblePageInput: @escaping () -> [String: PartFace.Value]? = { nil },
+    func mountMainScene(visiblePageInput: @escaping () -> [String: PartFace.Value]? = { nil }, chatIsVisible: @escaping () -> Bool,
                         replayTour: @escaping () -> Void,
                         deliver: @escaping (NativeAgentNavigationDestination) -> Void) -> UUID {
         let id = UUID()
-        mounted = (id, visiblePageInput, replayTour, deliver)
+        mounted = (id, visiblePageInput, chatIsVisible, replayTour, deliver)
         drain()
         FaceReports.shared.sceneChanged()
         return id
@@ -83,7 +79,7 @@ final class ApplicationLifetime {
         if mounted?.id == id {
             mounted = nil
             if let connection = FaceReports.shared.connectionID {
-                FaceReports.shared.submit(.reportScene(.init(connection: connection, id: id, destination: nil, isKey: false,
+                FaceReports.shared.submit(.reportScene(.init(connection: connection, id: id, destination: nil,
                     composerSession: nil, selectedSession: nil, mounted: false)))
             }
         }
@@ -119,7 +115,7 @@ final class ApplicationLifetime {
             if case .string(let value)? = visiblePageInput?["item"] { item = value } else { item = nil }
             destination = .init(page: page, item: item, session: nil, message: nil)
         } else { destination = nil }
-        return .init(connection: connection, id: mounted.id, destination: destination, isKey: NSApp.keyWindow != nil,
+        return .init(connection: connection, id: mounted.id, destination: destination,
                      composerSession: QuietSelfAdmin.shared.composerCards == nil ? nil : appModel?.activeChatSessionId,
                      selectedSession: appModel?.activeChatSessionId, mounted: true)
     }
@@ -156,12 +152,13 @@ final class ApplicationLifetime {
         else if target.page == "today_inbox" { destination = .activity(.inbox) }
         else if target.page == "memory_proposals" { destination = .activity(.memoryProposals) }
         // A page by its name, or a place by the word the rail draws for it, which opens on the page that place opens first.
-        else if let page = QuietPages.page(named: target.page)
-            ?? ShellSurface.named(target.page, appModel: appModel).flatMap({ QuietPages.shown($0.firstPage) }) {
-            destination = page.item == .ownPage ? .ownPage(page.id) : .sidebar(page.item)
+        else if let page = QuietPages.navigationPage(named: target.page, appModel: appModel) {
+            let targetItem = page.navigationItem
+            destination = targetItem == .ownPage ? .ownPage(page.id) : .sidebar(targetItem)
             shown = .init(page: page.id, item: target.item, session: nil, message: nil)
-            item = SidebarItem.shellHome(for: page.item)?.parent ?? page.item
-            tab = SidebarItem.shellHome(for: page.item)?.tab
+            let home = SidebarItem.shellHome(for: targetItem)
+            item = home?.parent ?? targetItem
+            tab = home?.tab
             if let handle = target.item, !handle.isEmpty, let item {
                 if item == .desk {
                     // Showing an item opens it, as its row does: the Desk's owner selects it, and the page draws it open.
@@ -176,12 +173,8 @@ final class ApplicationLifetime {
                     appModel.pendingMemoryFaceTarget = .init(page: "memories", item: memory.row, session: nil, message: nil)
                     tab = "memories"
                 } else {
-                    let tabs = appModel.shellLayout.map { ShellRailTab.all($0).first { $0.page == item }?.tabs ?? [] } ?? []
-                    let destinations = item == .personality ? PersonalityFaceDestinations.tabs : []
-                    if let match = (tabs + destinations).first(where: {
-                        $0.key.caseInsensitiveCompare(handle) == .orderedSame || $0.title.caseInsensitiveCompare(handle) == .orderedSame
-                    }) {
-                        tab = match.key
+                    if let match = ShellRailTab.match(handle, page: item, layout: appModel.shellLayout) {
+                        tab = match
                     } else {
                         if item == .diagnostics {
                             _ = try await appModel.client.act(.readRun(id: handle)).checkedValue()
@@ -254,6 +247,7 @@ final class ApplicationLifetime {
     private var followed: Set<String> = []
     private var personMovesAtStart = 0
     private var taken = false
+    private weak var heldChatSteps: FacePageSession?
     private var beganInChat = false
     private var moved = false
     private var moving = false
@@ -261,7 +255,7 @@ final class ApplicationLifetime {
     /// One draw a turn against a left page's sampling chance, so the window's choice holds for the whole turn.
     private var draw = Double.random(in: 0..<1)
     /// The move still to make and the turn it belongs to; it lands only while that turn is the window's and the person has not taken it.
-    private var owed: (destination: FaceDestination, turn: String?, observe: Bool)?
+    private var owed: (destination: FaceDestination, turn: String?, attention: FaceAttention?)?
 
     func receive(_ attention: FaceAttention, appModel: AppModel) {
         if attention.turn != turn {
@@ -275,17 +269,15 @@ final class ApplicationLifetime {
             draw = Double.random(in: 0..<1)
             let inChat = ApplicationLifetime.shared.currentPage?.item == .chat
             if backToChat, !inChat {
-                go(.init(page: "chat", item: nil, session: nil, message: nil), for: turn, observe: false, appModel: appModel)
+                go(.init(page: "chat", item: nil, session: nil, message: nil), for: turn, appModel: appModel)
             }
             // A turn that begins while the window goes back to Chat begins in Chat.
             beganInChat = inChat || backToChat
         }
         guard turn != nil, let link = attention.link, !followed.contains(link),
               case .page(let page, let item)? = FaceLink(link) else { return }
-        followed.insert(link)
         guard allowsMove(appModel) else { return }
-        moved = true
-        go(.init(page: page, item: item, session: nil, message: nil), for: turn, observe: true, appModel: appModel)
+        go(.init(page: page, item: item, session: nil, message: nil), for: turn, attention: attention, appModel: appModel)
     }
 
     /// Her own show moved the window during a turn: the same trial a follow begins, once a turn, unless the person already took the window.
@@ -296,6 +288,7 @@ final class ApplicationLifetime {
 
     /// The person's own page came back into view during the turn after the window had left it: the person took it back.
     func personShowed(_ page: String?) {
+        if page != "chat" { clearChatStepsHold() }
         if let page, trial?.origin == page { settle(.tookBack) }
     }
 
@@ -313,21 +306,27 @@ final class ApplicationLifetime {
         }
     }
 
-    /// Whether the person has taken the window this turn: typed, or brought the window to a page or chose a place or tab since it began.
+    func holdChatSteps(_ session: FacePageSession, held: Bool) {
+        if held { heldChatSteps = session }
+        else if heldChatSteps === session { clearChatStepsHold() }
+    }
+
+    func clearChatStepsHold() { heldChatSteps = nil }
+
     private func personTook() -> Bool {
         if !taken { taken = ApplicationLifetime.shared.personMoves != personMovesAtStart }
         return taken
     }
 
     private func allowsMove(_ appModel: AppModel) -> Bool {
-        guard appModel.facePreference(WindowFollowsPreference.key, as: Bool.self) == true, !personTook() else { return false }
+        guard heldChatSteps == nil, appModel.facePreference(WindowFollowsPreference.key, as: Bool.self) == true, !personTook() else { return false }
         if let page = ApplicationLifetime.shared.visiblePageID, appModel.windowLeaves.contains(page),
            draw >= appModel.windowSampling[page] ?? 0 { taken = true }
         return !taken
     }
 
-    private func go(_ destination: FaceDestination, for owner: String?, observe: Bool, appModel: AppModel) {
-        owed = (destination, owner, observe)
+    private func go(_ destination: FaceDestination, for owner: String?, attention: FaceAttention? = nil, appModel: AppModel) {
+        owed = (destination, owner, attention)
         guard !moving else { return }
         moving = true
         Task { @MainActor [self] in
@@ -335,10 +334,17 @@ final class ApplicationLifetime {
                 owed = nil
                 @MainActor func wanted() -> Bool { next.turn == self.turn && self.allowsMove(appModel) }
                 guard wanted() else { continue }
+                if let attention = next.attention, let link = attention.link {
+                    if next.destination.item == nil, attention.session == appModel.activeChatSessionId,
+                       ApplicationLifetime.shared.chatIsVisible,
+                       QuietPages.navigationPage(named: next.destination.page, appModel: appModel)?.id == "chat" { continue }
+                    followed.insert(link)
+                    moved = true
+                }
                 do {
                     _ = try await ApplicationLifetime.shared.navigate(.init(destination: next.destination, policy: .quiet),
                         wanted: wanted, followed: { origin, landing in
-                            if next.observe, self.trial == nil, let origin, let landing, origin != landing {
+                            if next.attention != nil, self.trial == nil, let origin, let landing, origin != landing {
                                 self.trial = (origin, landing)
                             }
                         })
@@ -353,6 +359,7 @@ final class ApplicationLifetime {
 
 /// One conversation's turn and where its attention is, as the window reads it from the turn's face.
 struct FaceAttention: Equatable {
+    let session: String?
     let turn: String?
     let link: String?
 }
@@ -364,11 +371,13 @@ struct FaceFollowsWatcher: View {
     var body: some View {
         // Any door's turn the conversation shows: the Mac's own, the phone's, a resident's.
         let attention = appModel.turnPart("nowOn", for: appModel.activeChatSessionId) {
-            FaceAttention(turn: $0?.isRunning == true ? $0?.turnID : nil, link: $0?.nowOn)
+            FaceAttention(session: $0?.sessionID, turn: $0?.isRunning == true ? $0?.turnID : nil, link: $0?.nowOn)
         }
         Color.clear
             .frame(width: 0, height: 0)
             .accessibilityHidden(true)
-            .onChange(of: attention, initial: true) { _, attention in FaceFollows.shared.receive(attention, appModel: appModel) }
+            .onChange(of: attention, initial: true) { _, attention in
+                FaceFollows.shared.receive(attention, appModel: appModel)
+            }
     }
 }

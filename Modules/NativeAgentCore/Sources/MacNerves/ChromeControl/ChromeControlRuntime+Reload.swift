@@ -137,24 +137,28 @@ extension ChromeControlRuntime {
     /// Explicit retry remains available; only an accepted attach completes reload.
     public func reloadExtension(source: ReloadSource = .manual, turn: Turn, context: MacOperationContext) async throws -> JSONValue {
         try await authorizeEffect(origin: turn.chromeOrigin, turn: turn)
-        if extensionReload?.pending == true {
-            let browsers = await Self.runningChromeProcesses()
-            reconcileReloadBrowser(browsers)
-        }
-        if extensionReload?.pending != true {
+        let joinedID = extensionReload.flatMap { $0.pending ? $0.id : nil }
+        if joinedID == nil {
             readExtensionFiles( context: context)
             do {
                 guard let channel else { throw await connectionFailure( context: context) }
                 try await beginExtensionReload(on: channel, source: source, context: context)
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 return recordReloadPreflightFailure(error, source: source)
             }
+            guard let attempt = extensionReload else { throw CancellationError() }
+            if !attempt.pending { return attempt.receipt }
         }
-        if extensionReload?.pending != true { return extensionReload!.receipt }
         let waiter = UUID()
         try Task.checkCancellation()
         let response = ReloadWait()
         reloadWaiters[waiter] = response
+        if let joinedID {
+            let browsers = await Self.runningChromeProcesses()
+            if extensionReload?.id == joinedID { reconcileReloadBrowser(browsers) }
+        }
         await response.done.park(budget: context.waitBudget)
         reloadWaiters.removeValue(forKey: waiter)
         guard let result = response.result else { throw CancellationError() }
@@ -248,13 +252,14 @@ extension ChromeControlRuntime {
         extensionReload = ExtensionReloadAttempt(id: id, source: source, before: before, beforeCode: facts.extensionCode,
             diskCode: files.code, shipped: files.shippedVersion,
             path: files.path, browserPID: pid, browserBirthStamp: birthStamp, startedAt: Date())
-        automaticReloadPairs.insert(files.shippedVersion + "/" + before)
+        let pair = files.shippedVersion + "/" + before
+        let insertedPair = automaticReloadPairs.insert(pair).inserted
         let generation = listenerGeneration
         // Reload drops the connection; one request deadline bounds the wait for its reconnect.
         defer {
             if generation == listenerGeneration, extensionReload?.id == id, extensionReload?.phase == "awaiting_reconnect" {
                 reconnectDeadline?.cancel()
-                reconnectDeadline = Task { [weak self, requestTimeout = connection.requestTimeout] in
+                reconnectDeadline = Task { [weak self, requestTimeout = ChromeControlChannel.requestTimeout] in
                     do { try await Task.sleep(for: requestTimeout) } catch { return }
                     await self?.reconnectOverdue(id)
                 }
@@ -274,6 +279,19 @@ extension ChromeControlRuntime {
                 facts.extensionReload = extensionReload?.receipt
                 saveConnectionFacts()
             }
+        } catch is CancellationError {
+            if generation == listenerGeneration && extensionReload?.id == id {
+                reconnectDeadline?.cancel()
+                extensionReload = nil
+                if insertedPair || source == .automatic { automaticReloadPairs.remove(pair) }
+                let waiters = reloadWaiters.values
+                reloadWaiters.removeAll()
+                for waiter in waiters {
+                    waiter.result = .failure(CancellationError())
+                    waiter.done.resume()
+                }
+            }
+            throw CancellationError()
         } catch {
             guard generation == listenerGeneration else { return }
             if extensionReload?.id == id {
@@ -322,8 +340,9 @@ extension ChromeControlRuntime {
         if extensionReload?.pending != true, let next = channel, let files = extensionFiles, let running = facts.extensionVersion,
            ChromeExtensionFiles.isOlder(running, than: files.shippedVersion) {
             let pair = files.shippedVersion + "/" + running
-            if await transportAvailable(), channel === next, automaticReloadPairs.insert(pair).inserted {
+            if await transportAvailable(), extensionReload?.pending != true, channel === next, automaticReloadPairs.insert(pair).inserted {
                 do { try await beginExtensionReload(on: next, source: .automatic, context: context) }
+                catch is CancellationError {}
                 catch { _ = recordReloadPreflightFailure(error, source: .automatic) }
             }
         }

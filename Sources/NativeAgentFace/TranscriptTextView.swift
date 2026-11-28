@@ -26,8 +26,15 @@ final class TranscriptTextView: NSTextView {
         // An unsized view keeps the column it has; laying the document out at zero width would only be thrown away.
         guard size.width > 0 else { return }
         let column = min(TranscriptMetrics.column, size.width)
-        let inset = NSSize(width: max(0, floor((size.width - column) / 2)), height: TranscriptMetrics.documentInset)
-        if textContainerInset != inset { textContainerInset = inset }
+        // To the pixel, as the composer and header below are centred, so the column glides with them instead of stepping a point at a time.
+        let scale = window?.backingScaleFactor ?? 2
+        let inset = NSSize(width: max(0, (((size.width - column) / 2) * scale).rounded(.down) / scale), height: TranscriptMetrics.documentInset)
+        if textContainerInset != inset {
+            textContainerInset = inset
+            // The margin moved the text: the hosted views ride their paragraphs in this same frame, not at whichever layout comes next.
+            needsLayout = true
+            controller?.placeHostedViews()
+        }
         guard let container = textContainer, container.size.width != column else { return }
         let resize = { container.size = NSSize(width: column, height: CGFloat.greatestFiniteMagnitude) }
         if let controller { controller.changeContainerWidth(column, resize) } else { resize() }

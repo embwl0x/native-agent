@@ -98,8 +98,6 @@ extension SwiftToolDispatcher {
                 reason: "Trust Full Mac Accessibility category is not active for \(tool)"
             )
         }
-        func str(_ key: String) -> String? { input[key]?.trimmedString }
-        func num(_ key: String) -> Double? { input[key]?.doubleValue }
         if tool == "screen", input["__sense_app_material"] != .bool(true), try Self.desktopPixelsRequested(input) {
             return try await fourVerbDesktopPixels(turn: turn, invocation: invocation, input: input)
         }
@@ -123,7 +121,7 @@ extension SwiftToolDispatcher {
         }
         // Only `screen` may attach a window image.
         let pixels = tool == "screen"
-            ? FourVerbPixelAttachment(part: str("part"), forced: input["pixels"] == .bool(true), turn: turn, invocation: invocation) : nil
+            ? FourVerbPixelAttachment(part: input["part"]?.trimmedString, forced: input["pixels"] == .bool(true), turn: turn, invocation: invocation) : nil
         var verbs = MacFourVerbs(
             host: host,
             supplementalSource: SwiftToolDispatcherFourVerbPerceptionSource(
@@ -135,7 +133,7 @@ extension SwiftToolDispatcher {
             ), flowRoot: dataRoot, flowSession: turn.verifiedSessionID
         )
         let sight = Mutex((app: "", values: [String](), window: Optional<MacRoomWindow>.none))
-        if tool == "act" || (tool == "screen" && str("app") != nil) {
+        if tool == "act" || (tool == "screen" && input["app"]?.trimmedString != nil) {
             verbs.sawWindow = { app, kind, values in
                 sight.withLock { last in
                     let window = MacRoomWindow(app: app, kind: kind, readouts: values, before: last.app == app ? last.values : [])
@@ -146,7 +144,8 @@ extension SwiftToolDispatcher {
         let reply: MacFourVerbsReply
         switch tool {
         case "screen":
-            let seen = await verbs.screen(part: str("part"), app: str("app"), structured: input["structured"] == .bool(true), turn: turn, context: context)
+            let seen = await verbs.screen(part: input["part"]?.trimmedString, app: input["app"]?.trimmedString,
+                structured: input["structured"] == .bool(true), turn: turn, context: context)
             reply = seen.ok ? pixels?.attach().map { line in
                 var detail = seen.detail
                 detail["pixel_capture_status"] = .string(line)
@@ -156,7 +155,7 @@ extension SwiftToolDispatcher {
         case "act":
             reply = try await fourVerbAct(verbs: verbs, input: input, turn: turn, context: context)
         case "go":
-            guard let name = str("name") else {
+            guard let name = input["name"]?.trimmedString else {
                 throw AutonomyGateError.toolDenied(
                     reason: "go needs `name` — an app, a file or folder path, or a URL"
                 )
@@ -179,7 +178,7 @@ extension SwiftToolDispatcher {
                 reply = went
             }
         case "wait":
-            reply = await verbs.wait(until: str("until"), seconds: num("seconds"), turn: turn, context: context)
+            reply = await verbs.wait(until: input["until"]?.trimmedString, seconds: input["seconds"]?.doubleValue, turn: turn, context: context)
         default:
             throw AutonomyGateError.toolDenied(
                 reason: "SwiftToolDispatcher: '\(tool)' is not a four-verb tool"
@@ -204,11 +203,10 @@ extension SwiftToolDispatcher {
     /// A screen call that asks for desktop pixels answers with that raw view; a `wrong` reading goes to the sense door with the pixels as its
     /// only raw view, which grows no app material from them.
     @concurrent private func fourVerbDesktopPixels(turn: Turn, invocation: ChatToolInvocation, input: [String: JSONValue]) async throws -> JSONValue {
-        func str(_ key: String) -> String? { input[key]?.trimmedString }
         // A failed picture reports its own cause; no other read stands in for it.
         let result = await Self.desktopPixels(turn: turn, invocation: invocation, context: invocation.macContext(dataRoot: dataRoot), input: input)
         if input["wrong"] == .bool(true), let corner = senseAppCorner(input) {
-            return try await SenseDoor.read(corner: corner, address: str("part"), input: input,
+            return try await SenseDoor.read(corner: corner, address: input["part"]?.trimmedString, input: input,
                 scope: turn.verifiedSessionID ?? "", operation: invocation.senseOperation(turn: turn), raw: { _ in result },
                 material: { _, _ in throw SenseFailure(code: "source_unavailable",
                     message: "Desktop pixels are a raw view; app growth uses the running window's AX material.") })
@@ -223,13 +221,12 @@ extension SwiftToolDispatcher {
     /// A concrete running app's accessibility material for the sense door: its look, recognized window text and window identity.
     @concurrent private func fourVerbAppMaterial(host: MacMotorCount, turn: Turn, invocation: ChatToolInvocation, input: [String: JSONValue],
         context: MacOperationContext) async throws -> JSONValue {
-        func str(_ key: String) -> String? { input[key]?.trimmedString }
-        guard let bundle = str("app"), bundle != "*" else {
+        guard let bundle = input["app"]?.trimmedString, bundle != "*" else {
             throw SenseFailure(code: "source_unavailable", message: "App material needs a concrete already-running app.")
         }
         var body: [String: JSONValue] = ["grade": .string("look"),
             "app_map": .bool(true), "sense_material": .bool(true), "app": .string(bundle)]
-        if let part = str("part") { body["seek"] = .string(part) }
+        if let part = input["part"]?.trimmedString { body["seek"] = .string(part) }
         let readBody = body
         let passive = input["__sense_app_observation"] == .bool(true) || invocation.passiveObservation
             || invocation.observationMode == .passive
@@ -261,8 +258,7 @@ extension SwiftToolDispatcher {
     /// A screen read of an app goes through the sense door: its raw view is this tool's structured read, its material the app's accessibility tree.
     @concurrent private func fourVerbSenseAppRead(corner: SenseCorner, bundle: String, turn: Turn, invocation: ChatToolInvocation, tool: String,
         input: [String: JSONValue], surface: String) async throws -> JSONValue {
-        func str(_ key: String) -> String? { input[key]?.trimmedString }
-        return try await SenseDoor.read(corner: corner, address: str("part"), input: input,
+        return try await SenseDoor.read(corner: corner, address: input["part"]?.trimmedString, input: input,
             scope: turn.verifiedSessionID ?? "",
             operation: invocation.senseOperation(turn: turn),
             raw: { operation in
@@ -283,16 +279,23 @@ extension SwiftToolDispatcher {
     /// point. Every malformed field is refused before anything runs.
     @concurrent private func fourVerbAct(verbs: MacFourVerbs, input: [String: JSONValue], turn: Turn, context: MacOperationContext) async throws
         -> MacFourVerbsReply {
-        func str(_ key: String) -> String? { input[key]?.trimmedString }
-        func num(_ key: String) -> Double? { input[key]?.doubleValue }
         let text = input["text"]?.stringValue
+        let deed = ["after", "cleanup"].contains { input[$0] != nil && input[$0] != .null }
+        if deed {
+            guard input["__sense_native_surface"] != .bool(true), input["handle"]?.trimmedString != nil,
+                  input["frame_id"]?.trimmedString != nil, input["verb"]?.trimmedString == "type",
+                  input["front"] != .bool(true), input["again"] != .bool(true) else {
+                throw AutonomyGateError.toolDenied(reason: "after and cleanup require one exact type/replace with handle and frame_id, no raise or replay.")
+            }
+        }
         for key in ["seconds", "interval"] where input[key] != nil && input[key] != .null {
-            guard let value = num(key), value.isFinite else {
+            guard let value = input[key]?.doubleValue, value.isFinite else {
                 throw AutonomyGateError.toolDenied(reason: "act \(key) must be a finite number; nothing was run")
             }
         }
         if input["__sense_native_surface"] == .bool(true) {
-            guard let app = str("app"), let target = str("target"), let verb = str("verb").map({ $0 == "press" ? "click" : $0 }),
+            guard let app = input["app"]?.trimmedString, let target = input["target"]?.trimmedString,
+                  let verb = (input["verb"]?.trimmedString).map({ $0 == "press" ? "click" : $0 }),
                   ["click", "type", "select", "focus", "toggle", "scroll"].contains(verb),
                   ["handle", "frame_id", "front", "steps", "to", "to_app", "seconds", "repeat", "interval", "holding", "button",
                       "scroll_amount"].allSatisfy({ input[$0] == nil || input[$0] == .null }) else {
@@ -300,7 +303,7 @@ extension SwiftToolDispatcher {
                     reason: "A native surface selection requires its app and current target, without foreground or gesture options.")
             }
             return await verbs.actNativeSurface(verb: verb, target: target, app: app,
-                label: str("__sense_native_label"),
+                label: input["__sense_native_label"]?.trimmedString,
                 text: text,
                 mode: try typeMode(input), turn: turn, context: context)
         }
@@ -308,19 +311,21 @@ extension SwiftToolDispatcher {
         if case .array(let rawSteps)? = input["steps"] { steps = try rawSteps.map { try parseStep($0, input: input) } }
         else { steps = [] }
         // A move has one point; a lone `to` is where it goes.
-        let moveTo = str("verb") == "move" && input["at"] == nil && input["from"] == nil ? input["to"] : nil
+        let moveTo = input["verb"]?.trimmedString == "move" && input["at"] == nil && input["from"] == nil ? input["to"] : nil
         let place = try imagePoint(input["at"] ?? input["from"] ?? moveTo).map {
-            MacImagePlace(image: str("frame_id") ?? str("image"), at: $0, to: try moveTo == nil ? imagePoint(input["to"]) : nil)
+            MacImagePlace(image: input["frame_id"]?.trimmedString ?? input["image"]?.trimmedString,
+                at: $0, to: try moveTo == nil ? imagePoint(input["to"]) : nil)
         }
         // Empty optional fields are absent; only parsed points or steps consume a reference.
         let absent: [JSONValue?] = [nil, .null, .string("")]
         let hasText = text?.isEmpty == false
-        let focusType = str("verb") == "type" && str("target") == nil && str("handle") == nil
+        let focusType = input["verb"]?.trimmedString == "type" && input["target"]?.trimmedString == nil && input["handle"]?.trimmedString == nil
             && place == nil && steps.isEmpty && hasText
         if !absent.contains(input["handle"]) || place == nil && steps.isEmpty
             && !focusType && ["frame_id", "image"].contains(where: { !absent.contains(input[$0]) }) {
-            guard let handle = str("handle"), let frame = str("frame_id") ?? str("image"), let verb = str("verb"),
-                  ["frame_id", "image"].allSatisfy({ absent.contains(input[$0]) || str($0) == frame }),
+            guard let handle = input["handle"]?.trimmedString,
+                  let frame = input["frame_id"]?.trimmedString ?? input["image"]?.trimmedString, let verb = input["verb"]?.trimmedString,
+                  ["frame_id", "image"].allSatisfy({ absent.contains(input[$0]) || input[$0]?.trimmedString == frame }),
                   ["at", "from", "steps", "to", "to_app", "seconds", "repeat", "interval", "holding", "button"].allSatisfy({
                       input[$0] == nil || input[$0] == .null }),
                   verb == "scroll" || ["direction", "scroll_amount"].allSatisfy({ input[$0] == nil || input[$0] == .null }) else {
@@ -331,13 +336,14 @@ extension SwiftToolDispatcher {
             }
             return await verbs.actSelection(verb: verb, handle: handle, frameID: frame,
                 text: text, mode: try typeMode(input), direction: try scrollDirection(input["direction"]),
-                scrollAmount: try scrollAmount(input["scroll_amount"]), app: str("app"), turn: turn, context: context)
+                scrollAmount: try scrollAmount(input["scroll_amount"]), app: input["app"]?.trimmedString,
+                after: input["after"], cleanup: input["cleanup"], turn: turn, context: context)
         }
         let usedReferences = steps.isEmpty ? [place?.image].compactMap { $0 } : steps.compactMap { $0.place?.image ?? $0.frameID }
         // Name steps re-resolve on fresh reads; a frame_id beside them is the read the agent acted from, carried along, not a reference left unused.
         let nameSteps = !steps.isEmpty && steps.allSatisfy { $0.place == nil && $0.handle == nil }
         guard nameSteps || focusType || ["frame_id", "image"].allSatisfy({ key in
-            absent.contains(input[key]) || str(key).map { usedReferences.contains($0) } == true
+            absent.contains(input[key]) || (input[key]?.trimmedString).map { usedReferences.contains($0) } == true
         }) else {
             throw AutonomyGateError.toolDenied(reason: "A screen reference requires a handle or an image point; nothing was run")
         }
@@ -350,19 +356,19 @@ extension SwiftToolDispatcher {
         }
 
         if !steps.isEmpty {
-            return await verbs.act(verb: "", target: "", app: str("app"),
+            return await verbs.act(verb: "", target: "", app: input["app"]?.trimmedString,
                                     front: input["front"] == .bool(true), steps: steps, again: input["again"] == .bool(true), turn: turn, context: context)
         }
         // No target: a type goes into whatever has focus; a key's chord may ride in text.
         let focusTarget: (String) -> String? = { verb in
-            if ["key", "press"].contains(verb) { return str("text") }
+            if ["key", "press"].contains(verb) { return input["text"]?.trimmedString }
             if verb == "type" && hasText || MacFourVerbs.isScrollVerb(verb) { return "" }
             return nil
         }
-        guard let verb = str("verb") else {
+        guard let verb = input["verb"]?.trimmedString else {
             throw AutonomyGateError.toolDenied(reason: "act needs a `verb` — say what to do (click, type, move, drag, scroll, key)")
         }
-        guard let target = place != nil ? "" : str("target") ?? focusTarget(verb) else {
+        guard let target = place != nil ? "" : input["target"]?.trimmedString ?? focusTarget(verb) else {
             throw AutonomyGateError.toolDenied(
                 reason: "act \(verb) needs a `target` (the name of the thing) or a point (`at`: {x, y}; a drag also takes `to`)"
             )
@@ -375,18 +381,18 @@ extension SwiftToolDispatcher {
             target: target,
             text: text,
             mode: try typeMode(input),
-            to: str("to"),
-            toApp: str("to_app"),
-            seconds: num("seconds"),
+            to: input["to"]?.trimmedString,
+            toApp: input["to_app"]?.trimmedString,
+            seconds: input["seconds"]?.doubleValue,
             repeat: input["repeat"].flatMap { value in
                 if case .int(let count) = value { return Int(clamping: count) }
                 return nil
             },
-            interval: num("interval"),
+            interval: input["interval"]?.doubleValue,
             holding: input["holding"]?.trimmedString,
             button: button,
             scrollAmount: amount,
-            app: str("app"),
+            app: input["app"]?.trimmedString,
             front: input["front"] == .bool(true),
             place: place, turn: turn, context: context
         )
@@ -434,11 +440,13 @@ extension SwiftToolDispatcher {
     }
     // String steps mean press; object steps retain verb, target, text or image-point geometry.
     private func parseStep(_ raw: JSONValue, input: [String: JSONValue]) throws -> MacActStep {
-        func str(_ key: String) -> String? { input[key]?.trimmedString }
         switch raw {
         case .string(let name) where !name.trimmingCharacters(in: .whitespaces).isEmpty:
             return MacActStep(verb: "press", target: name)
         case .object(let rawStep):
+            guard ["after", "cleanup"].allSatisfy({ rawStep[$0] == nil || rawStep[$0] == .null }) else {
+                throw AutonomyGateError.toolDenied(reason: "after and cleanup require a standalone exact type/replace. Flow steps cannot declare either.")
+            }
             let mode = try typeMode(rawStep)
             let holding = rawStep["holding"]?.trimmedString
             let button = try mouseButton(rawStep)
@@ -447,7 +455,7 @@ extension SwiftToolDispatcher {
             // {verb:"key", text:"cmd+s"}: a key's chord may ride in text.
             guard case .string(let verb)? = step["verb"] else { break }
             let at = try imagePoint(step["at"] ?? step["from"])
-            var image = str("frame_id") ?? str("image")
+            var image = input["frame_id"]?.trimmedString ?? input["image"]?.trimmedString
             if case .string(let id)? = step["frame_id"] ?? step["image"] { image = id }
             var text: String?
             if case .string(let value)? = step["text"] ?? step["value"], !value.isEmpty { text = value }

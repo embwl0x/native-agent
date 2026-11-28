@@ -8,7 +8,7 @@ import PersistenceCore
 import ProviderRouting
 import Synchronization
 import NativeAgentShared
-// Blueprint: | `TurnStem+Effects.swift` | `SwiftNativeTurnEngine`: `drive` (the stem's loop: runs the agent's turn part's effects, hands it each event with each result's declared effect (and, for a round's one deed whose call asked for `then_say`, its standing words as `say`), logs at every host-call boundary; the agent's own `app` calls run once as their own dispatch round through the same door and gates, and a turn may act or end before any model call; the turn returns at `reply.end` and `after`, and nothing of the agent's runs after it); after each tool round the familiarity nerve meets the turn's landed hand-work action ids (or one call repeated 3+ rounds) through `FamiliarLines` (`practice: `), and on a later meeting puts `practice` on the round's last result once a turn (naming an active ability whose recorded route covers it, to run or repair), traced as `practice.keep`; a `provider_failure` event carries the failure's work state and whether repair is owed |
+// Blueprint: | `TurnStem+Effects.swift` | `SwiftNativeTurnEngine`: `drive` (the stem's loop: runs the agent's turn part's effects, hands it each event with each result's declared effect (and, for a round's one deed whose call asked for `then_say`, its standing words as `say`), logs at every host-call boundary; the agent's own `app` calls run once as their own dispatch round through the same door and gates, and a turn may act or end before any model call; the turn returns at `reply.end` and `after`, and nothing of the agent's runs after it); after each tool round the familiarity nerve meets the turn's landed hand-work action ids (or one call repeated 3+ rounds) through `FamiliarLines` (`practice: `), and on a later meeting puts `practice` on the round's last result once a turn, traced as `practice.keep`; a `provider_failure` event carries the failure's work state and whether repair is owed |
 
 extension SwiftNativeTurnEngine {
     /// The agent's reply ends the turn: the stem returns at reply.end, and nothing of the agent's runs after it.
@@ -19,7 +19,7 @@ extension SwiftNativeTurnEngine {
             }
             // A provider failure or outstanding card leaves completion incomplete; text-only routes must also say the card's copy.
             if stem.part.replied { return try await finishReply(stem) }
-            guard let (effect, event) = try await stem.part.next() else { return nil }
+            guard let (effect, event) = try await stem.part.next(turn: stem.turn) else { return nil }
             switch effect["effect"] {
             case .string("reply.stream"):
                 if case .string(let text)? = effect["text"], !text.isEmpty {
@@ -118,7 +118,7 @@ extension SwiftNativeTurnEngine {
         // One round runs either the calls this model round named or the agent's program's own calls, each exactly once.
         let authored = effect["index"] == nil
         var batch = [effect]
-        while stem.part.nextIsApp(authored: authored), let more = try await stem.part.next() { batch.append(more.effect) }
+        while stem.part.nextIsApp(authored: authored), let more = try await stem.part.next(turn: stem.turn) { batch.append(more.effect) }
         let ran: (calls: [ParsedToolCall], indices: [Int?], raw: String, codec: TextMarkerCodec?, boundary: LLMToolBoundaryReason?)
         if authored {
             let calls = try batch.map { item -> ParsedToolCall in
@@ -204,7 +204,7 @@ extension SwiftNativeTurnEngine {
             if item.offset == ran.calls.count - 1 { event["practice"] = practice }
             // A deed alone in its round, whose own call asked for closing words, carries them when they stand; an answer cannot supply them.
             if ran.calls.count == 1, ToolNameAliases.canonical(call.name) == "app", case .string? = call.input["then_say"],
-               call.input["actions"]?.arrayValue != nil || (!JSONValue.trimmedScalarTextOrEmpty(call.input["action"]).isEmpty && (call.input["expect"] ?? .null) != .null),
+               call.input["actions"]?.arrayValue != nil || (!JSONValue.trimmedScalarTextOrEmpty(call.input["action"]).isEmpty && call.input["expect"] != nil),
                case .object(let said)? = reply?.payload.objectValue?["then_say"], said["stands"] == .bool(true),
                case .string(let words)? = said["words"] {
                 event["say"] = .string(words)
@@ -230,7 +230,7 @@ extension SwiftNativeTurnEngine {
             }
             events[last] = .object(event)
         }
-        try await stem.part.deliver(events)
+        try await stem.part.deliver(events, turn: stem.turn)
     }
 
     private func closingClass(_ round: ArraySlice<ToolDispatchRecord>, stem: TurnStem) -> String? {
@@ -336,8 +336,8 @@ extension SwiftNativeTurnEngine {
     }
 
     /// Persistence and eligibility stay with steering; the turn log retains each reading for relaunch.
-    func readArrivals(_ stem: TurnStem, keeping prose: String = "") async throws -> Bool {
-        guard let sessionId = stem.sessionId, !sessionId.isEmpty else { return false }
+    func readArrivals(_ stem: TurnStem, keeping prose: String = "") async throws -> [ChatTurnSteering.Offer] {
+        guard let sessionId = stem.sessionId, !sessionId.isEmpty else { return [] }
         let offers = try await ChatTurnSteering.shared.drain(sessionId: sessionId, cancelFlagPath: stem.cancelFlagPath)
         if Task.isCancelled || ChatCancelFlag.isRaised(stem.cancelFlagPath) { throw stem.stopCarryingPartial() }
         if !offers.isEmpty { stem.voice.spoken = false }
@@ -347,25 +347,32 @@ extension SwiftNativeTurnEngine {
             try stem.part.readArrival(offer)
             ConversationPrefixSeeding.appendUser(offer.reading, to: &stem.wire.conversation)
         }
-        return !offers.isEmpty
+        return offers
     }
 
     /// The stem applies or records observations; the agent's part decides how to go on.
-    func observe(_ stem: TurnStem, _ kind: TurnObservation.Kind, kept: String = "", unstarted: [ParsedToolCall] = []) async throws {
+    func observe(_ stem: TurnStem, _ kind: TurnObservation.Kind, kept: String = "",
+                 unstarted: (calls: [ParsedToolCall], arrival: ChatTurnSteering.WaitingArrival)? = nil) async throws {
         TurnObservation.apply(kind, kept: kept, to: &stem.wire.conversation, surface: stem.surface, turn: stem.turn)
         var text = TurnObservation.text(kind)
-        if !unstarted.isEmpty {
-            let note = "These proposed calls did not start: " + unstarted.map { $0.name + " (" + $0.id + ")" }.joined(separator: ", ")
-                + ". Read the person's message before deciding what to do next."
+        if let unstarted, !unstarted.calls.isEmpty {
+            let note = "These proposed calls did not start: " + unstarted.calls.map { $0.name + " (" + $0.id + ")" }.joined(separator: ", ")
+                + ". Read the \(unstarted.arrival.subject) before deciding what to do next."
             Self.appendStructuredUserNudge(note, to: &stem.wire.conversation)
             text += " " + note
             TurnTraceBus.fireFromContext(kind: "turn.proposalSkipped", surface: stem.surface, payload: .object([
-                "reason": .string("person_arrival"), "calls": .array(unstarted.map {
+                "reason": .string("person_arrival"), "calls": .array(unstarted.calls.map {
                     .object(["id": .string($0.id), "name": .string($0.name)])
                 }), "effects": .string("none"),
             ]), turn: stem.turn)
+            if stem.surface == "chat" {
+                for call in unstarted.calls {
+                    await stem.progress?(.unstartedStep(id: call.id, name: ToolNameAliases.shown(call.name, input: .object(call.input)).name,
+                        disposition: .withdrawnBeforeStart))
+                }
+            }
         }
-        try await stem.part.deliver([.object(["type": .string("observation"), "text": .string(text)])])
+        try await stem.part.deliver([.object(["type": .string("observation"), "text": .string(text)])], turn: stem.turn)
     }
 
     /// Every effect boundary checkpoints the turn with its log.
@@ -415,7 +422,7 @@ extension SwiftNativeTurnEngine {
                 "work": .string(emitted || ProviderFailure.report(error)?.work == .ranPartly
                     ? ProviderFailure.WorkState.ranPartly.rawValue : ChatTurnFailure.work(for: error)),
                 "owed": .bool(failure.owner != nil && !failure.personDecides),
-                "calls": .array(calls.map { .object(["id": .string($0.id), "name": .string($0.name), "input": .object($0.input)]) })])])
+                "calls": .array(calls.map { .object(["id": .string($0.id), "name": .string($0.name), "input": .object($0.input)]) })])], turn: turn)
         } catch { throw TurnEngineError.streamInterrupted(partial: stem.voice.visibleText, underlying: failure) }
     }
 

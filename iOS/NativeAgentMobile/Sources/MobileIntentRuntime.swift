@@ -117,10 +117,20 @@ enum MobileIntentRuntime {
             throw failure("This approval is no longer pending in the synced snapshot.")
         }
         // The approval's card is its Inbox row (an approval's matter is its own id): the Mac runs that row's action, or refuses it.
+        let decision = try await iCloudSyncEngine.shared.inboxDecision(id: id, approve: approve)
+        try await decide(decision.submission)
+    }
+
+    static func decide(_ submission: FaceActSubmission) async throws {
+        let sync = iCloudSyncEngine.shared
         try await withDeliveryConsumers {
-            _ = try await iCloudSyncEngine.shared.faceAction(page: "inbox", row: id, action: approve ? "approve" : "reject", value: nil)
+            let outcome = await sync.faceOutcome(page: "inbox", submission: submission)
+            if let failure = outcome.failure { throw failure }
+            if outcome.unresolved {
+                throw SyncError.responseUnconfirmed(outcome.words ?? "Read the action's current state before repeating it.")
+            }
         }
-        await iCloudSyncEngine.shared.refreshApprovalsSnapshot()
+        await sync.refreshApprovalsSnapshot()
     }
 
     private static func withDeliveryConsumers<T>(_ operation: () async throws -> T) async rethrows -> T {

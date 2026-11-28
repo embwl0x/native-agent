@@ -27,8 +27,6 @@ public struct ContextFlowCoordinatorHealth: Sendable, Equatable {
     public let arenaMetrics: ContextArenaMetrics
     /// Bounded rebuildable feedback retained across a coordinator restart. This health gauge never grants authority.
     public let feedbackEventCount: Int
-    /// Identity of the newest retained advisory event, for restart/cap observability without exposing event payloads through every turn.
-    public let newestFeedbackEventID: String?
     public let lastReconciledAt: Date?
     public let lastError: String?
 
@@ -41,7 +39,6 @@ public struct ContextFlowCoordinatorHealth: Sendable, Equatable {
         degradedSourceCount: Int,
         arenaMetrics: ContextArenaMetrics,
         feedbackEventCount: Int = 0,
-        newestFeedbackEventID: String? = nil,
         lastReconciledAt: Date?,
         lastError: String?
     ) {
@@ -53,7 +50,6 @@ public struct ContextFlowCoordinatorHealth: Sendable, Equatable {
         self.degradedSourceCount = degradedSourceCount
         self.arenaMetrics = arenaMetrics
         self.feedbackEventCount = feedbackEventCount
-        self.newestFeedbackEventID = newestFeedbackEventID
         self.lastReconciledAt = lastReconciledAt
         self.lastError = lastError
     }
@@ -121,6 +117,7 @@ public actor ContextPreparation: DerivedStateInvalidationSink {
     }
     /// Cache only immutable generation derivations; keep feedback and live effects outside.
     var generationDerivedCache: [GenerationDerivedCacheKey: GenerationDerivedTurnState] = [:]
+    var associationGraph: Result<ContextAssociationGraph, any Error>?
     /// Error-level diagnostic sink for context health and vocabulary drift.
     let diagnostics: @Sendable (String) -> Void
 
@@ -216,6 +213,7 @@ public actor ContextPreparation: DerivedStateInvalidationSink {
         pendingRegistrations.removeAll()
         pendingProjectionReconciliationRequestIDs.removeAll()
         pendingMemoryIDs.removeAll()
+        associationGraph = nil
         activeStoredGeneration = nil
         cachedFeedback = nil
         invalidateGenerationDerivedCache()
@@ -258,7 +256,6 @@ public actor ContextPreparation: DerivedStateInvalidationSink {
             degradedSourceCount: storeHealth?.degradedSources ?? 0,
             arenaMetrics: metrics,
             feedbackEventCount: feedbackEvents.count,
-            newestFeedbackEventID: feedbackEvents.last?.id,
             lastReconciledAt: lastReconciledAt,
             lastError: measurementError ?? sourceReadFailures.values.flatMap(\.values).sorted().first ?? lastError
         )

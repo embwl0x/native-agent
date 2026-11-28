@@ -282,6 +282,9 @@ extension AppActions {
         guard let schema, case .object(let properties)? = schema.objectValue?["properties"] else { return (given, []) }
         let address = ToolArguments.itemAddress(given, schema: schema)
         let given = address.args
+        if action.id == "ability.save", given.keys.contains(where: { Parts.saveAliases[$0] != nil }) {
+            return (given, address.understood)
+        }
         let unknown = given.keys.filter { properties[$0] == nil }.sorted { left, right in
             let leftNamed = action.argumentReferences[left] != nil || action.argumentNames.values.contains { $0.contains(left) }
             let rightNamed = action.argumentReferences[right] != nil || action.argumentNames.values.contains { $0.contains(right) }
@@ -386,7 +389,8 @@ extension AppActions {
             if requiresChange, call["action"] == .string(action.id), args == input["args"]?.objectValue {
                 shape["next_call"] = .object(["find": .string(action.id)])
                 shape["instruction"] = .string("""
-                    The supplied arguments already match this form. Read the action and correct the reported cause before calling again.
+                    Each supplied argument fits the action's schema, so the schema is not what refused it: the refusal's own detail \
+                    names the cause. Correct that before calling again.
                     """)
             } else {
                 call["args"] = .object(args)

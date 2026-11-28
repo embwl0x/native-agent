@@ -218,8 +218,8 @@ public final class NativeAgentEngine: Sendable {
             agentBridgeConfigRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot),
             a2aPushConfiguration: (hasBody ? ports : nil).map { $0.a2aPushConfiguration },
             standingBotRunEnqueue: (hasBody ? ports : nil).map { ports in { @Sendable id, question, turn, ancestry in
-                try ports.standingBotQueue.enqueue(bot: id, context: question, steeringSources: turn.peerSteering.map { taint in taint.checkpointSources.filter { !taint.elevatedSources.contains($0) } } ?? [],
-                    scope: .init(ancestry: ancestry))
+                try ports.standingBotQueue.enqueue(bot: id, context: question, steeringSources: PeerDataTaint.carried(turn: turn).sources,
+                    fileAccessCeiling: turn.fileAccessCeiling, scope: .init(ancestry: ancestry))
             } },
             standingBotRunner: bots.runner
         )
@@ -234,8 +234,8 @@ public final class NativeAgentEngine: Sendable {
         }
         AgentConversationStore.restoreProjections(engine: self)
         mind?.attach(stream: { MindStream(dataRoot: dataRoot, engine: engine, completionSender: completionSender) })
-        Task { @MainActor [turns, face, approvals, persona, transcripts] in
-            turns.bindTurnFaces(source: face, approvals: approvals, persona: persona, transcripts: transcripts)
+        Task { @MainActor [turns, face, pages, approvals, persona, transcripts] in
+            turns.bindTurnFaces(source: face, pages: pages, approvals: approvals, persona: persona, transcripts: transcripts)
         }
         Task { @MainActor [layout] in layout.start() }
         Task { @MainActor [weak self] in
@@ -248,17 +248,15 @@ public final class NativeAgentEngine: Sendable {
             await trust.bindSettingsFeed(settingsFeed)
             await persona.bindSettingsFeed(settingsFeed)
             await connectors.bindSettingsFeed(settingsFeed)
-            await macIntegration.bindSettingsFeed(settingsFeed)
-            await configuration.bindSettingsFeed(settingsFeed)
         }
     }
 
     private static func makeAgentJobs(dataRoot: URL, store: AgentJobStore, own: OwnLineDoor) -> AgentJobService {
-        AgentJobService(dataRoot: dataRoot, store: store, own: own) { id, executable, arguments in
+        AgentJobService(dataRoot: dataRoot, store: store, own: own) { id, elevated, executable, arguments in
             let job = try store.job(id)
             guard let origin = job.commission.origin else { throw JobRefusal("This job has no commissioning origin proof. Nothing ran.") }
             var permission = await SwiftNativeSecurityCenter(dataRoot: dataRoot).drivenAgentLaunchPermission(origin: origin, turn: nil)
-            let steering = PeerDataTaint(dataRoot: dataRoot, restoring: job.peers ?? [], elevated: job.elevated ?? [])
+            let steering = PeerDataTaint(dataRoot: dataRoot, restoring: (job.peers ?? []) + (job.elevated ?? []), elevated: elevated)
             if permission == .fullMac, steering.isTainted(dataRoot: dataRoot)
                 || (PeerTurnEffectPolicy.isPeerBridge(surface: origin.surface) && steering.checkpointSources.isEmpty) { permission = .restricted }
             let rule = await SwiftToolDispatcher.agentProgramLaunch(permission, dataRoot: dataRoot)

@@ -60,17 +60,12 @@ public struct TelegramPollLoop: LoopRunner {
         return .allowed
     }
 
-    /// Settings and live polling must share the group-message decision so requireMention controls actual admission.
     public static func dropsForMissingMention(
         requireMention: Bool,
-        chatId: Int,
-        text: String,
-        entities: JSONValue? = nil,
-        botUsername: String? = nil
+        chatId: Int
     ) -> Bool {
         guard requireMention && chatId < 0 else { return false }
-        guard let botUsername else { return true }
-        return !mentionedUsernames(in: text, entities: entities).contains(botUsername.lowercased())
+        return true
     }
 
     static func mentionedUsernames(in text: String, entities: JSONValue?) -> [String] {
@@ -176,6 +171,7 @@ public struct TelegramPollLoop: LoopRunner {
         let inbox = TelegramUpdateInbox(offsetURL: offsetURL, dataRoot: dataRoot)
         for claim in try await inbox.recoverableClaims() where claim.assistantDelivery != nil {
             do { _ = try await recoverReply(claim) }
+            catch is CancellationError { throw CancellationError() }
             catch { _ = await quarantineRecovery(claim, error: error) }
         }
 
@@ -451,14 +447,16 @@ public struct TelegramPollLoop: LoopRunner {
                     } else {
                         reconciled.append(claim)
                     }
-                } catch {
+                } catch is CancellationError { return .end(.skipped(reason: "Telegram poll cancelled")) }
+                catch {
                     if let terminal = await quarantineRecovery(claim, error: error) { reconciled.append(terminal) }
                 }
             }
             recoveredClaims = reconciled
             RepairOwed.settle(dataRoot, operation: "telegram.inbox:" + updateInbox.directory.path,
                 evidence: .init(source: updateInbox.directory.path, id: NativeTimestampFormat.fractionalZulu(Date())))
-        } catch {
+        } catch is CancellationError { return .end(.skipped(reason: "Telegram poll cancelled")) }
+        catch {
             let failure = updateInbox.repairFailure(error, dataRoot: dataRoot)
             guard let owner = failure.owner else {
                 await recordError(context: "update_inbox_load", error: failure.message)
@@ -558,6 +556,7 @@ public struct TelegramPollLoop: LoopRunner {
                 throw TelegramVoiceTranscriptionError.speechUnavailable("Voice transcription is not configured. Enable it on the Mac before resending.")
             }
             do { try await Self.defaultSendChatAction(token, message.destination, "typing") }
+            catch is CancellationError { throw CancellationError() }
             catch { await recordError(context: "voice_typing", error: String(describing: error), update: update, message: message) }
             var downloaded = try await mediaDownloader.download(token: token, attachment: voice, maxBytes: voiceMaxBytes)
             let transcription = try await voiceTranscriber.transcribe(downloaded)

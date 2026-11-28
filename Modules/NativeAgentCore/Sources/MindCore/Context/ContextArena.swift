@@ -100,7 +100,6 @@ public enum ContextArenaError: Error, Equatable, Sendable {
 public struct ContextArenaMetrics: Sendable, Equatable {
     public let currentGenerationID: Int64?
     public let activeLeaseCount: Int
-    public let pinnedGenerations: [Int64: Int]
     public let pressure: ContextArenaPressure
     public let prewarmingAllowed: Bool
 }
@@ -142,7 +141,6 @@ public final class ContextArena: Sendable {
 
     private struct ActiveSnapshot {
         var leaseCount: Int
-        let generationID: Int64
     }
 
     private struct State {
@@ -235,10 +233,7 @@ public final class ContextArena: Sendable {
     public func acquireSnapshot() throws -> ContextGenerationLease {
         let published = try state.withLock { state -> PublishedSnapshot in
             guard let published = state.current else { throw ContextArenaError.noPublishedSnapshot }
-            var active = state.activeSnapshots[published.sequence] ?? ActiveSnapshot(
-                leaseCount: 0,
-                generationID: published.snapshot.generationID
-            )
+            var active = state.activeSnapshots[published.sequence] ?? ActiveSnapshot(leaseCount: 0)
             active.leaseCount += 1
             state.activeSnapshots[published.sequence] = active
             return published
@@ -271,7 +266,6 @@ public final class ContextArena: Sendable {
                 activeLeaseCount: state.activeSnapshots.values.reduce(into: 0) {
                     $0 += $1.leaseCount
                 },
-                pinnedGenerations: pinnedGenerationsLocked(state),
                 pressure: state.pressure,
                 prewarmingAllowed: state.prewarmingAllowed
             )
@@ -296,12 +290,6 @@ public final class ContextArena: Sendable {
                 state.activeSnapshots[sequence] = active
             }
             changed = true
-        }
-    }
-
-    private func pinnedGenerationsLocked(_ state: State) -> [Int64: Int] {
-        state.activeSnapshots.values.reduce(into: [:]) { result, active in
-            result[active.generationID, default: 0] += active.leaseCount
         }
     }
 

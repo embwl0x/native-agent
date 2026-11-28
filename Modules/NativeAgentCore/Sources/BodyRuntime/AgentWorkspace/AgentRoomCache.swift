@@ -1,5 +1,4 @@
 import Synchronization
-import AppKit
 import Foundation
 import NativeAgentShared
 import MacNerves
@@ -8,6 +7,7 @@ import PersistenceCore
 import DeskCore
 import SenseCore
 import Darwin
+import AppKit
 // Blueprint: | `AgentRoomCache.swift` | Session-scoped room bindings with bounded lasting item names and current-draw verbs |
 // Expire bindings with their session and retain only the latest 512 lasting item bindings per room.
 

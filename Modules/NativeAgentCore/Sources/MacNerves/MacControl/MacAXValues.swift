@@ -60,6 +60,7 @@ public struct MacAXAttributes: Sendable, Equatable {
     public let titleIsHelp: Bool
     public let displayTitle: String?
     var listRead: MacAXAttributeRead.ListRead?
+    var queryFields: [String: JSONValue]?
     public let listSummary: String?
     /// Hidden or modifier-only alternate, absent from the default menu.
     public let isHiddenMenuItem: Bool

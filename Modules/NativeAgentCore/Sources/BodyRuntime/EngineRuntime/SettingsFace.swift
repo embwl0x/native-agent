@@ -95,7 +95,7 @@ extension NativeAgentEngine {
         ("preferences.shortcuts", "Shortcuts", ["settings.global_hotkey", "settings.shotgun_shortcut"]),
     ]
     /// Developer dials, drawn last under Advanced with the search service.
-    private static let advancedSettings = ["settings.developer_surfaces", "settings.daily_reflection_budget"]
+    private static let advancedSettings = ["settings.daily_reflection_budget"]
 
     /// One parent row per group whose nested rows are its settings' own rows, unchanged; a group with none of its settings is not drawn.
     private static func preferenceGroups(_ rows: [PartFace.Row], search: PartFace.Row) -> [PartFace.Row] {

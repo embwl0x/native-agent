@@ -32,7 +32,8 @@ final class TranscriptDocumentController: TranscriptReaderCore, NSTextViewDelega
     private var containerWidth = TranscriptMetrics.column
     private var pressWidth = TranscriptMetrics.column
     private var scaleObserver: NotificationCenter.ObservationToken?
-    private var scale = TranscriptTextScale.value
+    private var displayOptionsObserver: NotificationCenter.ObservationToken?
+    private var scale = TranscriptTextScale.value * BoardGeometry.macTextScale
     private var quiet = false
     private var reduceMotion = false
     private var pageVisible = true
@@ -42,7 +43,6 @@ final class TranscriptDocumentController: TranscriptReaderCore, NSTextViewDelega
     /// Where laying out the whole document has reached, as a character offset; nil once every paragraph has its real position.
     private var layoutOffset: Int?
     private var layoutPassOwed = false
-    private var selfMoving = false
     private var liveScrolling = false
     private var firstPaintOwed = true
     private var completeDocument = false
@@ -128,6 +128,12 @@ final class TranscriptDocumentController: TranscriptReaderCore, NSTextViewDelega
         scaleObserver = center.addObserver(of: nil, for: TranscriptTextScale.Changed.self) { [weak self] _ in
             self?.scaleChanged()
         }
+        let workspace = NSWorkspace.shared
+        displayOptionsObserver = workspace.notificationCenter.addObserver(
+            of: nil, for: NSWorkspace.AccessibilityDisplayOptionsDidChangeMessage.self
+        ) { [weak self] _ in
+            self?.scaleChanged()
+        }
     }
 
     deinit {
@@ -141,6 +147,7 @@ final class TranscriptDocumentController: TranscriptReaderCore, NSTextViewDelega
         speechChanges = nil
         releaseReader()
         scaleObserver = nil
+        displayOptionsObserver = nil
         NotificationCenter.default.removeObserver(self)
         if handle?.controller === self { handle?.controller = nil }
         model.controller = nil
@@ -331,23 +338,15 @@ final class TranscriptDocumentController: TranscriptReaderCore, NSTextViewDelega
         scrollView.reflectScrolledClipView(clip)
     }
 
-    /// Layout performed for our own edit or scroll may synchronously move the clip again.
-    override func moving(_ change: () -> Void) {
-        let enclosing = selfMoving
-        selfMoving = true
-        defer { selfMoving = enclosing }
-        change()
-    }
-
     /// Reader actions own their landed position; synchronous TextKit corrections cannot pin over the move.
     func readerMove<Result>(onlyIfScrolled: Bool = false, _ change: () -> Result) -> Result {
         guard !selfMoving else { return change() }
         let origin = clip.bounds.origin
-        selfMoving = true
-        let result = change()
-        if !pendingOpen, !onlyIfScrolled || clip.bounds.origin != origin { readerDidMove() }
-        selfMoving = false
-        return result
+        return moving {
+            let result = change()
+            if !pendingOpen, !onlyIfScrolled || clip.bounds.origin != origin { readerDidMove() }
+            return result
+        }
     }
 
     private func readerDidMove() {
@@ -599,8 +598,19 @@ final class TranscriptDocumentController: TranscriptReaderCore, NSTextViewDelega
         }
         continueDocumentLayout()
         containerWidth = width
-        // A live resize only reflows; the bubbles re-measure once, when the person lets go of the window.
-        guard !scrollView.inLiveResize else { widthRestyleOwed = true; return }
+        // While the window is dragged, the bubbles on screen follow the column on the next turn of the run loop, so they move with the text
+        // they sit in; every bubble is measured once more, and the reader restyled, when the person lets go.
+        guard !scrollView.inLiveResize else {
+            widthRestyleOwed = true
+            guard !widthRestylePending else { return }
+            widthRestylePending = true
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.widthRestylePending = false
+                self.attachments.follow(columnWidth: self.replyWidth)
+            }
+            return
+        }
         guard !widthRestylePending else { return }
         widthRestylePending = true
         Task { @MainActor [weak self] in
@@ -612,7 +622,7 @@ final class TranscriptDocumentController: TranscriptReaderCore, NSTextViewDelega
 
     /// The window stopped resizing: the one re-measure the resize owed.
     func liveResizeEnded() {
-        guard widthRestyleOwed else { return }
+        guard widthRestyleOwed else { requestRestyle(); return }
         widthRestyleOwed = false
         restyleForWidth()
     }
@@ -627,13 +637,16 @@ final class TranscriptDocumentController: TranscriptReaderCore, NSTextViewDelega
 
     private func requestRestyle() {
         guard readerRequested else { return }
-        let next = geometry
         let previous = lastGeometry
-        guard next != previous else { return }
-        lastGeometry = next
-        if next.width != previous?.width || next.scale != previous?.scale || next.viewportHeight != previous?.viewportHeight {
+        let resized = Double(pressWidth) != previous?.width || Double(scale) != previous?.scale
+        guard resized || (!scrollView.inLiveResize && !widthRestyleOwed) else { return }
+        let next = geometry
+        if resized {
+            guard next.viewportHeight.isFinite, next.viewportHeight > 0 else { return }
+            lastGeometry = next
             send(.resizeTranscriptReader(next))
         } else if next.viewport != previous?.viewport {
+            lastGeometry = next
             send(.transcriptReceipt(reader: readerID, receipt: .viewport(blocks: next.viewport)))
         }
     }
@@ -648,7 +661,7 @@ final class TranscriptDocumentController: TranscriptReaderCore, NSTextViewDelega
     }
 
     private func scaleChanged() {
-        let next = TranscriptTextScale.value
+        let next = TranscriptTextScale.value * BoardGeometry.macTextScale
         guard next != scale else { return }
         scale = next
         requestRestyle()
@@ -807,9 +820,8 @@ final class TranscriptDocumentController: TranscriptReaderCore, NSTextViewDelega
         let block = shown.blocks[hit.block]
         let origin = textView.textContainerOrigin
         var code: TranscriptCodeCopy?
-        if case .code = block.kind {
-            let frame = hit.fragment.layoutFragmentFrame
-            let y = frame.minY + origin.y + block.lead.topGap(message: NativeAgentShellLayout.transcriptGap) + TranscriptMetrics.codeHeader / 2
+        if let fragment = hit.fragment as? TranscriptCodeFragment {
+            let y = fragment.layoutFragmentFrame.minY + origin.y + fragment.topGap + fragment.headerHeight / 2
             let x = origin.x + containerWidth - TranscriptMetrics.gutter - TranscriptMetrics.codePadH
             code = TranscriptCodeCopy(blockID: block.id, anchor: hostPoint(NSPoint(x: x, y: y)))
         }

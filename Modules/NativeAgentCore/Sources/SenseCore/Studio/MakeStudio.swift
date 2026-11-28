@@ -23,8 +23,9 @@ public struct MakeStudio: Sendable {
         public let prompt: String?
         public let model: String?
         public let created: String
-        /// Native provenance for another agent's output registered as the agent's: "made by ‹contact› for ‹job›". The agent's own versions have none.
         public var madeBy: String?
+        public var jobID: String?
+        public var peerID: String?
         /// The version the person changed by hand to make this one (a table edited in the window). Absent on every other version; a build
         /// without this field reads the record and drops it from the record when it next appends a version.
         public var personEditOf: Int?
@@ -49,6 +50,19 @@ public struct MakeStudio: Sendable {
     public func folder(_ ref: String) -> URL { root.appendingPathComponent(ref, isDirectory: true) }
 
     public func url(_ ref: String, _ version: Version) -> URL { folder(ref).appendingPathComponent(version.file) }
+
+    package func version(at file: URL) throws -> Version? {
+        let resolved = NativeAgentWorkspaceRoot.canonicalFileURL(file)
+        let directory = resolved.deletingLastPathComponent()
+        let ref = directory.lastPathComponent.lowercased()
+        guard Self.isRef(ref), directory.deletingLastPathComponent().path.caseInsensitiveCompare(
+            NativeAgentWorkspaceRoot.canonicalFileURL(root).path) == .orderedSame,
+            try SenseSandboxProfile.containsResolved(directory, roots: [folder(ref)]) else { return nil }
+        return try readMeta(ref)?.versions.first { version in
+            guard version.file.caseInsensitiveCompare(resolved.lastPathComponent) == .orderedSame else { return false }
+            return try SenseSandboxProfile.containsResolved(resolved, roots: [url(ref, version)])
+        }
+    }
 
     /// Reads a retained board within the Make document bound.
     public func board(_ ref: String, _ version: Version) throws -> BoardDocument {
@@ -180,7 +194,8 @@ public struct MakeStudio: Sendable {
     /// never lands on top of newer work.
     @discardableResult
     public func add(_ file: URL, ref: String? = nil, prompt: String? = nil, model: String? = nil,
-                    madeBy: String? = nil, personEditOf: Int? = nil) throws -> (ref: String, version: Version) {
+                    madeBy: String? = nil, jobID: String? = nil, peerID: String? = nil,
+                    personEditOf: Int? = nil) throws -> (ref: String, version: Version) {
         let ref = ref?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         return try CredentialFileLock.withLock(root) {
             var meta: Meta
@@ -198,7 +213,8 @@ public struct MakeStudio: Sendable {
                     The newest is the one to change.
                     """)
             }
-            return try append(file, meta: &meta, prompt: prompt, model: model, madeBy: madeBy, personEditOf: personEditOf)
+            return try append(file, meta: &meta, prompt: prompt, model: model, madeBy: madeBy, jobID: jobID, peerID: peerID,
+                              personEditOf: personEditOf)
         }
     }
 
@@ -237,14 +253,16 @@ public struct MakeStudio: Sendable {
     }
 
     private func append(_ file: URL, meta: inout Meta, prompt: String? = nil, model: String? = nil,
-                        madeBy: String? = nil, personEditOf: Int? = nil) throws -> (ref: String, version: Version) {
+                        madeBy: String? = nil, jobID: String? = nil, peerID: String? = nil,
+                        personEditOf: Int? = nil) throws -> (ref: String, version: Version) {
         let (n, exhausted) = (meta.versions.last?.n ?? 0).addingReportingOverflow(1)
         guard !exhausted else {
             throw Refusal(reason: "version_exhausted", message: "Make has no version numbers left for this ref. Nothing was written.")
         }
         let ext = file.pathExtension.lowercased()
         let version = Version(n: n, file: ext.isEmpty ? "v\(n)" : "v\(n).\(ext)", prompt: prompt, model: model,
-                              created: NativeTimestampFormat.sixDigitUTCOffset(Date()), madeBy: madeBy, personEditOf: personEditOf)
+                              created: NativeTimestampFormat.sixDigitUTCOffset(Date()), madeBy: madeBy, jobID: jobID, peerID: peerID,
+                              personEditOf: personEditOf)
         let dir = folder(meta.ref)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let copy = try checkedDestination(meta.ref, file: version.file).deletingLastPathComponent().appendingPathComponent(version.file)

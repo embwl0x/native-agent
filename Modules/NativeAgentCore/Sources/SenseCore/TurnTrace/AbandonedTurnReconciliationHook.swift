@@ -10,7 +10,6 @@ package final class AbandonedTurnReconciliation {
     private let traceBus: TurnTraceBus
     private var generation: UUID?
     private var sweepTask: Task<Void, Never>?
-    private var resumeJobs: [UUID: Task<Void, Never>] = [:]
     private var resuming: Set<String> = []
     private var resume: (@Sendable (TurnCheckpoint) async throws -> Void)?
 
@@ -122,9 +121,7 @@ package final class AbandonedTurnReconciliation {
             // second saved send waits for the first instead of colliding with it. Conversations still recover side by side.
             let bySession = Dictionary(grouping: outcome.resumable.filter { !inFlight().contains($0.turnId) }, by: \.sessionId)
             for (_, checkpoints) in bySession {
-                let id = UUID()
-                resumeJobs[id] = Task { [self] in
-                    defer { resumeJobs[id] = nil }
+                Task { [self] in
                     for checkpoint in checkpoints.sorted(by: { $0.acceptedAt < $1.acceptedAt }) {
                         guard self.generation == generation, !Task.isCancelled else { return }
                         do {

@@ -95,8 +95,25 @@ public struct MemoryManagerExistingMemory: Sendable, Equatable {
 }
 
 public struct MemoryManagerRequest: Sendable, Equatable {
+    public enum Origin: String, Sendable, Equatable {
+        case person, peer, agent
+
+        init?(recordedPrincipal: String?) {
+            switch recordedPrincipal {
+            case "person": self = .person
+            case "self": self = .agent
+            case "agent:unknown": return nil
+            case let principal? where principal.hasPrefix("agent:"): self = .peer
+            default: return nil
+            }
+        }
+    }
+
     public let userMessage: String
     public let assistantMessage: String
+    public let origin: Origin?
+    public let turnId: String?
+    public let careWake: Bool
     public let existing: [MemoryManagerExistingMemory]
     public let standing: Int
     /// Pending rows shown in the prompt and used to resolve update targets before meaning is written. Never reconstructed on replay.
@@ -117,6 +134,7 @@ public struct MemoryManagerRequest: Sendable, Equatable {
     public let completedActsUnavailable: String?
     /// The agent's reply on this turn reached a person; only then can it prove a deed that is itself saying something to them.
     public let replyDelivered: Bool
+    public let personReplyAt: Date?
     /// A turn without an incoming message from someone, judged for settlement alone: only what it settled is kept, never memories, promises or
     /// cares.
     public let settlesOnly: Bool
@@ -137,10 +155,17 @@ public struct MemoryManagerRequest: Sendable, Equatable {
         completedActs: [MemoryManagerAct] = [],
         completedActsUnavailable: String? = nil,
         replyDelivered: Bool = false,
-        settlesOnly: Bool = false
+        settlesOnly: Bool = false,
+        personReplyAt: Date? = nil,
+        origin: Origin? = nil,
+        turnId: String? = nil,
+        careWake: Bool = false
     ) {
         self.userMessage = userMessage
         self.assistantMessage = assistantMessage
+        self.origin = origin
+        self.turnId = turnId
+        self.careWake = careWake
         self.existing = existing
         self.standing = standing
         self.pendingTargets = pendingTargets
@@ -155,6 +180,7 @@ public struct MemoryManagerRequest: Sendable, Equatable {
         self.completedActsUnavailable = completedActsUnavailable
         self.replyDelivered = replyDelivered
         self.settlesOnly = settlesOnly
+        self.personReplyAt = personReplyAt
     }
 }
 
@@ -163,9 +189,13 @@ public struct MemoryManagerPromise: Codable, Sendable, Equatable {
     public let words: String
     public let when: String
     public let source: String
+    /// A proof owed: the reply said a thing is fixed or working with no check in the turn. It lands as her own step (origin self), never one owed
+    /// to the person. Absent on an ordinary promise.
+    public let prove: Bool?
 
-    public init(words: String, when: String, source: String) {
+    public init(words: String, when: String, source: String, prove: Bool? = nil) {
         self.words = words; self.when = when; self.source = source
+        self.prove = prove == true ? true : nil
     }
 
     /// The one test for words quoted from the agent's reply: nonblank and exactly contained.
@@ -202,11 +232,22 @@ public struct MemoryManagerPromise: Codable, Sendable, Equatable {
                   let source = row["source"] as? String, Self.quoted(source, in: reply) else {
                 throw FoundationModelsError.decodeFailed("promise \(promises.count) requires nonempty words, when and exact reply source")
             }
-            guard row["committed"] as? Bool == true else {
+            // A JSON number is not the mark: only a real Boolean is.
+            let prove = (row["prove"] as? NSNumber).flatMap { CFGetTypeID($0) == CFBooleanGetTypeID() ? $0.boolValue : nil }
+            guard row["prove"] == nil || prove != nil else {
+                throw FoundationModelsError.decodeFailed("promise \(promises.count) requires a Boolean prove")
+            }
+            // Her own judgment that the reply did not undertake the work is an answer, not a malformed row: nothing is kept for it.
+            if prove != true, let committed = row["committed"] as? NSNumber, CFGetTypeID(committed) == CFBooleanGetTypeID(),
+               !committed.boolValue { continue }
+            // The claim itself is what commits her to a proof; an ordinary promise must undertake the work.
+            guard row["committed"] as? Bool == true || prove == true else {
                 throw FoundationModelsError.decodeFailed("promise \(promises.count) requires committed=true: the reply must undertake the work, "
                     + "not offer a draft, idea, possibility or an action awaiting someone choosing it")
             }
-            let promise = Self(words: words.trimmingCharacters(in: .whitespacesAndNewlines), when: when, source: source)
+            // A proof owed is hers to do on her own turn, whatever time the judgment named.
+            let promise = Self(words: words.trimmingCharacters(in: .whitespacesAndNewlines), when: prove == true ? "own_turn" : when,
+                               source: source, prove: prove)
             try promise.validate(reply: reply)
             promises.append(promise)
         }
@@ -228,6 +269,23 @@ public struct MemoryManagerAct: Sendable, Equatable {
 
     public init(id: String, record: JSONValue) {
         self.id = id; self.record = record
+    }
+
+    public var digestEvidence: Self { Self(id: id, record: Self.redactDigestEvidence(record)) }
+
+    public static func redactDigestEvidence(_ value: JSONValue) -> JSONValue {
+        switch value {
+        case .string(let text): return .string(TurnSecretRedactor.redactText(text))
+        case .array(let rows): return .array(rows.map(redactDigestEvidence))
+        case .object(let fields):
+            return .object(Dictionary(fields.map { key, field in
+                let safeKey = TurnSecretRedactor.redactText(key)
+                let secret = safeKey != key || TurnSecretRedactor.isCredentialName(key)
+                    || NativeAgentSecretRedactor.isSecretName(key, use: .scriptInput)
+                return (safeKey, secret && field != .null ? .string("[REDACTED_NAMED_SECRET]") : redactDigestEvidence(field))
+            }, uniquingKeysWith: { _, _ in .string("[REDACTED_NAMED_SECRET]") }))
+        default: return value
+        }
     }
 
     public func contains(_ source: String) -> Bool {
@@ -286,12 +344,17 @@ public struct AfterTurnInterpretation: Codable, Sendable {
     public let appAuthored: Bool
     public let model: String?
     public let surface: String
+    public let redactedQuotes: Bool?
+
+    package func quoteText(_ text: String) -> String {
+        redactedQuotes == true ? TurnSecretRedactor.redactText(text) : text
+    }
 
     public init(memories: [MemoryManagerDecision],
                 affect: CognitiveSubstrate.AffectAppraisal, caring: CaringAppraisalVerdict,
                 cares: [CognitiveCareJudgment] = [], careFaults: [String]? = nil, promises: [MemoryManagerPromise] = [],
                 settled: [MemoryManagerSettlement] = [], appAuthored: Bool = false,
-                model: String?, surface: String) {
+                model: String?, surface: String, redactedQuotes: Bool? = nil) {
         self.memories = memories
         self.affect = affect
         self.caring = caring
@@ -302,10 +365,11 @@ public struct AfterTurnInterpretation: Codable, Sendable {
         self.appAuthored = appAuthored
         self.model = model
         self.surface = surface
+        self.redactedQuotes = redactedQuotes
     }
 
     private enum CodingKeys: String, CodingKey {
-        case memories, affect, caring, cares, careFaults, promises, settled, appAuthored, model, surface
+        case memories, affect, caring, cares, careFaults, promises, settled, appAuthored, model, surface, redactedQuotes
     }
 
     public init(from decoder: Decoder) throws {
@@ -320,6 +384,7 @@ public struct AfterTurnInterpretation: Codable, Sendable {
         appAuthored = try values.decode(Bool.self, forKey: .appAuthored)
         model = try values.decodeIfPresent(String.self, forKey: .model)
         surface = try values.decode(String.self, forKey: .surface)
+        redactedQuotes = try values.decodeIfPresent(Bool.self, forKey: .redactedQuotes)
     }
 }
 
@@ -440,8 +505,7 @@ public enum MemoryManagerLane {
         guard let actionRaw = object["action"] as? String,
               let action = MemoryManagerAction(rawValue: actionRaw),
               let kindRaw = object["kind"] as? String, allowedKinds.contains(kindRaw) else { return nil }
-        let updatesId = (object["updates_id"] as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let updatesId = object["updates_id"] as? String
         let evidence = object["standing_evidence"] as? String
         guard let number = object["confidence"] as? NSNumber,
               CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
@@ -497,7 +561,7 @@ public enum MemoryManagerLane {
     static let allowedKinds = Set(MemoryKindStamp.writerKinds)
 
     public static func correctionRejectionReason(
-        _ decision: MemoryManagerDecision, userMessage: String, isPeer: Bool, personName: String? = nil
+        _ decision: MemoryManagerDecision, userMessage: String, isPeer: Bool, personName: String? = nil, redactedQuotes: Bool = false
     ) -> String? {
         guard !isPeer else { return "a peer cannot author a standing human correction" }
         guard let grounding = decision.grounding, grounding.standing,
@@ -505,9 +569,11 @@ public enum MemoryManagerLane {
               let evidence = decision.standingEvidence, evidence == grounding.evidence else {
             return "standing rule lacks the interpretation's direct human attribution and evidence"
         }
-        if let refusal = statementRejectionReason(decision, userMessage: userMessage, assistantMessage: "") { return refusal }
+        let shown = redactedQuotes ? TurnSecretRedactor.redactText(userMessage) : userMessage
+        if let refusal = statementRejectionReason(decision, userMessage: shown, assistantMessage: "") { return refusal }
         let unquoted = unquotedHumanMessage(userMessage)
-        guard unquoted.contains(evidence) else { return "quoted instruction is not a standing rule" }
+        let shownUnquoted = redactedQuotes ? TurnSecretRedactor.redactText(unquoted) : unquoted
+        guard shownUnquoted.contains(evidence) else { return "quoted instruction is not a standing rule" }
         func components(_ value: String) -> Set<String> {
             Set(value.lowercased().split { !$0.isLetter && !$0.isNumber }.map(String.init))
         }
@@ -584,7 +650,7 @@ public enum MemoryManagerLane {
             caring: interpretation.caring, cares: interpretation.cares, careFaults: interpretation.careFaults, promises: interpretation.promises,
             settled: interpretation.settled,
             appAuthored: interpretation.appAuthored,
-            model: interpretation.model, surface: interpretation.surface)
+            model: interpretation.model, surface: interpretation.surface, redactedQuotes: interpretation.redactedQuotes)
     }
 
     /// Share the store's normalized fingerprint so review and acceptance identify the same target.

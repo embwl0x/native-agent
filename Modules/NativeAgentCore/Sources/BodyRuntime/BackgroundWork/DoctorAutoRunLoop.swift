@@ -121,6 +121,9 @@ public struct DoctorAutoRunLoop: LoopRunner {
                 results, to: dir.appendingPathComponent("latest.json"),
                 runAt: formatter.string(from: Date()), measuredAt: formatter.string(from: measuredAt))
             return .completed(result: "doctor snapshot persisted (\(results.count) check(s))")
+        } catch is CancellationError {
+            // Quit or a settings reload stopped the run: nothing about the checks failed.
+            return .skipped(reason: "cancelled", healthNeutral: true)
         } catch {
             FileHandle.standardError.write(Data("DoctorAutoRunLoop: tick failed: \(error)\n".utf8))
             return .failed(error: String(describing: error))

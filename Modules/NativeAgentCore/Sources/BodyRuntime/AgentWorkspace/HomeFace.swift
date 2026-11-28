@@ -76,7 +76,7 @@ package enum HomeFace {
             }
         }
 
-        @concurrent nonisolated package func read(layout: SurfaceLayoutAvailability, attention: String) async -> PartFaces.Packet {
+        @concurrent nonisolated package func read(layout: SurfaceLayoutAvailability, attention: JSONValue) async -> PartFaces.Packet {
             await projection.read(workspace: workspace, dataRoot: dataRoot, layout: layout, attention: attention)
         }
     }
@@ -85,7 +85,7 @@ package enum HomeFace {
         private var components: [String: Component] = [:]
         private var repairRows: [String: RepairRow] = [:]
 
-        func read(workspace: WorkspaceOperation, dataRoot: URL, layout: SurfaceLayoutAvailability, attention: String) -> PartFaces.Packet {
+        func read(workspace: WorkspaceOperation, dataRoot: URL, layout: SurfaceLayoutAvailability, attention: JSONValue) -> PartFaces.Packet {
             let now = Date()
             let world = AgentScreen.retainedWorld(workspace: workspace, dataRoot, now: now)
             return HomeFace.packet(world, dataRoot: dataRoot, layout: layout, attention: attention, now: now,
@@ -111,7 +111,7 @@ package enum HomeFace {
 
     private static func component(_ id: String, from names: [String], world: AgentWorld, components: inout [String: Component],
                                   keys: inout RowKeys, content: Component.Input? = nil, build: (inout RowKeys) -> JSONValue) -> JSONValue {
-        let input = content ?? .readings(names.map { world.readings[$0] })
+        let input = content ?? .readings(names.map { world.readings[$0]?.identity })
         let result: Component
         if let kept = components[id], kept.input == input { result = kept }
         else {
@@ -153,7 +153,7 @@ package enum HomeFace {
         "elsewhere": ["elsewhere", "contacts"], "places": ["desk"], "mac": ["windows"],
     ]
 
-    private static func packet(_ world: AgentWorld, dataRoot: URL, layout: SurfaceLayoutAvailability, attention: String,
+    private static func packet(_ world: AgentWorld, dataRoot: URL, layout: SurfaceLayoutAvailability, attention: JSONValue,
                                now: Date, components: inout [String: Component], repairRows: inout [String: RepairRow]) -> PartFaces.Packet {
         var keys = RowKeys()
         let repairs = world.repairs.filter(RepairOwed.isOwed)
@@ -178,11 +178,14 @@ package enum HomeFace {
         for name in ["mind"] + order {
             gaps[name] = .array((sources[name] ?? []).compactMap { key -> JSONValue? in
                 if let failure = world.failures[key] { return fact(["source": .string(key), "failure": .string(failure)]) }
-                return world.unread.contains(key) ? fact(["source": .string(key)]) : nil
+                if world.unread.contains(key) { return fact(["source": .string(key)]) }
+                // A reading under a minute old that is already being read again is current enough: her own acts in a turn invalidate it constantly.
+                guard world.pending.contains(key), let reading = world.readings[key], Date().timeIntervalSince(reading.at) > 60 else { return nil }
+                return fact(["source": .string(key), "at": .string(clock(reading.at))])
             })
         }
         var facts: [String: JSONValue] = [
-            "person": .string(person), "order": .array(order.map(JSONValue.string)), "attention": .object(["state": .string(attention)]),
+            "person": .string(person), "order": .array(order.map(JSONValue.string)), "attention": attention,
             "mail": mail, "working": working, "gaps": .object(gaps),
         ]
         facts["thoughts"] = component("thoughts", from: ["thoughts"], world: world, components: &components, keys: &keys,

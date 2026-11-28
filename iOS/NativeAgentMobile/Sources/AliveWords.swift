@@ -10,15 +10,14 @@ enum AliveWords {
     private static let ones = ["zero", "one", "two", "three", "four", "five", "six",
                                "seven", "eight", "nine", "ten"]
 
-    static func spelled(_ n: Int, capitalized: Bool = true) -> String {
+    static func spelled(_ n: Int) -> String {
         guard ones.indices.contains(n) else { return "\(n)" }
-        let word = ones[n]
-        return capitalized ? word.prefix(1).uppercased() + word.dropFirst() : word
+        return ones[n]
     }
 
-    static func count(_ n: Int, _ noun: String, plural: String? = nil, spelled: Bool = false) -> String {
-        let number = spelled ? self.spelled(n, capitalized: false) : n.formatted()
-        return "\(number) \(n == 1 ? noun : plural ?? pluralized(noun))"
+    static func count(_ n: Int, _ noun: String, spelled: Bool = false) -> String {
+        let number = spelled ? self.spelled(n) : n.formatted()
+        return "\(number) \(n == 1 ? noun : pluralized(noun))"
     }
 
     private static func pluralized(_ noun: String) -> String {

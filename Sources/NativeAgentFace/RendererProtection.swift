@@ -127,11 +127,6 @@ final class RendererProtection {
         publish()
     }
 
-    func release(window: NSWindow) {
-        guard held.removeValue(forKey: ObjectIdentifier(window)) != nil else { return }
-        publish()
-    }
-
     func publishShotgun(window: NSWindow?) {
         shotgun = window
         window?.ignoresMouseEvents = passing

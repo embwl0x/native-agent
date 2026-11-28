@@ -17,7 +17,7 @@ extension AppModel {
         let reply = try await checkedFaceAct(act)
         let result: CommittedResult
         switch reply {
-        case .committed(let value), .operation(.completed(let value)): result = value
+        case .committed(let value): result = value
         default: throw PartCallError(code: "unconfirmed_reply", message: "I have not confirmed this operation's committed result.")
         }
         if let failure = result.publicationFailure { setFailureStatus(failure, action: "publish the saved result") }

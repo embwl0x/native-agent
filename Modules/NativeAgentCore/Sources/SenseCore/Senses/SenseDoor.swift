@@ -286,6 +286,7 @@ public enum SenseDoor {
     private static func readAuthoredView(corner: SenseCorner, address: String?, input: [String: JSONValue], scope: String,
                                          record: SenseRecord, operation: SenseReadOperation, source: DoorSource) async throws -> JSONValue {
         do { _ = try await source.material(for: corner, address: address, operation: operation) }
+        catch is CancellationError { throw CancellationError() }
         catch {
             return senseFailure(SenseFailure(error, code: "source_unavailable"), record: record)
         }

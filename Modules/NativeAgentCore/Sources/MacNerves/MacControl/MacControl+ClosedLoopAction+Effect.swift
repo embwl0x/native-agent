@@ -6,7 +6,8 @@ import PersistenceCore
 import AppKit
 import CoreGraphics
 import UserNotifications
-// Blueprint: | `MacControl+ClosedLoopAction+Effect.swift` | `SwiftNativeMacControl`: `actEffectBaseline`, `installActObserver`, `actuateAct`, `settleActEffect`, `composeActReceipt`, `reportActWithoutFrame`, `reportActFreshFrame` (the act's effect stages: baseline read now, observer before emission, one actuation, event-paced settle to a declared-effect verdict, the receipt and a fresh frame) |
+import SenseCore
+// Blueprint: | `MacControl+ClosedLoopAction+Effect.swift` | `SwiftNativeMacControl`: `actEffectBaseline`, `installActObserver`, `actuateAct`, `settleActEffect`, `cleanupActText`, `composeActReceipt`, `reportActWithoutFrame`, `reportActFreshFrame` (baseline, observer, one forward actuation, event-paced verdict, and a text restore through ordinary act dispatch and receipt settlement) |
 
 extension SwiftNativeMacControl {
     /// The effect baseline: the act's window as the fresh identity read saw it, under the presentation cap the settled read will use.
@@ -131,8 +132,6 @@ extension SwiftNativeMacControl {
         )
     }
 
-    /// Settle the declared effect: re-read the window as notifications arrive until the verdict is acted (or a background menu is closed),
-    /// keeping the last read, its diff and the verdict on the act. The caller stops `signals` when the act ends.
     func settleActEffect(_ loop: MacClosedLoopAct, performed: MacActPerformed, textBeforeInput: String?, performedAt: Date, turn: Turn,
                          context: MacOperationContext) async -> (signals: MacWaitSignals, effectWaitMs: Int, limits: MacAXLimits) {
         // No notification within wait_ms is an unobserved outcome, never proof that the action failed or did nothing.
@@ -203,7 +202,7 @@ extension SwiftNativeMacControl {
         let signals = MacWaitSignals(collector: loop.collector, startedAt: performedAt)
         _ = await macSettle("act", signals: signals, patience: Double(effectWaitMs) / 1000,
             until: navigationVerb ? MacActClosedLoop.navigationNotificationKinds.union(loop.background ? ["AXMenuOpened"] : []) : []) {
-            if loop.background, loop.collector.kinds().contains("AXMenuOpened"), loop.menuLeftOpen == nil {
+            if loop.after == nil, loop.background, loop.collector.kinds().contains("AXMenuOpened"), loop.menuLeftOpen == nil {
                 loop.menuLeftOpen = self.accessibilityActSource(context: context).perform(
                     performed.target, action: "AXCancel", turn: turn, context: context) != .performed
             }
@@ -223,10 +222,138 @@ extension SwiftNativeMacControl {
                 loop.postEffect = (percept, diff, caps)
             }
             loop.settledTarget = self.accessibilityActSource(context: context).reread(performed.target, context: context)
+            if let after = loop.after {
+                let value = self.observedDeedText(loop)
+                loop.settledText = value
+                let intrinsic = MacActClosedLoop.verify(declaration, value: value,
+                    valueBefore: performed.textBeforeWrite ?? textBeforeInput, redactingText: true)
+                let condition = MacActClosedLoop.verify(.textDigest(after), value: value)
+                loop.afterVerdict = condition
+                loop.settledVerdict = condition.status == "acted" ? intrinsic : condition
+                return loop.settledVerdict.status == "acted"
+                    || (condition.status == "acted_mismatch" && intrinsic.status == "acted")
+            }
             loop.settledVerdict = verdict(loop.postEffect?.diff, selected: loop.read?.snapshot.nodes.first { $0.path == loop.live.path }?.attributes.selected, read: loop.read)
             return loop.settledVerdict.status == "acted" || loop.menuLeftOpen != nil
         }
         return (signals, effectWaitMs, limits)
+    }
+
+    static func deedTextIsReadable(_ value: String, at node: MacAXNode, in nodes: [MacAXNode]) -> Bool {
+        let attributes = node.attributes
+        guard attributes.role == "AXTextField", !attributes.labelUnreadable,
+              !attributes.attributeGaps.contains(where: { $0.hasPrefix("AXValue:") }),
+              !MacScreenViewBuilder.isSecretField(role: attributes.role, subrole: attributes.subrole, label: attributes.title, value: value) else { return false }
+        let candidate = MacAXNode(attributes: MacAXAttributes(role: attributes.role, subrole: attributes.subrole,
+            title: attributes.title, value: value, frame: attributes.frame, attributeGaps: attributes.attributeGaps), path: node.path)
+        let captions = MacScreenViewTextRedaction.nodeSecretContext(nodes)
+        let redacted = MacScreenViewTextRedaction.redactedNodeFields(candidate, context: captions)
+        guard case .string(let visible)? = redacted["value"] else { return false }
+        return visible.utf8.elementsEqual(value.utf8)
+    }
+
+    private func observedDeedText(_ loop: MacClosedLoopAct) -> String? {
+        guard let nodes = loop.read?.snapshot.nodes, let percept = loop.postEffect?.percept,
+              let entry = MacLookFrame.entries(from: percept).values.first(where: { $0.path == loop.live.path }),
+              !entry.secret, !entry.ambiguous, let node = nodes.first(where: { $0.path == entry.path }),
+              let target = loop.settledTarget, target.role == "AXTextField", let value = target.value,
+              value.utf8.elementsEqual((node.attributes.value ?? "").utf8),
+              Self.deedTextIsReadable(value, at: node, in: nodes) else { return nil }
+        return value
+    }
+
+    func cleanupActText(_ loop: MacClosedLoopAct, performed: MacActPerformed, stop: URL?, turn: Turn,
+                        context: MacOperationContext) async -> [String: JSONValue] {
+        func skipped(_ reason: String, note: String? = nil) -> [String: JSONValue] {
+            var receipt: [String: JSONValue] = ["ran": .bool(false), "verified": .bool(false),
+                "status": .string("skipped"), "skipped_reason": .string(reason)]
+            receipt["note"] = note.map(JSONValue.string)
+            return receipt
+        }
+        let attempted = performed.extra["ax_emission_attempted"] == .bool(true)
+        func stopped() -> [String: JSONValue] {
+            skipped("stopped", note: attempted
+                ? "The deed attempted a write. The field was left as it stood at Stop. Read it to confirm what landed."
+                : "The deed attempted no value write before Stop.")
+        }
+        if Task.isCancelled || ChatCancelFlag.isRaised(stop) { return stopped() }
+        guard performed.method == "ax_set_value", attempted,
+              let previous = performed.textBeforeWrite,
+              let written = performed.expectedText, !previous.utf8.elementsEqual(written.utf8) else { return skipped("no_reversible_write") }
+        guard loop.afterVerdict?.status != "acted" else { return skipped("after_satisfied") }
+        guard loop.afterVerdict?.status == "acted_mismatch" else { return skipped("after_unobserved") }
+        guard loop.settledText?.utf8.elementsEqual(written.utf8) == true,
+              let read = loop.read, let postEffect = loop.postEffect else {
+            return skipped("write_not_held")
+        }
+        guard let driver = context.driver, driver.allowsAction(context: context) else { return skipped("act_authority_ended") }
+        let frame = MacLookFrame.from(percept: postEffect.percept, frameId: UUID().uuidString, capturedAt: now(),
+            windowTitle: read.rootTitle, windowIdentity: loop.actWindow.identity,
+            caps: postEffect.caps, completeWindow: loop.frame.completeWindow)
+        guard let entry = frame.entries.values.first(where: { $0.path == loop.live.path }),
+              let app = frame.bundleId ?? frame.appName else { return skipped("restore_target_unobserved") }
+        let body: [String: JSONValue] = [
+            "verb": .string("type"), "mode": .string("replace"), "text": .string(previous),
+            "handle": .string(entry.handle), "frame_id": .string(frame.frameId),
+            "app": .string(app),
+            "background": .bool(loop.background),
+            "after": .object(["expect": .string("text"), "value": .string(SHA256Hex.of(utf8: previous))]),
+        ]
+        let restore = MacTextRestore(targetHandle: performed.target.handle, written: written)
+        let inverseContext = context.with(\.batchFrames, [frame.frameId: frame]).with(\.capture, nil)
+            .with(\.textRestore, restore).with(\.textDeedStop, stop)
+        let traceBus = TurnTraceContext.bus
+        let result: MacControlResult? = await withTaskCancellationHandler {
+            await settle {
+                guard !ChatCancelFlag.isRaised(stop), driver.allowsAction(context: inverseContext) else {
+                    return nil
+                }
+                do {
+                    return try await TurnTraceContext.$bus.withValue(traceBus) {
+                        try await TurnTraceContext.$turnId.withValue(turn.id) {
+                            try await self.dispatchActTextRestore(body, turn: turn, context: inverseContext)
+                        }
+                    }
+                }
+                catch { return MacControlResult(ok: false, action: "act", output: .object(["status": .string("outcome_unknown")]),
+                    error: "restore_dispatch_unconfirmed", durationMs: 0) }
+            }
+        } onCancel: {
+            driver.cancel()
+        }
+        guard let result else {
+            if Task.isCancelled || ChatCancelFlag.isRaised(stop) { return stopped() }
+            return skipped("act_authority_ended")
+        }
+        let reply = result.output.objectValue ?? [:]
+        let bodyResult = reply["body_result"]?.objectValue?["output"]?.objectValue
+        let output = bodyResult ?? reply
+        let settlementFailed = reply["status"] == .string("settlement_failed")
+        let unknown = reply["status"] == .string("outcome_unknown") || (settlementFailed && bodyResult == nil)
+        let ran = output["ax_emission_attempted"] == .bool(true)
+        var receipt: [String: JSONValue]
+        if !ran, !unknown, Task.isCancelled || ChatCancelFlag.isRaised(stop) {
+            receipt = stopped()
+        } else {
+            let status: JSONValue = unknown ? .string("outcome_unknown") : settlementFailed ? .string("settlement_failed")
+                : ran ? output["status"] ?? .string("acted_unobserved") : .string("refused")
+            receipt = ["ran": unknown ? .null : .bool(ran), "verified": .bool(ran && output["verified"] == .bool(true)), "status": status]
+            receipt["note"] = settlementFailed ? result.error.map(JSONValue.string)
+                : (output["status_note"]?.stringValue ?? output["ax_cause"]?.stringValue ?? result.error).map(JSONValue.string)
+        }
+        receipt["operation_id"] = result.operationId.map(JSONValue.string)
+        return receipt
+    }
+
+    private func dispatchActTextRestore(_ body: [String: JSONValue], turn: Turn, context: MacOperationContext) async throws -> MacControlResult {
+        let response = try await dispatch(action: "act", body: body, turn: turn, context: context)
+        guard response.output.objectValue?["status"] == .string("outcome_unknown"),
+              let id = response.operationId, let operationStore else { return response }
+        let key = MacControlInFlightRegistry.Key(store: operationStore.registryIdentity, operationId: id)
+        guard let execution = MacControlInFlightRegistry.shared.execution(key: key) else { return response }
+        do { try await execution.waitForSettlement() }
+        catch { if let settled = execution.settledResult { return settled }; throw error }
+        return execution.settledResult ?? response
     }
 
     /// Write the receipt both report forms share: what was observed, the acted element before and after, and how the act was delivered.
@@ -302,10 +429,17 @@ extension SwiftNativeMacControl {
     }
 
     /// No fresh frame can be read: discard the old one and say why, with the verdict the settle reached.
-    func reportActWithoutFrame(_ loop: MacClosedLoopAct, performed: MacActPerformed) async -> MacControlResult {
-        // An absent or minimized window cannot supply a fresh frame; invalidate it and name the app/window identity failure.
-        await lookFrameStore.invalidate()
+    func reportActWithoutFrame(_ loop: MacClosedLoopAct, performed: MacActPerformed, framePredatesCleanup: Bool,
+                               restoringText: Bool) async -> MacControlResult {
+        if framePredatesCleanup {
+            await lookFrameStore.discard(frameId: loop.frame.frameId)
+        } else if !restoringText {
+            await lookFrameStore.invalidate()
+        }
         let (percept, note): (String, String) = {
+            if framePredatesCleanup {
+                return ("frame_predates_cleanup", "The deed's post-write frame predates cleanup. Read this window again before acting.")
+            }
             if loop.seam["window_minimized"] == .bool(true) {
                 let name = loop.read?.app?.name ?? "The app"
                 return (
@@ -352,7 +486,7 @@ extension SwiftNativeMacControl {
             }
         }()
         loop.effect["percept"] = .string(percept)
-        if performed.ok {
+        if performed.ok || (loop.after != nil && performed.method == "ax_set_value") {
             let classification = loop.settledVerdict
             loop.output.merge(classification.receipt) { _, new in new }
             loop.effect["observed"] = .bool(classification.status != "acted_unobserved")
@@ -363,13 +497,7 @@ extension SwiftNativeMacControl {
         loop.output["frame_invalidated"] = .bool(true)
         loop.output["glance"] = .null
         loop.output["how_to_read"] = .string(note)
-        return MacControlResult(
-            ok: performed.ok,
-            action: "act",
-            output: .object(loop.output),
-            error: performed.error,
-            durationMs: Int(now().timeIntervalSince(loop.started) * 1000)
-        )
+        return actResult(loop, performed: performed)
     }
 
     /// Report the diff and verdict, and publish a fresh frame compiled after the act so the next verb acts on what this one produced.
@@ -383,8 +511,9 @@ extension SwiftNativeMacControl {
         }
         // One verdict from the declared effect and the target's own AX state.
         let classification = loop.settledVerdict
-        if performed.ok { loop.output.merge(classification.receipt) { _, new in new } }
-        loop.effect["observed"] = .bool(performed.ok && classification.status != "acted_unobserved")
+        let judged = performed.ok || (loop.after != nil && performed.method == "ax_set_value")
+        if judged { loop.output.merge(classification.receipt) { _, new in new } }
+        loop.effect["observed"] = .bool(judged && classification.status != "acted_unobserved")
         if let reason = classification.reason { loop.effect["reason"] = .string(reason) }
         else { loop.effect.removeValue(forKey: "reason") }
         // Bulk changes include role counts and focus context alongside capped rows.
@@ -396,6 +525,7 @@ extension SwiftNativeMacControl {
             )
         }
         loop.output["effect"] = .object(loop.effect)
+        if context.textRestore != nil { return actResult(loop, performed: performed) }
 
         // The verb's reply look reads this same post-effect walk (a timed-out walk is read afresh).
         if loop.frame.completeWindow, !read.snapshot.truncationReasons.contains("time_budget") {
@@ -430,11 +560,21 @@ extension SwiftNativeMacControl {
             + "NOT need to call mac.look to find out whether this landed."
         )
 
+        return actResult(loop, performed: performed)
+    }
+
+    private func actResult(_ loop: MacClosedLoopAct, performed: MacActPerformed) -> MacControlResult {
+        let judgedDeed = loop.after != nil && (performed.method == "ax_set_value" || performed.method == "already_held")
+        let verdict = loop.settledVerdict
+        let ok = judgedDeed ? verdict.status == "acted" : performed.ok
+        let error = judgedDeed ? (ok ? nil : verdict.reason ?? performed.error ?? verdict.status) : performed.error
+        loop.output["ok"] = .bool(ok)
+        loop.output["error"] = error.map(JSONValue.string)
         return MacControlResult(
-            ok: performed.ok,
+            ok: ok,
             action: "act",
             output: .object(loop.output),
-            error: performed.error,
+            error: error,
             durationMs: Int(now().timeIntervalSince(loop.started) * 1000)
         )
     }

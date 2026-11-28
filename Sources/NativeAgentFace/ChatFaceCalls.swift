@@ -31,7 +31,6 @@ extension AppModel {
                     workPaneClosed: WorkPaneState.shared.userClosed(turnID: turn)))
             case .editComposer(let request): return .composerEdit(editFaceComposer(request))
             case .clearAcceptedComposer(let request): return .composerEdit(clearFaceAcceptedComposer(request))
-            case .focusComposer(let session): return focusFaceComposer(session: session)
             case .openComposerCard(let name): return QuietComposerCommands.openFaceCard(name)
             case .closeComposerCard: return QuietComposerCommands.closeFaceCard()
             case .prepareChatDraft(let text): return .composerEdit(try await prepareChatDraft(text))

@@ -124,8 +124,22 @@ extension EngineFaceActs {
             throw Self.failure("setup_token_failed", NativeAppSecretRedactor.redactText(issue))
         }
         engine.providers.fetchModelListInBackground(after: "anthropic_oauth_direct")
-        _ = try await providerReadback()
-        return try Self.committed(true, identities: ["anthropic_oauth_direct"])
+        var issue: WireFailure?
+        do { _ = try await providerReadback() }
+        catch {
+            let message = "The setup token was saved, but Providers could not be read."
+            var failure = Self.publicationIssue("provider_publication_failed", message, error)
+            if failure.code == "providers_unavailable" {
+                failure.message = message + " " + failure.message
+            }
+            issue = failure
+        }
+        return try Self.committed(true, identities: ["anthropic_oauth_direct"], publicationFailure: issue)
+    }
+
+    static func publicationIssue(_ code: String, _ message: String, _ error: any Error) -> WireFailure {
+        (error as? WireFailure) ?? WireFailure(code: code, message: message,
+            cause: NativeAppSecretRedactor.redactText(error.localizedDescription), effects: .known)
     }
 
     func providerReadback() async throws -> ProviderSettingsFace {

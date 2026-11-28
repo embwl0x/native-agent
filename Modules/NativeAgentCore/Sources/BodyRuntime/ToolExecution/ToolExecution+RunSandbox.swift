@@ -13,16 +13,22 @@ import Security
 import ProviderRouting
 import CFNetwork
 import MacNerves
+import CryptoKit
 // Blueprint: | `ToolExecution+RunSandbox.swift` | `ToolPrimitiveBroker`, `held`: declared reach; retained transport settlement |
 
 actor ToolPrimitiveBroker {
     static let readOperations = Set(AuthoredToolEffects.primitiveCapabilities.compactMap { $0.value.contains(.safeRead) ? $0.key : nil })
     static let operations = Set(AuthoredToolEffects.primitiveCapabilities.keys.filter { $0.hasPrefix("network.") || $0.hasPrefix("program.") })
-        .union(["model.call", "fetch", "screen.watch"]).union(frameOperations).union(AuthoredToolEffects.handOperations)
+        .union(["model.call", "fetch", "screen.watch", MacAXQuery.operation]).union(OwnedProgramRunner.layeredHostPrimitives)
+        .union(frameOperations).union(AuthoredToolEffects.handOperations)
     /// Reads inside the run's admitted watch: no admission and no receipt of their own.
     static let frameOperations: Set<String> = ["screen.next", "frame.read"]
     /// Reading or ending a program it started: inside its admitted start, no ledger row of its own. A send is an effect and is recorded as one.
     static let programOperations: Set<String> = ["program.receive", "program.close"]
+    static let streamOpenOperations: Set<String> = ["network.websocket.open", "fetch.sse.open"]
+    final class StreamRun: Sendable {
+        fileprivate let active = Mutex(true)
+    }
     static func readOnly(_ operation: String, _ arguments: JSONValue) -> Bool {
         if operation == "model.call" {
             let tools = Parts.fields(arguments)["tools"]
@@ -70,6 +76,10 @@ actor ToolPrimitiveBroker {
     /// Admitted requests own their transport and settlement beyond the run's response wait.
     private var fetches: [UUID: Task<Void, Never>] = [:]
     private var fetchConnections: Set<String> = []
+    private var runStreams: [String: RunStream] = [:]
+    private let streamConnections = Mutex<[String: (run: StreamRun, connection: NWConnection)]?>([:])
+    private var streamObserver: (any NSObjectProtocol)?
+    private static let maxConnections = 8
     private static let byteLimit = 4 * 1024 * 1024
     /// A run owns one current watch; keep receipts when it ends.
     private var watch: MacScreenWatch?
@@ -77,6 +87,16 @@ actor ToolPrimitiveBroker {
     private var abilityObserver: (any NSObjectProtocol)?
     /// All inserted secrets must be redacted from readback, including connection and stream forms.
     private var redactor = SecretRedactor()
+
+    func anatomyRedactor() -> SecretRedactor { redactor }
+
+    func anatomyRedactorIsCurrent(_ revision: Int) -> Bool { !closed && redactor.values.count == revision }
+
+    func checkNotebook(_ value: Data) throws {
+        guard redactor.whole(value) == value else {
+            throw AbilityStore.notebookSecretFailure
+        }
+    }
     private var hosts: [String: String] = [:]
     private var streams: [String: SecretStream] = [:]
     private var programs: [String: Program] = [:]
@@ -130,21 +150,42 @@ actor ToolPrimitiveBroker {
         self.abilityID = abilityID; self.held = held
     }
 
-    func check(_ operation: String, arguments: JSONValue) throws {
+    func check(_ operation: String, arguments: JSONValue, run: StreamRun, fixtureOwnsStream: Bool = false) throws {
         try Task.checkCancellation()
         guard !closed, Self.operations.contains(operation), case .object(let args) = arguments else {
             if closed { throw CancellationError() }
             throw Self.inputFailure("invalid_primitive", field: "operation/arguments",
                 accepted: "operation: \(Self.operations.sorted().joined(separator: ", ")); arguments: a JSON object")
         }
-        if ["fetch", "network.receive", "network.accept", "network.send", "program.receive", "program.send"].contains(operation), args["wait"] != nil {
+        if ["fetch", "fetch.sse.open", "network.receive", "network.accept", "network.send", "program.receive", "program.send"].contains(operation),
+           args["wait"] != nil {
             throw Self.inputFailure("unsupported_wait", field: "wait", accepted: "omitted; cancel an unfinished operation explicitly")
         }
         if let name = Keyring.names(in: arguments).first(where: { !permissions.contains(.secret($0)) }) {
             throw Parts.revisionFailure("undeclared", "Declare reach.capabilities secret:\(name) to use {{secret:\(name)}} in ability \(abilityID).",
                 id: abilityID)
         }
-        if operation.hasPrefix("program.") {
+        if ["model.call", "fetch", "fetch.sse.open"].contains(operation), args["connector"] != nil {
+            throw Self.inputFailure(
+                "unsupported_connector_argument",
+                field: "connector",
+                accepted: "omitted",
+                detail: operation == "model.call"
+                    ? """
+                    model.call takes no connector argument; remove it to use the run's admitted model or an existing \
+                    routing surface.
+                    """
+                    : """
+                    fetch takes no connector argument. Use {{secret:<name>}} where the key belongs and declare reach secret:<name>; \
+                    an unsaved key is requested once on a card.
+                    """)
+        }
+        if operation == MacAXQuery.operation {
+            let query = try MacAXQuery(arguments)
+            guard query.declaresApp(permissions) || permissions.contains(.flag(.screenWatch)) else { throw axQueryReachFailure(query) }
+        } else if OwnedProgramRunner.layeredHostPrimitives.contains(operation) {
+            try checkStream(operation, args: args, run: run, fixtureOwnsStream: fixtureOwnsStream)
+        } else if operation.hasPrefix("program.") {
             guard permissions.contains(.flag(.shell)) else {
                 throw Parts.revisionFailure("undeclared", "Declare reach.capabilities shell to call \(operation) in ability \(abilityID).", id: abilityID)
             }
@@ -157,28 +198,15 @@ actor ToolPrimitiveBroker {
             if operation == "screen.watch" { _ = try MacScreenWatch.Request(args) }
             if operation.hasPrefix("hand."), let refusal = watch?.handRefusal { throw refusal }
         } else if operation == "model.call" || operation == "fetch" {
-            // Connector credentials cannot be attached implicitly.
-            guard args["connector"] == nil else {
-                throw Self.inputFailure(
-                    "unsupported_connector_argument",
-                    field: "connector",
-                    accepted: "omitted",
-                    detail: operation == "model.call"
-                        ? """
-                        model.call takes no connector argument; remove it to use the run's admitted model or an existing \
-                        routing surface.
-                        """
-                        : """
-                        fetch takes no connector argument. Use {{secret:<name>}} where the key belongs and declare reach secret:<name>; \
-                        an unsaved key is requested once on a card.
-                        """)
-            }
             // A fetch to this Mac's own loopback (a local agent's endpoint) is reached as localhost is, and its secret may go there as network.send's does.
-            let local = try operation == "fetch" && NetworkAddress.loopback(Self.destination(args))
-            let reach: PartReachGrant.StaticFlag = operation == "model.call" ? .model : local ? .networkLocalhost : .networkPublic
-            guard permissions.contains(.flag(reach)) else {
-                throw Parts.revisionFailure("undeclared", "Declare reach.capabilities \(reach.rawValue) to call \(operation) in ability \(abilityID).", id: abilityID)
+            let reach: PartReachGrant.StaticFlag
+            if operation == "model.call" {
+                reach = .model
+            } else {
+                let url = try Self.destination(args)
+                reach = NetworkAddress.loopback(Self.hostName(url)) ? .networkLocalhost : .networkPublic
             }
+            try requireReach(reach, operation: operation)
         } else {
             guard !permissions.isDisjoint(with: [.flag(.network), .flag(.networkPublic), .flag(.networkLocalhost)]) else {
                 throw denied("\(operation) has no declared network reach.",
@@ -206,13 +234,93 @@ actor ToolPrimitiveBroker {
         }
     }
 
+    private func axQueryWatch(_ query: MacAXQuery) -> MacScreenWatch? {
+        guard permissions.contains(.flag(.screenWatch)), let watch, watch.axQueryActive,
+              watch.axQueryBundleID.flatMap(OpenURLClassification.normalizedBundleID) == query.bundleID else { return nil }
+        return watch
+    }
+
+    private func axQueryReachFailure(_ query: MacAXQuery) -> SenseFailure {
+        SenseFailure(code: "undeclared_target", message: """
+            Declare app_read:\(query.bundleID) or app_write:\(query.bundleID), or use an admitted, active screen.watch for this app.
+            """)
+    }
+
+    private func readAXQuery(_ query: MacAXQuery, context: MacOperationContext) async throws -> JSONValue {
+        try Task.checkCancellation()
+        let watchOnly = !query.declaresApp(permissions)
+        let watch = axQueryWatch(query)
+        let scope: MacScreenWatch.AXQueryScope?
+        if let watch {
+            scope = await watch.axQueryScope()
+            try Task.checkCancellation()
+            guard scope != nil, axQueryWatch(query) === watch else {
+                if watchOnly { throw axQueryReachFailure(query) }
+                return MacAXQuery.status("withheld", "watch_scope_changed")
+            }
+        } else {
+            if watchOnly { throw axQueryReachFailure(query) }
+            scope = nil
+        }
+        guard !closed else { throw CancellationError() }
+        let scrub = redactor
+        let result = try await query.read(context: context, watch: scope, watchOnly: watchOnly) { scrub($0) }
+        try Task.checkCancellation()
+        if let watch, await watch.axQueryScope() != scope {
+            return MacAXQuery.status("withheld", "watch_scope_changed")
+        }
+        guard !closed, !Task.isCancelled else { throw CancellationError() }
+        guard axQueryWatch(query) === watch else { return MacAXQuery.status("withheld", "watch_scope_changed") }
+        guard redactor.values.count == scrub.values.count else { return MacAXQuery.status("withheld", "redaction_scope_changed") }
+        return result
+    }
+
     /// Every primitive must pass its run's gated host.
-    func perform(_ operation: String, arguments: JSONValue, host: any OwnedProgramToolHost,
+    func perform(_ operation: String, arguments: JSONValue, run: StreamRun, host: any OwnedProgramToolHost,
                  profile: (any OwnedProgramHostProfile)? = nil, execution: OwnedProgramExecution,
                  openScreenWatch: (@Sendable (MacScreenWatch.Request, Bool) async throws -> MacScreenWatch)?) async throws -> JSONValue {
-        try check(operation, arguments: arguments)
+        try check(operation, arguments: arguments, run: run)
         let args = Parts.fields(arguments)
-        if operation == "model.call" { return try await model(args, host: host, profile: profile, execution: execution) }
+        if operation == MacAXQuery.operation {
+            let query = try MacAXQuery(arguments)
+            let context = execution.macOperation(dataRoot: dataRoot)
+            do {
+                return try await OperationWaitBudget.withDeadline(seconds: 2, budget: context.waitBudget) { budget in
+                    var bounded = context
+                    bounded.deadline = budget.deadline
+                    return try await self.readAXQuery(query, context: bounded)
+                }
+            } catch is OperationWaitBudget.Exceeded {
+                return MacAXQuery.status("withheld", "time_budget", truncated: true)
+            }
+        }
+        if operation == "model.call" {
+            if abilityID == DreamPart.id {
+                guard let dream = execution.turn?[DreamPart.Key.self] else {
+                    throw SenseFailure(code: "dream_needs_night", message: "The dream cycle needs the dream or REM owner's model route.")
+                }
+                guard NativeAgentSecretRedactor.secretPath(arguments) == nil else {
+                    throw SenseFailure(code: "secret_in_input", message: "The dream cycle's model input carries a credential.")
+                }
+                do { return ToolHost.receipt(try await dream.judge(args), effects: "none") }
+                catch let problem as PartCallError {
+                    throw SenseFailure(code: problem.code == "bad_dream_policy" ? "validation_failed" : problem.code, message: problem.message)
+                }
+            }
+            if abilityID == MindMemoryJudgment.DigestPart.id {
+                guard let digest = execution.turn?[MindMemoryJudgment.DigestPart.Key.self] else {
+                    throw SenseFailure(code: "digest_needs_moment", message: "The turn digest needs its recorded moment and Memory route.")
+                }
+                guard NativeAgentSecretRedactor.secretPath(arguments) == nil else {
+                    throw SenseFailure(code: "secret_in_input", message: "The turn digest's model input carries a credential.")
+                }
+                do { return ToolHost.receipt(try await digest.judge(args), effects: "none") }
+                catch let problem as PartCallError {
+                    return ToolHost.failure("validation_failed", problem.message, effects: "none", execution: "not_run", status: "failed")
+                }
+            }
+            return try await model(args, host: host, profile: profile, execution: execution)
+        }
         if operation != "screen.watch", operation.hasPrefix("screen.") || operation.hasPrefix("frame.") || operation.hasPrefix("hand.") {
             guard let watch else { throw SenseFailure(code: "no_watch", message: "Call screen.watch({app}) before \(operation).") }
             switch operation {
@@ -225,7 +333,9 @@ actor ToolPrimitiveBroker {
                     throw Self.inputFailure("invalid_frame_read", field: "watch/seq/queries",
                         accepted: "integer watch and seq with an array of queries; call frame.read([...]) on the frame returned by screen.next()")
                 }
-                return try await watch.read(watch: Int(generation), seq: Int(seq), queries: queries)
+                let read = try await watch.read(watch: Int(generation), seq: Int(seq), queries: queries)
+                let scrub = redactor
+                return read.mapStrings { scrub($0) }
             default: return try await watch.hand(String(operation.dropFirst("hand.".count)), args,
                 context: execution.macOperation(dataRoot: dataRoot))
             }
@@ -246,16 +356,35 @@ actor ToolPrimitiveBroker {
             return opened.opened
         }
         do {
+            if OwnedProgramRunner.layeredHostPrimitives.contains(operation) {
+                let budget = OperationWaitBudget(deadline: execution.deadline)
+                guard let limit = try Self.streamTimeout(operation, args) else {
+                    return try await stream(operation, args: args, run: run, opening: nil, budget: budget, execution: execution)
+                }
+                let opening = Self.streamOpenOperations.contains(operation) ? UUID().uuidString : nil
+                do {
+                    return try await OperationWaitBudget.withDeadline(seconds: limit, budget: budget) { budget in
+                        try await self.stream(operation, args: args, run: run, opening: opening, budget: budget, execution: execution)
+                    }
+                } catch {
+                    if let opening { endStream(opening) }
+                    else if error is OperationWaitBudget.Exceeded, let id = args["id"]?.stringValue, runStreams[id]?.run === run { endStream(id) }
+                    throw error
+                }
+            }
             if operation == "fetch" {
-                let host = try Self.destination(args), destination = Keyring.Destination.host(host), keys = ["url", "headers", "body"]
+                let target = try Self.destination(args), host = Self.hostName(target).lowercased()
+                let destination = Keyring.Destination.host(host), keys = ["url", "headers", "body", "multipart"]
                 func send(_ given: [String: JSONValue]) async throws -> JSONValue {
-                    try await self.sendFetch(given, to: host, execution: execution)
+                    try await self.sendFetch(given, to: target, execution: execution)
                 }
                 let given = try await inserting(args, keys, to: destination)
                 return try await send(given)
             }
             if operation.hasPrefix("program.") { return try await program(operation, args: args, host: host, execution: execution) }
-            if operation == "network.receive" { return try await receive(args, onActivity: execution.onActivity) }
+            if operation == "network.receive" {
+                return Self.networkReadback(try await receive(args, onActivity: execution.onActivity))
+            }
             var given = args
             if operation == "network.send", given["text"] != nil {
                 if !Keyring.names(in: .object(args)).isEmpty {
@@ -284,21 +413,50 @@ actor ToolPrimitiveBroker {
     }
 
     /// Resolve the host with two secret stand-ins: secrets may neither select their own destination nor leave unencrypted.
-    private static func destination(_ args: [String: JSONValue]) throws -> String {
+    private static func destination(_ args: [String: JSONValue], websocket: Bool = false) throws -> URL {
+        if !websocket { try Parts.checkFetchSecretFields(args) }
+        let fixedOrigin = "a fixed scheme, host and port; place {{secret:<name>}} only in the path or query"
+        if websocket, let raw = args["url"]?.stringValue, let separator = raw.range(of: "://") {
+            let scheme = raw[..<separator.lowerBound]
+            let authority = raw[separator.upperBound...].prefix { !"/?#".contains($0) }
+            let hostPort = authority.lastIndex(of: "@").map { authority[authority.index(after: $0)...] } ?? authority
+            guard Keyring.names(in: .string("\(scheme)://\(hostPort)")).isEmpty else {
+                throw inputFailure("secret_cannot_alter_host", field: "url", accepted: fixedOrigin)
+            }
+        }
         let names = Keyring.names(in: .object(args))
         let urls = try ["secret", "other"].map { stand in
-            try Parts.fetchRequest(args.mapValues { $0.mapStrings { insertingSecrets($0, Dictionary(uniqueKeysWithValues: names.map { ($0, stand) }),
-                url: true) } }).url!
+            let values = Dictionary(uniqueKeysWithValues: names.map { ($0, stand) })
+            if websocket {
+                var given = args
+                for key in ["url", "headers"] { given[key] = args[key]?.mapStrings { insertingSecrets($0, values, url: key == "url") } }
+                return try websocketRequest(given).url!
+            }
+            return try Parts.fetchRequest(args.mapValues { $0.mapStrings { insertingSecrets($0, values, url: true) } }).url!
         }
         let url = urls[0]
-        guard urls[1].host == url.host else {
-            throw Self.inputFailure("secret_in_url_host", field: "url", accepted: "a fixed host; place {{secret:<name>}} only in the path or query")
+        guard sameOrigin(url, urls[1]) else {
+            throw Self.inputFailure(websocket ? "secret_cannot_alter_host" : "secret_in_url_host", field: "url", accepted: fixedOrigin)
         }
-        guard names.isEmpty || url.scheme == "https" || NetworkAddress.loopback(url.host!) else {
-            throw Self.inputFailure("secret_transport_required", field: "url", accepted: "https, or http to admitted loopback on this Mac",
-                detail: "Use an https URL for a secret, or http to admitted loopback on this Mac.")
+        guard names.isEmpty || url.scheme?.lowercased() == "https" || NetworkAddress.loopback(hostName(url)) else {
+            let secure = websocket ? "wss" : "https", local = websocket ? "ws" : "http"
+            throw Self.inputFailure(websocket ? "secret_requires_tls" : "secret_transport_required", field: "url",
+                accepted: "\(secure), or \(local) to admitted loopback on this Mac",
+                detail: "Use an \(secure) URL for a secret, or \(local) to admitted loopback on this Mac.")
         }
-        return url.host!.lowercased()
+        return url
+    }
+
+    static func literalNetworkReach(_ url: String, websocket: Bool) throws -> PartReachGrant.StaticFlag? {
+        let host = hostName(try destination(["url": .string(url)], websocket: websocket))
+        if NetworkAddress.loopback(host) { return .networkLocalhost }
+        return NetworkAddress.privateNetwork(host) ? nil : .networkPublic
+    }
+
+    private func requireReach(_ reach: PartReachGrant.StaticFlag, operation: String, fullNetwork: Bool = false) throws {
+        guard permissions.contains(.flag(reach)) || fullNetwork && permissions.contains(.flag(.network)) else {
+            throw Parts.revisionFailure("undeclared", "Declare reach.capabilities \(reach.rawValue) to call \(operation) in ability \(abilityID).", id: abilityID)
+        }
     }
 
     /// Insert secrets only toward their granted destination and retain their values for redaction.
@@ -612,21 +770,14 @@ actor ToolPrimitiveBroker {
     }
 
     /// The admitted request owns transport and durable settlement through completion or cancellation.
-    private func sendFetch(_ args: [String: JSONValue], to destination: String, execution: OwnedProgramExecution) async throws -> JSONValue {
+    private func sendFetch(_ args: [String: JSONValue], to destination: URL, execution: OwnedProgramExecution) async throws -> JSONValue {
         try Task.checkCancellation()
         guard !closed else { throw CancellationError() }
         let token = UUID(), reply = ContinuationOnce<Result<JSONValue, Error>>()
-        let id = "fetch:" + token.uuidString.lowercased(), root = dataRoot, part = abilityID
+        let id = "fetch:" + token.uuidString.lowercased()
         let keepsRecord = !["GET", "HEAD"].contains((args["method"]?.stringValue ?? "GET").uppercased())
-        let cause = execution.turn.map { [$0.id] } ?? []
-        if keepsRecord {
-            ExperienceStore.record(root, id) { store in
-                try await store.begin(Experience(id: id, kind: .act, cause: cause,
-                    face: .init(words: "Fetch for ability \(part) is awaiting its transport outcome.", artifacts: []),
-                    owes: ["finish": .init(to: "self")],
-                    claims: RepairDebt(owner: "ability " + part, operation: id).claims))
-            }
-        }
+            || args["body_base64"] != nil || args["multipart"] != nil
+        if keepsRecord { beginFetchRecord(id, execution: execution) }
         let transport = Task.detached {
             let outcome: Result<JSONValue, Error>
             do { outcome = .success(try await self.fetch(args, to: destination, onActivity: execution.onActivity)) }
@@ -641,6 +792,16 @@ actor ToolPrimitiveBroker {
     }
 
     private func finishedFetch(_ token: UUID) { fetches[token] = nil }
+
+    private func beginFetchRecord(_ id: String, execution: OwnedProgramExecution) {
+        let cause = execution.turn.map { [$0.id] } ?? [], part = abilityID
+        ExperienceStore.record(dataRoot, id) { store in
+            try await store.begin(Experience(id: id, kind: .act, cause: cause,
+                face: .init(words: "Fetch for ability \(part) is awaiting its transport outcome.", artifacts: []),
+                owes: ["finish": .init(to: "self")],
+                claims: RepairDebt(owner: "ability " + part, operation: id).claims))
+        }
+    }
 
     private func settleFetch(_ outcome: Result<JSONValue, Error>, id: String, keepsRecord: Bool) async -> Result<JSONValue, Error> {
         guard keepsRecord else { return outcome.mapError { contextualFailure($0, operation: "fetch") } }
@@ -685,24 +846,36 @@ actor ToolPrimitiveBroker {
     }
 
     /// `destination` is the host its grant was checked for: the request with its secrets inserted goes there or nowhere.
-    private func fetch(_ args: [String: JSONValue], to destination: String, onActivity: (@Sendable () -> Void)?) async throws -> JSONValue {
+    private func fetch(_ args: [String: JSONValue], to destination: URL, onActivity: (@Sendable () -> Void)?) async throws -> JSONValue {
         let request = try Parts.fetchRequest(args)
-        let url = request.url!, host = url.host!, tls = url.scheme?.lowercased() == "https"
-        guard host.lowercased() == destination else { throw denied("With its secrets in, this fetch no longer goes to \(destination); nothing was sent.",
+        let url = request.url!, host = Self.hostName(url), tls = url.scheme?.lowercased() == "https"
+        guard Self.sameOrigin(destination, url) else { throw denied("With its secrets in, this fetch no longer goes to \(Self.hostName(destination)); nothing was sent.",
             "Keep the destination host fixed; put secret placeholders in the URL path, query, headers or body.") }
         let connected = try await network("network.connect", args: ["host": .string(host),
             "port": .int(Int64(url.port ?? (tls ? 443 : 80))), "tls": .bool(tls), "publicOnly": .bool(!NetworkAddress.loopback(host))], fetch: true,
                 onActivity: onActivity)
         let id = try text(Parts.fields(connected), "id")
         defer { connections.removeValue(forKey: id)?.cancel(); fetchConnections.remove(id) }
-        guard let method = request.httpMethod else {
+        guard let connection = connections[id] else { throw CancellationError() }
+        let newBody = args["body_base64"] != nil || args["multipart"] != nil
+        try await sendHTTP(request, to: connection, newBody: newBody, onActivity: onActivity)
+        if args["response_encoding"] == .string("base64") {
+            return try await readBinaryResponse(connection, method: request.httpMethod, onActivity: onActivity)
+        }
+        let received = try await readHTTP(connection, onActivity: onActivity)
+        return try fetchResponse(received, method: request.httpMethod)
+    }
+
+    private func sendHTTP(_ request: URLRequest, to connection: NWConnection, newBody: Bool = false,
+                          onActivity: (@Sendable () -> Void)?) async throws {
+        guard let method = request.httpMethod, let url = request.url else {
             throw SenseFailure(code: "http_method_missing", message: "The fetch request has no HTTP method.")
         }
+        let host = Self.hostName(url)
         let message = unsafe CFHTTPMessageCreateRequest(nil, method as CFString, url as CFURL, kCFHTTPVersion1_1).takeRetainedValue()
         for (key, value) in request.allHTTPHeaderFields ?? [:] {
             CFHTTPMessageSetHeaderFieldValue(message, key as CFString, value as CFString)
         }
-        // URL.host omits IPv6 brackets required by the HTTP Host field.
         let named = host.contains(":") ? "[\(host)]" : host
         let hostField = url.port.map { "\(named):\($0)" } ?? named
         CFHTTPMessageSetHeaderFieldValue(message, "Host" as CFString, hostField as CFString)
@@ -716,8 +889,11 @@ actor ToolPrimitiveBroker {
             throw SenseFailure(code: "http_request_encoding",
                 message: "fetch could not encode this HTTP request. Correct its URL, method, headers and body in the fetch call.")
         }
-        _ = try await network("network.send", args: ["id": .string(id), "base64": .string(wire.base64EncodedString())], fetch: true, onActivity: onActivity)
-        guard let connection = connections[id] else { throw CancellationError() }
+        guard newBody || wire.count <= Self.byteLimit else { throw Self.sendLimitFailure }
+        try await sendBytes(wire, to: connection, onActivity: onActivity)
+    }
+
+    private func readHTTP(_ connection: NWConnection, onActivity: (@Sendable () -> Void)?) async throws -> Data {
         var received = Data()
         while true {
             guard case .bytes(let chunk, _, let eof) = try await receive(connection, onActivity: onActivity) else { throw CancellationError() }
@@ -728,6 +904,11 @@ actor ToolPrimitiveBroker {
             received.append(chunk)
             if eof { break }
         }
+        return received
+    }
+
+    private func fetchResponse(_ bytes: Data, method: String?) throws -> JSONValue {
+        var received = bytes
         guard !received.isEmpty else { throw SenseFailure(code: "http_response_empty",
             message: "fetch received no HTTP response. Check that the endpoint serves HTTP and inspect service state before another request.") }
         var response = unsafe CFHTTPMessageCreateEmpty(nil, false).takeRetainedValue()
@@ -756,7 +937,7 @@ actor ToolPrimitiveBroker {
         let status = CFHTTPMessageGetResponseStatusCode(response)
         let body = unsafe CFHTTPMessageCopyBody(response)?.takeRetainedValue() as Data? ?? Data()
         var data = body
-        if request.httpMethod == "HEAD" || status == 204 || status == 304 { data = Data() }
+        if method == "HEAD" || status == 204 || status == 304 { data = Data() }
         else if lower["transfer-encoding"]?.lowercased() == "chunked" {
             data = Data(); var cursor = body.startIndex
             while true {
@@ -799,8 +980,14 @@ actor ToolPrimitiveBroker {
         return try Parts.fetchReply(status: status, headers: lower, data: data, name: { redactor.name($0) }) { redactor($0) }
     }
 
-    private func denied(_ detail: String, _ fix: String) -> SenseFailure {
-        SenseFailure(code: "permission_denied", message: detail, remedy: Repair.remedy(owner: "ability \(abilityID)",
+    private static func networkReadback(_ result: JSONValue) -> JSONValue {
+        guard case .object(var fields) = result else { return result }
+        fields["data_trust"] = .string("untrusted_network")
+        return .object(fields)
+    }
+
+    private func denied(_ detail: String, _ fix: String, code: String = "permission_denied") -> SenseFailure {
+        SenseFailure(code: code, message: detail, remedy: Repair.remedy(owner: "ability \(abilityID)",
             nextCall: Parts.readCall(abilityID), tap: nil, instruction: fix
                 + " Read this ability before revising its code or reach with ability.save and keeping the reviewed version."))
     }
@@ -847,10 +1034,12 @@ actor ToolPrimitiveBroker {
     }
     private static func data(_ args: [String: JSONValue]) throws -> Data {
         guard case .string(let base64)? = args["base64"], let data = Data(base64Encoded: base64), data.count <= byteLimit else {
-            throw Self.inputFailure("invalid_send_base64", field: "base64",
-                accepted: "a base64 string decoding to at most 4 MiB; alternatively pass nonempty text")
+            throw sendLimitFailure
         }
         return data
+    }
+    private static var sendLimitFailure: ToolFailureError {
+        inputFailure("invalid_send_base64", field: "base64", accepted: "a base64 string decoding to at most 4 MiB; alternatively pass nonempty text")
     }
     private func address(_ host: String, publicOnly: Bool = false, fetch: Bool = false) async throws -> String {
         try Task.checkCancellation()
@@ -871,14 +1060,16 @@ actor ToolPrimitiveBroker {
         // A run closing ends ordinary lookups, while an admitted fetch still owns its one request.
         guard !closed || fetch else { throw CancellationError() }
         // Loopback resolves only to this Mac; public fetches cannot reach private networks either.
-        guard !publicOnly || addresses.allSatisfy({ !NetworkAddress.loopback($0) && !NetworkAddress.privateNetwork($0) }),
+        guard !publicOnly || addresses.allSatisfy({
+            !NetworkAddress.loopback($0) && !NetworkAddress.privateNetwork($0) && !NetworkAddress.isIPv4MappedIPv6($0)
+        }),
               !NetworkAddress.loopback(host) || addresses.allSatisfy(NetworkAddress.loopback),
               let chosen = addresses.first, permissions.contains(.flag(.network))
             || addresses.allSatisfy({ NetworkAddress.loopback($0) ? permissions.contains(.flag(.networkLocalhost))
                 : !NetworkAddress.privateNetwork($0) && permissions.contains(.flag(.networkPublic)) }) else {
             throw denied("The resolved address for \(host) is outside the declared network reach.", """
-                Check the host's DNS addresses; use a matching loopback or public host and declare its network reach. A public fetch cannot target \
-                loopback or private network addresses.
+                Check the host's DNS addresses; use a matching loopback or public host and declare its network reach. The public destination check \
+                excludes loopback, private networks and IPv4-mapped IPv6 addresses.
                 """)
         }
         return chosen
@@ -921,6 +1112,7 @@ actor ToolPrimitiveBroker {
         guard !closed || fetch else { throw CancellationError() }
         switch operation {
         case "network.connect" where args["path"] != nil:
+            try checkConnectionCapacity()
             let id = UUID().uuidString
             connections[id] = NWConnection(to: .unix(path: try socketPath(args)), using: .tcp)
             try await ready(id, onActivity: onActivity)
@@ -933,13 +1125,10 @@ actor ToolPrimitiveBroker {
             guard !closed || fetch else { throw CancellationError() }
             let parameters: NWParameters
             if args["transport"] == .string("udp") { parameters = .udp }
-            else if args["tls"] == .bool(true), operation == "network.connect" {
-                let tls = NWProtocolTLS.Options()
-                sec_protocol_options_set_tls_server_name(tls.securityProtocolOptions, host)
-                parameters = NWParameters(tls: tls, tcp: NWProtocolTCP.Options())
-            } else { parameters = .tcp }
+            else { parameters = Self.tcpParameters(host: host, secure: args["tls"] == .bool(true) && operation == "network.connect") }
             let id = UUID().uuidString
             if operation == "network.connect" {
+                try checkConnectionCapacity()
                 connections[id] = NWConnection(host: NWEndpoint.Host(address), port: port, using: parameters)
                 if fetch { fetchConnections.insert(id) }
                 try await ready(id, onActivity: onActivity)
@@ -982,11 +1171,7 @@ actor ToolPrimitiveBroker {
             guard let connection = connections[id] else { throw denied("This ability does not own that connection.",
                 "Use an id returned to this ability by network.connect or network.accept; a closed connection cannot be reused.") }
             let data = try Self.data(args)
-            try await networkReply(onActivity: onActivity, cancel: { connection.cancel() }) { (done: AsyncThrowingStream<Void, Error>.Continuation) in
-                connection.send(content: data, completion: .contentProcessed { error in
-                    if let error { done.finish(throwing: error) } else { done.yield(()); done.finish() }
-                })
-            }
+            try await sendBytes(data, to: connection, onActivity: onActivity)
             return .object(["bytes": .int(Int64(data.count))])
         case "network.close":
             let id = try text(args, "id")
@@ -1004,8 +1189,18 @@ actor ToolPrimitiveBroker {
         }
     }
 
+    private func sendBytes(_ data: Data, to connection: NWConnection, context: NWConnection.ContentContext = .defaultMessage,
+                           onActivity: (@Sendable () -> Void)?) async throws {
+        try await networkReply(onActivity: onActivity, cancel: { connection.cancel() }) { (done: AsyncThrowingStream<Void, Error>.Continuation) in
+            connection.send(content: data, contentContext: context, isComplete: true, completion: .contentProcessed { error in
+                if let error { done.finish(throwing: error) } else { done.yield(()); done.finish() }
+            })
+        }
+    }
+
     private func incoming(_ connection: NWConnection, listener id: String) {
-        guard !closed, listeners[id] != nil, (inbox[id] ?? []).count < OwnedProgramRunner.actionLimit else { connection.cancel(); return }
+        guard !closed, listeners[id] != nil, connections.count + runStreams.count < Self.maxConnections,
+              (inbox[id] ?? []).count < OwnedProgramRunner.actionLimit else { connection.cancel(); return }
         let key = UUID().uuidString
         connections[key] = connection
         arrive(id, .accepted(key))
@@ -1015,20 +1210,30 @@ actor ToolPrimitiveBroker {
     private func ready(_ id: String, onActivity: (@Sendable () -> Void)?) async throws {
         guard let connection = connections[id] else { throw CancellationError() }
         do {
-            try await networkReply(onActivity: onActivity, cancel: { connection.cancel() }) { (done: AsyncThrowingStream<Void, Error>.Continuation) in
-                connection.stateUpdateHandler = { state in
-                    if case .ready = state { done.yield(()); done.finish() }
-                    // Refused or missing local sockets fail immediately instead of consuming the wait.
-                    if case .waiting(let error) = state { done.finish(throwing: error) }
-                    if case .failed(let error) = state { done.finish(throwing: error) }
-                    if case .cancelled = state { done.finish(throwing: CancellationError()) }
-                }
-                connection.start(queue: self.queue)
-            }
+            try await startConnection(connection, onActivity: onActivity)
         } catch {
             connections.removeValue(forKey: id)?.cancel()
             fetchConnections.remove(id)
             throw error
+        }
+    }
+
+    private func startConnection(_ connection: NWConnection, streamID: String? = nil, onActivity: (@Sendable () -> Void)?) async throws {
+        try await networkReply(onActivity: onActivity, cancel: { connection.cancel() }) { (done: AsyncThrowingStream<Void, Error>.Continuation) in
+            connection.stateUpdateHandler = { state in
+                if case .ready = state { done.yield(()); done.finish() }
+                if case .waiting(let error) = state { done.finish(throwing: error) }
+                if case .failed(let error) = state { done.finish(throwing: error) }
+                if case .cancelled = state { done.finish(throwing: CancellationError()) }
+            }
+            if let streamID {
+                streamConnections.withLock {
+                    if $0?[streamID] != nil { connection.start(queue: self.queue) }
+                    else { done.finish(throwing: CancellationError()) }
+                }
+            } else {
+                connection.start(queue: self.queue)
+            }
         }
     }
 
@@ -1109,9 +1314,10 @@ actor ToolPrimitiveBroker {
         arrive(id, arrival)
     }
 
-    private func receive(_ connection: NWConnection, onActivity: (@Sendable () -> Void)?) async throws -> Arrival {
+    private func receive(_ connection: NWConnection, maximum: Int = ToolPrimitiveBroker.byteLimit,
+                         onActivity: (@Sendable () -> Void)?) async throws -> Arrival {
         try await networkReply(onActivity: onActivity, cancel: { connection.cancel() }) { (done: AsyncThrowingStream<Arrival, Error>.Continuation) in
-            connection.receive(minimumIncompleteLength: 1, maximumLength: Self.byteLimit) { data, _, complete, error in
+            connection.receive(minimumIncompleteLength: 1, maximumLength: maximum) { data, _, complete, error in
                 if let error { done.finish(throwing: error) } else { done.yield(.bytes(data ?? Data(), stream: nil, eof: complete)); done.finish() }
             }
         }
@@ -1128,7 +1334,9 @@ actor ToolPrimitiveBroker {
     func begin() { running += 1 }
 
     /// Run exit settles watches and nonresident reach; resident resources remain held.
-    @discardableResult func finish() -> [JSONValue] {
+    @discardableResult func finish(run: StreamRun) -> [JSONValue] {
+        cancelStreams(run)
+        runStreams = runStreams.filter { $0.value.run !== run }
         guard held != nil else { return close() }
         running -= 1
         guard running == 0 else { return [] }
@@ -1151,6 +1359,9 @@ actor ToolPrimitiveBroker {
         for program in programs.values { program.end() }
         for waiting in readers.values { complete(waiting.read, .failure(CancellationError())) }
         connections = connections.filter { fetchConnections.contains($0.key) }
+        runStreams.removeAll()
+        invalidateStreams()
+        stopObservingStreams()
         listeners.removeAll(); programs.removeAll(); readers.removeAll(); inbox.removeAll(); ended.removeAll()
         endWatch("run_ended")
         return watched
@@ -1164,4 +1375,724 @@ actor ToolPrimitiveBroker {
         self.watch = nil; abilityObserver = nil
     }
 
+}
+
+extension ToolPrimitiveBroker {
+    private static let messageLimit = 1_048_576
+    private static let headLimit = 16_384
+    private static let headerEnd = Data("\r\n\r\n".utf8)
+    private static let lineEnd = Data("\r\n".utf8)
+
+    private final class RunStream {
+        enum Kind { case websocket, events }
+        let kind: Kind
+        let run: StreamRun
+        var busy = false
+        var secretHost: String?
+        var events: ServerEvents?
+
+        init(_ kind: Kind, run: StreamRun) { self.kind = kind; self.run = run }
+    }
+
+    private static func tcpParameters(host: String, secure: Bool, websocket: Bool = false) -> NWParameters {
+        guard secure || websocket else { return .tcp }
+        let tcp = NWProtocolTCP.Options()
+        if websocket { tcp.connectionTimeout = 15 }
+        let tls = secure ? NWProtocolTLS.Options() : nil
+        if let tls {
+            unsafe sec_protocol_options_set_tls_server_name(tls.securityProtocolOptions, host)
+            if websocket { sec_protocol_options_set_min_tls_protocol_version(tls.securityProtocolOptions, .TLSv12) }
+        }
+        return NWParameters(tls: tls, tcp: tcp)
+    }
+
+    private func checkConnectionCapacity() throws {
+        guard connections.count + runStreams.count < Self.maxConnections else {
+            throw SenseFailure(code: "connection_limit", message: "This ability already holds eight network connections. Close one before opening another.")
+        }
+    }
+
+    private static func streamTimeout(_ operation: String, _ args: [String: JSONValue]) throws -> Double? {
+        guard streamOpenOperations.contains(operation) || ["network.websocket.receive", "fetch.sse.next"].contains(operation) else { return nil }
+        guard let value = args["timeout_ms"] else { return operation == "network.websocket.receive" ? 10 : 15 }
+        guard case .int(let milliseconds) = value else {
+            throw inputFailure("invalid_timeout", field: "timeout_ms", accepted: "integer milliseconds (clamped to 50–60000)")
+        }
+        return Double(max(50, min(60_000, milliseconds))) / 1000
+    }
+
+    private static func token(_ value: String) -> Bool {
+        !value.isEmpty && value.utf8.allSatisfy { (48...57).contains($0) || (65...90).contains($0)
+            || (97...122).contains($0) || "!#$%&'*+-.^_`|~".utf8.contains($0) }
+    }
+
+    private static func websocketRequest(_ args: [String: JSONValue]) throws -> URLRequest {
+        guard let raw = args["url"]?.stringValue, var components = URLComponents(string: raw),
+              let scheme = components.scheme?.lowercased(), ["ws", "wss"].contains(scheme),
+              args["method"] == nil, ["body", "body_base64", "multipart", "connector"].allSatisfy({ args[$0] == nil }) else {
+            throw inputFailure("invalid_websocket_url", field: "url", accepted: "ws or wss URL without credentials or fragment; no body, method or connector")
+        }
+        components.scheme = scheme == "wss" ? "https" : "http"
+        guard let url = components.url, let host = url.host(percentEncoded: false), Keyring.host(host) != nil,
+              url.port.map({ (1...65535).contains($0) }) != false else {
+            throw inputFailure("invalid_websocket_url", field: "url", accepted: "a fixed host and valid port")
+        }
+        let headers = args["headers"]?.stringFields ?? [:]
+        let keys = headers.keys.map { $0.lowercased() }
+        let reserved: Set<String> = ["host", "connection", "upgrade", "content-length", "transfer-encoding",
+            "sec-websocket-key", "sec-websocket-version", "sec-websocket-extensions", "sec-websocket-protocol"]
+        guard Set(keys).count == keys.count, Set(keys).isDisjoint(with: reserved), headers.keys.allSatisfy(token),
+              headers.values.allSatisfy({ $0.utf8.allSatisfy { $0 == 9 || $0 >= 32 && $0 < 127 } }) else {
+            throw inputFailure("invalid_websocket_headers", field: "headers", accepted: "distinct HTTP header names and values; omit upgrade and framing headers")
+        }
+        var http = args
+        http["url"] = .string(url.absoluteString)
+        return try Parts.fetchRequest(http)
+    }
+
+    private static func hostName(_ url: URL) -> String {
+        let host = url.host(percentEncoded: false) ?? ""
+        return host.hasPrefix("[") && host.hasSuffix("]") ? String(host.dropFirst().dropLast()) : host
+    }
+
+    private static func sameOrigin(_ lhs: URL, _ rhs: URL) -> Bool {
+        lhs.scheme?.lowercased() == rhs.scheme?.lowercased() && hostName(lhs).lowercased() == hostName(rhs).lowercased()
+            && (lhs.port ?? (lhs.scheme?.lowercased() == "https" ? 443 : 80)) == (rhs.port ?? (rhs.scheme?.lowercased() == "https" ? 443 : 80))
+    }
+
+    private static func socketProtocols(_ args: [String: JSONValue]) throws -> [String] {
+        guard let field = args["subprotocols"] else { return [] }
+        let offered = JSONValue.stringArray(field)
+        guard case .array(let rows) = field, rows.count == offered.count, Set(offered).count == offered.count,
+              offered.allSatisfy(token), offered.joined(separator: ", ").utf8.count <= 4096 else {
+            throw inputFailure("invalid_websocket_subprotocols", field: "subprotocols", accepted: "distinct HTTP tokens, at most 4096 bytes")
+        }
+        return offered
+    }
+
+    private func checkStream(_ operation: String, args: [String: JSONValue], run: StreamRun, fixtureOwnsStream: Bool) throws {
+        _ = try Self.streamTimeout(operation, args)
+        guard streamConnections.withLock({ $0 != nil }), run.active.withLock({ $0 }) else { throw CancellationError() }
+        switch operation {
+        case "network.websocket.open":
+            let url = try Self.destination(args, websocket: true)
+            try requireReach(NetworkAddress.loopback(Self.hostName(url)) ? .networkLocalhost : .networkPublic, operation: operation, fullNetwork: true)
+            _ = try Self.socketProtocols(args)
+        case "fetch.sse.open":
+            guard ["body_base64", "multipart", "response_encoding"].allSatisfy({ args[$0] == nil }) else {
+                throw Self.inputFailure("invalid_sse_arguments", field: "arguments", accepted: "url, method?, headers?, body?, timeout_ms?; no connector or binary options")
+            }
+            let host = Self.hostName(try Self.destination(args))
+            let reach: PartReachGrant.StaticFlag = NetworkAddress.loopback(host) ? .networkLocalhost : .networkPublic
+            try requireReach(reach, operation: operation)
+        default:
+            let id = try text(args, "id")
+            let websocket = operation.hasPrefix("network.websocket.")
+            guard fixtureOwnsStream || runStreams[id].map({ $0.run === run && $0.kind == (websocket ? .websocket : .events) }) == true else {
+                throw denied("This run does not own that stream.", "Use a live id from the corresponding open call in this run.")
+            }
+            let allowed = operation == "network.websocket.send" ? Set(["text"]) : Set<String>()
+            guard Keyring.names(in: .object(args.filter { !allowed.contains($0.key) })).isEmpty else {
+                throw Self.inputFailure("invalid_stream_secret", field: "arguments", accepted: "a secret placeholder only in WebSocket send text")
+            }
+            if operation == "network.websocket.send" { _ = try Self.socketPayload(args) }
+            if operation == "network.websocket.close" { _ = try Self.socketClose(args) }
+        }
+    }
+
+    private static func socketPayload(_ args: [String: JSONValue]) throws -> (NWProtocolWebSocket.Opcode, Data) {
+        if let text = args["text"]?.stringValue, args["base64"] == nil, text.utf8.count <= messageLimit { return (.text, Data(text.utf8)) }
+        if args["text"] == nil, let text = args["base64"]?.stringValue, text.utf8.count <= 1_398_104,
+           let data = Data(base64Encoded: text), data.count <= messageLimit { return (.binary, data) }
+        throw inputFailure("invalid_websocket_message", field: "text/base64", accepted: "exactly one text or base64 message, at most 1 MiB decoded")
+    }
+
+    private static func socketClose(_ args: [String: JSONValue]) throws -> (NWProtocolWebSocket.CloseCode, Data) {
+        let raw = args["code"] ?? .int(1000), reason = args["reason"] ?? .string("")
+        guard case .int(let code) = raw, [1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011].contains(code) || (3000...4999).contains(code),
+              case .string(let text) = reason, text.utf8.count <= 123 else {
+            throw inputFailure("invalid_websocket_close", field: "code/reason", accepted: "a valid outgoing close code and a UTF-8 reason of at most 123 bytes")
+        }
+        return (try NWProtocolWebSocket.CloseCode(rawValue: UInt16(code)), Data(text.utf8))
+    }
+
+    func observeStreams() {
+        guard !closed, streamObserver == nil else { return }
+        let path = AbilityStore(dataRoot: dataRoot).root.appendingPathComponent(abilityID).path
+        streamObserver = NotificationCenter.default.observeSynchronously(for: AbilityStore.DidChange.self) { [weak self] change in
+            if change.path == path { self?.invalidateStreams() }
+        }
+    }
+
+    private nonisolated func invalidateStreams() {
+        streamConnections.withLock { connections in
+            connections?.values.forEach { $0.connection.cancel() }
+            connections = nil
+        }
+    }
+
+    nonisolated func cancelStreams(_ run: StreamRun) {
+        run.active.withLock { active in
+            active = false
+            streamConnections.withLock { connections in
+                let ids = connections?.compactMap { $0.value.run === run ? $0.key : nil } ?? []
+                for id in ids { connections?.removeValue(forKey: id)?.connection.cancel() }
+            }
+        }
+    }
+
+    private func stopObservingStreams() {
+        if let streamObserver { NotificationCenter.default.removeObserver(streamObserver) }
+        streamObserver = nil
+    }
+
+    private func endStream(_ id: String) {
+        guard runStreams.removeValue(forKey: id) != nil else { return }
+        streamConnections.withLock {
+            if let connection = $0?.removeValue(forKey: id)?.connection { connection.cancel() }
+        }
+    }
+
+    private func stream(_ operation: String, args: [String: JSONValue], run: StreamRun, opening: String?, budget: OperationWaitBudget,
+                        execution: OwnedProgramExecution) async throws -> JSONValue {
+        try Task.checkCancellation()
+        guard !closed, streamConnections.withLock({ $0 != nil }), run.active.withLock({ $0 }), !budget.expired else { throw budget.cancellationError }
+        if let opening {
+            return try await openStream(operation, args: args, run: run, id: opening, budget: budget, execution: execution)
+        }
+        let onActivity = execution.onActivity
+        let id = try text(args, "id")
+        guard let stream = runStreams[id], stream.run === run, let connection = streamConnections.withLock({ $0?[id]?.connection }) else {
+            throw SenseFailure(code: "stream_ended", message: "This run no longer owns that stream.")
+        }
+        guard !stream.busy else { throw SenseFailure(code: "busy", message: "This stream already has a call in progress.") }
+        stream.busy = true
+        defer { stream.busy = false }
+        do {
+            switch operation {
+            case "fetch.sse.close":
+                endStream(id)
+                return .object(["id": .string(id), "closed": .bool(true)])
+            case "fetch.sse.next":
+                guard let events = stream.events else { throw CancellationError() }
+                let value = try await nextEvent(events, connection: connection, onActivity: onActivity)
+                if value.objectValue?["done"] == .bool(true) {
+                    endStream(id)
+                    return value
+                }
+                return Self.networkReadback(value)
+            case "network.websocket.send":
+                var given = args
+                if !Keyring.names(in: .object(args)).isEmpty {
+                    guard let host = stream.secretHost else {
+                        throw denied("A secret needs established TLS or admitted loopback.",
+                            "Use a wss or admitted loopback WebSocket before sending a secret.", code: "secret_requires_tls")
+                    }
+                    given = try await inserting(args, ["text"], to: .host(host))
+                    try Task.checkCancellation()
+                    guard streamConnections.withLock({ $0?[id] != nil }), !budget.expired else { throw budget.cancellationError }
+                }
+                let (opcode, payload) = try Self.socketPayload(given)
+                try await sendSocket(payload, metadata: .init(opcode: opcode), connection: connection, onActivity: onActivity)
+                return .object(["bytes": .int(Int64(payload.count))])
+            case "network.websocket.close":
+                let (code, reason) = try Self.socketClose(args)
+                let metadata = NWProtocolWebSocket.Metadata(opcode: .close)
+                metadata.closeCode = code
+                try await sendSocket(reason, metadata: metadata, connection: connection, onActivity: onActivity)
+                endStream(id)
+                return .object(["id": .string(id), "closed": .bool(true)])
+            default:
+                let value = try await receiveSocket(connection, onActivity: onActivity)
+                if value.objectValue?["closed"] == .bool(true) { endStream(id) }
+                return Self.networkReadback(value)
+            }
+        } catch {
+            endStream(id)
+            throw error
+        }
+    }
+
+    private func openStream(_ operation: String, args: [String: JSONValue], run: StreamRun, id: String, budget: OperationWaitBudget,
+                            execution: OwnedProgramExecution) async throws -> JSONValue {
+        let onActivity = execution.onActivity
+        let socket = operation == "network.websocket.open"
+        let destination = try Self.destination(args, websocket: socket), host = Self.hostName(destination).lowercased()
+        var request: URLRequest
+        if socket {
+            request = try Self.websocketRequest(try await inserting(args, ["url", "headers"], to: .host(host)))
+        } else {
+            request = try Parts.fetchRequest(try await inserting(args, ["url", "headers", "body"], to: .host(host)))
+            if request.value(forHTTPHeaderField: "Accept") == nil { request.setValue("text/event-stream", forHTTPHeaderField: "Accept") }
+        }
+        let url = request.url!
+        guard Self.sameOrigin(destination, url) else {
+            throw denied("The stream destination changed with its secrets inserted.", "Use a fixed scheme, host and port.",
+                code: socket ? "secret_cannot_alter_host" : "permission_denied")
+        }
+        try Task.checkCancellation()
+        guard !closed, streamObserver != nil, streamConnections.withLock({ $0 != nil }), run.active.withLock({ $0 }), !budget.expired else {
+            throw budget.cancellationError
+        }
+        let local = NetworkAddress.loopback(host), secure = url.scheme?.lowercased() == "https"
+        let pinned = try await address(host, publicOnly: !local)
+        try Task.checkCancellation()
+        guard !budget.expired else { throw budget.cancellationError }
+        try checkConnectionCapacity()
+        if !socket, runStreams.values.filter({ $0.kind == .events }).count >= 4 {
+            throw SenseFailure(code: "sse_limit", message: "This ability already holds four SSE streams. Close one before opening another.")
+        }
+        let port = try self.port(["port": .int(Int64(url.port ?? (secure ? 443 : 80)))], zero: false)
+        let parameters = Self.tcpParameters(host: host, secure: secure, websocket: socket)
+        let upgrade: SocketUpgrade? = if socket { try SocketUpgrade(request, protocols: Self.socketProtocols(args)) } else { nil }
+        if let upgrade {
+            let options = NWProtocolFramer.Options(definition: UpgradeFramer.definition)
+            options["upgrade"] = upgrade
+            let websocket = NWProtocolWebSocket.Options()
+            websocket.skipHandshake = true; websocket.autoReplyPing = true; websocket.maximumMessageSize = Self.messageLimit
+            parameters.defaultProtocolStack.applicationProtocols = [websocket, options]
+        }
+        let connection = NWConnection(host: NWEndpoint.Host(pinned), port: port, using: parameters)
+        let registered = run.active.withLock { active in
+            guard active, !Task.isCancelled else { return false }
+            return streamConnections.withLock { connections in
+                guard connections != nil else { return false }
+                connections?[id] = (run, connection)
+                return true
+            }
+        }
+        guard registered else { connection.cancel(); throw CancellationError() }
+        let stream = RunStream(socket ? .websocket : .events, run: run)
+        runStreams[id] = stream
+        var keep = false
+        defer { if !keep { endStream(id) } }
+        do { try await startConnection(connection, streamID: id, onActivity: onActivity) }
+        catch let error as NWError where socket && error == .posix(.EPROTO) {
+            throw SenseFailure(code: "websocket_upgrade_failed", message: "The pinned service did not return a valid WebSocket upgrade. No redirect was followed.")
+        }
+        try Task.checkCancellation()
+        guard streamConnections.withLock({ $0?[id] != nil }), !budget.expired else { throw budget.cancellationError }
+        if socket {
+            if local || secure && connection.metadata(definition: NWProtocolTLS.definition) != nil { stream.secretHost = host }
+            if secure, stream.secretHost == nil { throw SenseFailure(code: "tls_missing", message: "The WebSocket did not establish TLS.") }
+            keep = true
+            return .object(["id": .string(id)])
+        }
+        let keepsRecord = !["GET", "HEAD"].contains(request.httpMethod ?? "GET")
+        let record = "fetch:" + id.lowercased()
+        if keepsRecord { beginFetchRecord(record, execution: execution) }
+        let outcome: Result<JSONValue, Error>
+        do { outcome = .success(try await openEvents(request, id: id, connection: connection, budget: budget, onActivity: onActivity)) }
+        catch { outcome = .failure(error) }
+        let value: JSONValue
+        if keepsRecord {
+            let settled = await settle { await self.settleFetch(outcome, id: record, keepsRecord: true) }
+            value = try settled.get()
+        } else { value = try outcome.get() }
+        try Task.checkCancellation()
+        guard streamConnections.withLock({ $0?[id] != nil }), !budget.expired else { throw budget.cancellationError }
+        keep = stream.events != nil
+        return value
+    }
+
+    private func openEvents(_ request: URLRequest, id: String, connection: NWConnection, budget: OperationWaitBudget,
+                            onActivity: (@Sendable () -> Void)?) async throws -> JSONValue {
+        try await sendHTTP(request, to: connection, onActivity: onActivity)
+        let (head, bytes, eof) = try await readHead(connection, onActivity: onActivity)
+        try Task.checkCancellation()
+        guard let stream = runStreams[id], streamConnections.withLock({ $0?[id] != nil }), !budget.expired else { throw budget.cancellationError }
+        let mime = head.headers["content-type"]?.split(separator: ";").first?.trimmingCharacters(in: .whitespaces).lowercased()
+        guard (200...299).contains(head.status), head.status != 204, request.httpMethod != "HEAD", mime == "text/event-stream" else {
+            let bounded = try await readNonStream(head, bytes: bytes, eof: eof, method: request.httpMethod, connection: connection, onActivity: onActivity)
+            return try fetchResponse(bounded, method: request.httpMethod)
+        }
+        guard head.headers["content-encoding"] == nil || head.tokens("content-encoding") == ["identity"] else {
+            throw SenseFailure(code: "sse_content_encoding", message: "SSE requires an uncompressed UTF-8 response.")
+        }
+        stream.events = try ServerEvents(head: head, bytes: Data(bytes.dropFirst(head.length)), eof: eof)
+        return .object(["id": .string(id), "status": .int(Int64(head.status))])
+    }
+
+    private func sendSocket(_ data: Data, metadata: NWProtocolWebSocket.Metadata, connection: NWConnection,
+                            onActivity: (@Sendable () -> Void)?) async throws {
+        try await sendBytes(data, to: connection, context: .init(identifier: "websocket", metadata: [metadata]), onActivity: onActivity)
+    }
+
+    private func receiveSocket(_ connection: NWConnection, onActivity: (@Sendable () -> Void)?) async throws -> JSONValue {
+        var message = Data(), kind: NWProtocolWebSocket.Opcode?
+        while true {
+            let (piece, metadata, complete): (Data, NWProtocolWebSocket.Metadata?, Bool) = try await networkReply(onActivity: onActivity,
+                cancel: { connection.cancel() }) { done in
+                connection.receiveMessage { data, context, complete, error in
+                    if let error { done.finish(throwing: error) }
+                    else {
+                        done.yield((data ?? Data(), context?.protocolMetadata(definition: NWProtocolWebSocket.definition) as? NWProtocolWebSocket.Metadata, complete))
+                        done.finish()
+                    }
+                }
+            }
+            guard let metadata else {
+                guard complete, kind == nil, piece.isEmpty else {
+                    throw SenseFailure(code: "websocket_incomplete", message: "The WebSocket message ended incomplete.")
+                }
+                return .object(["type": .string("close"), "closed": .bool(true), "close_code": .int(1006), "reason": .string("")])
+            }
+            switch metadata.opcode {
+            case .pong, .ping: continue
+            case .close:
+                let code = switch metadata.closeCode {
+                case .protocolCode(let code): code.rawValue
+                case .applicationCode(let code), .privateCode(let code): code
+                @unknown default: UInt16(1006)
+                }
+                return .object(["type": .string("close"), "closed": .bool(true), "close_code": .int(Int64(code)),
+                                "reason": .string(redactor(String(decoding: piece, as: UTF8.self)))])
+            case .text, .binary:
+                guard kind == nil || kind == metadata.opcode else { throw Self.invalidSocketMessage }
+                kind = metadata.opcode
+            case .cont:
+                guard kind != nil else { throw Self.invalidSocketMessage }
+            @unknown default: throw Self.invalidSocketMessage
+            }
+            guard piece.count <= Self.messageLimit - message.count else { throw Self.readbackLimit }
+            message.append(piece)
+            if !complete { continue }
+            if kind == .binary {
+                let safe = try cleanBinary(message, limit: Self.messageLimit)
+                return .object(["type": .string("binary"), "base64": .string(safe.base64EncodedString()), "bytes": .int(Int64(safe.count)), "closed": .bool(false)])
+            }
+            guard let value = String(data: message, encoding: .utf8) else {
+                throw SenseFailure(code: "websocket_text_invalid", message: "The WebSocket text message is not UTF-8.")
+            }
+            let text = redactor(value)
+            guard text.utf8.count <= Self.byteLimit else { throw Self.readbackLimit }
+            return .object(["type": .string("text"), "text": .string(text), "closed": .bool(false)])
+        }
+    }
+
+    private static var invalidSocketMessage: SenseFailure { .init(code: "websocket_message_invalid", message: "The WebSocket message framing is invalid.") }
+    private static var readbackLimit: SenseFailure { .init(code: "output_limit", message: "The redacted response exceeds its readback limit.") }
+
+    private func cleanBinary(_ bytes: Data, limit: Int) throws -> Data {
+        let data = redactor.whole(bytes)
+        guard data.count <= limit else { throw Self.readbackLimit }
+        return data
+    }
+
+    private struct HTTPHead: Sendable {
+        let status: Int
+        let length: Int
+        let headers: [String: String]
+
+        init?(_ bytes: Data, length: Int) {
+            let lines = String(decoding: bytes.prefix(length - 4), as: UTF8.self).components(separatedBy: "\r\n")
+            guard let statusLine = lines.first else { return nil }
+            let status = statusLine.split(separator: " ", maxSplits: 2)
+            guard status.count >= 2, status[0] == "HTTP/1.1" || status[0] == "HTTP/1.0", status[1].count == 3,
+                  let code = Int(status[1]), (100...599).contains(code) else { return nil }
+            var headers: [String: String] = [:]
+            for line in lines.dropFirst() {
+                guard let delimiter = line.firstIndex(of: ":") else { return nil }
+                let key = String(line[..<delimiter]).lowercased()
+                let value = line[line.index(after: delimiter)...].trimmingCharacters(in: .whitespaces)
+                guard ToolPrimitiveBroker.token(key), value.utf8.allSatisfy({ $0 == 9 || $0 >= 32 && $0 != 127 }) else { return nil }
+                if let previous = headers[key] { headers[key] = previous + ", " + value } else { headers[key] = value }
+            }
+            self.status = code; self.length = length; self.headers = headers
+        }
+
+        func tokens(_ field: String) -> [String] {
+            (headers[field] ?? "").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+        }
+    }
+
+    private struct SocketUpgrade: Sendable {
+        let request: Data
+        let accept: String
+        let protocols: [String]
+
+        init(_ request: URLRequest, protocols: [String]) throws {
+            let url = request.url!
+            let components = URLComponents(url: url, resolvingAgainstBaseURL: false)!
+            let host = ToolPrimitiveBroker.hostName(url)
+            let named = host.contains(":") ? "[\(host)]" : host
+            let authority = url.port.map { "\(named):\($0)" } ?? named
+            let path = components.percentEncodedPath.isEmpty ? "/" : components.percentEncodedPath
+            let target = path + (components.percentEncodedQuery.map { "?" + $0 } ?? "")
+            var random = SystemRandomNumberGenerator()
+            let key = Data((0..<16).map { _ in UInt8.random(in: .min ... .max, using: &random) }).base64EncodedString()
+            var rows = ["GET \(target) HTTP/1.1", "Host: \(authority)", "Upgrade: websocket", "Connection: Upgrade",
+                        "Sec-WebSocket-Key: \(key)", "Sec-WebSocket-Version: 13"]
+            if !protocols.isEmpty { rows.append("Sec-WebSocket-Protocol: " + protocols.joined(separator: ", ")) }
+            for (name, value) in request.allHTTPHeaderFields ?? [:] { rows.append("\(name): \(value)") }
+            let wire = Data((rows.joined(separator: "\r\n") + "\r\n\r\n").utf8)
+            guard wire.count <= ToolPrimitiveBroker.headLimit else {
+                throw ToolPrimitiveBroker.inputFailure("websocket_head_limit", field: "url/headers", accepted: "an upgrade request head of at most 16 KiB")
+            }
+            let digest = Insecure.SHA1.hash(data: Data((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").utf8))
+            self.request = wire; self.accept = Data(digest).base64EncodedString(); self.protocols = protocols
+        }
+
+        func accepted(_ head: HTTPHead) -> Bool {
+            head.status == 101 && head.tokens("upgrade") == ["websocket"] && head.tokens("connection").contains("upgrade")
+                && head.headers["sec-websocket-accept"] == accept && head.headers["sec-websocket-extensions"] == nil
+                && (head.headers["sec-websocket-protocol"].map(protocols.contains) ?? true)
+        }
+    }
+
+    private final class UpgradeFramer: NWProtocolFramerImplementation {
+        static let label = "NativeAgent WebSocket Upgrade"
+        static let definition = NWProtocolFramer.Definition(implementation: UpgradeFramer.self)
+        private let upgrade: SocketUpgrade?
+
+        init(framer: NWProtocolFramer.Instance) { upgrade = framer.options["upgrade"] as? SocketUpgrade }
+
+        func start(framer: NWProtocolFramer.Instance) -> NWProtocolFramer.StartResult {
+            guard let upgrade else { framer.markFailed(error: .posix(.EPROTO)); return .willMarkReady }
+            framer.writeOutput(data: upgrade.request)
+            return .willMarkReady
+        }
+
+        func handleInput(framer: NWProtocolFramer.Instance) -> Int {
+            guard let upgrade else { framer.markFailed(error: .posix(.EPROTO)); return 0 }
+            var next = 1, accepted = false, failed = false
+            _ = unsafe framer.parseInput(minimumIncompleteLength: 1, maximumLength: ToolPrimitiveBroker.headLimit) { buffer, complete in
+                guard let buffer else { failed = complete; return 0 }
+                let data = unsafe Data(buffer)
+                if let end = data.range(of: ToolPrimitiveBroker.headerEnd) {
+                    let length = end.upperBound - data.startIndex
+                    accepted = HTTPHead(data, length: length).map(upgrade.accepted) == true
+                    failed = !accepted
+                    return length
+                }
+                next = data.count + 1
+                failed = complete || data.count == ToolPrimitiveBroker.headLimit
+                return 0
+            }
+            if failed { framer.markFailed(error: .posix(.EPROTO)) }
+            if accepted {
+                framer.passThroughInput(); framer.passThroughOutput(); framer.markReady()
+            }
+            return accepted || failed ? 0 : next
+        }
+
+        func handleOutput(framer: NWProtocolFramer.Instance, message: NWProtocolFramer.Message, messageLength: Int, isComplete: Bool) {
+            do { try framer.writeOutputNoCopy(length: messageLength) } catch { framer.markFailed(error: .posix(.EIO)) }
+        }
+        func wakeup(framer: NWProtocolFramer.Instance) {}
+        func stop(framer: NWProtocolFramer.Instance) -> Bool { true }
+        func cleanup(framer: NWProtocolFramer.Instance) {}
+    }
+
+    private func readHead(_ connection: NWConnection, onActivity: (@Sendable () -> Void)?) async throws -> (HTTPHead, Data, Bool) {
+        var received = Data(), eof = false, interim = 0
+        while true {
+            if let marker = received.range(of: Self.headerEnd) {
+                let length = marker.upperBound - received.startIndex
+                guard length <= Self.headLimit, let head = HTTPHead(received, length: length) else { break }
+                if head.status >= 200 { return (head, received, eof) }
+                guard head.status != 101, interim < 8 else { break }
+                interim += 1
+                received.removeFirst(length)
+                continue
+            }
+            guard !eof, received.count < Self.headLimit else { break }
+            guard case .bytes(let chunk, _, let done) = try await receive(connection, maximum: Self.headLimit, onActivity: onActivity) else {
+                throw CancellationError()
+            }
+            received.append(chunk); eof = done
+        }
+        throw SenseFailure(code: "http_response_incomplete", message: "Fetch did not receive a valid bounded final HTTP response head.")
+    }
+
+    private func readBinaryResponse(_ connection: NWConnection, method: String?, onActivity: (@Sendable () -> Void)?) async throws -> JSONValue {
+        let (head, bytes, eof) = try await readHead(connection, onActivity: onActivity)
+        var data = Data()
+        if method != "HEAD", head.status != 204, head.status != 304 {
+            let body = try HTTPBody(head: head, bytes: Data(bytes.dropFirst(head.length)), eof: eof)
+            while true {
+                if let piece = try body.take() {
+                    guard piece.count <= Self.byteLimit - data.count else { throw Self.readbackLimit }
+                    data.append(piece)
+                } else if body.done {
+                    break
+                } else {
+                    guard case .bytes(let chunk, _, let eof) = try await receive(connection, maximum: Self.headLimit, onActivity: onActivity) else {
+                        throw CancellationError()
+                    }
+                    body.wire.append(chunk); body.eof = eof
+                }
+            }
+            data = try cleanBinary(data, limit: Self.byteLimit)
+        }
+        return try Parts.fetchReply(status: head.status, headers: head.headers, data: data, binary: true, name: { redactor.name($0) }) { redactor($0) }
+    }
+
+    private func readNonStream(_ head: HTTPHead, bytes: Data, eof: Bool, method: String?, connection: NWConnection,
+                               onActivity: (@Sendable () -> Void)?) async throws -> Data {
+        if method == "HEAD" || head.status == 204 || head.status == 304 || eof { return bytes }
+        let body = try HTTPBody(head: head, bytes: Data(bytes.dropFirst(head.length)), eof: false)
+        var received = bytes
+        while true {
+            while try body.take() != nil {}
+            if body.done { return received }
+            guard case .bytes(let chunk, _, let done) = try await receive(connection, maximum: Self.headLimit, onActivity: onActivity) else {
+                throw CancellationError()
+            }
+            guard received.count + chunk.count <= Self.byteLimit else { throw Self.readbackLimit }
+            received.append(chunk); body.wire.append(chunk); body.eof = done
+        }
+    }
+
+    private final class HTTPBody {
+        enum Framing { case eof, fixed(Int), chunkSize, chunk(Int), chunkEnd, trailers, done }
+        var wire: Data
+        var eof: Bool
+        var framing: Framing
+        private static var malformed: SenseFailure { .init(code: "http_body_framing", message: "The fetch response has incomplete or invalid HTTP body framing.") }
+        var done: Bool { if case .done = framing { true } else { false } }
+
+        init(head: HTTPHead, bytes: Data, eof: Bool) throws {
+            self.wire = bytes; self.eof = eof
+            if head.headers["transfer-encoding"] != nil {
+                guard head.tokens("transfer-encoding") == ["chunked"], head.headers["content-length"] == nil else { throw Self.malformed }
+                framing = .chunkSize
+            } else if let length = head.headers["content-length"] {
+                guard !length.isEmpty, length.utf8.allSatisfy({ (48...57).contains($0) }), let count = Int(length) else { throw Self.malformed }
+                framing = .fixed(count)
+            } else { framing = .eof }
+        }
+
+        func take() throws -> Data? {
+            while true {
+                switch framing {
+                case .done: return nil
+                case .eof:
+                    if eof { framing = .done }
+                    return wire.isEmpty ? nil : remove(wire.count)
+                case .fixed(let remaining), .chunk(let remaining):
+                    let chunk: Bool = if case .chunk = framing { true } else { false }
+                    if remaining == 0 {
+                        guard chunk || wire.isEmpty else { throw Self.malformed }
+                        framing = chunk ? .chunkEnd : .done
+                        continue
+                    }
+                    let count = min(remaining, wire.count)
+                    if count == 0 { if eof { throw Self.malformed }; return nil }
+                    framing = chunk ? .chunk(remaining - count) : .fixed(remaining - count)
+                    return remove(count)
+                case .chunkEnd:
+                    guard wire.count >= 2 else { if eof { throw Self.malformed }; return nil }
+                    guard wire.starts(with: ToolPrimitiveBroker.lineEnd) else { throw Self.malformed }
+                    wire.removeFirst(2); framing = .chunkSize
+                case .chunkSize:
+                    guard let end = wire.range(of: ToolPrimitiveBroker.lineEnd) else {
+                        if eof || wire.count > ToolPrimitiveBroker.headLimit { throw Self.malformed }; return nil
+                    }
+                    let line = remove(end.upperBound - wire.startIndex)
+                    guard line.count <= ToolPrimitiveBroker.headLimit else { throw Self.malformed }
+                    let size = line.dropLast(2).prefix { $0 != 59 }
+                    guard !size.isEmpty, size.allSatisfy({ (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0) }),
+                          let count = Int(String(decoding: size, as: UTF8.self), radix: 16) else { throw Self.malformed }
+                    framing = count == 0 ? .trailers : .chunk(count)
+                case .trailers:
+                    if wire.starts(with: ToolPrimitiveBroker.lineEnd) || wire.range(of: ToolPrimitiveBroker.headerEnd) != nil {
+                        framing = .done; continue
+                    }
+                    if eof || wire.count > ToolPrimitiveBroker.headLimit { throw Self.malformed }
+                    return nil
+                }
+            }
+        }
+
+        private func remove(_ count: Int) -> Data {
+            let data = Data(wire.prefix(count))
+            wire.removeFirst(count)
+            return data
+        }
+    }
+
+    private final class ServerEvents {
+        let body: HTTPBody
+        var total = 0
+        var transportBytes: Int
+        var redacting = SecretStream()
+        var lines = Data()
+        var first = true, skipLF = false
+        var eventSize = 0
+        var data: [String] = []
+        var name = "", lastID = ""
+        var retry: Int64?
+        var limited = false, flushed = false
+
+        init(head: HTTPHead, bytes: Data, eof: Bool) throws {
+            body = try HTTPBody(head: head, bytes: bytes, eof: eof)
+            transportBytes = bytes.count
+        }
+
+        func event(_ redactor: SecretRedactor) throws -> JSONValue? {
+            while true {
+                if skipLF, let byte = lines.first {
+                    if byte == 10 { lines.removeFirst() }
+                    skipLF = false
+                }
+                guard let end = lines.firstIndex(where: { $0 == 10 || $0 == 13 }) else {
+                    guard eventSize + lines.count <= 262_144 else { throw ToolPrimitiveBroker.readbackLimit }
+                    return nil
+                }
+                var line = String(decoding: lines[..<end], as: UTF8.self)
+                skipLF = lines[end] == 13
+                let length = end - lines.startIndex + 1
+                lines.removeFirst(length)
+                eventSize += length
+                guard eventSize <= 262_144 else { throw ToolPrimitiveBroker.readbackLimit }
+                if first { first = false; if line.hasPrefix("\u{FEFF}") { line.removeFirst() } }
+                if line.isEmpty {
+                    let type = name.isEmpty ? "message" : name
+                    defer { name = ""; data.removeAll(keepingCapacity: true); eventSize = 0 }
+                    if data.isEmpty { continue }
+                    return .object(["done": .bool(false), "event": .string(redactor(type)), "id": .string(redactor(lastID)),
+                                    "retry_ms": retry.map(JSONValue.int) ?? .null, "data": .string(redactor(data.joined(separator: "\n")))])
+                }
+                let delimiter = line.firstIndex(of: ":") ?? line.endIndex
+                let field = line[..<delimiter]
+                var value = delimiter == line.endIndex ? "" : String(line[line.index(after: delimiter)...])
+                if value.first == " " { value.removeFirst() }
+                switch field {
+                case "data": data.append(value)
+                case "event": name = value
+                case "id" where !value.utf8.contains(0): lastID = value
+                case "retry" where !value.isEmpty && value.utf8.allSatisfy({ (48...57).contains($0) }):
+                    if let milliseconds = Int64(value) { retry = milliseconds }
+                default: break
+                }
+            }
+        }
+    }
+
+    private func nextEvent(_ events: ServerEvents, connection: NWConnection, onActivity: (@Sendable () -> Void)?) async throws -> JSONValue {
+        let limit = 16 * 1024 * 1024
+        while true {
+            try Task.checkCancellation()
+            if let result = try events.event(redactor) { return result }
+            if events.limited { return .object(["done": .bool(true), "reason": .string("byte_limit")]) }
+            if let bytes = try events.body.take() {
+                let count = min(bytes.count, limit - events.total)
+                events.total += count
+                events.limited = events.total == limit
+                events.lines.append(events.redacting.characters(Data(bytes.prefix(count)), end: false, redactor))
+            } else if events.body.done {
+                if events.flushed { return .object(["done": .bool(true), "reason": .string("eof")]) }
+                events.flushed = true
+                events.lines.append(events.redacting.characters(Data(), end: true, redactor))
+            } else {
+                guard case .bytes(let chunk, _, let eof) = try await receive(connection, maximum: Self.headLimit, onActivity: onActivity) else {
+                    throw CancellationError()
+                }
+                events.transportBytes += chunk.count
+                if events.transportBytes > 2 * limit { events.limited = true; continue }
+                events.body.wire.append(chunk); events.body.eof = eof
+            }
+        }
+    }
 }

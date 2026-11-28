@@ -156,7 +156,7 @@ struct PersonalityEditor: View {
                 }
             }
             .pickerStyle(.segmented)
-            .hazeTinted(.segments)
+            .hazeTinted()
             if let document = selectedDocument {
                 Text(PersonalityDocumentPurpose.explanation(for: document.id)).font(ShellType.body)
                     .fixedSize(horizontal: false, vertical: true)

@@ -1,12 +1,12 @@
 import SenseCore
-import CommonCrypto
-import CryptoKit
-import AppKit
 import PersistenceCore
 import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import MindCore
+import CommonCrypto
+import CryptoKit
+import AppKit
 // Blueprint: | `MacSyncEngine+Lifecycle.swift` | `MacSyncEngine`, `start`, `stop`; Local CloudKit projection roots; one snapshot lifecycle. |
 
 extension MacSyncEngine {

@@ -30,7 +30,10 @@
         act: (verb, address, args) => invoke("act", {verb, address, args: args === undefined ? {} : args}),
         state: Object.freeze({
             get: key => invoke("state_get", {key}),
-            set: (key, value) => invoke("state_set", {key, value})
+            set: (key, value, options) => invoke("state_set", {key, value, options}),
+            delete: key => invoke("state_delete", {key}),
+            list: prefix => invoke("state_list", {prefix}),
+            cas: (key, expected, value, options) => invoke("state_cas", {key, expected, value, options})
         }),
         log: (...values) => invoke("log", {text: values.map(value =>
             typeof value === "string" ? value : JSON.stringify(value)).join(" ")})

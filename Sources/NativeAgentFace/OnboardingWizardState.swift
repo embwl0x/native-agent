@@ -113,7 +113,9 @@ final class OnboardingWizardState {
         case .identity:
             return missingNamesMessage == nil
         case .provider:
-            return !providersLoading && !savingModel && (!providerConnected || chatModelReady)
+            // A connected account that offers no model yet must not hold setup: the model is chosen later in Providers.
+            return !providersLoading && !savingModel && (!providerConnected || chatModelReady
+                || !providers.contains { $0.auth_status.eligible && !$0.offeredModels.isEmpty })
         case .building, .done, .error, .profileRepair:
             return false
         }

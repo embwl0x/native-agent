@@ -184,9 +184,7 @@ extension MemoryStorage {
                 memories: count(.memory),
                 proposals: count(.proposal),
                 tombstones: count(.tombstone),
-                unembeddable: staged.filter { if case .unembeddable = $0.result { return true }; return false }.count,
-                previousEpoch: prior.activeEpoch,
-                activatedAt: activatedAt
+                unembeddable: staged.filter { if case .unembeddable = $0.result { return true }; return false }.count
             ))
         }
         let report = try outcome.get()
@@ -239,8 +237,6 @@ extension MemoryStorage {
         return MemoryEmbeddingEpochState(
             activeEpoch: row["active_epoch"],
             dimensions: row["dimensions"],
-            previousEpoch: row["previous_epoch"],
-            activatedAt: row["activated_at"],
             activationFailure: activationFailure
         )
     }

@@ -67,10 +67,10 @@ public enum RuntimeReadouts {
         guard let window = ContextBudgetPolicy.windowTokens(forModel: resolvedModel, providerID: providerID, dataRoot: dataRoot) else {
             throw ProviderRoutingError.configurationFailed("The selected model's context window is unavailable. Refresh its catalog in Providers.")
         }
-        let measurement = try await SessionContextMeasurement.read(sessionId: sessionId,
+        guard let measurement = try await SessionContextMeasurement.read(sessionId: sessionId,
             model: resolvedModel, providerID: providerID, dataRoot: dataRoot, windowTokens: window,
-            call: .init(turn: nil, surface: "chat", purpose: "context_usage", session: sessionId))
-        guard let usedTokens = measurement.observedInputTokens else {
+            call: .init(turn: nil, surface: "chat", purpose: "context_usage", session: sessionId)),
+            let usedTokens = measurement.observedInputTokens else {
             throw RuntimeReadError.unreadableFeed("""
                 Context usage has not been observed for this session's selected provider and model. Send a turn on this route to obtain a provider \
                 usage receipt.
@@ -82,8 +82,6 @@ public enum RuntimeReadouts {
         return SessionContextStatus(
             session_id: sessionId,
             used_tokens: usedTokens,
-            transcript_tokens: nil,
-            prompt_tokens: nil,
             previous_turn_tokens: measurement.previousTurnTokens,
             turn_delta_tokens: measurement.turnDeltaTokens,
             budget: budget,
@@ -92,7 +90,6 @@ public enum RuntimeReadouts {
             model: resolvedModel,
             context_loaded: true,
             context_mode: "provider_usage_receipt",
-            context_fingerprint: nil,
             context_prompt_chars: measurement.renderedCharacters
         )
     }

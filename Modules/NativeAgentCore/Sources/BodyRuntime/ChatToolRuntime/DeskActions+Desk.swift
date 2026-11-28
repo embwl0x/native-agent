@@ -120,17 +120,7 @@ extension DeskActions {
                     commit/receipt/observed result proving its tracked outcome. The owner's explicit instruction is sufficient even if earlier \
                     notes say work remains; put that instruction in reason without claiming the underlying work happened. Otherwise reason must \
                     name the specific commit/receipt/observed result; \
-                    never use fuzzy title matches, execution completion alone or unattributed commits. Sets done (cancelled if canceled=true); \
-                    stays visible briefly, then becomes archive-eligible.
-                    """
-            ),
-            ActionDescriptor(DeskArchiveArgs.self, name: "desk_archive",
-                run: { context, input in
-                    try await context.client.impl_desk_archive(input: input)
-                }, toolClass: .write, capabilities: [.ledgerWrite, .toolCall],
-                description: """
-                    Archive a Desk item and its whole subtree: remove from live view and write archive summaries. Every item must already be done \
-                    or cancelled. Refuses unfinished work and standing items anywhere in the subtree; leaves all items unchanged on refusal.
+                    never use fuzzy title matches, execution completion alone or unattributed commits. Sets done (cancelled if canceled=true).
                     """
             ),
             ActionDescriptor(DeskBlockedOnArgs.self, name: "desk_blocked_on",
@@ -139,23 +129,8 @@ extension DeskActions {
                 }, toolClass: .write, capabilities: [.ledgerWrite, .toolCall],
                 description: """
                     Replace a Desk item's blockers with blocked_on CSV numbers (\"2,3.1\") or handles; empty clears. These are edges: \
-                    closing/cancelling/archiving a blocker automatically readies every waiting item, without a follow-up call. Refuses unknown \
+                    closing or cancelling a blocker automatically readies every waiting item, without a follow-up call. Refuses unknown \
                     blockers, self-blocking and dependency cycles.
-                    """
-            ),
-            ActionDescriptor(DeskBreakdownArgs.self, name: "desk_breakdown",
-                run: { context, input in
-                    try await context.client.impl_desk_breakdown(input: input)
-                }, toolClass: .write, capabilities: [.ledgerWrite, .toolCall],
-                description: """
-                    Create an ordered numbered Desk plan: parent + children, blocked-on edges and optional child dates. children: \
-                    [{title,summary?,blocked_on?,defer_until?}]. Child blocked_on CSV bare integers mean 1-based sibling positions (\"1,2\" = first \
-                    two); dotted numbers (\"3.1\")/desk_ handles name existing items. Bare top-level numbers are ambiguous here; link them \
-                    afterward with desk.blocked_on. parent grafts children onto an existing item, ignoring project/title/kind. Returns the numbered \
-                    plan and ready children. Same-kind/project/title live campaigns return status=\"existing\", adding only missing steps. \
-                    Mid-batch refusal returns status=\"partial\" and created items. One call lays out a whole plan, and the Desk page draws \
-                    an item with steps as a board: a column per state (Now, Next, Waiting, Done), each step a card whose Start and Done are \
-                    desk.set_status and desk.close.
                     """
             ),
             ActionDescriptor(DeskDeferArgs.self, name: "desk_defer",
@@ -177,18 +152,6 @@ extension DeskActions {
                     one nag for a new window and returns intervening drift; proposal returns the notify loop’s current proposal without changing \
                     Desk or reminder settings or delivering notifications; status/read reports config. A nag requires staleness plus an underlying \
                     change (blocker cleared, deferral elapsed, or movement while stale), once per item per window, digest only, never urgent.
-                    """
-            ),
-            ActionDescriptor(DeskOpenPursuitArgs.self, name: "desk_open_pursuit",
-                run: { context, input in
-                    try await context.client.impl_desk_open_pursuit(input: input)
-                }, toolClass: .write, capabilities: [.ledgerWrite, .toolCall],
-                description: """
-                    The only route to a self-authored Desk pursuit (origin=agent): an answerable question for ~6–12 work sessions. Required: \
-                    title, first-person why, done_looks_like, abandon_condition and typed evidence (shapes below). Needs ≥1 non-friction \
-                    source; felt_salience needs ≥2 dates; chat_observation needs distinctDays≥2. Optional private_name, summary, max_sessions \
-                    (default 12, cap 24), max_days (default 10, cap 21). Returns handle/alias; on cap or dossier failure, use the cause and \
-                    supplied remedy.
                     """
             ),
             ActionDescriptor(DeskWorkLogArgs.self, name: "desk_work_log",
@@ -281,7 +244,7 @@ struct DeskReadOffset: Sendable {
 
     init?(door: inout DoorObjectDecoder, field: DoorFieldDescriptor) throws(DoorDecodeError) {
         guard let raw = try door.value(field) else { return nil }
-        guard let number = SwiftToolDispatcher.jsonInt(raw) else {
+        guard let number = raw.exactIntegerValue else {
             throw DoorDecodeError(path: door.path + "." + field.name, accepted: "an integer")
         }
         value = number
@@ -376,21 +339,19 @@ struct DeskProgressFields: DoorObjectSchema {
 }
 
 struct DeskNoteArgs: DoorArgs {
-    static let handleField = DoorFieldDescriptor.string("handle", "The item's desk number (4, 2.1, desk.4) or stable handle.", required: true, subject: true)
     static let textField = DoorFieldDescriptor.string("text", "The note text.", required: true)
-    static let doorFields = [handleField, textField]
+    static let doorFields = [DeskUpdateItemArgs.handleField, textField]
 
     let handle: String
     let text: String
 
     init(door: inout DoorObjectDecoder) throws(DoorDecodeError) {
-        handle = try door.string(Self.handleField)!
+        handle = try door.string(DeskUpdateItemArgs.handleField)!
         text = try door.string(Self.textField)!
     }
 }
 
 struct DeskAddRefArgs: DoorArgs {
-    static let handleField = DoorFieldDescriptor.string("handle", "The item's desk number (4, 2.1, desk.4) or stable handle.", required: true, subject: true)
     static let refKindField = DoorFieldDescriptor("ref_kind", ToolSchema.enumStringSchema(["file", "commit", "gh_issue", "gh_pr", "url", "agent", "approval", "trace", "note"],
         "file | commit | gh_issue | gh_pr | url | agent | approval | trace | note."), required: true)
     static let pathField = DoorFieldDescriptor.string("path", "file: path.")
@@ -410,7 +371,7 @@ struct DeskAddRefArgs: DoorArgs {
     static let traceKindField = DoorFieldDescriptor.string("trace_kind", "trace: optional trace kind.")
     static let textField = DoorFieldDescriptor.string("text", "note: the note text.")
     static let doorFields = [
-        handleField, refKindField, pathField, lineField, labelField, shaField,
+        DeskUpdateItemArgs.handleField, refKindField, pathField, lineField, labelField, shaField,
         repoField, numberField, titleField, statusField, checksField, urlField,
         nameField, handoffIDField, sessionIDField, idField, traceKindField,
         textField
@@ -436,7 +397,7 @@ struct DeskAddRefArgs: DoorArgs {
     let text: String?
 
     init(door: inout DoorObjectDecoder) throws(DoorDecodeError) {
-        handle = try door.string(Self.handleField)!
+        handle = try door.string(DeskUpdateItemArgs.handleField)!
         refKind = try door.string(Self.refKindField)!
         path = try door.string(Self.pathField)
         line = try door.int(Self.lineField)
@@ -458,13 +419,12 @@ struct DeskAddRefArgs: DoorArgs {
 }
 
 struct DeskSetCadenceArgs: DoorArgs {
-    static let handleField = DoorFieldDescriptor.string("handle", "The item's desk number (4, 2.1, desk.4) or stable handle.", required: true, subject: true)
     static let modeField = DoorFieldDescriptor("mode", ToolSchema.enumStringSchema(["manual", "on_ask", "tick", "event", "daily", "weekly", "blocked_watch"],
         "manual | on_ask | tick | event | daily | weekly | blocked_watch."), required: true)
     static let intervalField = DoorFieldDescriptor.string("interval", "Optional refresh interval (e.g. \"1h\", \"1d\").")
     static let staleAfterField = DoorFieldDescriptor.string("stale_after", "Optional staleness window after which the item is considered stale.")
     static let refreshSourcesField = DoorFieldDescriptor.string("refresh_sources", "Optional comma-separated list of refresh sources.")
-    static let doorFields = [handleField, modeField, intervalField, staleAfterField, refreshSourcesField]
+    static let doorFields = [DeskUpdateItemArgs.handleField, modeField, intervalField, staleAfterField, refreshSourcesField]
 
     let handle: String
     let mode: String
@@ -473,7 +433,7 @@ struct DeskSetCadenceArgs: DoorArgs {
     let refreshSources: String?
 
     init(door: inout DoorObjectDecoder) throws(DoorDecodeError) {
-        handle = try door.string(Self.handleField)!
+        handle = try door.string(DeskUpdateItemArgs.handleField)!
         mode = try door.string(Self.modeField)!
         interval = try door.string(Self.intervalField)
         staleAfter = try door.string(Self.staleAfterField)
@@ -482,14 +442,13 @@ struct DeskSetCadenceArgs: DoorArgs {
 }
 
 struct DeskSetNotifyArgs: DoorArgs {
-    static let handleField = DoorFieldDescriptor.string("handle", "The item's desk number (4, 2.1, desk.4) or stable handle.", required: true, subject: true)
     static let levelField = DoorFieldDescriptor("level", ToolSchema.enumStringSchema(["quiet", "digest", "direct", "urgent"], "quiet | digest | direct | urgent."), required: true)
     static let onField = DoorFieldDescriptor.string("on", """
         Optional comma-separated triggers: state_change | blocked | done | explicit. Use explicit alone for a one-time \
         announcement.
         """)
     static let cooldownField = DoorFieldDescriptor.string("cooldown", "Optional notify cooldown (e.g. \"6h\").")
-    static let doorFields = [handleField, levelField, onField, cooldownField]
+    static let doorFields = [DeskUpdateItemArgs.handleField, levelField, onField, cooldownField]
 
     let handle: String
     let level: String
@@ -497,7 +456,7 @@ struct DeskSetNotifyArgs: DoorArgs {
     let cooldown: String?
 
     init(door: inout DoorObjectDecoder) throws(DoorDecodeError) {
-        handle = try door.string(Self.handleField)!
+        handle = try door.string(DeskUpdateItemArgs.handleField)!
         level = try door.string(Self.levelField)!
         on = try door.string(Self.onField)
         cooldown = try door.string(Self.cooldownField)
@@ -505,14 +464,13 @@ struct DeskSetNotifyArgs: DoorArgs {
 }
 
 struct DeskCloseArgs: DoorArgs {
-    static let handleField = DoorFieldDescriptor.string("handle", "The item's desk number (4, 2.1, desk.4) or stable handle.", required: true, subject: true)
     static let reasonField = DoorFieldDescriptor.string("reason", "Why it closes: the outcome, or the owner's instruction; the same word queue.done takes.", required: true)
     static let canceledField = DoorFieldDescriptor("canceled", ToolSchema.boolSchema("Close as cancelled instead of done. Default false."), required: false)
     static let subtreeField = DoorFieldDescriptor("subtree", ToolSchema.boolSchema("Also close every open descendant in this call. Returns closed count + handles. Default false."), required: false)
     static let expectedUpdatedAtField = DoorFieldDescriptor("expected_updated_at", ToolSchema.versionSchema("""
         Optional row version from a just-read Desk projection. When supplied, refuses if the item changed before this close.
         """), required: false)
-    static let doorFields = [handleField, reasonField, canceledField, subtreeField, expectedUpdatedAtField]
+    static let doorFields = [DeskUpdateItemArgs.handleField, reasonField, canceledField, subtreeField, expectedUpdatedAtField]
     static let argumentNames = ["reason": ["evidence", "summary"], "canceled": ["status"]]
 
     let handle: String
@@ -522,22 +480,11 @@ struct DeskCloseArgs: DoorArgs {
     let expectedUpdatedAt: String?
 
     init(door: inout DoorObjectDecoder) throws(DoorDecodeError) {
-        handle = try door.string(Self.handleField)!
+        handle = try door.string(DeskUpdateItemArgs.handleField)!
         reason = try door.string(Self.reasonField)!
         canceled = try door.bool(Self.canceledField)
         subtree = try door.bool(Self.subtreeField)
         expectedUpdatedAt = try door.string(Self.expectedUpdatedAtField)
-    }
-}
-
-struct DeskArchiveArgs: DoorArgs {
-    static let handleField = DoorFieldDescriptor.string("handle", "The item's desk number (4, 2.1, desk.4) or stable handle.", required: true, subject: true)
-    static let doorFields = [handleField]
-
-    let handle: String
-
-    init(door: inout DoorObjectDecoder) throws(DoorDecodeError) {
-        handle = try door.string(Self.handleField)!
     }
 }
 
@@ -555,47 +502,15 @@ struct DeskBlockedOnArgs: DoorArgs {
     }
 }
 
-struct DeskBreakdownArgs: DoorArgs {
-    static let projectField = DoorFieldDescriptor.string("project", "Optional project bucket for a new plan's parent item; left out, \(DeskItem.tasksProject).")
-    static let titleField = DoorFieldDescriptor.string("title", "Title for the new plan's parent item. Required unless parent is given.")
-    static let kindField = DoorFieldDescriptor("kind", ToolSchema.enumStringSchema(["watch", "plan", "project", "gh", "standing"],
-        "Optional parent kind (default plan): watch|plan|project|gh|standing."), required: false)
-    static let summaryField = DoorFieldDescriptor.string("summary", "Optional one-line parent summary.")
-    static let parentField = DoorFieldDescriptor.string("parent", "Graft mode: desk number or handle of an existing item to attach the sub-items to.")
-    static let childrenField = DoorFieldDescriptor("children", ActionDescriptor.looseObjectArraySchema("""
-        Ordered sub-items. Each: {title (required), summary?, blocked_on? (CSV string or array: bare integers = positions of \
-        siblings in this call, dotted numbers/handles = existing items), defer_until? (yyyy-MM-dd or ISO)}. no other fields — \
-        an unknown field is refused, not ignored.
-        """), required: true)
-    static let doorFields = [projectField, titleField, kindField, summaryField, parentField, childrenField]
-
-    let project: String?
-    let title: String?
-    let kind: String?
-    let summary: String?
-    let parent: String?
-    let children: [[String: JSONValue]]
-
-    init(door: inout DoorObjectDecoder) throws(DoorDecodeError) {
-        project = try door.string(Self.projectField)
-        title = try door.string(Self.titleField)
-        kind = try door.string(Self.kindField)
-        summary = try door.string(Self.summaryField)
-        parent = try door.string(Self.parentField)
-        children = try door.objectValues(Self.childrenField)!
-    }
-}
-
 struct DeskDeferArgs: DoorArgs {
-    static let handleField = DoorFieldDescriptor.string("handle", "The item's desk number (e.g. 2 or 2.1) or its stable handle.", required: true, subject: true)
     static let untilField = DoorFieldDescriptor.string("until", "yyyy-MM-dd day or full ISO timestamp. Empty string clears the deferral.", required: true)
-    static let doorFields = [handleField, untilField]
+    static let doorFields = [DeskBlockedOnArgs.handleField, untilField]
 
     let handle: String
     let until: String
 
     init(door: inout DoorObjectDecoder) throws(DoorDecodeError) {
-        handle = try door.string(Self.handleField)!
+        handle = try door.string(DeskBlockedOnArgs.handleField)!
         until = try door.string(Self.untilField)!
     }
 }
@@ -641,7 +556,6 @@ struct DeskWorkLogArgs: DoorArgs {
 }
 
 struct DeskSetStatusArgs: DoorArgs {
-    static let handleField = DoorFieldDescriptor.string("handle", "The item's desk number (4, 2.1, desk.4) or stable handle.", required: true, subject: true)
     static let statusField = DoorFieldDescriptor.string("status", """
         New status: watch | flag | now | next | todo | done | blocked | canceled | waiting on <person>. Also accepts 'blocked: \
         reason' and stores the reason in the Desk's blocked reason field.
@@ -661,7 +575,7 @@ struct DeskSetStatusArgs: DoorArgs {
         """)), required: false)
     static let progressField = DoorFieldDescriptor.object("progress", DeskProgressFields.self, description: "Optional explicit progress. Requires 0 <= done <= total and total > 0; omit or send null when unknown.").nullable()
     static let doorFields = [
-        handleField, statusField, remainingWorkField, blockedReasonField,
+        DeskUpdateItemArgs.handleField, statusField, remainingWorkField, blockedReasonField,
         reasonField, waitingOnField, assigneeField, laneOfField, progressField
     ]
 
@@ -688,7 +602,7 @@ struct DeskSetStatusArgs: DoorArgs {
     }
 
     init(door: inout DoorObjectDecoder) throws(DoorDecodeError) {
-        handle = try door.string(Self.handleField)!
+        handle = try door.string(DeskUpdateItemArgs.handleField)!
         status = try door.string(Self.statusField)!
         remainingWork = try door.string(Self.remainingWorkField)
         blockedReason = try door.string(Self.blockedReasonField)
@@ -720,82 +634,5 @@ struct DeskWaitArgs: DoorArgs {
         handle = try door.string(Self.handleField)!
         on = try door.stringOrList(Self.onField)!
         note = try door.string(Self.noteField)
-    }
-}
-
-struct DeskOpenPursuitArgs: DoorArgs {
-    static let projectField = DoorFieldDescriptor.string("project", "Optional project bucket this pursuit belongs to; left out, \(DeskItem.workshopProject).")
-    static let titleField = DoorFieldDescriptor.string("title", "Short pursuit title.", required: true)
-    static let whyField = DoorFieldDescriptor.string("why", "First-person: why this is worth your sessions.", required: true)
-    static let doneLooksLikeField = DoorFieldDescriptor.string("done_looks_like", "A question that can end — answerable in ~6–12 work sessions.", required: true)
-    static let abandonConditionField = DoorFieldDescriptor.string("abandon_condition", "The condition under which you'd let this go (unpenalized).", required: true)
-    static let evidenceField = DoorFieldDescriptor("evidence", .object([
-        "type": .string("array"), "minItems": .int(1), "description": .string("""
-        Typed citations in the required source shape. At least one non-friction source is required; live source existence \
-        is not checked by preview.
-        """),
-        "items": .object(["anyOf": .array(DeskEvidence.alternatives.map {
-            DoorArgsContract(fields: $0.all, constraints: ["additionalProperties": .bool(false)]).schema
-        })])
-    ]), required: true)
-    static let privateNameField = DoorFieldDescriptor.string("private_name", "Optional private name for this pursuit (yours).")
-    static let maxSessionsField = DoorFieldDescriptor("max_sessions", ToolSchema.intSchema("Optional session bound (default 12, cap 24)."), required: false)
-    static let maxDaysField = DoorFieldDescriptor("max_days", ToolSchema.intSchema("Optional day bound (default 10, cap 21)."), required: false)
-    static let summaryField = DoorFieldDescriptor.string("summary", "Optional one-line summary.")
-    static let doorFields = [
-        projectField, titleField, whyField, doneLooksLikeField, abandonConditionField,
-        evidenceField, privateNameField, maxSessionsField, maxDaysField, summaryField
-    ]
-
-    let project: String?
-    let title: String
-    let why: String
-    let doneLooksLike: String
-    let abandonCondition: String
-    let evidence: [DossierSource]
-    let privateName: String?
-    let maxSessions: Int?
-    let maxDays: Int?
-    let summary: String?
-
-    init(door: inout DoorObjectDecoder) throws(DoorDecodeError) {
-        project = try door.string(Self.projectField)
-        title = try door.string(Self.titleField)!
-        why = try door.string(Self.whyField)!
-        doneLooksLike = try door.string(Self.doneLooksLikeField)!
-        abandonCondition = try door.string(Self.abandonConditionField)!
-        evidence = try door.objects(Self.evidenceField, decode: DeskEvidence.decode)!
-        privateName = try door.string(Self.privateNameField)
-        maxSessions = try door.int(Self.maxSessionsField)
-        maxDays = try door.int(Self.maxDaysField)
-        summary = try door.string(Self.summaryField)
-    }
-}
-
-private enum DeskEvidence {
-    static let source = DoorFieldDescriptor.string("source", required: true)
-    static let id = DoorFieldDescriptor("id", ActionDescriptor.nonEmptyStringSchema("Exact source record ID."), required: true)
-    static let dates = DoorFieldDescriptor("dates", ActionDescriptor.stringArraySchema("At least two distinct calendar dates, yyyy-MM-dd.", minItems: 2), required: true)
-    static let noteIDs = DoorFieldDescriptor("noteIds", ActionDescriptor.stringArraySchema("Exact cited note IDs; at least distinctDays distinct notes.", minItems: 2), required: true)
-    static let days = DoorFieldDescriptor("distinctDays", ToolSchema.intSchema("Distinct calendar days represented by the cited notes.", minimum: 2), required: true)
-    static let count = DoorFieldDescriptor("count", ToolSchema.intSchema("Positive observed occurrence count.", minimum: 1), required: true)
-    static let window = DoorFieldDescriptor("window", ActionDescriptor.nonEmptyStringSchema("Positive duration, e.g. 7d, 24h or 30m."), required: true)
-
-    static let alternatives = [
-        NonEmptyFields(DoorFieldDescriptor("source", ToolSchema.enumStringSchema(["care", "dream_digest"]), required: true), id),
-        NonEmptyFields(DoorFieldDescriptor("source", ToolSchema.enumStringSchema(["felt_salience"]), required: true), dates),
-        NonEmptyFields(DoorFieldDescriptor("source", ToolSchema.enumStringSchema(["chat_observation"]), required: true), noteIDs, days),
-        NonEmptyFields(DoorFieldDescriptor("source", ToolSchema.enumStringSchema(["trace_friction"]), required: true), count, window),
-    ]
-
-    static func decode(_ door: inout DoorObjectDecoder) throws(DoorDecodeError) -> DossierSource {
-        switch try door.string(source) {
-        case "care": return .care(id: try door.string(id)!)
-        case "dream_digest": return .dreamDigest(id: try door.string(id)!)
-        case "felt_salience": return .feltSalience(dates: try door.strings(dates)!)
-        case "chat_observation": return .chatObservation(noteIds: try door.strings(noteIDs)!, distinctDays: try door.int(days)!)
-        case "trace_friction": return .traceFriction(count: try door.int(count)!, window: try door.string(window)!)
-        default: throw DoorDecodeError(path: door.path + ".source", accepted: "a declared citation source")
-        }
     }
 }

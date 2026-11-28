@@ -67,12 +67,7 @@ public struct MemoryStoreCheck: DoctorCheck {
                     title: title,
                     status: "fail",
                     detail: "Knowledge graph tables in memory.sqlite could not be read: \(error.localizedDescription)",
-                    harm: "The agent cannot recall connections between its saved memories.",
-                    human_action: """
-                        Open Trust → Advanced → Backups, select a verified backup containing memory/memory.sqlite, then choose Restore → Restore \
-                        backup.
-                        """,
-                    ask: .permission
+                    harm: "The agent cannot recall connections between its saved memories."
                 )
             }
         }
@@ -213,7 +208,7 @@ public struct CoreMLEmbedderCheck: RepairingDoctorCheck {
             var state: MemoryEmbeddingEpochState?
             if installed != nil { state = try await memory.memoryEmbeddingEpochState() }
             if let epoch, reconcileRefusal, state?.activationFailure?.epoch == epoch.rawValue {
-                _ = await memory.releaseEmbeddingMemory(reason: "Doctor repaired the refused model's compile cache")
+                await memory.releaseEmbeddingMemory()
                 _ = await memory.reconcileEmbeddingEpochAtLaunch()
                 state = try await memory.memoryEmbeddingEpochState()
             }

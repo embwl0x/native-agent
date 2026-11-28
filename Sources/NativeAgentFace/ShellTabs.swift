@@ -124,14 +124,15 @@ extension View {
     /// Use static safe-area geometry to keep scrolling responsive; safeAreaBar can block the main thread.
     /// Fade over the header gap and clear its first points so clipped partial glyphs stay invisible.
     /// Keep the fade within the gap so resting content retains full opacity.
-    func aliveTopDissolve(_ gap: CGFloat) -> some View {
-        safeAreaPadding(.top, gap)
+    func aliveTopDissolve() -> some View {
+        let gap: CGFloat = 20
+        return safeAreaPadding(.top, gap)
             .mask(alignment: .top) {
                 VStack(spacing: 0) {
                     Color.clear
-                        .frame(height: min(aliveTopClearBand, gap))
+                        .frame(height: aliveTopClearBand)
                     LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom)
-                        .frame(height: max(gap - aliveTopClearBand, 0))
+                        .frame(height: gap - aliveTopClearBand)
                     Color.black
                 }
                 .ignoresSafeArea(edges: .bottom)

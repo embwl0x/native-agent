@@ -71,22 +71,19 @@ public struct StudioEncounterCandidate: Sendable, Equatable, Hashable {
     public var reference: String?
     /// Use consult or entity identity to deduplicate candidates.
     public var originID: String
-    public var noticedAt: String
 
     public init(
         source: Source,
         title: String? = nil,
         creator: String? = nil,
         reference: String? = nil,
-        originID: String,
-        noticedAt: String
+        originID: String
     ) {
         self.source = source
         self.title = title
         self.creator = creator
         self.reference = reference
         self.originID = originID
-        self.noticedAt = noticedAt
     }
 
 }

@@ -168,6 +168,8 @@ extension SwiftNativeMacControl {
             "effects": .string("unknown"), "settlement_error": .string(error.localizedDescription)]
         switch body {
         case .success(let result): output["body_result"] = result.toJSON(readContent: context.readContent)
+        case .failure(let stopped as AppleScriptExecution.ScriptStopped):
+            output["body_result"] = stopped.result.toJSON(readContent: context.readContent)
         case .failure(let bodyError):
             output["body_error"] = .string(bodyError.localizedDescription)
             let produced: ProcessRunResult?

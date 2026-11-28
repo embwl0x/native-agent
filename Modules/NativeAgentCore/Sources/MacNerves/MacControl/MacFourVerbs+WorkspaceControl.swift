@@ -30,7 +30,8 @@ extension MacFourVerbs {
     /// Exact references retain drift checks and ordinary admission; selection receipts preserve the chosen identity.
     public func actSelection(verb: String, handle: String, frameID: String,
                              text: String? = nil, mode: MacTypeMode = .replace, direction: String? = nil, scrollAmount: Int? = nil,
-                             app: String? = nil, turn: Turn, context: MacOperationContext) async -> MacFourVerbsReply {
+                             app: String? = nil, after: JSONValue? = nil, cleanup: JSONValue? = nil,
+                             turn: Turn, context: MacOperationContext) async -> MacFourVerbsReply {
         let ownsSerial = !context.holdsActSerial
         if ownsSerial {
             guard await MacActSerial.shared.acquire(context: context) else {
@@ -65,6 +66,8 @@ extension MacFourVerbs {
         body["mode"] = .string(mode.rawValue)
         if let direction { body["direction"] = .string(direction) }
         if let scrollAmount { body["scroll_amount"] = .int(Int64(scrollAmount)) }
+        body["after"] = after
+        body["cleanup"] = cleanup
         let postRead = MacSightCaptureBinding(frameID: UUID().uuidString)
         do {
             let result = try await context.holding(\.capture, postRead) {
@@ -92,8 +95,8 @@ extension MacFourVerbs {
                 text: (result.ok
                     ? (mismatch ? "The selected effect did not match. "
                         : verified ? "Verified: " : "The selected input was delivered. ") + effect.sentence
-                    : "The selected action is unverified: " + (Self.string(output["detail"]) ?? Self.string(output["guidance"])
-                        ?? result.error ?? effect.sentence))
+                    : "The selected action is unverified: " + (Self.string(output["status_note"]) ?? Self.string(output["detail"])
+                        ?? Self.string(output["guidance"]) ?? result.error ?? effect.sentence))
                     + "\n" + screen,
                 detail: detail)
         } catch {

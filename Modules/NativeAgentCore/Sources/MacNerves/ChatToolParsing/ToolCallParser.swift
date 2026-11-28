@@ -12,7 +12,6 @@ package struct ParsedToolCall: Equatable {
     package let id: String
     package let name: String
     package let input: [String: JSONValue]
-    /// <invoke> parameters that were JSON-typed, as written, so a string-schema param given text "42" can be restored to the string.
     package var invokeRawText: [String: String] = [:]
     /// Text lane: undeclared fields or raw invoke content without parameters. Such a block is a result the agent wrote, not a call, and never runs.
     package var undeclaredKeys: [String] = []
@@ -44,8 +43,8 @@ package struct ToolCallProtocolViolation: Equatable {
 
     package var modelFeedback: String {
         if kind == .malformedToolUseMarker {
-            return "Broken call text (\(marker)); no call from this reply ran. If you meant a call, correct it in this conversation's call format; "
-                + "a literal </ inside a JSON string ends the call early: write it as <\\/. If you were writing about calls, put the markup inside backticks."
+            return "Broken call text (\(marker)). This reply ran no calls. Use a JSON object in the conversation's call format. "
+                + "When writing about calls, put the markup inside backticks."
         }
         return """
             The call was formatted as Markdown; no call from this reply ran. Use this conversation's executable call format.
@@ -76,7 +75,6 @@ package enum ToolCallParser {
     package static func throughLastToolMarker(_ raw: String) -> String {
         guard ["</tool_use>", "</invoke>", "</function_calls>"].contains(where: raw.contains) else { return raw }
         var cut = raw
-        // The API stop swallows the closing tag; replay the block whole.
         if let open = cut.range(of: "<function_calls>", options: .backwards),
            cut.range(of: "</function_calls>", range: open.upperBound..<cut.endIndex) == nil {
             cut += "\n</function_calls>"
@@ -147,6 +145,8 @@ package enum ToolCallParser {
     }
 
     private static let orphanRegex = try! NSRegularExpression(pattern: #"(?im)^[ \t]*(?:</?(?:tool_use|invoke|parameter)\b|_?(?:tool_use|ool_use)\b[ \t>])"#)
+    private static let fabricatedResultRegex = try! NSRegularExpression(
+        pattern: #"(?im)<function_results>|^[ \t]*(?:<tool_result|NativeAgent tool result #)"#)
     private static let invokeStartRegex = try! NSRegularExpression(pattern: #"(?im)^[ \t]*(?:<function_calls>\s*)?<invoke\b"#)
     private static let formattedMarkerRegex = try! NSRegularExpression(
         pattern: #"(?is)(?:\*\*|__)\s*<(?:tool_use|invoke)\b[\s\S]*?</(?:tool_use|invoke)>\s*(?:\*\*|__)"#)
@@ -233,13 +233,14 @@ package enum ToolCallParser {
         return kept + strippingDebris(ns.substring(from: from))
     }
 
+    private static let strippingDebrisRegex = try! NSRegularExpression(
+        pattern: #"(?is)(```.*?```|~~~.*?~~~|(?<!`)(`+)(?!`).*?(?<!`)\2(?!`)|<tool_use\b[^<>]*>.*?</tool_use>"#
+            + #"|<invoke\b[^<>]*>\s*\{.*?</(?:tool_use|invoke)>|<invoke\b[^<>]*>.*?</invoke>)|(?:"# + protocolDebrisPattern + ")")
+
     private static func strippingDebris(_ raw: String) -> String {
-        let stripped = raw.replacingOccurrences(
-            of: #"(?is)(```.*?```|~~~.*?~~~|(?<!`)(`+)(?!`).*?(?<!`)\2(?!`)|<tool_use\b[^<>]*>.*?</tool_use>"#
-                + #"|<invoke\b[^<>]*>\s*\{.*?</(?:tool_use|invoke)>|<invoke\b[^<>]*>.*?</invoke>)|(?:"# + protocolDebrisPattern + ")",
-            with: "$1", options: .regularExpression)
         // Expected protocol debris carries no receipt because a stamp cannot distinguish it from valid protocol.
-        return stripped
+        return strippingDebrisRegex.stringByReplacingMatches(
+            in: raw, options: [], range: NSRange(raw.startIndex..., in: raw), withTemplate: "$1")
     }
 
     /// Broken or formatted executable calls get a format nudge; quoted code is prose. The shared loop gives one format nudge before settling incomplete.
@@ -256,8 +257,10 @@ package enum ToolCallParser {
     ) -> ToolCallProtocolViolation? {
         let unquoted = unquotedProtocolText(raw)
         // Remove complete calls before looking for orphan tags or placeholders. Their arguments may legitimately contain these strings.
-        let remainder = stripToolUseMarkers(unquoted)
+        let argumentsBlanked = blankingArguments(unquoted)
+        let remainder = stripToolUseMarkers(argumentsBlanked)
         let stray: String? = if regexMatches(orphanRegex, in: remainder) { "a stray call tag or placeholder outside a complete call" }
+            else if parseInvoke && regexMatches(fabricatedResultRegex, in: remainder) { "model-written result markup outside a call" }
             else if !unquoted.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 && stripProtocolDebris(unquoted).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { "call markup with no words or call around it" }
             else if !parseInvoke && regexMatches(invokeStartRegex, in: unquoted) { "invoke markup, which this conversation does not run" }
@@ -265,7 +268,7 @@ package enum ToolCallParser {
             else { nil }
         if let stray { return ToolCallProtocolViolation(kind: .malformedToolUseMarker, marker: stray) }
 
-        if regexMatches(formattedMarkerRegex, in: blankingArguments(unquoted)) {
+        if regexMatches(formattedMarkerRegex, in: argumentsBlanked) {
             return ToolCallProtocolViolation(kind: .formattedToolUseMarker)
         }
 

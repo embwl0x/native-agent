@@ -3,6 +3,7 @@ import DeskCore
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
+import PersistenceCore
 // Blueprint: | `EngineHome.swift` | Home's packet read for `native-home` with the cognition runtime's attention reading; its rows' keys carry their calls |
 
 extension NativeAgentEngine {
@@ -16,9 +17,14 @@ extension NativeAgentEngine {
         // The mind is read at each draw: Home drawn before setup finished sees the mind once it runs.
         return { [layout, owner, mind] in
             let availability = await MainActor.run { layout.availability }
-            let attention: String
-            if let cognition = mind?.runtime { attention = await cognition.isAsleep ? "asleep" : "awake" } else { attention = "unavailable" }
+            let attention = await mind?.runtime?.homeAttention ?? .object(["state": .string("unavailable")])
             return await owner.read(layout: availability, attention: attention)
         }
+    }
+}
+
+extension NativeCognitionRuntime {
+    fileprivate var homeAttention: JSONValue {
+        .object(["state": .string(isAsleep ? "asleep" : "awake"), "at": .string(HomeFace.clock(Date()))])
     }
 }

@@ -53,6 +53,13 @@ public struct VisionRect: Sendable, Equatable, Hashable {
         return VisionRect(x: left, y: top, w: right - left, h: bottom - top)
     }
 
+    func geometryPrecedes(_ other: VisionRect) -> Bool {
+        if y != other.y { return y < other.y }
+        if x != other.x { return x < other.x }
+        if w != other.w { return w < other.w }
+        return h < other.h
+    }
+
     /// Group against each first member after strict sorting; pairwise tolerances are not transitive.
     static func readingOrder<Value>(
         _ values: [Value], rect: KeyPath<Value, VisionRect>, tolerance: Double,

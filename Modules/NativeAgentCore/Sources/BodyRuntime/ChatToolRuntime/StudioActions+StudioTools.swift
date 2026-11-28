@@ -97,7 +97,7 @@ extension SwiftToolDispatcher {
         return .object(response)
     }
 
-    private func studioStore() -> SwiftNativeStudioStore {
+    func studioStore() -> SwiftNativeStudioStore {
         SwiftNativeStudioStore(dataRoot: dataRoot)
     }
 
@@ -208,7 +208,7 @@ extension SwiftToolDispatcher {
                 relations: relations,
                 tags: (input.tags ?? []).compactMap(\.trimmedNonEmpty)
             )
-            let graph = await studioJournalDidAppend(entry)
+            let graph = await settle { [self] in await studioJournalDidAppend(entry) }
             var result: JSONValue = .object([
                 "status": .string("ok"),
                 "effects": .string("occurred"),
@@ -279,6 +279,8 @@ extension SwiftToolDispatcher {
     /// The entry is already durable; derived consumer failures must not make the canonical write appear failed.
     @discardableResult
     private func studioJournalDidAppend(_ entry: StudioJournalEntry) async -> (report: StudioGraphIndexReport?, failures: [String]) {
+        // Re-derive the whole journal idempotently so every append retains all current relation history.
+        var report = await indexStudioJournalIntoGraph(reason: "entry_filed")
         // Wake StudioContext with its namespace and locator; it rereads the journal, never treating the event as source data.
         await DerivedStateInvalidationCenter.shared.publish(DerivedSourceChange(
             namespace: "studio",
@@ -287,8 +289,6 @@ extension SwiftToolDispatcher {
             canonicalLocator: studioStore().journalPath.standardizedFileURL.path,
             reason: "studio_journal_entry_filed"
         ))
-        // Re-derive the whole journal idempotently so every append retains all current relation history.
-        var report = await indexStudioJournalIntoGraph(reason: "entry_filed")
         // Cognition owns appraisal from the entry’s judgment (zero for abstention); publish only that an entry landed.
         if let studioJournalBus {
             await studioJournalBus.publish(entry)

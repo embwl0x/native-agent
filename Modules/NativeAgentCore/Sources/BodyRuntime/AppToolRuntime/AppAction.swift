@@ -122,14 +122,12 @@ public struct AppAction: Sendable {
                      subject: [String] = [], input: [String: JSONValue] = [:], read: Bool = false,
                      argumentNames: [String: [String]] = [:], argumentValues: [String: [String: JSONValue]] = [:],
                      argumentReferences: [String: ArgumentReference] = [:],
-                     irreversible: Bool = false, toolClass: ToolClass? = nil, reach: ToolReach = .agent, capabilities: CapabilitySet = [.safeRead, .toolCall],
+                     irreversible: Bool = false, reach: ToolReach = .agent, capabilities: CapabilitySet = [.safeRead, .toolCall],
                          screen: Bool = false,
-                     warn: String = "", schema: LLMToolSchema? = nil, versionExempt: Bool = false,
+                     warn: String = "", versionExempt: Bool = false,
                      readWhen: [String: JSONValue] = [:], advisory: Bool = false,
                      resultSchema: JSONValue = AppActions.resultEnvelope, lifecycle: CapabilityLifecycle.Action? = nil) throws -> AppAction {
-        // Without an explicit class, read declares a read; other folds write with the door's default capabilities.
-        let toolClass = toolClass ?? (read ? .read : .write)
-        let schema = schema ?? AppActions.foldSchemas[tool]
+        let schema = AppActions.foldSchemas[tool]
         // Declared args take the door's names; init's rename maps them back to the host call's.
         let names = ToolNameAliases.doorArgNames[tool] ?? [:]
         func door(_ arg: String) -> String {
@@ -146,7 +144,7 @@ public struct AppAction: Sendable {
         return AppAction(id ?? ToolNameAliases.appAction(tool) ?? tool, page,
                          label ?? schema.map { AppActions.firstSentence(ToolNameAliases.foldedProse($0.description)) } ?? tool,
                          declaredArgs, subject: subject.isEmpty ? hostSubjects : subject.map(door),
-                         irreversible: irreversible, toolClass: toolClass, reach: reach, capabilities: capabilities,
+                         irreversible: irreversible, reach: reach, capabilities: capabilities,
                          screen: screen, warn: warn, tool: tool, input: input,
                          read: read, argumentNames: hostNames.merging(argumentNames) { _, declared in declared }, argumentValues: argumentValues,
                          argumentReferences: hostReferences.merging(argumentReferences) { _, declared in declared },

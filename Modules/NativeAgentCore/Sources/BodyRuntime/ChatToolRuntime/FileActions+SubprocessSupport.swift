@@ -1,8 +1,7 @@
 import Foundation
 import Synchronization
 import NativeAgentCore
-import NativeAgentShared
-// Blueprint: | `FileActions+SubprocessSupport.swift` | `SubprocessWork`, `settle`; one process owner; bounded observation; output/audit settlement |
+// Blueprint: | `FileActions+SubprocessSupport.swift` | `SubprocessWork`, `settle`; one process owner; output/audit settlement |
 
 extension SwiftToolDispatcher {
     /// Bounded pipe capture shared by builder and image subprocess adapters. Final drain must not wait for a descendant that inherited a write FD.
@@ -72,44 +71,6 @@ extension SwiftToolDispatcher {
     /// One effect owner, one settlement. Launch and Stop share admission; Stop freezes the tree before killing it, leaving no grace in which it can fork work.
     /// Only physical exit releases the waiter to settlement.
     final class SubprocessWork: Sendable {
-        private static let retention = Mutex<[String: SubprocessWork]>([:])
-
-        /// Only live owners are retained; terminal evidence belongs to the adapter's audit. The key is its exact per-root audit path.
-        static func retained(at key: String) -> SubprocessWork? {
-            retention.withLock { $0[key] }
-        }
-
-        private final class ObservedResult<T: Sendable>: Sendable {
-            private let result = Mutex<T?>(nil)
-            let done = ScopedWaiter()
-            func finish(_ value: T) {
-                result.withLock { $0 = value }
-                done.resume()
-            }
-            var value: T? { result.withLock { $0 } }
-        }
-
-        /// Admission outlives this observer. Expiry, inherited call deadline and caller cancellation release only the wait. Explicit abort uses this retained
-        /// owner's stop(); execution keeps its own ceiling.
-        func observe<T: Sendable>(key: String, waitSeconds: Int, executionTimeoutSeconds: Int,
-                                  pending: T, settlement: @escaping @Sendable (Exit) async -> T) async -> T {
-            let observed = ObservedResult<T>()
-            if Task.isCancelled { stop() }
-            Self.retention.withLock { $0[key] = self }
-            Task {
-                let result = await self.run(timeoutSeconds: executionTimeoutSeconds, settlement: settlement)
-                observed.finish(result)
-                _ = Self.retention.withLock { $0.removeValue(forKey: key) }
-            }
-            let wait = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
-            wait.schedule(deadline: .now() + .seconds(waitSeconds))
-            wait.setEventHandler { observed.done.resume() }
-            wait.resume()
-            defer { wait.cancel() }
-            await observed.done.park()
-            return observed.value ?? pending
-        }
-
         struct Exit: Sendable {
             let code: Int32
             let stopped: Bool

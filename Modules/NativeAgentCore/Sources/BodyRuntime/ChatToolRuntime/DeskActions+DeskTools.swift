@@ -94,7 +94,7 @@ extension SwiftToolDispatcher {
 
     static let deskItemTools: Set<String> = [
         "desk_set_status", "desk_wait", "desk_update_item", "desk_note", "desk_add_ref", "desk_set_cadence", "desk_set_notify",
-        "desk_close", "desk_archive", "desk_blocked_on", "desk_defer", "desk_work_log",
+        "desk_close", "desk_blocked_on", "desk_defer", "desk_work_log",
     ]
 
     func deskHeld(_ handle: String) async throws -> JSONValue? {
@@ -210,52 +210,6 @@ extension SwiftToolDispatcher {
                 ? "reused existing \(item.alias) \(item.kind.rawValue) \(item.project) · \(item.title)"
                 : "created \(item.alias) \(item.kind.rawValue) \(item.project) · \(item.title)"),
         ])
-    }
-
-    // MARK: - desk_open_pursuit
-
-    /// The sole chat path to an origin=agent pursuit; the store gates dossier sources and caps. Store refusals return their reason with status "refused".
-    func impl_desk_open_pursuit(input: DeskOpenPursuitArgs) async throws -> JSONValue {
-        let project = try deskProject(input.project, absent: DeskItem.workshopProject)
-        let title = try deskString(input.title, "title").trimmingCharacters(in: .whitespacesAndNewlines)
-        // The store owns refusal of empty pursuit fields.
-        let why = (nonblankDoorText(input.why) ?? "")
-        let doneLooksLike = (nonblankDoorText(input.doneLooksLike) ?? "")
-        let abandonCondition = (nonblankDoorText(input.abandonCondition) ?? "")
-        let privateName = nonblankDoorText(input.privateName)
-        let dossier = PromotionDossier(citations: input.evidence)
-        guard dossier.isValid else {
-            throw deskInvalid("evidence", reason: "evidence must be an array of complete current citation records. Nothing was opened.")
-        }
-        let pursuit = Pursuit(
-            why: why,
-            evidence: dossier,
-            doneLooksLike: doneLooksLike,
-            maxSessions: input.maxSessions ?? Pursuit.defaultMaxSessions,
-            maxDays: input.maxDays ?? Pursuit.defaultMaxDays,
-            abandonCondition: abandonCondition,
-            privateName: (privateName?.isEmpty == false) ? privateName : nil
-        )
-        let summary = nonblankDoorText(input.summary)
-        let store = deskStore()
-        do {
-            let item = try await store.openPursuit(
-                project: project, title: title, pursuit: pursuit,
-                summary: (summary?.isEmpty == false) ? summary : nil
-            )
-            return .object([
-                "status": .string("ok"),
-                "handle": .string(item.handle),
-                "alias": .string(item.alias),
-                "confirmation": .string("opened pursuit \(item.alias) \(item.project) · \(item.title)"),
-            ])
-        } catch let e as DeskError {
-            // Surface the store’s refusal so the model can adjust the dossier or scope.
-            return .object([
-                "status": .string("refused"),
-                "reason": .string(e.errorDescription ?? "\(e)"),
-            ])
-        }
     }
 
     // MARK: - desk_work_log
@@ -675,19 +629,6 @@ extension SwiftToolDispatcher {
             ])
         }
         return await deskConfirm(store, handle: handle, prefix: prefix)
-    }
-
-    // MARK: - desk_archive
-
-    func impl_desk_archive(input: DeskArchiveArgs) async throws -> JSONValue {
-        let handle = try deskString(input.handle, "handle")
-        let store = deskStore()
-        let rec = try await store.archiveItem(handle)
-        return .object([
-            "status": .string("ok"),
-            "handle": .string(handle),
-            "confirmation": .string("archived \(rec.project) · \(rec.title) (\(rec.finalStatus.rawValue))"),
-        ])
     }
 
     // MARK: - Helpers

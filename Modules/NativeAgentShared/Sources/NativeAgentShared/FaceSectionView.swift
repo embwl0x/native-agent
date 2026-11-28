@@ -266,7 +266,7 @@ struct FaceSectionView: View {
     }
 
     private func rowDoor(_ row: PartFace.Row) -> any FaceDoor {
-        if let collection, let scope = session.collections.scope(section: collection.id, row: row.id) { return door.scoped(to: scope) }
+        if let collection, let scope = session.collections.scope(section: collection, row: row.id) { return door.scoped(to: scope) }
         return door
     }
 }

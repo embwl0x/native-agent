@@ -19,9 +19,6 @@ public enum JSONLLineCaps {
     public static let receiptTrimTriggerBytes = 4 * 1024 * 1024
     public static let telegramBlocked = 5000
 
-    /// Desk receipts are display/idempotency evidence; base and tail own truth.
-    public static let deskArchive = 5000
-
     /// Inbox retention archives first and exempts held deliveries; destructive JSONL tail trimming is forbidden. The journal is a life record; its cap is only
     /// a runaway backstop.
     public static let studioJournal = 100_000

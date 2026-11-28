@@ -1,5 +1,3 @@
-import Foundation
-import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 
@@ -28,7 +26,7 @@ public struct TelegramModelSelectionCallback: Sendable, Equatable {
     }
 
     public static func selectionKey(_ identity: String) -> String {
-        SHA256.hash(data: Data(identity.utf8)).prefix(12).map { String(format: "%02x", $0) }.joined()
+        AttentionRouter.stableDigest(identity)
     }
 
     public static func providerData(id: String) -> String {

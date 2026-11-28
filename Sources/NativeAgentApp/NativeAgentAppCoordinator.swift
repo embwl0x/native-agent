@@ -161,10 +161,6 @@ final class ApplicationLifetime {
         routeObserverTokens = [
             notificationCenter.addObserver(of: nil, for: OpenApprovalsRequest.self) { [weak self] _ in
                 Task { @MainActor [weak self] in self?.request(.activity(.approvals)) }
-            },
-            notificationCenter.addObserver(of: nil, for: OpenCommandRouteRequest.self) { [weak self] message in
-                guard let target = NativeAgentNavigationDestination.route(message.route) else { return }
-                Task { @MainActor [weak self] in self?.request(target) }
             }
         ]
     }

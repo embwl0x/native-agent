@@ -568,18 +568,16 @@ public enum SwiftNativePersistenceCore {
         )
     }
 
-    /// Replace relative to a borrowed parent descriptor, or open the pathname's parent. The private 0600 temp uses a drive-cache flush when fullFlush is true;
-    /// its parent always uses a checked namespace fsync.
     @discardableResult
-    package static func atomicWrite(_ data: Data, to path: URL, parentFD: Int32? = nil, fullFlush: Bool = false,
+    package static func atomicWrite(_ data: Data, to path: URL, fullFlush: Bool = false,
                                     trackingRevision: Bool = false) throws -> SnapshotTailOpLog.FileStamp? {
         let dir = path.deletingLastPathComponent()
         let name = path.lastPathComponent
-        let directoryFD = parentFD ?? open(dir.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        let directoryFD = open(dir.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
         guard directoryFD >= 0 else {
             throw PersistenceCoreError.ioFailure("open(parent directory) failed: \(unsafe String(cString: strerror(errno)))")
         }
-        defer { if parentFD == nil { _ = close(directoryFD) } }
+        defer { _ = close(directoryFD) }
         let tmpName = ".\(UUID().uuidString.lowercased()).tmp"
         let tmpPath = dir.appendingPathComponent(tmpName)
 

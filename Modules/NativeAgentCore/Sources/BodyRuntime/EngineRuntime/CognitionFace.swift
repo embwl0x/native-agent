@@ -146,10 +146,6 @@ extension NativeAgentEngine {
             sections.append(.init(id: "embedding", style: .note,
                 rows: [.init(id: "embedding", title: issue.message, detail: issue.cause, tone: .failed)]))
         }
-        if let issue = reading.cloudKitIssue {
-            sections.append(.init(id: "cloudkit", style: .note,
-                rows: [.init(id: "cloudkit", title: issue.message, detail: issue.cause, tone: .failed)]))
-        }
         if reading.stale == true {
             sections.append(.init(id: "retained", style: .note,
                 rows: [.init(id: "retained", title: "Showing retained memory diagnostics.", tone: .attention)]))

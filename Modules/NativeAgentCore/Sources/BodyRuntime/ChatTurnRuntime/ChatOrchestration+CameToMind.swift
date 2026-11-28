@@ -10,7 +10,7 @@ import NativeAgentCore
 
 extension SwiftNativeTurnEngine {
     func familiarityFailure(_ error: Error, root: URL, turn: Turn) -> String? {
-        let owner = root.appendingPathComponent("mind/familiar.bin")
+        let owner = FamiliarLines.url(root)
         RepairOwed.owe(root, id: UUID().uuidString, kind: .run, operation: "mind.familiar", owner: owner.path,
             words: "Familiarity is unavailable: \(error.localizedDescription). No new familiarity was recorded; saved bytes are preserved.",
             tap: ToolFailureError.fileRepairInstruction(owner,

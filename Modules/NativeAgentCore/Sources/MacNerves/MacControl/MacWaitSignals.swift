@@ -26,12 +26,12 @@ public struct SystemMacAppActivationObserverSource: MacAppActivationObserverSour
             object: nil,
             queue: nil
         ) { _ in onActivation() }
-        return MacWorkspaceActivationObservation(center: center, token: token)
+        return MacWorkspaceObservation(center: center, token: token)
     }
 }
 
 /// Release the workspace subscription exactly once on every wait exit.
-final class MacWorkspaceActivationObservation: MacAXEffectObservation, Sendable {
+final class MacWorkspaceObservation: MacAXEffectObservation, Sendable {
     private let center: NotificationCenter
     private let token: Mutex<NSObjectProtocol?>
 

@@ -56,7 +56,6 @@ extension AppActions {
                   Requires Full Mac file access. The same read certification and confinement as shell.run applies; all other commands remain writes. \
                   Pre-launch refusals return execution:not_run, effect:none.
                   """),
-        .fold("git", "shell", "Run Git with explicit args; omitted cwd uses the app's verified source checkout, or workspace when none exists; returns cwd"),
         .fold("swift_build", "shell"),
         .fold("swift_test", "shell"),
         .fold("remote_node_list", "shell", read: true),

@@ -26,7 +26,7 @@ struct OnboardingWizard: View {
                             Circle()
                                 .fill(i <= state.step.rawValue ? NativeAgentShell.text : NativeAgentShell.tertiary)
                                 .frame(width: 8, height: 8)
-                                .animation(NativeAgentMotion.respecting(NativeAgentMotion.quickCurve, reduceMotion: reduceMotion), value: state.step)
+                                .animation(Animation.respecting(NativeAgentMotion.quickCurve, reduceMotion: reduceMotion), value: state.step)
                         }
                     }
                     .padding(.top, NativeAgentSpacing.xl)
@@ -165,13 +165,17 @@ private struct ProviderConnectStep: View {
     let onContinue: () async -> Void
     @Environment(AppModel.self) private var appModel
     @State private var configureSheet: String?
+    private var modelRow: PartFace.Row? {
+        appModel.face.slot(.page("providers")).value(as: PartFaceSnapshot.self)?.drawnFace?.allRows
+            .first { $0.id == "providers.chat_model" }
+    }
     private var accounts: [PartFace.Row] {
         state.providers.filter { $0.auth_modes.contains("api_key") }.map { provider in
             .init(id: provider.provider_id, title: provider.display_name, detail: provider.auth_status.detail,
                 actions: [.init(id: "configure", label: "Add key", call: .init("onboarding.provider.open", ["id": .string(provider.provider_id)]))])
         }
     }
-    private var face: PartFace {
+    private func face(modelRow: PartFace.Row?) -> PartFace {
         var sections: [PartFace.Section] = [
             .init(id: "onboarding.accounts", title: "Or use an API key", rows: accounts, folded: true)
         ]
@@ -192,7 +196,7 @@ private struct ProviderConnectStep: View {
             sections.append(.init(id: "onboarding.model", rows: [], block: .init(kind: "form", key: "onboarding.model", fields: [
                 .init(id: "model", label: "Chat model", kind: "choice",
                     value: .string(appModel.displayedChatProvider + "::" + appModel.displayedChatModel), required: true, options: options)
-            ], submit: [.init(id: "model", label: "Use this model", call: .init("onboarding.provider.model"))])))
+            ], submit: [.init(id: "model", label: "Use this model", call: modelRow?.control?.call)])))
         }
         sections.append(.init(id: "onboarding.navigation", rows: [
             .init(id: "onboarding.navigation", title: state.providerConnected ? "Ready to finish" : "You can connect later in Providers",
@@ -205,6 +209,8 @@ private struct ProviderConnectStep: View {
         return PartFace(title: "Connect an AI account.", line: "Use your subscription or an API key. Chat needs a connected account.", sections: sections)
     }
     var body: some View {
+        let modelRow = self.modelRow
+        let face = self.face(modelRow: modelRow)
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
                 FaceView(face: PartFace(title: face.title, line: face.line, sections: []), door: ReadOnlyFaceDoor(), session: state.forms)
@@ -212,7 +218,8 @@ private struct ProviderConnectStep: View {
                 OAuthSignInButton(provider: .anthropic)
                 AnthropicSetupTokenInput()
                 OAuthSignInButton(provider: .xai)
-                FaceView(face: PartFace(sections: face.sections), door: door, session: state.forms)
+                FaceView(face: PartFace(sections: face.sections).stampingPageRevision(modelRow?.pageRevision),
+                         door: door, session: state.forms)
             }
         }
         .sheet(isPresented: Binding(get: { configureSheet != nil }, set: { if !$0 { configureSheet = nil } })) {
@@ -221,6 +228,7 @@ private struct ProviderConnectStep: View {
             }
         }
         .task { await state.reloadProviders(refresh: { await appModel.loadProvidersForChat() }) }
+        .modifier(FaceObservation(demand: .key(.page("providers"))))
     }
     private var door: ClosureFaceDoor {
         ClosureFaceDoor(open: { _ in }, waitingOn: "your account") { input in
@@ -236,9 +244,9 @@ private struct ProviderConnectStep: View {
                         throw WireFailure(code: "model_required", message: "Choose a model.", cause: nil, effects: .none)
                     }
                     let reply = try await appModel.protectedFormAct(.pageAct(.init(page: "providers", row: "providers.chat_model", action: "set",
-                        value: .string(model), expectedRevision: nil,
-                        expectedCall: PartFace.Call("provider.choose", ["group": .string("chat"), "setting": .string("model")]).setting(.string(model)),
-                        answers: true, operation: input.id, checking: input.checking)))
+                        value: .string(model), expectedRevision: nil, expectedCall: input.expectedCall.setting(.string(model)),
+                        answers: true, operation: input.id, checking: input.checking,
+                        expectedPageRevision: input.expectedPageRevision)))
                     let outcome = try FaceActOutcome.reply(reply)
                     if let failure = outcome.failure { throw failure }
                     guard outcome.accepted, !outcome.unresolved else { return outcome }

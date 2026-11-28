@@ -39,7 +39,6 @@ public final class LLMCallTraceRecorder: Sendable {
 
     public struct Receipt: Sendable {
         public var recorded = false
-        public var ttftMs: Int?
         /// Capture request size before send.
         public var requestBytes: Int?
         /// Hashes of the cache scope and the request's first 2k and 8k bytes: whether two calls could share a cached prefix.
@@ -189,7 +188,6 @@ public final class LLMCallTraceRecorder: Sendable {
         guard !call.preview else { return }
         if let claim = Self.requestRecorded, claim.withLock({ receipt in
             defer { receipt.recorded = true }
-            if !receipt.recorded { receipt.ttftMs = ttftMs }
             return receipt.recorded
         }) { return }
         let accountingOverflow: Bool
@@ -350,18 +348,6 @@ public final class LLMCallTraceRecorder: Sendable {
             )
         }()
         await write(row, usageReceipt: usageReceipt, call: call)
-    }
-
-    /// Record `provider.noReply` once: the bound turn's daily trace or a standalone receipt.
-    public func recordNoReply(provider: String, seconds: Int, events: Int, surface: String, call: LLMCall) async {
-        guard !call.preview else { return }
-        let payload: [String: JSONValue] = [
-            "provider": .string(provider), "seconds": .int(Int64(seconds)), "events": .int(Int64(events)),
-            "surface": .string(surface), "turnId": .string(call.turn?.id ?? "unknown"),
-        ]
-        await write(TurnTraceEvent(kind: "provider.noReply", title: provider, status: "failed",
-            payload: .object(payload), createdAt: ISO8601DateFormatter().string(from: Date()),
-            turnId: call.turn?.id, sessionId: call.session, surface: surface, turn: call.turn), usageReceipt: nil, call: call)
     }
 
     /// Collection records incomplete output as failure evidence; Stop can release its caller before collection settles.

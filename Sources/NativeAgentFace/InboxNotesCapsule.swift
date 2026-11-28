@@ -42,11 +42,7 @@ struct InboxNotesCapsule: View {
         .sheet(item: $selectedItem) { item in
             InboxItemDetailSheet(
                 item: item,
-                onAction: { actionID in
-                    await actionFlight.perform {
-                        try await onAction(item.id, actionID)
-                    }
-                },
+                actionFlight: actionFlight,
                 onClose: { selectedItem = nil }
             )
             .presentationDetents([.medium, .large])

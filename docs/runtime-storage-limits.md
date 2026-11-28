@@ -10,9 +10,7 @@ applying the line policy before the byte policy and publishing the result once.
 | `telegram/receipts.jsonl` | 5,000 → 4,000 | No hard byte cap in this policy |
 
 Activity and Telegram receipt row checks run on the first append and then every 128 appends,
-so their row triggers can overshoot by 127. An oversized incoming diagnostic row is refused;
-inherited unreadable diagnostic bytes are preserved and appends that would
-cross the ceiling are refused.
+so their row triggers can overshoot by 127.
 
 Turn traces and standalone receipts are details in `experiences/experiences.sqlite`;
 the record forgets details older than `ExperienceStore.detailHorizon` (14 days) and

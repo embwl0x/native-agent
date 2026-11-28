@@ -100,9 +100,6 @@ public actor EngineFaceActs: FaceActHandler {
             case .committed(var result):
                 result.publicationFailure = result.publicationFailure.map { Self.redacted($0, act: act) }
                 return .committed(result)
-            case .operation(.completed(var result)):
-                result.publicationFailure = result.publicationFailure.map { Self.redacted($0, act: act) }
-                return .operation(.completed(result))
             case .card(var result):
                 result.failure = result.failure.map { Self.redacted($0, act: act) }
                 return .card(result)
@@ -149,9 +146,9 @@ public actor EngineFaceActs: FaceActHandler {
         case .restoreConversation:
             guard let platform else { throw Self.failure("body_adapter_unavailable", "The body selection adapter has not been installed.") }
             return try await platform.handle(act)
-        case .createConversation, .selectConversation, .markConversationRead, .renameConversation,
+        case .createConversation, .selectConversation, .renameConversation,
              .archiveConversation, .clearConversation, .pinConversation, .unpinConversation, .send, .stop,
-             .regenerate, .revise, .prepareRetryDraft, .appendSlashHelp:
+             .regenerate, .revise, .appendSlashHelp:
             return try await chat.handle(act, renderer: sink)
         case .setSurfaceExpanded(let surface, let block, let open):
             let saved = try await engine.setSurfaceExpanded(open, surface: surface, block: block).get()
@@ -169,7 +166,7 @@ public actor EngineFaceActs: FaceActHandler {
             return .provider(saved)
         case .pageAct(let request): return try await actOnPage(act, request: request)
         case .requestDocument(let request):
-            return try await EngineFaceProjection.document(request, engine: engine)
+            return try await EngineFaceProjection.document(request, engine: engine, stampRevision: true)
         case .remember(let text):
             try await engine.turns.runtime.storeMacChatMemoryFact(text)
             return .acknowledged
@@ -180,21 +177,11 @@ public actor EngineFaceActs: FaceActHandler {
             let saved = try await engine.turns.runtime.writeMacChatScratch(key: key, value: value, sessionId: session)
             guard saved.succeeded else { throw Self.failure("scratch_refused", saved.message) }
             return .result(.string(saved.message))
-        case .pinMemory(let id, let pinned):
-            try await engine.memory.setPinned(pinned, id: id)
-            return .acknowledged
         case .forgetMemory(let id):
             try await engine.memory.delete(id: id)
             return .committed(.init(identities: [id], value: .null, revision: nil, effects: .known, publicationFailure: nil))
-        case .resolveMemoryProposal(let id, let decision):
-            switch decision {
-            case .accept: _ = try await engine.memory.accept(proposalID: id)
-            case .reject: try await engine.memory.reject(proposalID: id, reason: "")
-            }
-            return .acknowledged
         case .searchMemories(let query): return try await searchMemories(query)
         case .readPersona(let documents): return try await readPersona(documents: documents)
-        case .savePersonaProfile(let profile): return try await savePersonaProfile(profile)
         case .savePersonaName(let name):
             let saved = try await engine.persona.saveName(name)
             await engine.memory.teachAssistantName(saved)
@@ -202,68 +189,23 @@ public actor EngineFaceActs: FaceActHandler {
         case .savePersonaDocument(let id, let content, let append, let expectedContent):
             let saved = try await engine.persona.saveDocument(id: id, content: content, appending: append, expectedContent: expectedContent)
             return try Self.committed(saved)
-        case .setDreamCycleEnabled(let enabled):
-            let saved = try await engine.cognitionView.setDreamCycleEnabled(enabled)
-            await engine.trust.publishPolicy(saved)
-            return try Self.committed(saved)
-        case .setREMCycleEnabled(let enabled):
-            let saved = try await engine.cognitionView.setRemCycleEnabled(enabled)
-            await engine.trust.publishPolicy(saved)
-            return try Self.committed(saved)
-        case .setInnerLifeEnabled(let enabled):
-            guard let runtime = engine.cognition else { throw Self.failure("body_unavailable", "There is no running mind: it starts when setup finishes.") }
-            let result = await engine.cognitionView.setInnerLifeEnabled(enabled, runtime: runtime, contextFlow: engine.contextFlow)
-            return .result(.object(["enabled": .bool(result.state.enabled), "contextFlowReady": .bool(result.contextFlowReady)]))
-        case .setContextFlowMode(let name): return try await setContextFlowMode(name)
-        case .setEmbeddingsEnabled(let enabled): return try await setEmbeddingsEnabled(enabled)
         case .testProvider(let request):
             return try await testProvider(request)
         case .disconnectProvider(let id):
             return try await disconnectProvider(id)
-        case .clearTelegramLogs:
-            let result = try await engine.telegram.clearTelegramDiagnostics(manager: .shared)
-            return .committed(.init(identities: ["telegram"], value: .object(["removedRows": .int(Int64(result.removedRowCount)),
-                "removedFiles": .int(Int64(result.removedFileCount))]), revision: result.clearedAt, effects: .known, publicationFailure: nil))
-        case .runDream: return .result(PartFace.Value(try await Self.dream(engine.dataRoot, rem: false)))
-        case .runREM: return .result(PartFace.Value(try await Self.dream(engine.dataRoot, rem: true)))
         case .cognition(let command): return try await cognition(command)
         case .onboarding(.greet):
             guard let platform else { throw Self.failure("body_adapter_unavailable", "The body greeting owner has not been installed.") }
             return try await platform.handle(act)
         case .onboarding(let request): return try await onboarding(request)
-        case .createBackup(let reason): return try await createBackup(reason)
         case .saveChatChoice(let request): return try await saveChatChoice(request)
         case .saveProviderConnection(let request): return try await saveProviderConnection(request)
         case .signOutProvider(let id): return try await disconnectProvider(id)
         case .decideCodexCLIConsent(let allow): return try await decideCodexCLIConsent(allow)
         case .repairCodexCLIConsent: return try await repairCodexCLIConsent()
         case .saveAnthropicSetupToken(let secret): return try await saveAnthropicSetupToken(secret)
-        case .setConnectorEnabled(let id, let enabled): return try await setConnectorEnabled(id, enabled: enabled)
-        case .disconnectConnector(let id): return try await disconnectConnector(id)
         case .saveConnectorCredentials(let request): return try await saveConnectorCredentials(request)
-        case .configureTelegram(let request): return try await configureTelegram(request)
-        case .testTelegram: return try await testTelegram()
-        case .removePhonePairing(let id): return try await removePhonePairing(id)
         case .applyTrustPreset(let request): return try await applyTrustPreset(request)
-        case .saveMemoryPolicy(let request): return try await savePolicyBlock("memoryPolicy", fields: request.fields, revision: request.expectedRevision)
-        case .setAutonomyEnabled(let enabled): return try await savePolicy(["enableAutonomy": .bool(enabled)])
-        case .setChromeControlEnabled(let enabled):
-            let saved = try await savePolicy(["chromeControlPolicy": .object(["enabled": .bool(enabled)])])
-            await engine.chrome.reconcilePolicy(context: .init(dataRoot: engine.dataRoot))
-            return saved
-        case .setKillSwitchEnabled(let enabled): return try await savePolicy(["securityPolicy": .object(["killSwitchEnabled": .bool(enabled)])])
-        case .saveMacIntegrationPreset(let preset): return try await saveMacIntegrationPreset(preset)
-        case .saveMacControlPolicy(let request): return try await saveMacControlPolicy(request)
-        case .saveMultimodalPolicy(let request):
-            return try await savePolicyBlock("multimodalPolicy", fields: request.fields, revision: request.expectedRevision)
-        case .refreshPrivacyInventory: await engine.trust.refreshPrivacyMap(); return .acknowledged
-        case .checkMail: await engine.macIntegration.checkMail(); return .acknowledged
-        case .setActivityPolicy(let request): return try await saveActivityPolicy(request)
-        case .excludeActivityApp(let id, let confirmed): return try await excludeActivityApp(id, confirmed: confirmed)
-        case .removeActivityExclusion(let id): return try await removeActivityExclusion(id)
-        case .wipeActivity(let confirmed): return try await wipeActivity(confirmed)
-        case .restoreBackup(let id, let confirmed): return try await restoreBackup(id, confirmed: confirmed)
-        case .requestSupportSnapshot: return try Self.result(await SupportDiagnostics.read(reusingChecks: nil))
         case .setEmbeddingDownload(let command):
             await MainActor.run {
                 switch command {
@@ -272,8 +214,6 @@ public actor EngineFaceActs: FaceActHandler {
                 }
             }
             return .acknowledged
-        case .createProductionExport(let support):
-            return try Self.committed(try await engine.doctor.createProductionExport(support: support))
         case .readRun(let id): return try await readRun(id)
         case .research(let query): return try await research(query)
         case .senseViewEvent(let presentation, let revision, let event):
@@ -288,18 +228,15 @@ public actor EngineFaceActs: FaceActHandler {
                 throw Self.failure("mac_handoff_unconfirmed", "Mac control changed or its input observer is unavailable. Control was not handed back.")
             }
             return .acknowledged
-        case .cancelRequest, .exportConversation, .requestCopy, .openTranscriptReader, .resizeTranscriptReader,
+        case .cancelRequest, .exportConversation, .openTranscriptReader, .resizeTranscriptReader,
              .releaseTranscriptReader, .transcriptReceipt, .setTranscriptFold, .firstVisibleReply,
-             .declarePreferences, .setPreference, .beginOAuth,
-             .answerCard, .verifyCardOnReturn, .importGrokCredentials, .setUpChrome,
-             .resolveApproval, .inboxAction, .openCard, .requestMacOSAccess,
-             .openMacOSSettings, .runMacControl, .notify,
-             .runDoctor, .reindexSpotlight, .requestUpdate, .updateInteraction,
+             .setPreference, .beginOAuth, .answerCard, .verifyCardOnReturn, .importGrokCredentials,
+             .inboxAction, .openCard, .runMacControl, .reindexSpotlight, .requestUpdate, .updateInteraction,
              .deskCommand, .addDeskNote,
              .exportMake, .sendContactMessage, .stopContactMessage, .resendContactMessage,
-             .withdrawContactMessage, .ingestAttachment, .captureScreen, .openBrowser, .voice,
-             .reportScene, .followSettled, .reportProtectedWindows, .reportOverlayWindow, .reportInspector, .reportRendererDiagnostic,
-             .notificationResponse, .quitBody, .restartBody:
+             .ingestAttachment, .captureScreen, .openBrowser, .voice,
+             .reportScene, .followSettled, .reportProtectedWindows, .reportOverlayWindow, .reportInspector,
+             .notificationResponse, .quitBody:
             guard let platform else { throw Self.failure("body_adapter_unavailable", "The body act adapter has not been installed.") }
             return try await platform.handle(act)
         }
@@ -425,16 +362,21 @@ public actor EngineFaceActs: FaceActHandler {
             throw Self.failure("invalid_control_value", "This page control takes a scalar value.")
         }
         if request.answers == true {
-            guard let expected = request.expectedCall else { throw Self.failure("drawn_call_missing", "Read the page before acting.") }
             let renderer = sink
             let outcome: FaceActOutcome
             do {
                 if request.checking == true {
-                    outcome = await engine.pages.reconcile(page: request.page, row: request.row, value: value, values: values, expecting: expected)
+                    guard let expected = request.expectedCall else { throw Self.failure("drawn_call_missing", "Read the page before checking.") }
+                    if let checked = try checkTurnStep(request, expecting: expected) {
+                        outcome = checked
+                    } else {
+                        outcome = await engine.pages.reconcile(page: request.page, row: request.row, value: value, values: values, expecting: expected)
+                    }
                 } else {
                     outcome = try await engine.pages.actOutcome(page: request.page, row: request.row, action: request.action, value: value,
                         values: values, formRevision: request.expectedRevision,
-                        door: "mac", expecting: expected, renderer: renderer, operation: request.operation, undoOf: request.undoOf)
+                        door: "mac", expecting: request.expectedCall, renderer: renderer, operation: request.operation, undoOf: request.undoOf,
+                        expectedPageRevision: request.expectedPageRevision)
                 }
             } catch let error as PartCallError {
                 outcome = .interrupted(Self.failure(error.code, error.message))
@@ -444,10 +386,14 @@ public actor EngineFaceActs: FaceActHandler {
             clean.failure = outcome.failure.map { Self.redacted($0, act: act) }
             return .result(try clean.wireValue())
         }
-        let words = try await engine.pages.act(page: request.page, row: request.row, action: request.action, value: value,
-            values: values, formRevision: request.expectedRevision,
-            door: "mac", expecting: request.expectedCall, renderer: sink)
-        return .result(words.map(PartFace.Value.string) ?? .null)
+        do {
+            let words = try await engine.pages.act(page: request.page, row: request.row, action: request.action, value: value,
+                values: values, formRevision: request.expectedRevision,
+                door: "mac", expecting: request.expectedCall, renderer: sink, expectedPageRevision: request.expectedPageRevision)
+            return .result(words.map(PartFace.Value.string) ?? .null)
+        } catch let error as PartCallError {
+            throw Self.failure(error.code, error.message)
+        }
     }
 
     private func searchMemories(_ query: String) async throws -> FaceActReply {
@@ -470,36 +416,28 @@ public actor EngineFaceActs: FaceActHandler {
         return .persona(reading)
     }
 
-    private func savePersonaProfile(_ profile: PersonalityProfile) async throws -> FaceActReply {
-        let saved = try await engine.persona.saveProfile(profile)
-        await engine.memory.teachAssistantName(saved.profile)
-        return .committed(.init(identities: [], value: PartFace.Value(try JSONValue.fromEncodable(saved.profile)), revision: nil, effects: .known,
-            publicationFailure: saved.documentsIssue.map {
-                WireFailure(code: "persona_documents_unavailable", message: "The profile was saved, but its documents could not be refreshed.",
-                    cause: $0, effects: .known)
-            }))
-    }
-
-    private func setContextFlowMode(_ name: String) async throws -> FaceActReply {
-        guard let mode = ContextFlowMode(rawValue: name) else { throw Self.failure("invalid_mode", "Choose an offered context mode.") }
-        let status = await engine.contextFlow.setMode(mode)
-        guard let saved = status.effectiveMode, status.unavailableReason == nil else {
-            throw Self.failure("context_unavailable", status.unavailableReason ?? "The context owner returned no effective mode.")
+    private func checkTurnStep(_ request: PageActRequest, expecting call: PartFace.Call) throws -> FaceActOutcome? {
+        guard let act = ChatTurnSteering.OwnerAct(rawValue: request.action) else { return nil }
+        guard call.action == request.action, let session = call.args["session"]?.stringValue,
+              NativeAgentChatSessionID.normalizedPathComponent(session) == session,
+              let turn = call.args["turn"]?.stringValue, request.row == turn,
+              let run = call.args["run"]?.stringValue, !run.isEmpty, request.page == PageFaceKey.turnSteps(session) else {
+            throw PartCallError(code: "drawn_call_missing", message: "Read the page before checking.")
         }
-        await engine.cognitionView.refreshContextFlowHealth { @Sendable [engine] in
-            await engine.contextFlow.observatoryHealthState()
+        let root = engine.dataRoot
+        switch act {
+        case .withdrawUnstarted:
+            if let checkpoint = try TurnCheckpoint.read(dataRoot: root, sessionId: session, turnId: turn),
+               checkpoint.runId == run, checkpoint.withdrawsUnstarted == true {
+                return .init(words: "Withdrawal was recorded for this turn.", effects: .known, accepted: true)
+            }
+        case .stop:
+            let marker = ChatCancelFlag.path(dataRoot: root, sessionId: session)
+            if let saved = try? String(contentsOf: marker, encoding: .utf8), saved.split(separator: "\n").contains(where: { $0 == run }) {
+                return .init(words: "Stop was requested for this run.", effects: .known, accepted: true)
+            }
         }
-        return .result(.string(saved.rawValue))
-    }
-
-    private func setEmbeddingsEnabled(_ enabled: Bool) async throws -> FaceActReply {
-        try await engine.memory.toggleEmbeddings(enabled)
-        guard let saved = await engine.memory.readEmbeddingSnapshot() else {
-            throw Self.failure("embedding_readback_unavailable", "The embedding choice was saved, but its runtime could not be read.", effects: .known)
-        }
-        return .result(.object(["requestedBackend": .string(saved.requestedBackend), "effectiveBackend": .string(saved.effectiveBackend),
-            "model": .string(saved.modelId), "dimensions": .int(Int64(saved.dimensions)),
-            "loadError": saved.lastLoadError.map(PartFace.Value.string) ?? .null]))
+        return .init(words: "The saved evidence does not confirm this command.", effects: .unknown)
     }
 
     /// A checking Mac control act reads its original operation's record; nothing runs again.
@@ -548,8 +486,9 @@ public actor EngineFaceActs: FaceActHandler {
         .result(PartFace.Value(try JSONValue.fromEncodable(value)))
     }
 
-    static func committed<Value: Encodable>(_ value: Value, identities: [String] = []) throws -> FaceActReply {
+    static func committed<Value: Encodable>(_ value: Value, identities: [String] = [],
+        publicationFailure: WireFailure? = nil) throws -> FaceActReply {
         .committed(.init(identities: identities, value: PartFace.Value(try JSONValue.fromEncodable(value)),
-            revision: nil, effects: .known, publicationFailure: nil))
+            revision: nil, effects: .known, publicationFailure: publicationFailure))
     }
 }

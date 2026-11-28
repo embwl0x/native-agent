@@ -5,10 +5,10 @@ import SenseCore
 import MindCore
 import DeskCore
 import Foundation
-import os
 import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
+import os
 
 // Blueprint: | `NativeCognitionRuntime+Continuity.swift` | `NativeCognitionRuntime`. |
 

@@ -367,7 +367,7 @@ extension MacSyncEngine {
         let processedSaved = await saveProcessedIds()
         let commit = await sync.storage.perform {
             Self.commitCompletionBookkeeping(dataRoot: actionStateRoot, msgId: action.msgId,
-                processedSaved: processedSaved, archiveError: nil)
+                processedSaved: processedSaved)
         }
         if !commit.clean, generation == snapshotLifecycleGeneration { syncError = commit.syncError }
 
@@ -375,12 +375,10 @@ extension MacSyncEngine {
         do {
             try await sync.bridge.sendCloudKitActionResponse(response, correlationID: action.msgId)
             guard isActive, generation == snapshotLifecycleGeneration else { return false }
-            lastInboxAt = Date()
             if !["chat_history_page", "faceRead", "workActivityState"].contains(action.action) {
                 await writeSnapshots(forceHeavy: true)
             }
             guard isActive, generation == snapshotLifecycleGeneration else { return false }
-            NotificationCenter.default.post(DeviceSync.InboxDidProcess())
             return true
         } catch {
             guard isActive, generation == snapshotLifecycleGeneration else { return false }

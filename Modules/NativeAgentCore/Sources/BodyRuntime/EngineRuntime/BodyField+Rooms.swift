@@ -25,12 +25,12 @@ extension BodyField {
         let next = MacRoom(front: front, readable: session.sessionReadable,
                            onConsole: session.onConsole, locked: session.screenIsLocked,
                            running: Set(apps).sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending })
-        guard room != next else { return }
-        room = next
+        guard room?.value != next else { return }
+        room = (next, Date())
         NotificationCenter.default.post(AgentWorkspaceScreenPreview.DidChange())
     }
 
-    func macRoom(_ root: URL) throws -> MacRoom {
+    func macRoom(_ root: URL) throws -> (value: MacRoom, at: Date) {
         guard !stopped else { throw PartCallError(code: "mac_body_stopped", message: "The Mac body field has stopped.") }
         guard root == self.root, let room else { throw Self.roomUnavailable }
         return room

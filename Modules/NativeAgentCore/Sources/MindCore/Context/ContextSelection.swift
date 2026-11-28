@@ -1,4 +1,5 @@
 import Foundation
+import Dispatch
 import HashTreeCollections
 import NativeAgentCore
 // Blueprint: | `ContextSelection.swift` | `ContextSelector.select`, `commonEligibilityFailure`: eligibility, touch, rest, quotas and receipts |
@@ -20,6 +21,11 @@ public struct ContextSelector: Sendable {
         pinnedTo snapshot: ContextGenerationSnapshot? = nil,
         sourceReadFailures: [ContextDegradedSourceNotice]
     ) throws -> ContextPacket {
+        try selectForTurn(need, from: generation, pinnedTo: snapshot, sourceReadFailures: sourceReadFailures).packet
+    }
+
+    func selectForTurn(_ need: NeedSignal, from generation: ContextStoredGeneration, pinnedTo snapshot: ContextGenerationSnapshot?,
+                       sourceReadFailures: [ContextDegradedSourceNotice]) throws -> (packet: ContextPacket, seeds: [ContextAtomID], rowLimit: Int?) {
         let selectionStarted = DispatchTime.now().uptimeNanoseconds
         try validate(need, generation: generation, snapshot: snapshot)
         let run = SelectionRun(need: need, generation: generation, snapshot: snapshot)
@@ -28,7 +34,12 @@ public struct ContextSelector: Sendable {
         seedMandatory(run)
         rankMemory(run, scoreContext: scoreContext)
         pack(run)
-        return packet(run, sourceReadFailures: sourceReadFailures, selectionStarted: selectionStarted)
+        let threshold = run.memoryTouch.relevance.count < 3 ? configuration.minimumRelevance : memoryStandout
+        let seeds = run.selectedItems.compactMap { item -> ContextAtomID? in
+            let id = item.pointer.atomID
+            return !item.mandatory && (run.memoryTouch.relevance[id] ?? 0) >= threshold ? id : nil
+        }
+        return (packet(run, sourceReadFailures: sourceReadFailures, selectionStarted: selectionStarted), seeds, run.effectiveMemoryRowLimit)
     }
 }
 
@@ -106,13 +117,15 @@ private extension ContextSelector {
 
         var decisions: [ContextEligibilityDecision] = []
         var excludedIDs: [ContextAtomID] = []
-    var eligible: [ContextStoredAtom] = []
+        var eligible: [ContextStoredAtom] = []
+        var mandatoryIDs = need.mandatoryAtomIDs
+        let now = Date()
         for atom in sortedAtoms {
             let reason = eligibilityReason(
                 for: atom,
                 generationID: generation.generation.id,
                 source: sourceByID[atom.draft.sourceID],
-                need: need
+                need: need, now: now
             )
             decisions.append(ContextEligibilityDecision(
                 atomID: atom.draft.id,
@@ -120,11 +133,11 @@ private extension ContextSelector {
                 exclusionReason: reason
             ))
             if reason == nil { eligible.append(atom) } else { run.excludedIDs.append(atom.draft.id) }
+            if reason == .notYetValid || reason == .expired { mandatoryIDs.remove(atom.draft.id) }
         }
         run.decisions = decisions
         run.eligible = eligible
 
-        var mandatoryIDs = need.mandatoryAtomIDs
         // Always-atoms are mandatory only within this request's authorized source scope.
         mandatoryIDs.formUnion(eligible.lazy.filter {
             $0.draft.injectionPolicy == .always
@@ -525,10 +538,88 @@ private extension ContextSelector {
 // MARK: - Selection internals
 
 extension ContextSelector {
+    func hasAssociationRoom(in packet: ContextPacket, rowLimit: Int?) -> Bool {
+        let dynamic = packet.selectedItems.filter { !$0.mandatory }
+        let memories = dynamic.filter { $0.pointer.kind == .memory || $0.pointer.kind == .correction }
+        return dynamic.count < configuration.maximumDynamicAtoms && packet.expandablePointers.count < configuration.maximumDynamicAtoms
+            && memories.count < min(rowLimit ?? Int.max, configuration.maximumAtoms(forKind: .memory))
+            && packet.characterCount < packet.budget.characterLimit
+    }
+
+    func addingAssociations(to packet: ContextPacket, seeds: [ContextAtomID], rowLimit: Int?, graph: ContextAssociationGraph,
+                            verified: Set<ContextAtomID>, studioAllowed: Bool, need: NeedSignal, generation: ContextStoredGeneration) -> ContextPacket {
+        let eligible = Set(packet.receipt.eligibility.filter(\.eligible).map(\.atomID))
+        let degraded = Set(packet.degradedSources.map(\.sourceID))
+        let now = Date()
+        func current(_ atom: ContextStoredAtom) -> Bool {
+            guard !degraded.contains(atom.draft.sourceID),
+                  let source = generation.sources(id: atom.draft.sourceID).first else { return false }
+            return Self.commonEligibilityFailure(for: atom, generationID: packet.generationID,
+                                                source: source, need: need, now: now) == nil
+        }
+        let memories = verified.intersection(eligible).compactMap { generation.atoms(id: $0).first }.filter {
+            !need.precoveredSourceIDs.contains($0.draft.sourceID) && current($0)
+        }
+        let partitions = Dictionary(uniqueKeysWithValues: memories.map {
+            ($0.draft.id, Set(ContextMemoryLead.untrustedSources(for: $0.draft)))
+        })
+        let relations = Set(graph.edges.compactMap(\.relation)).filter { id in
+            generation.atoms(id: id).first.map(current) == true
+        }
+        let studio = Set(graph.edges.compactMap { edge in
+            studioAllowed && edge.relation == edge.witness && relations.contains(edge.witness) ? edge.witness : nil
+        })
+        let touched = Set(packet.receipt.memoryRecall.map(\.atomID) + packet.receipt.selectedAtomIDs)
+        let indirect = memories.filter {
+            $0.draft.kind == .memory && !touched.contains($0.draft.id)
+                && (need.servedTurnsAgo[$0.draft.id] ?? Int.max) >= configuration.memoryRestTurns
+        }.map(\.draft.id).sorted()
+        guard seeds.contains(where: { partitions[$0] != nil }), !graph.edges.isEmpty, indirect.count >= 3 else { return packet }
+        let start = DispatchTime.now().uptimeNanoseconds
+        let hits = graph.walk(seeds: seeds, partitions: partitions, relations: relations, studio: studio, indirect: indirect)
+        let elapsed = Int((DispatchTime.now().uptimeNanoseconds - start) / 1_000)
+        var receipt = packet.receipt
+        var pointers = packet.expandablePointers
+        let dynamic = packet.selectedItems.filter { !$0.mandatory }
+        var sourceCounts = Dictionary(grouping: dynamic, by: \.pointer.sourceID).mapValues(\.count)
+        var kindCounts = Dictionary(grouping: dynamic, by: \.pointer.kind).mapValues(\.count)
+        var used = packet.characterCount, added = 0
+        for hit in hits {
+            guard dynamic.count + added < configuration.maximumDynamicAtoms, pointers.count < configuration.maximumDynamicAtoms else { break }
+            guard let atom = generation.atoms(id: hit.atom).first,
+                  quotaAllows(SelectionUnit(stableKey: hit.atom.rawValue, atoms: [atom]), sourceCounts: sourceCounts,
+                              kindCounts: kindCounts, memoryAtomRowLimit: rowLimit) else { continue }
+            let pointer = ContextAtomPointer(atom: atom, generationID: packet.generationID)
+            let cost = pointer.lazyLine.count + (added == 0 ? "\n\n# Deeper context\n".count : 1)
+            guard cost <= need.characterBudget - used else { continue }
+            var why = ContextMemoryRecallScore(atomID: hit.atom, relevance: nil,
+                reachability: need.memoryReachability[hit.atom] ?? 1, rested: false)
+            why.associationSeed = hit.seed
+            receipt.memoryRecall.append(why)
+            receipt.pointerAtomIDs.append(hit.atom)
+            pointers.append(pointer)
+            used += cost
+            added += 1
+            sourceCounts[pointer.sourceID, default: 0] += 1
+            kindCounts[pointer.kind, default: 0] += 1
+        }
+        if added > 0 {
+            receipt.budget = ContextBudgetUsage(characterLimit: need.characterBudget, usedCharacters: used,
+                                                mandatoryCharacters: packet.budget.mandatoryCharacters)
+            receipt.id = ContextStableID.digest(parts: [receipt.needFingerprint, String(packet.generationID), packet.sourceFingerprint]
+                + receipt.selectedAtomIDs.map(\.rawValue) + receipt.pointerAtomIDs.map(\.rawValue))
+        }
+        return ContextPacket(generationID: packet.generationID, sourceFingerprint: packet.sourceFingerprint,
+            selectedItems: packet.selectedItems, expandablePointers: pointers, degradedSources: packet.degradedSources,
+            budget: receipt.budget, receipt: receipt, associationWalkMicroseconds: elapsed)
+    }
+}
+
+extension ContextSelector {
     /// Shared admission, in selection-policy order. Expansion keeps pointer checks.
     static func commonEligibilityFailure(
         for atom: ContextStoredAtom, generationID: Int64,
-        source: ContextStoredSource, need: NeedSignal
+        source: ContextStoredSource, need: NeedSignal, now: Date
     ) -> (reason: ContextEligibilityReason, expansionError: ContextExpansionError)? {
         let id = atom.draft.id, sourceID = source.descriptor.id
         guard atom.validFromGeneration <= generationID,
@@ -558,7 +649,8 @@ extension ContextSelector {
         }
         if atom.draft.injectionPolicy == .neverInject { return (.neverInject, .atomNotExpandable(policy: .neverInject)) }
         if source.descriptor.injectionPolicy == .neverInject { return (.neverInject, .sourceInjectionDenied(sourceID)) }
-        if atom.draft.freshness.isExpired(at: need.evaluationTime) { return (.expired, .expired(id)) }
+        if let startsAt = atom.draft.freshness.startsAt, startsAt > now { return (.notYetValid, .notYetValid(id)) }
+        if atom.draft.freshness.isExpired(at: now) { return (.expired, .expired(id)) }
         if need.staleRuntimeAtomIDs.contains(id) { return (.staleRuntime, .staleRuntime(id)) }
         if need.secretBearingAtomIDs.contains(id) { return (.secretBearing, .secretBearing(id)) }
         return nil
@@ -575,10 +667,11 @@ private extension ContextSelector {
         for atom: ContextStoredAtom,
         generationID: Int64,
         source: ContextStoredSource?,
-        need: NeedSignal
+        need: NeedSignal,
+        now: Date
     ) -> ContextEligibilityReason? {
         guard let source else { return .missingSource }
-        let failure = Self.commonEligibilityFailure(for: atom, generationID: generationID, source: source, need: need)
+        let failure = Self.commonEligibilityFailure(for: atom, generationID: generationID, source: source, need: need, now: now)
         if let failure, failure.reason == .generationMismatch || failure.reason == .deleted { return failure.reason }
         if !ContextCorrectionScope.applies(atom.draft, message: need.message, recentTurns: need.recentTurns,
                                           subjectEntities: need.extractedEntities) {

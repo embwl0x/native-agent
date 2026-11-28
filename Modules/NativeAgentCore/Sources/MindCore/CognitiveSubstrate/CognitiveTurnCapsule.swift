@@ -157,6 +157,9 @@ public struct CognitiveCapsuleRequest: Sendable, Equatable {
     public var fromUser: Bool
     /// `UserTurnStamp` provides the prior verified user turn; unknown or non-user turns leave it nil.
     public var previousUserTurnAt: Date?
+    /// How much of the time since that turn fell in the person's usual quiet hours (`PersonRhythm.usualQuiet`), set by the runtime that owns the
+    /// rhythm. A night's sleep is not an absence: a gap under a day is measured without it.
+    public var usualQuietSincePreviousUserTurn: TimeInterval = 0
     /// Care speaker identity limits privacy; nil wakes or unidentified senders may press only self-held cares.
     public var speaker: String?
     public var sleepDream: CognitiveSleepDreamReading?
@@ -212,7 +215,6 @@ public struct CognitiveFeelingFrame: Sendable, Equatable {
 public struct CognitiveCapsule: Sendable, Equatable {
     public var generatedAt: Date
     public var mode: CognitiveCapsuleMode
-    public var stableKernel: String
     public var dynamicContext: String
     public var provenanceNodeIds: [UUID]
     public var sourcePeerIds: [String]?
@@ -221,15 +223,11 @@ public struct CognitiveCapsule: Sendable, Equatable {
     public var feelingFrame: CognitiveFeelingFrame?
 
     public var combined: String {
-        [stableKernel, dynamicContext]
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-            .joined(separator: "\n\n")
+        dynamicContext.trimmingCharacters(in: .whitespacesAndNewlines)
     }
     public init(
         generatedAt: Date,
         mode: CognitiveCapsuleMode,
-        stableKernel: String,
         dynamicContext: String,
         provenanceNodeIds: [UUID],
         truncated: Bool,
@@ -238,7 +236,6 @@ public struct CognitiveCapsule: Sendable, Equatable {
     ) {
         self.generatedAt = generatedAt
         self.mode = mode
-        self.stableKernel = stableKernel
         self.dynamicContext = dynamicContext
         self.provenanceNodeIds = provenanceNodeIds
         self.sourcePeerIds = sourcePeerIds
@@ -314,6 +311,17 @@ public struct CognitionAtTurn: Sendable, Equatable {
     public var isEmpty: Bool { capsule == nil && posture == nil }
 }
 public struct CognitiveAffectState: Codable, Sendable, Equatable {
+    public struct NamedFeeling: Codable, Sendable, Equatable {
+        public enum Name: String, Codable, Sendable {
+            case alarmed, angry, ashamed, guilty, longing, bored, disgusted, envious, awed, proud
+        }
+
+        static let retentionFloor = 0.05
+        public let name: Name
+        public internal(set) var strength: Double
+        public let at: Date
+    }
+
     public var arousal: Double
     public var uncertainty: Double
     public var taskPressure: Double
@@ -322,6 +330,7 @@ public struct CognitiveAffectState: Codable, Sendable, Equatable {
     /// Save the lived fold seq with affect axes and anchors so every writer retains the mutation's proof; zero carries no watermark.
     public var lived: UInt64
     public var chosenRegister: CognitiveChosenRegister?
+    public var namedFeeling: NamedFeeling?
 
     public init(
         arousal: Double = 0,
@@ -330,14 +339,16 @@ public struct CognitiveAffectState: Codable, Sendable, Equatable {
         socialWarmth: Double = 0,
         updatedAt: Date = Date(timeIntervalSince1970: 0),
         lived: UInt64 = 0,
-        chosenRegister: CognitiveChosenRegister? = nil
+        chosenRegister: CognitiveChosenRegister? = nil,
+        namedFeeling: NamedFeeling? = nil
     ) {
         self.arousal = (arousal).clamped01()
         self.uncertainty = (uncertainty).clamped01()
         self.taskPressure = (taskPressure).clamped01()
-        self.socialWarmth = (socialWarmth).clamped01()
+        self.socialWarmth = socialWarmth.clampedSigned()
         self.updatedAt = updatedAt
         self.lived = lived
         self.chosenRegister = chosenRegister
+        self.namedFeeling = namedFeeling
     }
 }

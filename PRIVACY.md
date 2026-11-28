@@ -141,7 +141,7 @@ rule expires it, or a bounded subsystem consolidates it. Removing a memory or
 conversation does not necessarily erase an independently created external
 record, provider log, exported file, backup, or previously delivered message.
 
-**More → Settings → Connection → Repair connection** removes
+**Control → Connection → Repair connection** removes
 the phone's local pairing key, clears connection delivery history, and opens
 pairing setup. It is a recovery flow, not a general deletion control, and does
 not delete Mac or iCloud data. To remove the mobile app's local container,

@@ -97,21 +97,30 @@ extension TelegramPollLoop {
         case .end(let outcome): return outcome
         }
         guard shouldCompleteClaim else { return nil }
-        await turnCoordinator.endUpdateProcessing(update.updateId)
-        do {
-            let completed = try await updateInbox.transition(
-                updateId: update.updateId,
-                from: [.processing],
-                to: .completed
-            )
+        let completion: Result<TelegramUpdateClaim, Error> = await settle {
+            let result: Result<TelegramUpdateClaim, Error>
+            do {
+                result = .success(try await updateInbox.transition(
+                    updateId: update.updateId,
+                    from: [.processing],
+                    to: .completed
+                ))
+            } catch {
+                await recordError(context: "update_inbox_complete", error: String(describing: error), update: update)
+                result = .failure(error)
+            }
+            await turnCoordinator.endUpdateProcessing(update.updateId)
+            return result
+        }
+        switch completion {
+        case .success(let completed):
             guard completed.phase == .completed else {
                 return .failed(error: "Telegram update \(update.updateId) could not be settled")
             }
-        } catch {
-            await recordError(context: "update_inbox_complete", error: String(describing: error), update: update)
+            return nil
+        case .failure:
             return .failed(error: "Telegram update \(update.updateId) completed but its durable claim could not settle")
         }
-        return nil
     }
 
     /// Route one update in processing: card buttons first, then the message: its words, a command, a handoff, or a chat turn.
@@ -162,13 +171,9 @@ extension TelegramPollLoop {
             await runCommandDetached(update: update, message: msg, text: handoffText)
             return .rested(completeClaim: false)
         }
-        if let unsupportedAttachmentKind {
-            // A supported text caption still follows its original route; the notice makes clear that its attached file was not read.
-            await notifyUnsupportedAttachment(kind: unsupportedAttachmentKind, update: update, message: msg)
-        }
         return await startChatTurn(update: update, claim: claim, msg: msg, textFromMessage: textFromMessage,
-            voiceAttachment: voiceAttachment, mediaAttachment: mediaAttachment, text: text, handoffText: handoffText,
-            updateInbox: updateInbox)
+            voiceAttachment: voiceAttachment, mediaAttachment: mediaAttachment, unsupportedAttachmentKind: unsupportedAttachmentKind,
+            text: text, handoffText: handoffText, updateInbox: updateInbox)
     }
 
     private typealias IncomingMessage = (textFromMessage: String?, voiceAttachment: TelegramMediaAttachment?,
@@ -241,7 +246,7 @@ extension TelegramPollLoop {
            textFromMessage?.isEmpty != false, voiceAttachment == nil, mediaAttachment == nil {
             // Admitted senders need truthful attachment evidence; never reply to outsiders or unmentioned groups, or invent attachment text.
             await recordBlocked(reason: "empty_or_non_text", update: update, message: msg, text: msg.text)
-            if !Self.dropsForMissingMention(requireMention: requireMention, chatId: msg.chatId, text: "") {
+            if !Self.dropsForMissingMention(requireMention: requireMention, chatId: msg.chatId) {
                 await notifyUnsupportedAttachment(kind: unsupportedAttachmentKind, update: update, message: msg)
             }
             return nil
@@ -297,23 +302,32 @@ extension TelegramPollLoop {
         return nil
     }
 
-    private func retainPendingBotIdentity(update: TelegramUpdate, updateInbox: TelegramUpdateInbox) async -> UpdateRouting {
-        let failure = "Telegram update \(update.updateId) could not be retained pending bot identity"
-        do {
-            let pending = try await updateInbox.transition(updateId: update.updateId, from: [.processing], to: .pending)
-            await turnCoordinator.endUpdateProcessing(update.updateId)
-            return pending.phase == .pending ? .rested(completeClaim: false) : .end(.failed(error: failure))
-        } catch {
-            await turnCoordinator.endUpdateProcessing(update.updateId)
-            await recordError(context: "bot_identity_pending", error: String(describing: error), update: update)
-            return .end(.failed(error: failure))
+    private func releaseClaimToPending(_ update: TelegramUpdate, updateInbox: TelegramUpdateInbox, context: String) async -> Bool {
+        await settle {
+            do {
+                let pending = try await updateInbox.transition(updateId: update.updateId, from: [.processing], to: .pending)
+                await turnCoordinator.endUpdateProcessing(update.updateId)
+                return pending.phase == .pending
+            } catch {
+                await turnCoordinator.endUpdateProcessing(update.updateId)
+                await recordError(context: context, error: String(describing: error), update: update)
+                return false
+            }
         }
+    }
+
+    private func retainPendingBotIdentity(update: TelegramUpdate, updateInbox: TelegramUpdateInbox) async -> UpdateRouting {
+        guard await releaseClaimToPending(update, updateInbox: updateInbox, context: "bot_identity_pending") else {
+            return .end(.failed(error: "Telegram update \(update.updateId) could not be retained pending bot identity"))
+        }
+        return .rested(completeClaim: false)
     }
 
     /// Pin the session, register Stop and start the tracked turn; from here the turn's own work owns the claim.
     private func startChatTurn(update: TelegramUpdate, claim: TelegramUpdateClaim, msg: TelegramMessage, textFromMessage: String?,
                                voiceAttachment: TelegramMediaAttachment?, mediaAttachment: TelegramMediaAttachment?,
-                               text: String, handoffText: String, updateInbox: TelegramUpdateInbox) async -> UpdateRouting {
+                               unsupportedAttachmentKind: String?, text: String, handoffText: String,
+                               updateInbox: TelegramUpdateInbox) async -> UpdateRouting {
         // Pin before media work and queue waits so later /new or /resume cannot redirect the message while polling admits controls.
         let turnSessionId: String
         do {
@@ -323,6 +337,11 @@ extension TelegramPollLoop {
                 turnSessionId = try await TelegramSessionStore(dataRoot: dataRoot)
                     .activeSessionId(destination: msg.destination)
             }
+        } catch is CancellationError {
+            guard await releaseClaimToPending(update, updateInbox: updateInbox, context: "update_inbox_shutdown_hold") else {
+                return .end(.failed(error: "Telegram update \(update.updateId) could not be saved for replay"))
+            }
+            return .end(.skipped(reason: "Telegram poll cancelled"))
         } catch {
             await recordError(context: "turn_session", error: String(describing: error), update: update, message: msg, text: text)
             let notice = Self.chatErrorNotice(for: error)
@@ -395,7 +414,7 @@ extension TelegramPollLoop {
                         await card.transition(canceled ? .canceled(reason: retryAfterShutdown
                             ? "Interrupted by shutdown; message saved for retry" : stopReadFailure ?? "Stopped by user")
                             : noticeSent ? .completed(summary: nil) : .failed(reason: Self.chatErrorNotice(for: error)))
-                        if !retryAfterShutdown {
+                        if !canceled || stopReadFailure != nil {
                             await recordError(context: "media_preparation", error: stopReadFailure ?? String(describing: error),
                                 update: update, message: msg, text: text)
                         }
@@ -409,6 +428,9 @@ extension TelegramPollLoop {
                         }
                     }
                     return nil
+                }
+                if let unsupportedAttachmentKind {
+                    await notifyUnsupportedAttachment(kind: unsupportedAttachmentKind, update: update, message: msg)
                 }
                 await turnCoordinator.recordLastUserMessage(destination: msg.destination, text: prepared.text, message: msg,
                     sessionId: turnSessionId, updatingCurrent: true)
@@ -427,10 +449,9 @@ extension TelegramPollLoop {
         await turnCoordinator.recordLastUserMessage(destination: msg.destination, text: text, message: msg, sessionId: turnSessionId)
         guard await turnCoordinator.startTrackedTurn(id: queuedTurnId, destination: msg.destination, text: text,
             priority: .userInitiated, operation: turnOperation) else {
-            // Intake is stopping: the update waits for recovery instead of settling unanswered.
-            await turnCoordinator.endUpdateProcessing(update.updateId)
-            do { _ = try await updateInbox.transition(updateId: update.updateId, from: [.processing], to: .pending) }
-            catch { await recordError(context: "update_inbox_shutdown_hold", error: String(describing: error), update: update) }
+            guard await releaseClaimToPending(update, updateInbox: updateInbox, context: "update_inbox_shutdown_hold") else {
+                return .end(.failed(error: "Telegram update \(update.updateId) could not be saved for replay"))
+            }
             return .nextUpdate
         }
         return .rested(completeClaim: false)

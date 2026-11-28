@@ -24,13 +24,17 @@ private enum CognitiveReflectionPersonaError: Error, Sendable, CustomStringConve
 }
 
 extension NativeCognitionRuntime {
+    private static let reflectionCancelled = LoopTickOutcome.skipped(reason: "reflection cancelled")
+    private static let reflectionCancelledBeforeDispatch = LoopTickOutcome.skipped(reason: "reflection cancelled before dispatch")
+
     /// Budget and in-flight refusals keep dream reflection owed; disabled reflection settles with its off reason.
     public enum DreamReflection: Sendable { case judged(CognitiveReflectionReceipt), skipped(String) }
 
     /// Persist the provider receipt before returning; exact reason identity lets recovery integrate without another production call.
     public func produceDreamReflection(id: UUID, material: [String: CognitiveReflectionCause]) async throws -> DreamReflection {
         await bootstrap()
-        guard usesLiveAppBody, !isAdmissionClosed, !Task.isCancelled else {
+        try Task.checkCancellation()
+        guard usesLiveAppBody, !isAdmissionClosed else {
             throw PersistenceCoreError.ioFailure("dream reflection awaits the running mind")
         }
         if let bootstrapFailure { throw PersistenceCoreError.ioFailure(bootstrapFailure) }
@@ -42,7 +46,10 @@ extension NativeCognitionRuntime {
             return .judged(receipt)
         }
         let configuration = await substrate.configurationSnapshot()
-        guard configuration.enabled, configuration.reflectiveCallsEnabled else { return .skipped("reflection disabled") }
+        guard configuration.enabled, configuration.reflectiveCallsEnabled else {
+            OrganJudge.beatOff("pursuit_proposer", because: "reflection is off")
+            return .skipped("reflection disabled")
+        }
         guard configuration.persistenceEnabled else {
             throw PersistenceCoreError.ioFailure("dream reflection requires durable inner life")
         }
@@ -57,7 +64,7 @@ extension NativeCognitionRuntime {
             throw PersistenceCoreError.ioFailure("dream reflection awaits replay: \(detail)")
         }
         let outcome = await runReflectionIfDue(
-            llm: NativeAgentEngine.makeSharedLLMClient(dataRoot: dataRoot, cognitionRuntime: self, assembly: .suppliedPersona),
+            llm: NativeAgentEngine.makeSharedLLMClient(dataRoot: dataRoot, cognitionRuntime: self),
             reason: reason, material: material.merging(rem) { dream, _ in dream }, retainForDream: true)
         if case .skipped = outcome {} else { rem = [:] }
         await reportLoopOutcome(loopId: "cognition_reflection", outcome: outcome)
@@ -68,6 +75,7 @@ extension NativeCognitionRuntime {
             try await substrate.checkpointReflectionResultChecked(receipt)
             return .judged(receipt)
         }
+        if outcome == Self.reflectionCancelled || outcome == Self.reflectionCancelledBeforeDispatch { throw CancellationError() }
         switch outcome {
         case .failed(let error): throw PersistenceCoreError.ioFailure("dream reflection failed: \(error)")
         // Switched-off reflection settles with its off reason.
@@ -115,7 +123,7 @@ extension NativeCognitionRuntime {
         defer { reflectionEventTask = nil }
         guard !isAdmissionClosed, !Task.isCancelled else { return }
         let outcome = await runReflectionIfDue(
-            llm: NativeAgentEngine.makeSharedLLMClient(dataRoot: dataRoot, cognitionRuntime: self, assembly: .suppliedPersona),
+            llm: NativeAgentEngine.makeSharedLLMClient(dataRoot: dataRoot, cognitionRuntime: self),
             reason: reason,
             material: material
         )
@@ -124,7 +132,6 @@ extension NativeCognitionRuntime {
     }
 
     /// Dream and replay reflection share admission and retained settlement.
-    /// The injected client uses supplied-persona assembly: this owner compiles the reflection system itself.
     @discardableResult
     public func runReflectionIfDue(
         llm: any LLMClient,
@@ -140,10 +147,12 @@ extension NativeCognitionRuntime {
         let now = Date()
         let window = DeskPursuitChoice.windowKey(now)
         let acquired = await lease.tryAcquire(holder: "reflection", window: window)
+        if !acquired, Task.isCancelled { return Self.beatReflection(Self.reflectionCancelled) }
         if !acquired, !retainForDream {
             // A claimed slot is busy and names its holder and the next slot; a lease that cannot be read is a failure, never a hold.
             let held: (holder: String, acquiredAt: String)?
             do { held = try await lease.claim(window: window) }
+            catch is CancellationError { return Self.beatReflection(Self.reflectionCancelled) }
             catch { return Self.beatReflection(.failed(error: "the background work lease could not be read: \(error.localizedDescription)")) }
             guard let held else {
                 return Self.beatReflection(.failed(error: "the background work lease refused window \(window), but no claim on it was read"))
@@ -176,9 +185,8 @@ extension NativeCognitionRuntime {
             }
         }
         let reflectionOutcome = await executeReflection(request: request, llm: llm, retainForDream: retainForDream)
-        if acquired, case .skipped(let why, _) = reflectionOutcome, why != "reflection cancelled" {
-            // Return the unused slot if routing refused before provider work; cancellation after dispatch spends it.
-            _ = await lease.releaseUnused(holder: "reflection", window: window)
+        if acquired, case .skipped = reflectionOutcome, reflectionOutcome != Self.reflectionCancelled {
+            await settle { _ = await lease.releaseUnused(holder: "reflection", window: window) }
         }
         if case .failed(let error) = reflectionOutcome { failedReflection = (window, error) }
         publishRuntimeChange(reason: "reflection:finished")
@@ -296,7 +304,7 @@ extension NativeCognitionRuntime {
         }
         let outcome = await executeReflection(
             request: request,
-            llm: NativeAgentEngine.makeSharedLLMClient(dataRoot: dataRoot, cognitionRuntime: self, assembly: .suppliedPersona),
+            llm: NativeAgentEngine.makeSharedLLMClient(dataRoot: dataRoot, cognitionRuntime: self),
             retainForDream: false
         )
         publishRuntimeChange(reason: "reflection:manual_finished")
@@ -332,6 +340,9 @@ extension NativeCognitionRuntime {
                 throw ProviderRoutingError.configurationFailed("Reflection's admitted Think level is unavailable.")
             }
             plannedRequest.reasoningEffort = effort
+        } catch is CancellationError {
+            await substrate.releaseReflectionReservation(request: request)
+            return Self.reflectionCancelledBeforeDispatch
         } catch {
             await substrate.releaseReflectionReservation(request: request)
             await substrate.recordReceipt(
@@ -345,7 +356,12 @@ extension NativeCognitionRuntime {
         }
         let request = plannedRequest
         do {
-            let system = try await cognitiveReflectionSystemPrompt(surface: request.surface)
+            let system: String
+            do { system = try await cognitiveReflectionSystemPrompt(surface: request.surface) }
+            catch is CancellationError {
+                await substrate.releaseReflectionReservation(request: request)
+                return Self.reflectionCancelledBeforeDispatch
+            }
             guard let provider = route.providerId, !provider.isEmpty else {
                 throw ProviderRoutingError.configurationFailed("The reflection provider is unavailable.")
             }
@@ -382,7 +398,7 @@ extension NativeCognitionRuntime {
                 rejection: "reflection cancellation was not accepted by the substrate",
                 persistenceFailure: "reflection cancellation receipt persistence failed"
             ) { return failure }
-            return .skipped(reason: "reflection cancelled")
+            return Self.reflectionCancelled
         } catch {
             if let failure = await settleReflectionResult(
                 request: request,
@@ -458,6 +474,8 @@ extension NativeCognitionRuntime {
             packet = try await PersonaCompiler(engine: persona).compile(
                 surface: surface, userMemoryCore: userMemoryCore
             )
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             throw CognitiveReflectionPersonaError.compileFailed(String(describing: error))
         }
@@ -493,7 +511,6 @@ extension NativeCognitionRuntime {
             guard let preference = snapshot.preferences[surface] else {
                 return NativeReflectionRouteStatus(
                     model: "",
-                    providerID: "",
                     providerReady: false,
                     modelKnown: nil,
                     detail: "No reflection route is configured."
@@ -504,7 +521,6 @@ extension NativeCognitionRuntime {
             guard let provider = providers.first(where: { $0.id == providerID }) else {
                 return NativeReflectionRouteStatus(
                     model: preference.model,
-                    providerID: providerID,
                     providerReady: false,
                     modelKnown: nil,
                     detail: "The selected reflection provider is unavailable."
@@ -542,7 +558,6 @@ extension NativeCognitionRuntime {
             }
             return NativeReflectionRouteStatus(
                 model: preference.model,
-                providerID: providerID,
                 providerReady: providerReady,
                 modelKnown: modelKnown,
                 detail: detail
@@ -550,7 +565,6 @@ extension NativeCognitionRuntime {
         } catch {
             return NativeReflectionRouteStatus(
                 model: "",
-                providerID: "",
                 providerReady: false,
                 modelKnown: nil,
                 detail: "Reflection routing is unavailable: \(error.localizedDescription)"

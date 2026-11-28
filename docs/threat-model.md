@@ -21,7 +21,7 @@ underlying Trust checks still apply.
 | Browser IPC | Separate loopback endpoint/token; browser operations reject unsafe URL schemes |
 | Paired iOS transport | Signed requests checked by `MacSyncEngine` before dispatch; pairing material owned by `PairingSecret` |
 | APNS | HTTP 2xx means provider acceptance, not proof of user display; `MobileNotificationDeliveryReceipt.swift` reports display as unverified |
-| Peer-steered turns | **Just this** admits one call; **For this task** elevates its peers for the run; [Trust](ONE_DOOR.md#authority-and-receipts) applies |
+| Peer-steered turns | **Just this** admits one call. **For this task** can elevate peers on the same live, unjoined Ask. [Trust](ONE_DOOR.md#authority-and-receipts) applies. |
 | Contacts at the table | A saved contact with a table door reads the standing table through MCP `agent_desk` with its own key; the rest of the Desk and the pieces laid on it need the person's per-contact lever (`readsDesk`) or Trust (`atTable`). Only a trusted contact writes, and only on the standing table (`put`, `cross`, `remove`, signed with its own identity, editing only its own elements). Reads reach only pieces laid on open board items (each document's words bounded at 2 MB), the lever is rechecked before any words go back, and the contact's last read or write is kept on its own record, shown on Connectors and in the agent's line for it |
 | Model input from web, tools or peers | Content is input, not operator authority |
 
@@ -37,7 +37,9 @@ can obtain its bearer token; the peer descriptor contains only the URL.
 - **An untrusted agent's command:** even under Full Mac, a turn an agent the
   owner has not trusted started with its message files one card on its first
   effect, quoting what the agent asked. **Just this** runs one call; the next protected call asks again.
-  **For this task** elevates the card's peers until the run ends. Reading any agent's words steers nothing. Agents enabled in
+  **For this task** elevates the card's peers on the same live, unjoined Ask.
+  A continuation uses the current Ask's authority. An untrusted job report
+  adds its attested author to the Ask as a steering source when read. Agents enabled in
   Trust → Connected agents carry the owner's authority on authenticated turns.
   App startup and engine port installation bind the same root-independent trust readers once, before any engine opens.
   Only the body-backed engine installs the ability-keep policy reader. Each keep reads the policy in its own data root.

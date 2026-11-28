@@ -18,7 +18,7 @@ struct TurnPart {
 
     let dataRoot: URL
     let surface: String
-    let turn: Turn
+    private let askID: String
     let deadlines: OperationDeadlines
     /// The turn's cancel flag: Stop ends every wait here.
     let stop: URL?
@@ -34,7 +34,7 @@ struct TurnPart {
     /// Keep started calls without results so a re-proposal identifies the same uncertain effect.
     private(set) var uncertain: [JSONValue] = []
     private var finished = false
-    private var queue: [(effect: [String: JSONValue], identity: String, step: Int)] = []
+    private var queue: [(effect: [String: JSONValue], identity: String, step: Int, askID: String)] = []
     private var state: JSONValue = .null
     /// Track round and call identity so each model call dispatches once.
     private var round: (ordinal: Int, ids: [String], used: Set<Int>)?
@@ -54,7 +54,7 @@ struct TurnPart {
     /// The installed current version runs. Only an absent current slot admits
     /// seed installation; a failed read or write ends with its storage cause.
     init(dataRoot: URL, surface: String, stop: URL?, context: LazyContextBox, log: [JSONValue], turn: Turn, deadlines: OperationDeadlines) async throws {
-        self.turn = turn
+        self.askID = turn.id
         self.deadlines = deadlines
         self.dataRoot = dataRoot; self.surface = surface; self.stop = stop; self.log = log
         self.context = context
@@ -117,10 +117,18 @@ struct TurnPart {
 
     /// Each event is one step. A program/helper fault heals and replays the
     /// batch; Stop and storage failures retain their own boundaries.
-    mutating func deliver(_ events: [JSONValue]) async throws {
+    mutating func deliver(_ events: [JSONValue], turn: Turn) async throws {
+        try checkAsk(turn.id)
         let first = log.count
-        log += events.map { .object(["event": $0]) }
-        do throws(TurnPartStepError) { for index in first..<log.count { try await step(index) } }
+        let steering = PeerDataTaint.carried(turn: turn, surface: surface)
+        let ask: JSONValue = .object([
+            "id": .string(turn.id), "principal": .string(turn.originPrincipal),
+            "steered_by": .array(steering.sources.map(JSONValue.string)),
+            "elevated": .array(steering.elevated.map(JSONValue.string)),
+            "file_access_ceiling": .array(turn.fileAccessCeiling.modes.map(JSONValue.string)),
+        ])
+        log += events.map { .object(["event": $0, "ask": ask]) }
+        do throws(TurnPartStepError) { for index in first..<log.count { try await step(index, turn: turn) } }
         catch {
             _ = try await heal(error, turn: turn)
         }
@@ -128,9 +136,10 @@ struct TurnPart {
 
     /// Resume reports unmatched starts, queued effects or undispatched model calls without rerunning uncertain work.
     /// After repair, use the repaired version's pending effects.
-    mutating func resume() async throws -> Bool {
+    mutating func resume(turn: Turn) async throws -> Bool {
+        try checkAsk(turn.id)
         let before = heals
-        let inFlight = try await rebuild()
+        let inFlight = try await rebuild(turn: turn)
         let lastStart = log.lastIndex { if case .object(let entry) = $0 { entry["start"] != nil } else { false } } ?? -1
         // Effects queued beside the last started one were decided on certain ground unless a call is still in flight:
         // then finish them (reply.end and after a checkpointed stream); with a call in flight, the program decides again.
@@ -143,13 +152,16 @@ struct TurnPart {
     }
 
     /// Log an effect as started before returning it for execution.
-    mutating func next() async throws -> (effect: [String: JSONValue], event: [String: JSONValue])? {
+    mutating func next(turn: Turn) async throws -> (effect: [String: JSONValue], event: [String: JSONValue])? {
+        try checkAsk(turn.id)
         while queue.isEmpty {
             if finished { return nil }
             if Task.isCancelled || ChatCancelFlag.isRaised(stop) { throw CancellationError() }
             _ = try await heal(.programFault(code: "stalled", why: "Its steps left the turn with nothing to do and no reply.end."), turn: turn)
         }
-        let item = queue.removeFirst()
+        let item = queue[0]
+        try checkAsk(item.askID)
+        queue.removeFirst()
         log.append(.object(["start": .object(["id": .string(item.identity)])]))
         if case .object(let entry) = log[item.step], case .object(let event)? = entry["event"],
            event["type"] == .string("provider_failure") {
@@ -168,6 +180,10 @@ struct TurnPart {
             row.objectValue?["event"] != nil || row.objectValue?["arrival"] != nil
         }
         return (item.effect, superseded ? [:] : event)
+    }
+
+    private func checkAsk(_ id: String) throws {
+        guard id == askID else { throw TurnEngineError.turnPartFailed("The turn part and its effects belong to a different ask.") }
     }
 
     /// One dispatch round holds either the model's calls or the agent's program's own, never both.
@@ -231,7 +247,8 @@ struct TurnPart {
     }
 
     /// Hearing is optional CPU judgment, with no step, effects or turn-program recovery.
-    mutating func hear(_ offer: ChatTurnSteering.Offer) async throws -> Bool {
+    mutating func hear(_ offer: ChatTurnSteering.Offer, turn: Turn) async throws -> Bool {
+        try checkAsk(turn.id)
         let runner = OwnedProgramRunner(dataRoot: dataRoot)
         let program = OwnedProgram(kind: .turn, id: file.id, version: file.bodyDigest, source: file.body, entry: .run, resident: true)
         var trace: [String: JSONValue] = ["arrival": .string(offer.turn.run), "sourceDigest": .string(file.bodyDigest)]
@@ -315,7 +332,7 @@ struct TurnPart {
     }
 
     /// Replay one log for resume and repair; match effects by identity, retain unknown in-flight starts and queue only unstarted work.
-    private mutating func reconstruct() async throws(TurnPartStepError) -> Bool {
+    private mutating func reconstruct(turn: Turn) async throws(TurnPartStepError) -> Bool {
         state = .null; queue = []; round = nil; rounds = 0; seen = [:]
         openingBody = nil
         system = nil; offeredTools = nil; finished = false; afterTurn = false; quietReflection = nil; answered = ""
@@ -345,7 +362,7 @@ struct TurnPart {
                     queue.removeAll { $0.effect["effect"] == .string("app") }
                 default: break
                 }
-                try await step(index)
+                try await step(index, turn: turn)
                 if event["type"] == .string("model"), let round, case .array(let calls)? = event["calls"] {
                     for (at, call) in calls.enumerated() where round.ids.indices.contains(at) {
                         named[Self.callIdentity(round, at)] = call
@@ -361,8 +378,8 @@ struct TurnPart {
         return !open.isEmpty
     }
 
-    private mutating func rebuild() async throws -> Bool {
-        do throws(TurnPartStepError) { return try await reconstruct() }
+    private mutating func rebuild(turn: Turn) async throws -> Bool {
+        do throws(TurnPartStepError) { return try await reconstruct(turn: turn) }
         catch {
             return try await heal(error, turn: turn)
         }
@@ -377,13 +394,15 @@ struct TurnPart {
         catch { throw .storageUnavailable(error) }
     }
 
-    private mutating func step(_ index: Int) async throws(TurnPartStepError) {
+    private mutating func step(_ index: Int, turn: Turn) async throws(TurnPartStepError) {
         guard case .object(var entry) = log[index], case .object(let event)? = entry["event"] else { return }
         var logged: [String: JSONValue] = [:]
         if case .object(let answers)? = entry["reach"] { logged = answers }
         let host = Reach(context: context, answers: logged)
         defer { entry["reach"] = .object(host.answers); log[index] = .object(entry) }
-        let answer = try await run(.object(["state": state, "event": .object(event)]), host: host)
+        var input = event
+        input["ask"] = entry["ask"]
+        let answer = try await run(.object(["state": state, "event": .object(input)]), host: host, turn: turn)
         guard let next = answer["state"], case .array(let list)? = answer["do"] else {
             throw .programFault(code: "malformed", why: "Its step returned no {state, do: [effects]}.")
         }
@@ -393,7 +412,7 @@ struct TurnPart {
             rounds += 1
             round = (rounds, calls.map { if case .object(let call) = $0, case .string(let id)? = call["id"] { id } else { "" } }, [])
         } else if event["type"] != .string("result") { round = nil }
-        var effects: [(effect: [String: JSONValue], identity: String, step: Int)] = []
+        var effects: [(effect: [String: JSONValue], identity: String, step: Int, askID: String)] = []
         var opened: (system: SystemPromptSegments, tools: [String]?)?
         // The agent's reply ends the turn: in the step that returns it, only the after-turn line may follow.
         var ended = false
@@ -482,7 +501,7 @@ struct TurnPart {
                 seen[identity, default: 0] += 1
                 identity += "#\(seen[identity] ?? 1)"
             }
-            effects.append((effect, identity, index))
+            effects.append((effect, identity, index, turn.id))
         }
         if let opened { (system, offeredTools) = opened }
         state = next
@@ -491,7 +510,7 @@ struct TurnPart {
     }
 
     /// Non-Stop failures reach bounded recovery, retaining whether the helper or the program failed.
-    private mutating func run(_ input: JSONValue, host: Reach) async throws(TurnPartStepError) -> [String: JSONValue] {
+    private mutating func run(_ input: JSONValue, host: Reach, turn: Turn) async throws(TurnPartStepError) -> [String: JSONValue] {
         let runner = OwnedProgramRunner(dataRoot: dataRoot)
         let program = OwnedProgram(kind: .turn, id: file.id, version: file.bodyDigest, source: file.body, entry: .run, resident: true)
         let opening = helper == nil
@@ -654,7 +673,7 @@ struct TurnPart {
             arrivals.append(Happening(.body, subject: "turn", door: "stem", who: "self", words: line,
                 once: "turn-heal:" + broken.bodyDigest, shows: why))
         }
-        return try await rebuild()
+        return try await rebuild(turn: turn)
     }
 
     /// Reads and closes the open trial under one store lock, only while its version is the one healed away from. A close that fails never fails

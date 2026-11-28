@@ -6,11 +6,6 @@ import DeskCore
 // Blueprint: | `KnowledgeGraph+PrimaryUserIndexing.swift` | `SwiftNativeKnowledgeGraphIndexer`, `profileNames`, `primaryUserName`, `consolidatePrimaryUserEntities`, `removeUnreferencedPrimaryUserRole` |
 
 extension SwiftNativeKnowledgeGraphIndexer {
-    struct PrimaryUserConsolidation {
-        var entitiesRemoved: Int = 0
-        var relationshipsRemoved: Int = 0
-    }
-
     /// Resolve the user identity only from onboarding's canonical profile. Generic or unavailable values retain the role label rather than guessing a person's
     /// name from accepted-memory prose.
     static func primaryUserName(explicit: String?, saved: String?) -> String {
@@ -101,7 +96,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
     static func consolidatePrimaryUserEntities(
         _ db: Database,
         primaryUserName: String
-    ) throws -> PrimaryUserConsolidation {
+    ) throws {
         let configuredLower = primaryUserName.lowercased()
         let rows = try Row.fetchAll(db, sql: """
             SELECT id, name, type, summary, aliases_json, mention_count,
@@ -120,7 +115,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
             )
             ORDER BY mention_count DESC, last_seen DESC
             """, arguments: [configuredLower, configuredLower])
-        guard let first = rows.first else { return PrimaryUserConsolidation() }
+        guard let first = rows.first else { return }
 
         func role(_ row: Row) throws -> String? {
             let raw: String? = row["metadata_json"]
@@ -146,7 +141,6 @@ extension SwiftNativeKnowledgeGraphIndexer {
             ?? rows.first(where: { name($0).lowercased() == "the user" })
             ?? first
         let canonicalID: String = try canonical.decode(forColumn: "id")
-        var report = PrimaryUserConsolidation()
 
         for row in rows {
             let duplicateID: String = try row.decode(forColumn: "id")
@@ -205,13 +199,11 @@ extension SwiftNativeKnowledgeGraphIndexer {
                     sql: "DELETE FROM kg_relationships WHERE id = ?",
                     arguments: [relationshipID]
                 )
-                report.relationshipsRemoved += db.changesCount
             }
             try db.execute(
                 sql: "DELETE FROM kg_entities WHERE id = ?",
                 arguments: [duplicateID]
             )
-            report.entitiesRemoved += db.changesCount
         }
 
         let metadata = primaryUserMetadata(existing: try metadataObject(canonical["metadata_json"]))
@@ -234,12 +226,11 @@ extension SwiftNativeKnowledgeGraphIndexer {
                 metadataJSON(metadata),
                 canonicalID,
             ])
-        return report
     }
 
     static func removeUnreferencedPrimaryUserRole(
         _ db: Database
-    ) throws -> PrimaryUserConsolidation {
+    ) throws {
         let roleIDs = try String.fetchAll(db, sql: """
             SELECT id FROM kg_entities
             WHERE json_extract(metadata_json, '$.role') = 'primary_user'
@@ -248,13 +239,12 @@ extension SwiftNativeKnowledgeGraphIndexer {
                 WHERE from_id = kg_entities.id OR to_id = kg_entities.id
               )
             """)
-        guard !roleIDs.isEmpty else { return PrimaryUserConsolidation() }
+        guard !roleIDs.isEmpty else { return }
         let placeholders = roleIDs.map { _ in "?" }.joined(separator: ", ")
         try db.execute(
             sql: "DELETE FROM kg_entities WHERE id IN (\(placeholders))",
             arguments: StatementArguments(roleIDs)
         )
-        return PrimaryUserConsolidation(entitiesRemoved: db.changesCount)
     }
 
     /// The shared identity comes from the profile, not the last fact indexed. Source evidence belongs to each fact and relationship separately.
@@ -273,7 +263,8 @@ extension SwiftNativeKnowledgeGraphIndexer {
     static func upsertPrimaryUserEntity(
         _ db: Database,
         primaryUserName: String,
-        now: String
+        now: String,
+        rebuildEntityIDs: RebuildEntityIDs?
     ) throws -> String {
         if let row = try Row.fetchOne(db, sql: """
             SELECT id, aliases_json, metadata_json, mention_count
@@ -305,7 +296,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
                   summary = ?,
                   aliases_json = ?,
                   mention_count = ?,
-                  last_seen = ?,
+                  last_seen = MAX(COALESCE(last_seen, ''), ?),
                   metadata_json = ?
                 WHERE id = ?
                 """, arguments: [
@@ -320,7 +311,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
             return id
         }
 
-        let id = try uniqueEntityID(db)
+        let id = try entityIDForInsert(db, name: primaryUserName, type: "person", rebuildEntityIDs: rebuildEntityIDs)
         let aliases = try primaryUserAliases(name: primaryUserName)
         let aliasData = try JSONEncoder().encode(aliases)
         let metadata = primaryUserMetadata()

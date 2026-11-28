@@ -1,9 +1,9 @@
-import MacNerves
 import NativeAgentCore
-import NativeAgentShared
 import PersistenceCore
-import DeskCore
 import SenseCore
+import MacNerves
+import NativeAgentShared
+import DeskCore
 import Foundation
 import ProviderRouting
 import MindCore
@@ -24,11 +24,15 @@ extension AppActions {
                   tool: "make_studio", input: verb("add"), versionExempt: true),
         AppAction("table.put", "desk", """
             Put something on the table: with type, add (occupied id: exists); missing id mints e plus twelve lowercase hex digits. Without type, \
-            edit by id (absent: not_found). A new shape or container needs x,y,w,h; text x,y; arrow from,to; stroke x,y and points (the points run from x,y). \
+            edit by id (absent: not_found). An existing text edit can require its exact opening text with if_text. Read page:desk for element ids. For a shape, text or container, use x,y or one anchor: \
+            beside (right of an id), after or under (below an id), inside (a container id), or cluster (1–32 ids to wrap in a container or place below). \
+            Gap for beside, after, under or placement below a cluster is 0–400 points and defaults to 24. Anchored new shapes and containers have default sizes. \
+            Absolute shapes and containers need w,h. Anchored puts return the resolved x,y,w,h. Arrow needs from,to; stroke needs x,y,points. \
             Colors: green|yellow|purple|blue|peach|white|ink
             """,
-                  [.optional("id"), .optional("type", .options("shape", "text", "container", "arrow", "stroke")), .optional("x", .number), .optional("y", .number), .optional("w", .number), .optional("h", .number), .optional("text"), .optional("color"),
-                   .optional("kind"), .optional("size"), .optional("from"), .optional("to"), .optional("fromSide"), .optional("toSide"), .optional("label"), .optional("points", .numbers), .optional("width", .number), .optional("item"), .optional("piece")],
+                  [.optional("id"), .optional("type", .options("shape", "text", "container", "arrow", "stroke")), .optional("x", .number), .optional("y", .number), .optional("w", .number), .optional("h", .number), .optional("text"), .optional("if_text"), .optional("color"),
+                   .optional("kind"), .optional("size"), .optional("from"), .optional("to"), .optional("fromSide"), .optional("toSide"), .optional("label"), .optional("points", .numbers), .optional("width", .number), .optional("item"), .optional("piece"),
+                   .optional("beside"), .optional("after"), .optional("under"), .optional("inside"), .optional("cluster", .list), .optional("gap", .number)],
                   tool: "table_change", input: verb("put"), versionExempt: true),
         AppAction("table.cross", "desk", "Cross a Desk card off through desk.close, or toggle a mark's crossing", [.required("id")],
                   tool: "table_change", input: verb("cross"), versionExempt: true),

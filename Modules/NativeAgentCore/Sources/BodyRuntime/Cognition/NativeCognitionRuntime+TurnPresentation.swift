@@ -26,15 +26,17 @@ extension NativeCognitionRuntime {
     /// Use one fixed-time body refresh without consuming cadence until confirmed provider delivery.
     public func prepareTurnProjection(_ request: CognitiveCapsuleRequest, turn: Turn) async -> CognitionAtTurn {
         await bootstrap()
-        let fixedAt = now()
-        let bodySample = await organismBodySample(at: fixedAt)
+        let (bodySample, fixedAt) = await organismBodySample()
         let canonicalAffect = await substrate.canonicalAffectProjection(at: fixedAt)
         let organism = await organismKernel.refreshBodySchemaAndFrozenRead(
             bodySample,
-            integratesChemistry: false,
             canonicalAffect: canonicalAffect,
             fixedAt: fixedAt
         )
+        var request = request
+        if let last = request.previousUserTurnAt {
+            request.usualQuietSincePreviousUserTurn = usualQuiet(from: last, to: fixedAt)
+        }
         let capsuleRequest = await requestWithOrganismProjection(
             request,
             projection: organism.projection,

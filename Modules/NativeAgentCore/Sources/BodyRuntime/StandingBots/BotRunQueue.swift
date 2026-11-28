@@ -2,6 +2,7 @@ import Synchronization
 import Foundation
 import Darwin
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 // Blueprint: | `BotRunQueue.swift` | `BotRunQueue`; `enqueue`, `presence`, `refusal`: commit claim/refusal before removal; daily reservations |
 
@@ -54,6 +55,7 @@ public struct BotRunQueue: Sendable {
         var context: String? = nil
         var origin: BotRunOrigin
         var steeringSources: [String]?
+        var fileAccessCeiling: ICloudChatFileAccessPolicy.Ceiling?
         var provenance: BotEventProvenance? = nil
         var isEvent: Bool { origin == .event }
     }
@@ -117,7 +119,8 @@ public struct BotRunQueue: Sendable {
     /// Event context is run input, never authority to instruct the app.
     public func enqueue(bot id: UUID, context: String? = nil,
                         origin: BotRunOrigin = .manual,
-                        provenance: BotEventProvenance? = nil, steeringSources: [String], scope: BotRunScope) throws -> BotRunReceipt {
+                        provenance: BotEventProvenance? = nil, steeringSources: [String],
+                        fileAccessCeiling: ICloudChatFileAccessPolicy.Ceiling? = nil, scope: BotRunScope) throws -> BotRunReceipt {
         guard !scope.ancestry.contains(id) else {
             throw StandingBotsError.invalidValue(Self.alreadyExecutingWords)
         }
@@ -137,7 +140,8 @@ public struct BotRunQueue: Sendable {
                 }
                 let runID = UUID()
                 let text = (context?.isEmpty ?? true) ? nil : context
-                requests[id] = QueuedRequest(runID: runID, context: text, origin: origin, steeringSources: steeringSources, provenance: provenance)
+                requests[id] = QueuedRequest(runID: runID, context: text, origin: origin, steeringSources: steeringSources,
+                    fileAccessCeiling: fileAccessCeiling, provenance: provenance)
                 try disk.write(requests, at: path)
                 return BotRunReceipt(runID: runID, accepted: true, reason: "queued")
             }
@@ -262,6 +266,7 @@ public struct BotRunQueue: Sendable {
         let context: String?
         let provenance: BotEventProvenance?
         let steeringSources: [String]
+        let fileAccessCeiling: ICloudChatFileAccessPolicy.Ceiling?
     }
 
     func claim(bot id: UUID, requestID: UUID?, manual: Bool = false) throws -> ClaimedRun {
@@ -346,11 +351,13 @@ public struct BotRunQueue: Sendable {
                 var context: String? = nil
                 var provenance: BotEventProvenance? = nil
                 var steeringSources: [String] = []
+                var fileAccessCeiling: ICloudChatFileAccessPolicy.Ceiling?
                 let admittedID = runID ?? UUID()
                 if let runID {
                     guard let request = requests[id], request.runID == runID else { throw BotRunAdmissionError.alreadyRunning }
                     context = request.context
                     steeringSources = request.steeringSources ?? []
+                    fileAccessCeiling = request.fileAccessCeiling
                     if request.isEvent {
                         provenance = request.provenance ?? BotEventProvenance(source: nil)
                     }
@@ -379,7 +386,8 @@ public struct BotRunQueue: Sendable {
                 }
                 admission.active[rootKey, default: [:]][id] = (descriptor, ScopedWaiter(), nil)
                 retained = true
-                return ClaimedRun(runID: admittedID, bot: bot, context: context, provenance: provenance, steeringSources: steeringSources)
+                return ClaimedRun(runID: admittedID, bot: bot, context: context, provenance: provenance,
+                    steeringSources: steeringSources, fileAccessCeiling: fileAccessCeiling)
             }
         }
     }

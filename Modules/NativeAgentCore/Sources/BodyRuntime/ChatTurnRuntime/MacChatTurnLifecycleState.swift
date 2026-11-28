@@ -126,6 +126,7 @@ public enum MacChatTurnLifecycleReducer {
             // Activity proves movement; only closed terminal evidence may end a turn.
             guard activity.identity == state.identity,
                   !activity.phase.isTerminal else { return state }
+            let unstartedID: String? = if case .unstartedStep(let id) = activity.source { id } else { nil }
             nextPresentation = TurnPresentationReducer.recordActivity(
                 state.presentation,
                 phase: activity.phase,
@@ -134,6 +135,8 @@ public enum MacChatTurnLifecycleReducer {
                 outcome: activity.outcome,
                 callName: activity.source == .toolUse ? activity.callName : nil,
                 endsCall: activity.source == .toolResult ? activity.callName : nil,
+                disposition: activity.disposition,
+                unstartedID: unstartedID,
                 at: activity.occurredAt,
                 resetStreamLength: activity.phase == .retrying,
                 additionalRedactor: additionalRedactor

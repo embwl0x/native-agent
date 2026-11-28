@@ -25,6 +25,7 @@ struct ContentView: View {
     @State private var navigationMountID: UUID?
     @State private var shownBodyToasts: Set<UUID> = []
     @State private var chatShortcut: ChatSlashPage?
+    @State private var simplePane: SimpleShellView.Pane = .agent
     @State private var agentRoom = "home"
     @State private var tourID = UUID()
     /// The page last shown in each surface during this run of the window, which choosing the surface shows again.
@@ -110,7 +111,7 @@ struct ContentView: View {
                     }
                 }.padding(24)
             } else if showsSimpleView {
-                SimpleShellView(shown: shownRow, choose: { chooseSurface($0, pages: $1) }, select: { selectRow($0) })
+                SimpleShellView(pane: $simplePane, shown: shownRow, choose: { chooseSurface($0, pages: $1) }, select: { selectRow($0) })
                     .task(id: selectionRaw) { await refreshShownPage() }
             } else if showsAgentView {
                 AgentScreenView(room: $agentRoom)
@@ -203,7 +204,7 @@ struct ContentView: View {
             shownBodyToasts = Set(toasts.map(\.id))
         }
         .animation(
-            NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion),
+            Animation.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion),
             value: showTour
         )
         .onAppear {
@@ -215,6 +216,10 @@ struct ContentView: View {
                     if let page = ownPageID { return ["page": .string(page)] }
                     return QuietPages.shown(activeContentItem).map { ["page": .string($0.id)] }
                 }
+            }, chatIsVisible: {
+                isShowingChat && !showsAgentView && (!showsSimpleView || simplePane == .agent)
+                    && !showFirstRunOnboarding && !(showTour && appModel.shellLayout?.value != nil)
+                    && appModel.settingsViewModeIssue == nil && chatShortcut == nil
             }, replayTour: {
                 chatShortcut = nil
                 showFirstRunOnboarding = false
@@ -378,6 +383,7 @@ struct ContentView: View {
         case .activity(let section):
             applyActivitySection(section)
         case .sidebar(let target):
+            if target == .chat { simplePane = .agent }
             if target == .activity {
                 applyActivityRoot()
                 return

@@ -29,6 +29,8 @@ public struct ClockWork: Sendable {
         guard let entries = try row.optionalInt("entriesWritten"), let sessions = try row.optionalInt("sessionsProcessed"),
               let disabled = try row.optionalBool("disabled") else { throw JSONRow.Malformed.field("dream result") }
         var errors = try row.strings("errors")
+        let stopped = try row.optionalString("status") == "stopped"
+        if stopped { errors = [] }
         guard !disabled, try row.optionalString("skipReason") != "already_running",
               entries > 0 || !errors.isEmpty else { return .object([:]) }
         let failedWithoutEntry = entries <= 0 && !errors.isEmpty
@@ -46,14 +48,17 @@ public struct ClockWork: Sendable {
         let agentName = NativeAgentNotificationDefaults.agentDisplayName(dataRoot: root)
         let title = failedWithoutEntry ? "\(agentName) dream needs repair" : "\(agentName) dreamed"
         let message = Self.dreamInboxMessage(entriesWritten: entries, sessionsProcessed: sessions, errors: errors, entries: entriesForToday)
+            + (stopped ? "\n\nDream delivery remains pending after Stop." : "")
         let itemId = "dream-cycle-\(dateKey)-\(UUID().uuidString.lowercased())"
         let delivery = try await tell(Matter(id: itemId, form: failedWithoutEntry ? .wentWrong : .done,
             from: "dream_cycle", title: title, summary: String(message.prefix(500)), words: message,
             symbol: "moon.stars.fill", badge: "DREAM", artifacts: paths.map { .init(source: Matter.files, id: $0) }))
-        let archivedDreamCards = try await archiveOlderDreamInboxItems(keeping: itemId)
         var receipt: [String: JSONValue] = [
-            "inboxItemId": .string(itemId), "archivedOlderDreamInboxItems": .int(Int64(archivedDreamCards)), "delivery": delivery
+            "inboxItemId": .string(itemId), "delivery": delivery
         ]
+        let (archived, archiveFailure) = await archiveOlderDreamInboxItems(keeping: itemId)
+        receipt["archivedOlderDreamInboxItems"] = .int(Int64(archived))
+        if let archiveFailure { receipt["archiveFailure"] = .string(archiveFailure) }
         if failedWithoutEntry { receipt["failureKind"] = .string("dream_failed_before_write") }
         return .object(receipt)
     }
@@ -99,7 +104,7 @@ public struct ClockWork: Sendable {
         if case .object(let receipt) = payload, receipt["action"] != nil, let result = receipt["result"] { payload = result }
         if case .object(var read) = payload {
             // The door's receipt cannot turn an absent observation into content.
-            for key in ["calls", "changed", "read_only", "irreversible", "effect"] { read[key] = nil }
+            for key in ["calls", "changed", "read_only", "irreversible", "effect", "dispatch_receipt_id", "dispatch_receipt_source"] { read[key] = nil }
             if case .string? = read["execution"] { read["execution"] = nil }
             if let returned = read["returned"] {
                 // Some parts return a count and expose their content beside it.
@@ -226,15 +231,18 @@ public struct ClockWork: Sendable {
         return .object(fields)
     }
 
-    @discardableResult
-    func archiveOlderDreamInboxItems(keeping keepItemId: String) async throws -> Int {
+    func archiveOlderDreamInboxItems(keeping keepItemId: String) async -> (Int, String?) {
         let forPerson = ForPerson.at(root)
         var count = 0
-        for old in try await forPerson.matters() where old.face?.from == "dream_cycle" && old.id != keepItemId
-            && (ForPerson.reading(old) == .unread || ForPerson.reading(old) == .read) {
-            try await forPerson.putAway(old.id, .resolved)
-            count += 1
+        do {
+            for old in try await forPerson.matters() where old.face?.from == "dream_cycle" && old.id != keepItemId
+                && (ForPerson.reading(old) == .unread || ForPerson.reading(old) == .read) {
+                try await forPerson.putAway(old.id, .resolved)
+                count += 1
+            }
+        } catch {
+            return (count, error.localizedDescription)
         }
-        return count
+        return (count, nil)
     }
 }

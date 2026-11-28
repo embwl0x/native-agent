@@ -5,6 +5,7 @@ import PersistenceCore
 import DeskCore
 import CryptoKit
 import NativeAgentShared
+import MacNerves
 // Blueprint: | `Parts+Creation.swift` | checked save/rehearsal; ratcheted provenance |
 
 extension Parts {
@@ -161,19 +162,131 @@ extension Parts {
 
     private func refuse(_ why: String) -> PartError { .invalid(why + " Nothing was saved.") }
 
+    static let saveAliases = ["capabilities": "reach", "inputs": "params", "schema": "params", "source": "code", "js": "code"]
+    private static let saveArgumentFields = fields(fields(saveArgumentsSchema)["properties"] ?? .null)
+
+    static func unknownSaveArguments(_ input: [String: JSONValue]) -> [String] {
+        input.keys.filter { saveArgumentFields[$0] == nil && !["verb", "preview"].contains($0) && !$0.hasPrefix("__") }.sorted()
+    }
+
+    struct SaveRefusal: Error {
+        let failure: SenseFailure
+        var dependency: ToolFailureError? = nil
+    }
+
+    static func boundedSaveRemedy(_ value: JSONValue?) -> JSONValue? {
+        guard let value, ((try? value.serializedData(pretty: false).count) ?? Int.max) >= 2_048 else { return value }
+        var remedy: [String: JSONValue] = ["kind": .string("correct_arguments"), "try_instead": .null, "next_call": .null,
+            "instruction": .string("This repair exceeds the 2 KiB budget. Apply the change named in detail to your original save.")]
+        if case .bool(let required)? = value.objectValue?["requires_owner_approval"] {
+            remedy["requires_owner_approval"] = .bool(required)
+        }
+        return .object(remedy)
+    }
+
+    private struct SaveRepair {
+        let id: String
+        let input: [String: JSONValue]
+        let retained: [String: JSONValue]
+        let revision: Bool
+        let ownerKeeps: () -> Bool
+
+        func reach(adding missing: [String]) -> JSONValue {
+            let previous = Parts.fields(retained["reach"] ?? .null)
+            var scope = previous.merging(Parts.fields(input["reach"] ?? .null)) { $1 }
+            let names = JSONValue.stringArray(previous["capabilities"]) + JSONValue.stringArray(scope["capabilities"]) + missing
+            scope["capabilities"] = .array(Set(names).sorted().map(JSONValue.string))
+            return .object(scope)
+        }
+
+        func failure(_ code: String, _ instruction: String, patch: [String: JSONValue]? = nil, dependency: Bool = false) -> SaveRefusal {
+            let proposed = Parts.fields(patch?["reach"] ?? input["reach"] ?? retained["reach"] ?? .null)
+            let previous = Parts.fields(retained["reach"] ?? .null)
+            let added = Set(JSONValue.stringArray(proposed["capabilities"]).compactMap(PartReachGrant.init))
+                .subtracting(JSONValue.stringArray(previous["capabilities"]).compactMap(PartReachGrant.init))
+            var remedy: [String: JSONValue] = ["kind": .string("correct_arguments"), "instruction": .string(instruction),
+                "requires_owner_approval": .bool(added.contains { !$0.agentOwned } && ownerKeeps()),
+                "try_instead": .null, "next_call": .null]
+            if var args = patch {
+                let remaining = input.keys.contains { key in
+                    key != "id" && key != "verb" && key != "preview" && !key.hasPrefix("__") && args[key] == nil
+                }
+                args["id"] = .string(id)
+                if !revision {
+                    args["description"] = input["description"]
+                    args["code"] = .string("<keep_your_code>")
+                    if input["create_only"] == .bool(true) { args["create_only"] = .bool(true) }
+                }
+                let hasSourceSlot = args["code"] == .string("<keep_your_code>")
+                let call: JSONValue = .object(["tool": .string("app"), "input": .object([
+                    "action": .string("ability.save"), "args": .object(args)])])
+                if hasSourceSlot {
+                    remedy["instruction"] = .string(instruction + " Replace <keep_your_code> with your original source and keep your other submitted fields.")
+                } else if remaining {
+                    remedy["instruction"] = .string(instruction + " Apply this header patch to your original save, keeping the other submitted fields.")
+                }
+                remedy["try_instead"] = call
+                if dependency && !hasSourceSlot && !remaining { remedy["next_call"] = call }
+            }
+            return SaveRefusal(failure: SenseFailure(code: code, message: instruction + " Nothing was saved.", remedy: .object(remedy)))
+        }
+    }
+
+    func saveArgumentRefusal(_ input: [String: JSONValue], steer: [String], fullMac: Bool, origin given: JSONValue? = nil) throws -> SaveRefusal? {
+        let unknown = Self.unknownSaveArguments(input)
+        guard !unknown.isEmpty else { return nil }
+        let code = "unknown_save_argument"
+        let instruction = "Use ability.save's declared fields. Input goes in params, grants in reach.capabilities, and JavaScript in code."
+        let named = Self.string(input, "id")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        var mapped: [String: JSONValue] = [:]
+        for key in unknown {
+            guard let field = Self.saveAliases[key], mapped[field] == nil, let value = input[key],
+                  (field == "reach" ? Self.fields(input["reach"] ?? .object([:]))["capabilities"] == nil : input[field] == nil),
+                  field != "code" || input["edits"] == nil else {
+                mapped.removeAll()
+                break
+            }
+            if field == "reach" {
+                guard (input["reach"] ?? .object([:])).objectValue != nil, case .array(let names) = value,
+                      names.allSatisfy({ $0.stringValue.flatMap(PartReachGrant.init) != nil }) else {
+                    mapped.removeAll()
+                    break
+                }
+                mapped[field] = value
+            } else {
+                guard let schema = Self.saveArgumentFields[field], value.schemaProblem(schema: schema) == nil else {
+                    mapped.removeAll()
+                    break
+                }
+                mapped[field] = field == "code" ? .string("<keep_your_code>") : value
+            }
+        }
+        let existing = named.isEmpty || mapped.isEmpty ? nil : try row(named)
+        let id = existing.flatMap { Self.string($0, "id") } ?? Self.id(named)
+        let base = try existing.flatMap(latest)
+        let retained = base.map { Self.fields($0.manifest) } ?? [:]
+        var corrected = input
+        for key in unknown { corrected.removeValue(forKey: key) }
+        let repair = SaveRepair(id: id, input: corrected, retained: retained, revision: base != nil) {
+            let origin = given ?? self.merged([self.origin(steeredBy: steer)] + Self.recorded(existing) + (base == nil ? [] : [retained["origin"]]))
+            return given != nil || Self.keepRefusal(origin: origin, name: id, fullMac: fullMac) != nil
+        }
+        guard !named.isEmpty, id != Self.turnID, AbilityStore.isAbilityID(id), !mapped.isEmpty,
+              input["set_aside"] != .bool(true), existing == nil || input["create_only"] != .bool(true) else {
+            return repair.failure(code, instruction)
+        }
+        if let capabilities = mapped["reach"] { mapped["reach"] = repair.reach(adding: JSONValue.stringArray(capabilities)) }
+        return repair.failure(code, instruction + " Replace aliases in your original call.", patch: mapped)
+    }
+
     /// Admit the request and settle turn, set-aside or occupied-name saves at their existing boundaries.
     private func prepareSave(_ input: [String: JSONValue], steer: [String], fullMac: Bool, origin given: JSONValue?,
         invocation: Invocation, timing: SaveTiming) async throws -> SavePreparation {
         var timing = timing
-        guard case .object(let declaredArguments)? = Self.fields(Self.saveArgumentsSchema)["properties"] else {
+        guard case .object? = Self.fields(Self.saveArgumentsSchema)["properties"] else {
             throw refuse("The installed ability.save schema has no argument properties. Repair that schema before saving.")
         }
-        if let unknown = input.keys.sorted().first(where: { !$0.hasPrefix("__") && !["verb", "preview"].contains($0) && declaredArguments[$0] == nil }) {
-            throw refuse("""
-                \(unknown) is not an ability.save argument. Read ability.save's current schema; declare input with params and authority with \
-                reach.capabilities.
-                """)
-        }
+        if let failure = try saveArgumentRefusal(input, steer: steer, fullMac: fullMac, origin: given) { throw failure }
         guard invocation.host != nil else {
             throw refuse("ability.save needs the gated app door of a conversation or wake run to check dependencies.")
         }
@@ -243,6 +356,12 @@ extension Parts {
         var timing = timing
         let base = try keptSelf?.kept ?? existing.flatMap(latest)
         let was = base.map { Self.fields($0.manifest) } ?? [:]
+        func saveOrigin() -> JSONValue {
+            given ?? self.merged([self.origin(steeredBy: steer)] + Self.recorded(existing) + (base == nil ? [] : [was["origin"]]))
+        }
+        let repair = SaveRepair(id: id, input: input, retained: was, revision: base != nil) {
+            given != nil || Self.keepRefusal(origin: saveOrigin(), name: id, fullMac: fullMac) != nil
+        }
         var code = Self.string(input, "code")
         if let edits = input["edits"] {
             guard code == nil else { throw refuse("Send code or edits, not both.") }
@@ -271,10 +390,11 @@ extension Parts {
         }
         // Inputs inherit the latest version's contract unless explicitly restated.
         var params = was["params"]
-        var schema = base?.program.schema ?? .object(["type": .string("object"), "properties": .object([:])])
+        let emptySchema: JSONValue = .object(["type": .string("object"), "properties": .object([:])])
+        var schema = base?.program.schema ?? emptySchema
         if let declared = input["params"] {
             if declared == .null || declared == .object([:]) {
-                params = nil; schema = .object(["type": .string("object"), "properties": .object([:])])
+                params = nil; schema = emptySchema
             } else {
                 let read = try Self.params(declared)
                 params = .object(read.params); schema = try Self.inputSchema(read.params, readOnly: read.readOnly)
@@ -285,20 +405,94 @@ extension Parts {
         let part = try AbilityStore.partHeader(header)
         // A part that answers door verbs takes {verb, ...args}; each verb's args are its declared schema, so params never sits beside answers.
         if let answered = AbilityStore.answeredInputSchema(part["answers"]) {
-            if let declared = input["params"], declared != .null { throw refuse("answers declares this part's inputs; remove params.") }
+            if let declared = input["params"], declared != .null {
+                throw repair.failure("params_beside_answers", "answers declares this part's inputs. Clear params with null.", patch: ["params": .null])
+            }
             params = nil; schema = answered
         }
+        if let answers = part["answers"]?.objectValue, !answers.isEmpty, input["answers"] != nil {
+            let floors = try SwiftToolDispatcher.shippedAnswerFloor.get()
+            for verb in answers.keys.sorted() {
+                guard let floor = floors[verb], var entry = answers[verb]?.objectValue, let effect = entry["class"]?.stringValue else { continue }
+                let toolClass = try SwiftToolDispatcher.answerClass(effect, part: id, verb: verb)
+                if toolClass < floor.toolClass {
+                    let name = switch floor.toolClass {
+                    case .read: "read"
+                    case .write: "write"
+                    case .send: "send"
+                    case .destructive: "destructive"
+                    }
+                    entry["class"] = .string(name)
+                }
+                if floor.irreversible { entry["irreversible"] = .bool(true) }
+                guard .object(entry) != answers[verb] else { continue }
+                var merged = Self.fields(was["answers"] ?? .null).merging(answers) { $1 }
+                merged[verb] = .object(entry)
+                throw repair.failure("answers_seed_floor_violation", "Raise the declaration of \(verb) to the shipped verb's effect floor.",
+                    patch: ["answers": .object(merged)])
+            }
+        }
         let permissions = try Self.declaredStrings(Self.fields(part["reach"] ?? .null)["capabilities"], name: "reach.capabilities")
+        let grants = try PartReachGrant.parse(permissions)
         // Direct app members, literal door requests and reach derive dependencies; indirect calls declare theirs in actions.
         let reached = AbilityStore.reachActions(permissions)
         let calls = analysis.calls
-        if calls.literal.contains(where: { $0.primitive && $0.id == "fetch" }),
-           Set(permissions).isDisjoint(with: ["network_public", "network_localhost"]) {
-            throw Self.revisionFailure("undeclared",
-                "Declare reach.capabilities network_public (network_localhost for loopback) to call fetch in ability \(id). Nothing was saved.",
-                id: id)
+        for call in calls.literal where call.primitive && ["fetch", "fetch.sse.open", "network.websocket.open"].contains(call.spelling) {
+            let operation = call.spelling
+            let websocket = operation == "network.websocket.open", fullNetwork = websocket && grants.contains(.flag(.network))
+            let hasNetwork = fullNetwork || !grants.isDisjoint(with: [.flag(.networkLocalhost), .flag(.networkPublic)])
+            if call.given?.first?.value?.stringValue != nil {
+                throw repair.failure("invalid_primitive_arguments", "\(operation) at line \(call.line) takes one object, not a bare string: "
+                    + "pass {url: <your url>} with any other fields beside it.")
+            }
+            if case .object(let args)? = call.given?.first, let url = args["url"]?.value?.stringValue {
+                let reach: PartReachGrant.StaticFlag?
+                do { reach = try ToolPrimitiveBroker.literalNetworkReach(url, websocket: websocket) }
+                catch {
+                    if hasNetwork { continue }
+                    throw repair.failure("undeclared_fetch_reach", "Supply a valid fixed URL for \(operation) at line \(call.line) before choosing its network grant.")
+                }
+                guard let reach else {
+                    throw repair.failure("private_network_destination", "\(operation) at line \(call.line) targets a private network address. Use a loopback or public URL.")
+                }
+                if fullNetwork || grants.contains(.flag(reach)) { continue }
+                throw repair.failure("undeclared_fetch_reach", "Declare \(reach.rawValue) in reach.capabilities for \(operation) at line \(call.line).",
+                    patch: ["reach": repair.reach(adding: [reach.rawValue])])
+            } else if !hasNetwork {
+                throw repair.failure("undeclared_fetch_reach", "For \(operation) at line \(call.line), declare network_localhost for loopback or "
+                    + "network_public for a public destination in reach.capabilities, based on the URL your code supplies.")
+            }
+        }
+        for call in calls.literal where call.primitive && call.spelling == PartOpenURLRequest.operation {
+            guard case .object(let args)? = call.given?.first else { continue }
+            let literal = args.compactMapValues(\.value)
+            let arguments = JSONValue.object(literal)
+            guard (literal["bundle_id"] != nil && literal["url"] != nil) || !Keyring.names(in: arguments).isEmpty else { continue }
+            let request = try PartOpenURLRequest(arguments)
+            var missing = request.missingAppReach(grants)
+            if request.needsShellReach(grants) { missing.append("shell") }
+            if !missing.isEmpty {
+                throw repair.failure("undeclared_app_reach", "Declare \(missing.joined(separator: ", ")) in reach.capabilities for host.app.openURL at line \(call.line).",
+                    patch: ["reach": repair.reach(adding: missing)])
+            }
+        }
+        let missingSecrets = analysis.secretLines.keys.sorted().filter { Keyring.validName($0) && !grants.contains(.secret($0)) }
+        if let name = missingSecrets.first, let line = analysis.secretLines[name] {
+            let more = missingSecrets.count > 1 ? " Declare each remaining literal secret reference by name as well." : ""
+            throw repair.failure("undeclared_secret_reach", "Declare secret:\(name) in reach.capabilities for the placeholder at line \(line)." + more,
+                patch: ["reach": repair.reach(adding: missingSecrets.map { "secret:" + $0 })])
+        }
+        for call in calls.literal where call.primitive && call.spelling == MacAXQuery.operation {
+            guard case .object(let args)? = call.given?.first, let bundle = args["bundle_id"]?.value else { continue }
+            let query = try MacAXQuery(call.given?.first?.value ?? .object(["bundle_id": bundle]))
+            guard query.declaresApp(grants) || grants.contains(.flag(.screenWatch)) else {
+                let grant = "app_read:" + query.bundleID
+                throw repair.failure("undeclared_app_reach", "Declare \(grant) in reach.capabilities for host.ax.query at line \(call.line), "
+                    + "or use screen.watch with a matching bound watch.", patch: ["reach": repair.reach(adding: [grant])])
+            }
         }
         let called = calls.literal.filter { $0.inferred && !$0.primitive }.map(\.id)
+        let retainedActions = try await declaredActions(was, program: base?.program)
         let declared: [String]
         if let given = input["actions"] {
             declared = try Self.declaredStrings(given, name: "actions").map { spelled in
@@ -311,12 +505,18 @@ extension Parts {
                 return action
             }
         } else {
-            declared = try await declaredActions(was, program: base?.program)
+            declared = retainedActions
         }
         var actions: [String] = []
         for id in declared + called + reached where !actions.contains(id) { actions.append(id) }
         guard actions.count <= OwnedProgramRunner.actionLimit else { throw refuse("An ability calls at most \(OwnedProgramRunner.actionLimit) app actions.") }
-        let shapes = try await checkedCallShapes(calls, id: id, actions: actions, selfSchema: schema, invocation: invocation)
+        let shapes = try await checkedCallShapes(calls, id: id, actions: actions, selfSchema: schema, invocation: invocation) { args, instruction in
+            let merged = Set(JSONValue.stringArray(args["actions"]) + retainedActions).sorted()
+            guard merged.count <= OwnedProgramRunner.actionLimit else {
+                return repair.failure("undeclared_dependency", instruction + " Keep at most \(OwnedProgramRunner.actionLimit) app actions.")
+            }
+            return repair.failure("undeclared_dependency", instruction, patch: ["actions": .array(merged.map(JSONValue.string))], dependency: true)
+        }
         // Only recorded practice can supply an inherited tape; callers cannot author proof.
         let suppliedFixtures = input["fixtures"]
         let fixtures = suppliedFixtures ?? base?.fixtures ?? .array([])
@@ -327,7 +527,7 @@ extension Parts {
             throw refuse("fixtures is a list of at most 16 {input, expected} cases in 256 KiB; omit it to capture during ability.validate.")
         }
         let name = Self.string(input, "name") ?? existing.flatMap { Self.string($0, "name") } ?? Self.referenceID(named)
-        let origin = given ?? self.merged([self.origin(steeredBy: steer)] + Self.recorded(existing) + (base.map { [Self.fields($0.manifest)["origin"]] } ?? []))
+        let origin = saveOrigin()
         let guidance = defaultPersonaRoot(dataRoot: root).appendingPathComponent("skills/bodies/\(id).md")
         var manifest: [String: JSONValue] = [
             "id": .string(id), "name": .string(name), "description": .string(description), "language": .string("javascript"),
@@ -345,7 +545,7 @@ extension Parts {
             var before = was.filter { authoredKeys.contains($0.key) }
             before.merge(try AbilityStore.partHeader(was.filter { AbilityStore.partKeys.contains($0.key) })) { _, value in value }
             before["converts"] = try OwnedProgramStore.conversionSources(was["converts"])
-            before["declaredActions"] = .array(try await declaredActions(was, program: base.program).map(JSONValue.string))
+            before["declaredActions"] = .array(retainedActions.map(JSONValue.string))
             before["inputSchema"] = base.program.schema
             if source == base.program.source, fixtures == base.fixtures, before == manifest {
                 try AbilityStore.withLock {
@@ -455,7 +655,6 @@ extension Parts {
     /// Never a version swap.
     private func setAside(_ id: String, accounting: [String: JSONValue], why: String?, steer: [String], fullMac: Bool, origin given: JSONValue?,
         invocation: Invocation) async throws -> [String: JSONValue] {
-        func refuse(_ why: String) -> PartError { .invalid(why + " Nothing was saved.") }
         guard let open = accounting["trial"] else { throw refuse("\(id) has no open trial to set aside.") }
         guard case .object(let trial) = open, let version = Self.string(trial, "version"), let keptKey = Self.string(trial, "kept") else {
             throw refuse("\(id)'s open trial is unreadable in abilities/state.json; repair that record before setting it aside.")
@@ -490,7 +689,8 @@ extension Parts {
     // MARK: - Rehearsal
 
     /// Intercepted validation replies cannot establish live behavior.
-    public func validate(_ named: String, input: JSONValue?, capture: Bool, invocation: Invocation) async -> Outcome {
+    public func validate(_ named: String, input: JSONValue?, capture: Bool, faceSampleInput: JSONValue?,
+                         facePages: [PartFaces], invocation: Invocation) async -> Outcome {
         var attempted = false
         do {
             guard let row = try row(named), let id = Self.string(row, "id") else { return try unknown(named) }
@@ -511,14 +711,15 @@ extension Parts {
                     ?? .null])
             }
             var fields: [String: JSONValue] = ["id": .string(id), "name": .string(name), "candidate_digest": .string(candidate.digest),
-                "effects": .string("none"), "effect": .string("none"), "read_only": .bool(true), "execution": .string("rehearsed")]
+                "effects": .string("none"), "effect": .string("none"), "read_only": .bool(true)]
             let calls = try await OwnedProgramRunner(dataRoot: root).analyze(candidate.program).calls
             _ = try await checkedCallShapes(calls, id: id, actions: candidate.program.dependencies, selfSchema: candidate.program.schema,
                 invocation: invocation)
             if !calls.warnings.isEmpty { fields["warnings"] = .array(calls.warnings.map(JSONValue.string)) }
             do {
                 attempted = true
-                let proof = try await rehearse(candidate, capture: capture, input: input, invocation: invocation)
+                let (proof, faceChecked) = try await rehearse(candidate, capture: capture, input: input, faceSampleInput: faceSampleInput,
+                    facePages: facePages, invocation: invocation)
                 let replayed = Self.fields(proof)["tape"] != nil
                 try mutate(id, turn: invocation.execution.turn) { current in
                     guard var row = current, (row["candidateDigest"] ?? row["codeFingerprint"]) == .string(candidate.digest) else {
@@ -530,21 +731,26 @@ extension Parts {
                 fields["validation_evidence"] = AbilityStore.validationEvidence(proof, fixtures: candidate.fixtures)
                 fields["capture"] = Self.fields(proof)["capture"] ?? .null
                 fields["next_call"] = .object(["action": .string("ability.read"), "args": .object(["id": .string(id)])])
+                fields["execution"] = .string("rehearsed")
+                if faceChecked { fields["rehearsal"] = .string("rehearsed-with-face") }
+                let faceDetail = faceChecked ? " The sample face passed decoding, block kind, key, action and published page control checks." : ""
                 if replayed {
+                    let effectDetail = faceChecked ? "no effect ran" : "nothing ran"
                     return (true, """
-                        Its recorded examples replayed exactly from the tape and nothing ran. That proves those examples, no other input or branch; \
+                        Its recorded examples replayed exactly from the tape and \(effectDetail). That proves those examples, no other input or branch; \
                         ability.enable keeps it, and its live runs earn its record.
-                        """, fields)
+                        """ + faceDetail, fields)
                 }
                 return (true,
-                    "The supplied inputs passed rehearsal; intercepted replies are not behavioral proof. Read its exact version before keeping it.", fields)
+                    "The supplied inputs passed rehearsal; intercepted replies are not behavioral proof. Read its exact version before keeping it."
+                        + faceDetail, fields)
             } catch let failure as SenseFailure where failure.code == "bad_input" {
-                return (false, "Rehearsal needs input: \(failure.message) Pass input as an object matching \(name)'s params.",
+                return (false, "Rehearsal needs input: \(failure.message)",
                         fields.merging(["reason": .string("bad_input"), "effects": .string("none"), "input_schema": candidate.program.schema,
-                                        "remedy": failure.remedy ?? .null]) { $1 })
+                                        "execution": .string("attempted"), "remedy": failure.remedy ?? .null]) { $1 })
             }
         } catch {
-            var fields = Self.fields(ToolHost.failure(error, effects: "none", execution: attempted ? "rehearsed" : "not_run"))
+            var fields = Self.fields(ToolHost.failure(error, effects: "none", execution: attempted ? "attempted" : "not_run"))
             fields["effects"] = .string("none")
             fields["effect"] = .string("none"); fields["read_only"] = .bool(true)
             fields["remedy"] = fields["remedy"] ?? Repair.remedy(owner: "ability " + named, nextCall: Self.readCall(named), tap: nil,

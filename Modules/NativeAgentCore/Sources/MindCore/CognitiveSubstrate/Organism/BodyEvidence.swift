@@ -34,6 +34,7 @@ public struct OrganismLifeReading: Sendable {
 public enum BodyEvidenceClass: String, Codable, Sendable, Equatable, CaseIterable {
     case signedPeerContact
     case apnsAcceptance
+    case deliveryAttempt
     case notificationTransportFailure
     case deviceProcessReceipt
     case deviceProcessFailure

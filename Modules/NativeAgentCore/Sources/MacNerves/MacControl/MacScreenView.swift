@@ -275,11 +275,11 @@ public final class MacScreenViewStore {
         public var guidance: String {
             switch self {
             case .noView:
-                return "no fused view has been taken yet — call mac_view first"
+                return "no fused view has been taken yet — take a fresh mac.look, then repeat the act"
             case .staleView:
-                return "that view is not the latest one — the screen may have changed; call mac_view again"
+                return "that view is not the latest one — the screen may have changed; take a fresh mac.look, then repeat the act"
             case .viewExpired:
-                return "that view is older than \(Int(MacLookFrameStore.ttlSeconds))s — call mac_view again"
+                return "that view is older than \(Int(MacLookFrameStore.ttlSeconds))s — take a fresh mac.look, then repeat the act"
             case .unknownMark:
                 return "that mark number is not in the latest view's legend"
             }

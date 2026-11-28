@@ -24,13 +24,6 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
         if case .success(let snapshot)? = checkedPermissions { return snapshot.permissions }
         return [:]
     }
-    public var permissionLoadError: String? {
-        if case .failure(let error)? = checkedPermissions {
-            return UserFacingError.message(error, action: "load the saved Mac Integration permissions")
-        }
-        return nil
-    }
-    public private(set) var isLoading = true
     public private(set) var systemStatuses: [String: String] = [:]
     public private(set) var watchState: MacAssistantWatchSetupLoadState = .loading
     public private(set) var checkedPermissions: Result<MacIntegrationPermissionStore.Snapshot, Error>?
@@ -40,16 +33,7 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
     @ObservationIgnored private var permissionObservation: NotificationCenter.ObservationToken?
     @ObservationIgnored private var activationObservation: AnyCancellable?
     @ObservationIgnored private var permissionWatcher: FileChangeWatcher?
-    @ObservationIgnored private var settingsFeed: SettingsFeedProjection?
 
-    public func bindSettingsFeed(_ feed: SettingsFeedProjection) {
-        settingsFeed = feed
-        publishSettings()
-    }
-
-    private func publishSettings() {
-        settingsFeed?.updatePermissions(statuses: systemStatuses, issue: permissionLoadError, isReading: isLoading)
-    }
     /// The last Check Mail result, kept on disk across restarts: it speaks only for what the live readings cannot tell (a read that
     /// failed, account coverage, Mail not running), and is dropped once a grant it was read under reads otherwise, even across a restart.
     /// The kept result and the Mail Automation and Full Disk Access readings it was read under, read from disk on first use on the main actor.
@@ -170,7 +154,6 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
             }
             if permissionWatcher == nil { permissionWatcher = watcher } else { watcher.cancel() }
         }
-        isLoading = true
         let (result, _, _) = await permissionRead.read {
             let result: Result<MacIntegrationPermissionStore.Snapshot, Error>
             do { result = .success(try await MacIntegrationPermissionStore(dataRoot: dataRoot).snapshotChecked()) }
@@ -192,8 +175,6 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
             }) { keepMailCheck(nil) }
             let grantsChanged = systemStatuses != grants
             systemStatuses = grants
-            isLoading = false
-            publishSettings()
             if grantsChanged { Self.SystemStatusesDidChange(root: dataRoot).post() }
         }
         if refreshWatches, watchState.response != nil { await self.refreshWatches(refreshPermissions: false) }

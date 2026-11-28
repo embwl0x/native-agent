@@ -13,7 +13,7 @@ public protocol BrowserIPCWindowEffects: BrowserRouteEffects {
 
 extension BrowserActionRoutes {
     @MainActor public static func authenticatedIPCRoute(
-        method: String, path: String, headers: [String: String], body: Data,
+        path: String, headers: [String: String], body: Data,
         token: String, effects: any BrowserIPCWindowEffects
     ) async -> (status: Int, object: [String: Any]) {
         let auth = headers["authorization"] ?? ""
@@ -21,7 +21,7 @@ extension BrowserActionRoutes {
             return (401, ["error": "unauthorized"])
         }
         do {
-            return (200, try await handleIPCRoute(method: method, path: path, body: body, effects: effects))
+            return (200, try await handleIPCRoute(path: path, body: body, effects: effects))
         } catch {
             return (500, ["error": error.localizedDescription])
         }
@@ -55,7 +55,7 @@ extension BrowserActionRoutes {
                 "error": receipt["error"] ?? NSNull(), "outcomeKind": receipt["outcomeKind"] ?? NSNull()]
     }
 
-    @MainActor public static func handleIPCRoute(method: String, path: String, body: Data, effects: any BrowserIPCWindowEffects) async throws -> [String: Any] {
+    @MainActor public static func handleIPCRoute(path: String, body: Data, effects: any BrowserIPCWindowEffects) async throws -> [String: Any] {
         try Task.checkCancellation()
         let json = body.isEmpty ? [:] : ((try? JSONSerialization.jsonObject(with: body)) as? [String: Any] ?? [:])
 

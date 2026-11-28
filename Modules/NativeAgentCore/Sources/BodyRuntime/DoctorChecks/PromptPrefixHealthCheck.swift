@@ -53,7 +53,8 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
         var historyContextWindow: String?
         var fingerprint: String?
         /// One digest per cacheable-prefix message. Missing evidence is ungraded.
-        var prefixDigests: [String] = []
+        /// nil when the call left no digest receipt; empty when it had no message before its changing block (a session's first turn).
+        var prefixDigests: [String]? = nil
         var volatileChars: Int?
         var toolFingerprint: String?
         var stableFingerprint: String?
@@ -195,7 +196,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                 cacheCreation: payload["cacheCreationInputTokens"]?.intValue,
                 historyContextWindow: payload["historyContextWindow"]?.stringValue,
                 fingerprint: payload["prefixFingerprintSHA256"]?.stringValue,
-                prefixDigests: JSONValue.stringArray(payload["prefixMessageDigests"]),
+                prefixDigests: payload["prefixMessageDigests"]?.arrayValue.map { _ in JSONValue.stringArray(payload["prefixMessageDigests"]) },
                 volatileChars: payload["volatileBlockChars"]?.intValue,
                 toolFingerprint: payload["component.toolsSHA256"]?.stringValue,
                 stableFingerprint: payload["component.stablePrefixSHA256"]?.stringValue,
@@ -319,7 +320,10 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                 // This turn can reuse the preceding turn's last request, not its first.
                 let previousLast = (scan.callsByTurn[previous.turnId] ?? [previous]).max { $0.at < $1.at } ?? previous
                 // Creation alone can be growth; rebuilding requires reading below the previous request's cached share.
-                let cachedBefore = (previousLast.cacheRead ?? 0) + (previousLast.cacheCreation ?? 0)
+                // A turn that carries no history opens its own conversation (her queue wakes do): of the turn before, it shares that
+                // turn's first request, never the tool rounds that followed it.
+                let shared = turn.prefixDigests?.isEmpty == true ? previous : previousLast
+                let cachedBefore = (shared.cacheRead ?? 0) + (shared.cacheCreation ?? 0)
                 let rebuilt = turn.cacheRead.map { $0 == 0 || Double($0) * 100 < Double(cachedBefore) * minimumAnthropicHitPercent } ?? false
                 // The longest breakpoint TTL is 1h; past it nothing is left to read.
                 if rebuilt, turn.at.timeIntervalSince(previousLast.at) > cacheTTLSeconds {
@@ -344,8 +348,9 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
 
                 // The current cacheable prefix must extend the previous digest list; missing receipts cannot prove movement.
                 let prefixMoved: Bool? = {
-                    if !turn.prefixDigests.isEmpty, !previous.prefixDigests.isEmpty {
-                        return !turn.prefixDigests.starts(with: previous.prefixDigests)
+                    // An empty prefix is a receipt too: a first turn's is extended by whatever follows, and a prefix that vanished moved.
+                    if let now = turn.prefixDigests, let before = previous.prefixDigests {
+                        return !now.starts(with: before)
                     }
                     return nil
                 }()

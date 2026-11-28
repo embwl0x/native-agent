@@ -9,7 +9,6 @@ import MindCore
 /// A malformed claim makes only its own section unavailable; siblings remain readable.
 public struct DreamClaimSection<Claim: Sendable>: Sendable {
     public let content: String
-    public let line: Int
     public let claims: [Claim]
     public let unavailable: String?
 }
@@ -62,40 +61,11 @@ public struct DreamEntryProvenance: Sendable, Codable, Equatable {
         "\(peersPrefix)\(String(decoding: try JSONEncoder().encode(peers), as: UTF8.self)) -->\n"
     }
 
-    static func transcriptCause(_ row: [String: JSONValue], session: String, dataRoot: URL) -> CognitiveReflectionCause? {
+    static func transcriptCause(_ row: [String: JSONValue]) -> CognitiveReflectionCause? {
         guard case .string(let role)? = row["role"] else { return nil }
         guard ["user", "assistant"].contains(role), case .string(let content)? = row["content"] else { return nil }
-        let text = "\(role):\n\(content)"
-        var metadata: [String: JSONValue] = [:]
-        switch row["metadata"] {
-        case .object(let value)?: metadata = value
-        case .string(let encoded)?:
-            do {
-                guard case .object(let value) = try JSONValue.parse(Data(encoded.utf8)) else {
-                    return CognitiveReflectionCause(text: text)
-                }
-                metadata = value
-            } catch { return CognitiveReflectionCause(text: text) }
-        case .null?, nil: break
-        default: return CognitiveReflectionCause(text: text)
-        }
-        metadata["sessionId"] = .string(session)
-        var peers = CognitiveSubstrate.peerIdentity(metadata: metadata, dataRoot: dataRoot).map { [$0] } ?? []
-        let binding = ConversationHistory.continuityBinding(role: role, metadata: metadata)
-        if case .object(let value)? = binding, case .string(let participant)? = value["participant"],
-           participant.hasPrefix("peer:") { peers.append(participant) }
-        var carried = [metadata["untrusted_sources"]]
-        if case .object(let origin)? = metadata["origin"] {
-            carried += [origin["peerSources"], origin["elevatedPeerSources"]]
-        }
-        for value in carried.compactMap({ $0 }) {
-            guard case .array(let sources) = value else { return CognitiveReflectionCause(text: text) }
-            for source in sources {
-                guard case .string(let peer) = source else { return CognitiveReflectionCause(text: text) }
-                peers.append(peer)
-            }
-        }
-        return CognitiveReflectionCause(text: text, sourcePeerIds: Array(Set(peers)).sorted())
+        // A row she cites is from a conversation she was in: it names no outside source. Who said it stays on the row itself.
+        return CognitiveReflectionCause(text: "\(role):\n\(content)", sourcePeerIds: [])
     }
 
     /// Resolve exact cited rows; exchange identity groups recurrence without defining its material.
@@ -106,7 +76,7 @@ public struct DreamEntryProvenance: Sendable, Codable, Equatable {
         var journal: [StudioJournalEntry]?
         for ref in refs.sorted() {
             if let message = messages[ref] {
-                material[ref] = transcriptCause(message.row, session: message.session, dataRoot: dataRoot)
+                material[ref] = transcriptCause(message.row)
                 continue
             }
             let parts = ref.split(separator: ":", maxSplits: 1).map(String.init)
@@ -118,7 +88,8 @@ public struct DreamEntryProvenance: Sendable, Codable, Equatable {
                 guard path.count == 1 else { continue }
                 if journal == nil { journal = try await SwiftNativeStudioStore(dataRoot: dataRoot).journalEntriesIncludingArchive() }
                 if let entry = journal?.first(where: { $0.id == path[0] }) {
-                    material[ref] = CognitiveReflectionCause(text: String(decoding: try entry.toJSON().serializedData(pretty: true), as: UTF8.self))
+                    material[ref] = CognitiveReflectionCause(text: String(decoding: try entry.toJSON().serializedData(pretty: true), as: UTF8.self),
+                        sourcePeerIds: [])
                 }
             default: break
             }
@@ -142,8 +113,7 @@ public struct DreamEntryProvenance: Sendable, Codable, Equatable {
         return String(straight).split(whereSeparator: \.isWhitespace).joined(separator: " ")
     }
 
-    /// Leave unsupported claims without lineage and name them as dropped without discarding the night.
-    static func renderBlock(_ claims: [DreamClaim], content: String, sources: [DreamSourceRef], dropped: inout [String]) throws -> String {
+    static func checkProse(_ content: String) throws {
         guard !content.contains("<!-- claim-sources"), !content.contains("<!-- dream-peers"),
               !content.contains(DreamPendingWork.identityPrefix),
               !content.components(separatedBy: "\n").dropFirst().contains(where: { $0.hasPrefix(DreamNight.againHeading) }) else {
@@ -153,19 +123,24 @@ public struct DreamEntryProvenance: Sendable, Codable, Equatable {
                     the night stays owed and the next run retries it.
                     """])
         }
+    }
+
+    /// Leave unsupported claims without lineage and name them as dropped without discarding the night.
+    static func renderBlock(_ claims: [DreamClaim], content: String, sources: [DreamSourceRef], dropped: inout [String]) throws -> String {
+        try checkProse(content)
         // Bind the dream's own reference and date rather than trusting a model-repeated date tail.
         let canonical = Dictionary(sources.map { (undated($0.reference), $0.reference) }, uniquingKeysWith: { first, _ in first })
         let prose = plain(content)
         var result = ""
         for (index, original) in claims.enumerated() {
             let claim = original.provenance
-            let quote = "claims[\(index)] \"" + String(claim.quote.prefix(80)) + "\""
+            let quote = "claims[\(index)] \"" + String(DreamPart.redact(claim.quote).prefix(80)) + "\""
             guard !claim.quote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { dropped.append("claims[\(index)] has an empty quote"); continue }
             // Quote matching tolerates typography and spacing without changing words.
             guard prose.contains(plain(claim.quote)) else { dropped.append(quote + " is not in the dream's prose"); continue }
             let unbound = claim.sourceRefs.filter { canonical[undated($0)] == nil }
             guard unbound.isEmpty else {
-                dropped.append(quote + " cites sources this dream did not read: " + unbound.prefix(5).joined(separator: ", "))
+                dropped.append(quote + " cites sources this dream did not read: " + unbound.prefix(5).map(DreamPart.redact).joined(separator: ", "))
                 continue
             }
             var admitted = original
@@ -209,7 +184,7 @@ public struct DreamEntryProvenance: Sendable, Codable, Equatable {
                     break
                 }
             }
-            return DreamClaimSection(content: body, line: start + 1,
+            return DreamClaimSection(content: body,
                 claims: unavailable == nil ? claims : [], unavailable: unavailable)
         }
     }

@@ -5,25 +5,9 @@ import NativeAgentShared
 import MindCore
 import PersistenceCore
 import MacNerves
-// Blueprint: | `EngineFaceActs+Owners.swift` | Body onboarding, backup, research and dream acts return their owner's checked outcomes |
+// Blueprint: | `EngineFaceActs+Owners.swift` | Body onboarding and research acts return their owner's checked outcomes |
 
 extension EngineFaceActs {
-    @concurrent static func dream(_ root: URL, rem: Bool) async throws -> JSONValue {
-        let result = rem ? try await NativeAgentEngine.runRem(dataRoot: root)
-            : try await NativeAgentEngine.runDream(dataRoot: root, trigger: .manual)
-        return .object(try NativeActionWire.jsonValueBody(result))
-    }
-
-    func createBackup(_ reason: String) async throws -> FaceActReply {
-        let saved = try await TrustBackupPersistence.createBackup(reason: reason, dataRoot: engine.dataRoot)
-        let issue: WireFailure?
-        do { _ = try await engine.trust.refreshBackups(); issue = nil }
-        catch { issue = WireFailure(code: "backup_publication", message: "The backup was created, but its list could not be refreshed.",
-            cause: error.localizedDescription, effects: .known) }
-        return .committed(.init(identities: [saved.id], value: PartFace.Value(try JSONValue.fromEncodable(saved)),
-            revision: nil, effects: .known, publicationFailure: issue))
-    }
-
     func research(_ query: String) async throws -> FaceActReply {
         let clean = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { throw Self.failure("empty_query", "Enter a research query.") }
@@ -89,8 +73,8 @@ extension EngineFaceActs {
         let rows = read.abilityOverview.map {
             PartFace.Row(id: $0.id, title: $0.title, detail: $0.detail, actions: [])
         }
-        await engine.face.post(OnboardingFace(disposition: disposition, agentName: read.currentPersonaName, userName: nil,
-            abilityOverview: rows, progress: nil, greeting: nil, state: .ready), at: .onboarding)
+        await engine.face.post(OnboardingFace(disposition: disposition, agentName: read.currentPersonaName,
+            abilityOverview: rows, state: .ready), at: .onboarding)
         return disposition
     }
 }

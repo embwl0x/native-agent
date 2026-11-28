@@ -346,7 +346,6 @@ public struct ActivityRollups: Sendable {
         from: Double,
         to: Double,
         timezone: TimeZone,
-        grain: Grain? = nil,
         rowCap: Int = ActivityRollups.answerRowCap,
         bundleID: String? = nil
     ) async throws -> ActivityAnswerBundle {
@@ -361,7 +360,7 @@ public struct ActivityRollups: Sendable {
             throw RollupError.sourceRowsExceeded(limit: Self.sourceSpanLimit)
         }
         // Use day buckets above roughly 36 hours, when hourly detail obscures the shape.
-        let chosenGrain = grain ?? ((to - from) > 36 * 3600 ? .daily : .hourly)
+        let chosenGrain: Grain = (to - from) > 36 * 3600 ? .daily : .hourly
 
         let cap = max(3, rowCap)
         let topLimit = min(10, max(1, cap / 5))

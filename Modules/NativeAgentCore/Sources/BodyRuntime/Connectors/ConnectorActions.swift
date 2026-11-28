@@ -19,9 +19,7 @@ public struct ConnectorActions: Sendable {
         id: String,
         dryRun: Bool,
         input: [String: JSONValue] = [:],
-        surface: String = "connector_action",
-        dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot(),
-        turn: Turn
+        dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot()
     ) async throws -> ConnectorActionReceipt {
         let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let descriptor = connectorActionDescriptors().first(where: { $0.id == trimmed }) else {
@@ -34,8 +32,7 @@ public struct ConnectorActions: Sendable {
             descriptor: descriptor,
             dryRun: dryRun,
             input: input,
-            surface: surface,
-            dataRoot: dataRoot, turn: turn
+            dataRoot: dataRoot
         )
     }
 
@@ -44,36 +41,8 @@ public struct ConnectorActions: Sendable {
         dryRun: Bool,
         input: [String: JSONValue] = [:],
         approvedReplayApprovalID: String? = nil,
-        surface: String = "connector_action",
-        dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot(),
-        turn: Turn
+        dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot()
     ) async throws -> ConnectorActionReceipt {
-        let yoloAdmitted = !dryRun && approvedReplayApprovalID == nil
-            ? await SwiftNativeSecurityCenter(dataRoot: dataRoot).fullMacYoloAuthority(
-                origin: .currentTurn(turn: turn, surface: surface, source: "native_client_direct_action"), turn: turn).admitted
-            : false
-        if descriptor.requiresApproval, !dryRun, approvedReplayApprovalID == nil, !yoloAdmitted {
-            let approval = try await Self.createConnectorActionApproval(
-                descriptor,
-                input: input,
-                dataRoot: dataRoot,
-                turn: turn
-            )
-            return try await Self.appendConnectorActionReceipt(
-                descriptor: descriptor,
-                dryRun: false,
-                approvalId: approval.id,
-                output: .object([
-                    "actionId": .string(descriptor.id),
-                    "connectorId": .string(descriptor.connectorId),
-                    "status": .string("pending_approval"),
-                    "approvalId": .string(approval.id),
-                    "risk": .string(descriptor.risk),
-                ]),
-                dataRoot: dataRoot
-            )
-        }
-
         if !dryRun {
             if let approvalID = approvedReplayApprovalID {
                 try await Self.validateApprovedConnectorReplay(
@@ -82,6 +51,10 @@ public struct ConnectorActions: Sendable {
                     input: input,
                     dataRoot: dataRoot
                 )
+            } else if descriptor.requiresApproval {
+                throw NSError(domain: "NativeAgentConnectorApproval", code: 403, userInfo: [
+                    NSLocalizedDescriptionKey: "Connector action \(descriptor.id) requires an approved replay."
+                ])
             }
             let output: JSONValue
             switch descriptor.id {
@@ -96,15 +69,12 @@ public struct ConnectorActions: Sendable {
             case "scheduler.cancel_job":
                 output = try await ScheduledReads.cancel(input["jobId"]?.scalarText ?? "", dataRoot: dataRoot)
             default:
-                guard descriptor.id.hasSuffix(".status") else {
-                    throw NSError(domain: "NativeAgentSwiftOnly", code: -410, userInfo: [
-                        NSLocalizedDescriptionKey: """
-                            Connector action \(descriptor.id) needs a live Swift provider executor. This action is registered but no Swift executor owns \
-                            its effects yet.
-                            """
-                    ])
-                }
-                output = try await connectorStatusActionOutput(descriptor)
+                throw NSError(domain: "NativeAgentSwiftOnly", code: -410, userInfo: [
+                    NSLocalizedDescriptionKey: """
+                        Connector action \(descriptor.id) needs a live Swift provider executor. This action is registered but no Swift executor owns \
+                        its effects yet.
+                        """
+                ])
             }
             return try await Self.appendConnectorActionReceipt(
                 descriptor: descriptor,
@@ -199,55 +169,6 @@ public struct ConnectorActions: Sendable {
         try MacAppleScriptBridge.clampedInt(raw, defaultValue: defaultValue, min: Int.min, max: Int.max)
     }
 
-    public func connectorStatusActionOutput(_ descriptor: ConnectorActionDescriptor) async throws -> JSONValue {
-        let action = try await platform.statusEvidence(actionID: descriptor.id)
-        return .object([
-            "actionId": .string(descriptor.id),
-            "connectorId": .string(descriptor.connectorId),
-            "name": .string(descriptor.name ?? descriptor.id),
-            "status": .string("completed"),
-            "risk": .string(descriptor.risk),
-            "connectorStatus": .string(action?.connectorStatus ?? "needs_setup"),
-            "authState": .string(action?.authState ?? "not_connected"),
-            "enabled": .bool(action?.enabled ?? false),
-            "dryRunAvailable": .bool(descriptor.dryRunAvailable),
-            "requiresApproval": .bool(descriptor.requiresApproval),
-        ])
-    }
-
-    public static func createConnectorActionApproval(
-        _ descriptor: ConnectorActionDescriptor,
-        input: [String: JSONValue],
-        dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot(),
-        turn: Turn
-    ) async throws -> ApprovalRecord {
-        let payload: JSONValue = .object([
-            "kind": .string("connector_action_v1"),
-            "surface": .string("connector_action"),
-            "actionId": .string(descriptor.id),
-            "connectorId": .string(descriptor.connectorId),
-            "name": .string(descriptor.name ?? descriptor.id),
-            "risk": .string(descriptor.risk),
-            "input": .object(input),
-        ])
-        let payloadBytes = try payload.serializedData(pretty: false)
-        guard payloadBytes.count <= 65_536 else {
-            throw NSError(domain: "NativeAgentConnectorApproval", code: 413, userInfo: [
-                NSLocalizedDescriptionKey: "Connector approval input exceeds the 64 KiB replay limit."
-            ])
-        }
-        let inbox = SwiftNativeApprovalInbox(root: dataRoot)
-        return try await inbox.create(.object([
-            "title": .string("Approve \(descriptor.name ?? descriptor.id)"),
-            "action": .string("connector.action.\(descriptor.id)"),
-            "risk": .string(descriptor.risk),
-            "reason": .string("Connector action \(descriptor.id) requires approval before any external side effect can run."),
-            "remoteResolvable": .bool(true),
-            "localOnly": .bool(false),
-            "payload": payload,
-        ]), turn: turn)
-    }
-
     public static func validateApprovedConnectorReplay(
         approvalID: String,
         descriptor: ConnectorActionDescriptor,
@@ -274,8 +195,7 @@ public struct ConnectorActions: Sendable {
         dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot()
     ) async throws -> ConnectorActionReceipt {
         let reply = ToolResult(output)
-        let directRead = !dryRun && output.objectValue?["status"] != .string(
-            "pending_approval") && ["codex.handoff", "mac_assistant.watch_templates"].contains(descriptor.id)
+        let directRead = !dryRun && ["codex.handoff", "mac_assistant.watch_templates"].contains(descriptor.id)
         let facts = (directRead ? ChatToolOutcome.ExactResultClass.succeeded : reply.outcome).receipt
         let status = facts.ok == false ? facts.status : directRead ? "completed" : output.objectValue?["status"]?.stringValue ?? (
             facts.ok == true ? "completed" : facts.status)

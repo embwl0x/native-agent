@@ -3,7 +3,7 @@ import SenseCore
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `OneClock.swift` | `OneClock`: declared times, checked recurrence and durable consumption before delivery |
+// Blueprint: | `OneClock.swift` | `OneClock`: ordered held times on their own sleeper, declared times with checked recurrence and durable consumption before delivery |
 
 public actor OneClock {
     public struct Time: Codable, Sendable, Equatable {
@@ -53,6 +53,7 @@ public actor OneClock {
 
     /// Delivered with the occurrence it fired for (its `next` as it stood).
     public typealias Deliver = @Sendable (_ time: Time, _ occurrence: Date) async -> Void
+    public typealias Wake = @Sendable (_ id: String, _ at: Date) async -> Void
 
     private static let clocks = Mutex([String: OneClock]())
 
@@ -69,8 +70,11 @@ public actor OneClock {
     private let dataRoot: URL
     private var loaded: [String: Time]?
     private var handlers: [String: Deliver] = [:]
+    private var held: [String: (at: Date, wake: Wake)] = [:]
+    private var heldOrder: [String: UInt64] = [:]
     private var deliveries: [UUID: Task<Void, Never>]? = [:]
     private var deadline: Task<Void, Never>?
+    private var heldDeadline: Task<Void, Never>?
     private var observers: [NSObjectProtocol] = []
 
     private init(dataRoot: URL) { self.dataRoot = dataRoot }
@@ -89,10 +93,52 @@ public actor OneClock {
         handlers[owner] = nil
     }
 
+    public func hold(_ id: String, until: Date, order: UInt64, _ wake: @escaping Wake) {
+        guard deliveries != nil, until.timeIntervalSinceReferenceDate.isFinite, order >= heldOrder[id, default: 0] else { return }
+        heldOrder[id] = order
+        held[id] = (until, wake)
+        fireHeld()
+    }
+
+    public func release(held id: String, order: UInt64) {
+        guard order >= heldOrder[id, default: 0] else { return }
+        heldOrder[id] = order
+        guard held.removeValue(forKey: id) != nil else { return }
+        fireHeld()
+    }
+
+    private func fireHeld() {
+        guard deliveries != nil else { return }
+        let now = Date()
+        for (id, time) in held where time.at <= now {
+            held[id] = nil
+            let deliveryID = UUID()
+            deliveries?[deliveryID] = Task.detached {
+                await time.wake(id, time.at)
+                await self.delivered(deliveryID)
+            }
+        }
+        armHeld()
+    }
+
+    private func armHeld() {
+        guard deliveries != nil else { return }
+        heldDeadline?.cancel()
+        guard let earliest = held.values.lazy.map({ $0.at }).min() else { heldDeadline = nil; return }
+        heldDeadline = Task { [weak self] in
+            let boundedDelay = min(max(0, earliest.timeIntervalSinceNow), Double(Int64.max / 1_000_000_000))
+            do { if boundedDelay > 0 { try await Task.sleep(for: .seconds(boundedDelay)) } }
+            catch { return }
+            guard !Task.isCancelled else { return }
+            await self?.fireHeld()
+        }
+    }
+
     package func finishScheduledDeliveries() async {
         guard let admitted = deliveries else { return }
         deliveries = nil
         deadline?.cancel()
+        heldDeadline?.cancel()
         for task in admitted.values { task.cancel() }
         for task in admitted.values { await task.value }
     }
@@ -240,7 +286,7 @@ public actor OneClock {
         deadline?.cancel()
         guard let earliest = times.values.filter({ $0.isPending && handlers[$0.owner] != nil && !failed.contains($0.id) }).map(\.next).min()
         else { deadline = nil; return }
-        let delay = max(0, earliest.timeIntervalSinceNow)
+        let delay = min(max(0, earliest.timeIntervalSinceNow), 31_536_000)
         deadline = Task { [weak self] in
             // Continuous time runs through the Mac's sleep, so a time passed while asleep fires on waking.
             do { if delay > 0 { try await Task.sleep(for: .seconds(delay)) } }
@@ -255,6 +301,7 @@ public actor OneClock {
         for name in [Notification.Name.NSSystemClockDidChange, .NSSystemTimeZoneDidChange] {
             observers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in
                 Task { await self?.fire() }
+                if name == .NSSystemClockDidChange { Task { await self?.fireHeld() } }
             })
         }
     }

@@ -55,7 +55,7 @@ package struct SentTurnContext: Sendable {
         let path = (dataRoot ?? PersistenceCore.defaultDataRoot()).appendingPathComponent("chat/messages/\(safe).jsonl")
         try await SwiftNativePersistenceCore.withFileLock(path) {
             let bytes = try Data(contentsOf: path)
-            guard let updated = try ContactThread.editingRow(in: bytes, last: true, matching: { row in
+            guard let updated = try ContactThread.editingRow(in: bytes, matching: { row in
                 Self.matches(row, runID: runID, userMessageID: userMessageID)
             }, replacement: { original in
                 var row = original

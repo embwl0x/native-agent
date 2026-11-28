@@ -39,7 +39,7 @@ public final class WordPieceTokenizer: Sendable {
         self.vocab = dict
     }
 
-    public func encode(_ text: String, maxLength: Int) -> (inputIds: [Int], attentionMask: [Int], isComplete: Bool) {
+    public func encode(_ text: String, maxLength: Int) -> (inputIds: [Int], attentionMask: [Int]) {
         let maxLength = max(0, maxLength)
         let bodyMax = max(0, maxLength - 2)
         var s = String(String.UnicodeScalarView(text.unicodeScalars.compactMap { scalar in
@@ -75,7 +75,6 @@ public final class WordPieceTokenizer: Sendable {
             }
         }
         if ids.count <= bodyMax { appendWord(word) }
-        let isComplete = ids.count <= bodyMax
         var inputIds: [Int] = [clsID] + ids.prefix(bodyMax) + [sepID]
         var mask = [Int](repeating: 1, count: inputIds.count)
         while inputIds.count < maxLength {
@@ -86,7 +85,7 @@ public final class WordPieceTokenizer: Sendable {
             inputIds = Array(inputIds.prefix(maxLength))
             mask = Array(mask.prefix(maxLength))
         }
-        return (inputIds, mask, isComplete)
+        return (inputIds, mask)
     }
 
     private func isPunctuation(_ scalar: Unicode.Scalar) -> Bool {

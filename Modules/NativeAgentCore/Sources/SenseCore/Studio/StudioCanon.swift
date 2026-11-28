@@ -481,69 +481,71 @@ public extension SwiftNativeStudioStore {
         let maximumTrackedWorks = 256
         let stamp = NativeTimestampFormat.sixDigitUTCOffset(now)
         let path = canonRecallHitsPath
-        var committed = false
-        do {
-            try FileManager.default.createDirectory(at: canonDirectory, withIntermediateDirectories: true)
-            try await SwiftNativePersistenceCore.withFileLock(path) {
-            let current = try Self.readRecallCounter(at: path)
-            let counts = try Self.checkedRecallCounts(current)
-            guard case .object(let obj) = current, case .object(var table)? = obj["works"] else {
-                throw StudioCanonError.unavailableRecallCounts
-            }
-            var seen = Set<String>()
-            for entry in titles {
-                let cleaned = entry.title.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !cleaned.isEmpty else { continue }
-                let key = StudioCanonLaw.workKey(title: cleaned, creator: entry.creator)
-                guard seen.insert(key).inserted else { continue }
-                let count = Int64(counts[key]?.count ?? 0) // This key has never been pulled when absent.
-                let (next, overflow) = count.addingReportingOverflow(1)
-                guard !overflow else { throw StudioCanonError.unavailableRecallCounts }
-                let row: [String: JSONValue] = [
-                    "count": .int(next),
-                    "last_at": .string(stamp),
-                ]
-                table[key] = .object(row)
-            }
-            if table.count > maximumTrackedWorks {
-                // Bound evidence by evicting the least recently pulled work.
-                let updated = try Self.checkedRecallCounts(.object(["works": .object(table)]))
-                let keep = Set(updated.sorted { $0.value.lastAt > $1.value.lastAt }.prefix(maximumTrackedWorks).map(\.key))
-                table = table.filter { keep.contains($0.key) }
-            }
-            try await SwiftNativePersistenceCore.writeJSON(
-                .object(["works": .object(table)]),
-                to: path
-            )
-            }
-            committed = true
-            try await requireRecallCountingAvailable()
-            return nil
-        } catch {
-            let words = "Recall returned its entries, but production-pull counting at \(path.path) is unavailable: \(error.localizedDescription). "
-                + (committed ? "This pull was counted; earlier counting remains unreconciled. Pull at " : "Unconfirmed pull at ")
-                + "\(stamp) for work keys: "
-                + titles.map { StudioCanonLaw.workKey(title: $0.title, creator: $0.creator) }.joined(separator: ", ")
-            let instruction = ToolFailureError.fileRepairInstruction(path,
-                shape: """
-                    Reconcile the unconfirmed pull in this repair's evidence against the existing counter before restoring counting; a later successful pull \
-                    cannot prove this one was counted. Do not repeat the completed recall.
-                    """)
-            if !committed {
-                let operation = Self.recallCountingOperation
-                let debt = ExperienceStore.record(dataRoot, "repair:" + operation) { store in
-                    try await RepairOwed.owe(store, id: "studio-recall-count:" + UUID().uuidString,
-                        kind: .act, evidence: [.init(source: "studio/canon/recall_hits.json", id: stamp)],
-                        operation: operation, owner: path.path, words: words, tap: path.path)
-                    if let open = try await RepairOwed.openDebt(store, operation: operation, owner: path.path) {
-                        // Repeated failures share one debt, but every pull keeps its exact timestamp, works and cause for reconciliation.
-                        try await store.append([.claim(.init(claim: words, evidence: []))], to: open.id)
+        return await settle { () async -> JSONValue? in
+            var committed = false
+            do {
+                try FileManager.default.createDirectory(at: canonDirectory, withIntermediateDirectories: true)
+                try await SwiftNativePersistenceCore.withFileLock(path) {
+                    let current = try Self.readRecallCounter(at: path)
+                    let counts = try Self.checkedRecallCounts(current)
+                    guard case .object(let obj) = current, case .object(var table)? = obj["works"] else {
+                        throw StudioCanonError.unavailableRecallCounts
                     }
+                    var seen = Set<String>()
+                    for entry in titles {
+                        let cleaned = entry.title.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !cleaned.isEmpty else { continue }
+                        let key = StudioCanonLaw.workKey(title: cleaned, creator: entry.creator)
+                        guard seen.insert(key).inserted else { continue }
+                        let count = Int64(counts[key]?.count ?? 0) // This key has never been pulled when absent.
+                        let (next, overflow) = count.addingReportingOverflow(1)
+                        guard !overflow else { throw StudioCanonError.unavailableRecallCounts }
+                        let row: [String: JSONValue] = [
+                            "count": .int(next),
+                            "last_at": .string(stamp),
+                        ]
+                        table[key] = .object(row)
+                    }
+                    if table.count > maximumTrackedWorks {
+                        // Bound evidence by evicting the least recently pulled work.
+                        let updated = try Self.checkedRecallCounts(.object(["works": .object(table)]))
+                        let keep = Set(updated.sorted { $0.value.lastAt > $1.value.lastAt }.prefix(maximumTrackedWorks).map(\.key))
+                        table = table.filter { keep.contains($0.key) }
+                    }
+                    try await SwiftNativePersistenceCore.writeJSON(
+                        .object(["works": .object(table)]),
+                        to: path
+                    )
                 }
-                await settle { await debt.value }
+                committed = true
+                try await requireRecallCountingAvailable()
+                return nil
+            } catch {
+                let words = "Recall returned its entries, but production-pull counting at \(path.path) is unavailable: \(error.localizedDescription). "
+                    + (committed ? "This pull was counted; earlier counting remains unreconciled. Pull at " : "Unconfirmed pull at ")
+                    + "\(stamp) for work keys: "
+                    + titles.map { StudioCanonLaw.workKey(title: $0.title, creator: $0.creator) }.joined(separator: ", ")
+                let instruction = ToolFailureError.fileRepairInstruction(path,
+                    shape: """
+                        Reconcile the unconfirmed pull in this repair's evidence against the existing counter before restoring counting; a later successful pull \
+                        cannot prove this one was counted. Do not repeat the completed recall.
+                        """)
+                if !committed {
+                    let operation = Self.recallCountingOperation
+                    let debt = ExperienceStore.record(dataRoot, "repair:" + operation) { store in
+                        try await RepairOwed.owe(store, id: "studio-recall-count:" + UUID().uuidString,
+                            kind: .act, evidence: [.init(source: "studio/canon/recall_hits.json", id: stamp)],
+                            operation: operation, owner: path.path, words: words, tap: path.path)
+                        if let open = try await RepairOwed.openDebt(store, operation: operation, owner: path.path) {
+                            // Repeated failures share one debt, but every pull keeps its exact timestamp, works and cause for reconciliation.
+                            try await store.append([.claim(.init(claim: words, evidence: []))], to: open.id)
+                        }
+                    }
+                    await debt.value
+                }
+                return .object(["status": .string("unavailable"), "reason": .string(words),
+                    "remedy": Repair.remedy(owner: path.path, nextCall: nil, tap: path.path, instruction: instruction)])
             }
-            return .object(["status": .string("unavailable"), "reason": .string(words),
-                "remedy": Repair.remedy(owner: path.path, nextCall: nil, tap: path.path, instruction: instruction)])
         }
     }
 

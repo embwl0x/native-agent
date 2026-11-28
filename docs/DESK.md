@@ -1,7 +1,6 @@
 # Desk vocabulary
 
-The Desk is the agent's durable work. `ledger.list` reads the shared task
-ledger, a separate list; an empty ledger says nothing about the Desk.
+The Desk holds the agent's durable work.
 
 The Desk journal commits one or more operations under the store's lock.
 Operations receive ordered timestamps and are appended together to
@@ -9,9 +8,7 @@ Operations receive ordered timestamps and are appended together to
 creation, status and step together. Validation that depends on an earlier
 operation reads the staged prefix before any journal write. A torn tail
 from storage failure or power loss still follows the journal's existing
-integrity handling. Archival works deepest first, saving each receipt on
-its separate shelf and committing that item's removal before moving on.
-A retry replaces a staged receipt for the item it archives.
+integrity handling.
 
 The Desk packet names failed contact and Inbox-answer reads as
 `unavailable.contacts` and `unavailable.inbox`; its face shows those causes
@@ -50,12 +47,18 @@ artifacts. The archive omits visible numbers and ordinary notes. An unknown id
 remains `not_found`;
 absence is not completion evidence. An unreadable required archive remains a
 storage failure, never `not_found`.
-Each step's time is a `moment:<handle>` time on the one
+Each ordinary step's time is a `moment:<handle>` time on the one
 clock; what comes due is posted once as a `moment` happening, never a second queue
 of reminders or turns. The [intention contract](INTENTIONS.md) owns the form,
 readiness and delivery. A step imported from a scheduler job keeps its job identity
 (`scheduledJobID`), so the same job never files a second step. A stopped import names the
 evidence to reconcile before refiling it.
+
+An open agent pursuit or carried work step can declare a typed `wait_for`
+through `queue.update`. Its Desk step keeps the declaration across restarts.
+The named cause offers work through the existing clock, Attention or Desk
+observation. This path uses causal offers instead of work reservations.
+See [Declared pursuit waits](INTENTIONS.md#declared-pursuit-waits).
 
 Each item's `workAttempts` ledger holds both pursuit and owner-cadence work.
 Only current attempt records enter that ledger; retired reservation formats
@@ -87,13 +90,10 @@ before drawing: the opened item is the Desk's own selection, so the picture
 shows it open and the window stays on its page. `page.show` answers with the
 Desk as it now reads, its "Open now" line naming the item.
 
-`desk.add` and a new `desk.breakdown` parent take `project` optionally. Left
-out, an item goes under its parent's project, and with no parent under `Tasks`
-(`DeskItem.tasksProject`), where a task the person starts is filed. `desk.add`
-takes `kind` optionally too; left out, it is `project` (`DeskItem.tasksKind`),
-the kind of that same task. `desk.open_pursuit` with no `project` files the
-pursuit under `workshop` (`DeskItem.workshopProject`), where the agent's own
-proposed pursuits go.
+`desk.add` takes `project` optionally. Left out, an item goes under its
+parent's project, and with no parent under `Tasks` (`DeskItem.tasksProject`),
+where a task the person starts is filed. `desk.add` takes `kind` optionally
+too; left out, it is `project` (`DeskItem.tasksKind`), the kind of that same task.
 
 **The table** is the Desk's one standing board. On the board view it follows
 Waiting and Needs you, with any **On the table** pieces listed just above it.
@@ -120,20 +120,76 @@ Both table readings summarize each stroke by id, author, bounding box in board p
 an open stroke lists shape, text and container ids whose frames contain a point or intersect a segment in `touches`.
 Signed frame dimensions use the intervals between the two ends on each axis.
 Raw points stay in the file reached by `make.read {ref:"table"}`.
+In `app {page:"desk"}` and on pages with a table slice, the same spatial
+reading groups elements under their enclosing containers and orders each group
+by row band and horizontal position. It gives each element's id, words, live
+facts and measured geometry, with `inside`, `beside`, `under`, arrow and ink
+relations derived from the current board.
 
 **THE STORE ANSWERS; NO HAND GUESSES.**
 `table.put` with `type` adds a whole element under a supplied free `id` or mints `e` followed by twelve lowercase hexadecimal digits.
 An occupied supplied id is `exists`.
 Without `type`, it changes only supplied fields of an existing `id`: absent is `not_found`, omitted is `invalid_input`.
-Refusals write nothing; an edit never recreates an element or changes its type. No shape or position defaults are invented. An id
-must contain 1–40 letters, digits or hyphens, otherwise `invalid_input`.
+An existing text edit can pass `if_text` to require the exact opening text. The locked write refuses a mismatch with `table_text_changed`.
+Refusals write nothing. An edit keeps the element's type and requires its id.
+An id must contain 1–40 letters, digits or hyphens, otherwise `invalid_input`.
 A typeless put carrying `item` or `piece` is `invalid_input`, with nothing written: the pointer is set only at creation.
+Only Agent or the person can promote a job artifact. Placement verifies the Make
+version's job and peer IDs against the job's registered ref and version. The table
+read shows its `made_by` and `made_version` beside the card signer as `promoted_by`.
+Later card edits keep the original placement and credit. Older Make versions
+with display credit alone still open, and require attestation for new promotion.
+Opening a document, board or sheet on the Desk carries the exact version's peer
+source into the Ask when its contents are read.
 Every coordinate, size, width and stroke point is a finite number within a million points of the table's origin; anything else is
 `invalid_input`. A card's target is checked when the card is put, not again as the write lands, so a card can point at an item that
 closed in that instant; it then reads as closed. A contact's change that landed is reported as landed even when its lever or grant is
 turned off right after; only refusals are withheld from a contact that has left the table.
-A new shape or container requires `x`, `y`, `w`, `h`; text requires `x`, `y`; an arrow requires `from`, `to`;
-a stroke requires `x`, `y` and `points` (the points run from x,y). Missing fields are named in an `invalid_input` refusal, with nothing written.
+A new absolute shape or container requires `w` and `h`.
+A new shape, container or text with absolute placement needs both `x` and `y`.
+A new arrow requires `from` and `to`. A new stroke requires `x`, `y` and `points`
+(the points run from x,y). Refusals for missing fields name them as `invalid_input`.
+In `app`, give one anchor in place of `x` and `y` when adding or moving a shape,
+text element or container. Contact writes use explicit positions.
+
+- `beside` names an element id and starts to its right, aligned at the top.
+- `after` and `under` name an element id and start below it, aligned at the left.
+- `inside` names a container id. It takes the first free whole-point position
+  from top to bottom, then left to right, with 16 points of padding and room
+  for the title at the current text size (44 points at standard size).
+  An agent placement may grow the right or bottom of a full container created
+  by the agent and still signed by the agent. A full container in any other
+  hand returns `container_full`.
+- `cluster` names an array of 1–32 element ids. A shape or text starts below
+  their combined frame. A container wraps the combined frame with 24 points
+  on each side and below, and 44 points above. Its dimensions come from the
+  cluster and it takes fixed padding.
+
+For `beside`, `after`, `under` and placement below a cluster, `gap` is
+0–400 points and defaults to 24. A new anchored shape defaults to 220 points
+wide and at least 88 points high, growing to fit its measured words. A new
+anchored container outside a cluster defaults to 420 × 280. Text measures
+its own frame.
+Placement on the Mac uses the same text size and frames as the Mac canvas,
+including wrapped notes and the bounds of the painted pen curves. If the aligned position is blocked, side placement
+checks 24-point steps and takes the nearest free slot on the requested side.
+Linked anchors, cluster members and linked cards being placed use the current title while the
+board change is locked. A plain note beside a plain note needs no Desk or peer
+read. If an unrelated Desk card's unmeasured title could cover the selected
+slot, placement returns `card_frame_unavailable` with no write.
+Unknown anchor ids return `not_found` before any write. Combining either
+coordinate with an anchor, combining anchors, using an invalid anchor type or
+resolving geometry outside the coordinate limit returns `invalid_input`.
+The local put receipt for a shape, container or text gives the resolved rectangle as
+`geometry` with `x`, `y`, `w` and `h` for both absolute and anchored placement.
+When the put grows a container, the receipt gives its `id` and new `geometry`
+in `grown_container` and describes the growth in `detail`. A committed local
+arrow put reports each `from` and `to` endpoint in `detail` as its valid element
+ID, `unset` for an absent or empty end, or `invalid endpoint ID` for a malformed end.
+Placement stores whole points for new positions and sizes. The placed element
+and an eligible container's growth commit in the same board version. Existing cards retain their position
+and size as a side effect of placement, including all cards placed by hand.
+
 Fields include an arrow's `fromSide` and `toSide` (left, right, top or
 bottom). `item` resolves through `DeskState.matching` and keeps the stable
 handle. `piece` is a `make:<ref>` address holding a version of an ordinary Make piece. Cards keep their
@@ -185,13 +241,30 @@ In the window, the table's floating glass toolbar offers **Select**, **Note**, *
 then **Zoom out**, the percentage, **Zoom in** and **Fit**, each button named and illustrated.
 One tool is active, shown with a neutral fill, and Select is the default. The pop-out keeps the toolbar on one row.
 In a narrow Desk tab, the camera controls sit below the tools in the same bar.
+The Table tools and Make board zoom controls group glass locally on the board.
+Reduce Transparency gives those controls the opaque house fill.
 **Note** opens a new note's in-place editor centred on the board click, and Select resumes. The editor fills the card with wrapping, top-leading words;
 clicks inside the card keep editing. Shift+Return inserts a line break; Return or clicking outside commits words; Escape also commits a new note's words,
 while Escape on an existing note restores the previous words. An empty new note disappears immediately, puts nothing and holds nothing.
 The first commit sends the new note only when words are present. New notes start at 200 × 110 board points;
-every paint draws a card at the larger of stored height and the height needed at the current width: attributed note words, or wrapped live title plus caption.
-The same frame serves selection, handles, arrows, placement and Fit. Reading writes no version; word commits and resizing alone store height.
-Table body text is at least 22 board points (13.2 at 60% Fit).
+every paint draws a card at the larger of its stored height and the space its
+words or linked title and caption need at the current text size. The same frame
+serves selection, handles, arrows, placement and Fit. Word commits save the
+words and resizing saves the dimensions. Changing Text Size writes no version.
+`NativeAgentShared` owns board geometry, SwiftUI painting, and pointer, touch
+and Pencil gestures. The Mac supplies its palette, wheel navigation, context
+menu and inline editor. The iPhone supplies touch-sized tools and a note editor
+sheet. On either platform, the measured frames give VoiceOver and the keyboard
+the same top-to-bottom, left-to-right order. VoiceOver announces element names,
+spatial relations and contact provenance where present. It uses each element's
+center to identify the smallest section containing it. It offers Open, Cross off
+and Remove where available. With the board focused, Tab and Shift+Tab cycle
+elements. Arrow keys nudge by 8 board points, or 24 with Shift. Return opens a
+linked Desk item or the note editor, and opens a linked Make piece on the Mac.
+Delete removes the selected element. Escape clears selection and lets Tab or
+Shift+Tab leave the canvas. Command+0 resumes fitting the board as it changes.
+Table body text starts at 22 board points and follows macOS Text
+Size or iOS Dynamic Type before applying the camera scale.
 Clearing an existing note edits the words and keeps the note in place.
 Double-clicking empty space with Select also adds a note. **Card** opens a searchable list of open Desk items by title and number,
 and ready pieces on open items by title and kind. Choosing one places a live pointer card; no handle entry is needed.
@@ -222,7 +295,7 @@ Moving, sizing, writing, adding, drawing, joining and Delete also call that same
 an absolute `table.put` addressed by id, or `table.remove {id}`. A new card, arrow or stroke carries a hand-minted id.
 On the table, an item or piece card cannot be written on by hand; other boards still open the editor.
 Moving a section sends one independent put for each carried element. A join targets the element under the release point in the picture then drawn.
-The picture is the last board read with the union of fields held by hand laid over it, newest per field; a held removal hides the element.
+On Mac, the picture is the last board read with the union of fields held by hand laid over it, newest per field; a held removal hides the element.
 Each gesture sends its whole absolute call, including every geometry field painted at release, without merging or subtracting fields between calls.
 Calls for one element run in order, each after the previous call returns; different elements proceed independently.
 The hold drops only when that element's chain is empty and a read reaches its last returned version.
@@ -234,12 +307,38 @@ A refusal or failure drops the element's hold, cancels the remaining calls for t
 including an ordinary `not_found` when another hand removed the element. The read shows what is.
 Once an add's own returned version has been read, that hold no longer appends a missing element, even while later calls remain in flight.
 Nothing queues whole boards or rebases the table. Pan, zoom and Fit remain available.
-The Desk tab and its table window mount the table controls. Other pages draw a read-only table.
+On iPhone, each element edit is signed and sent through the existing paired-phone
+request channel. The Mac runs the same Table actions through the person's door.
+The phone draws the committed revision from the signed Desk face. During a
+gesture the phone shows a preview. The next edit waits for the Mac's reply and,
+when it returns a board version, for the drawing at that version or later.
+**Cancel waiting** pauses the wait. **Resume waiting** listens for the same
+signed request's reply, including after reopening the Table. If the Mac replies
+with an unknown outcome, **Check table** compares the requested change with
+the committed element. Other elements remain editable while that change is unresolved.
+A section move continues past an element the Mac refuses and names failed and unsubmitted IDs
+if a reply is uncertain. A note draft stays open through Save and remains
+available after a refusal, including when the Mac's stored words differ from
+the text shown on iPhone.
+The Desk tab, the Mac table window and the iPhone Table mount these controls.
+Other pages draw read-only slices.
+A Desk item with a card on the standing table can show **This item on the table**. It is a live, read-only slice of the current table,
+with directly connected neighbours, enclosing regions and arrows between the included elements. It appears when the item and its
+neighbours fit the slice's ID limit and the page has a free section.
+A page can name exact element IDs, including a region to show what it contains, or omit IDs for an overview. Click a populated slice
+to open the Mac table window fitted to those elements, or tap it to open the fitted table on iPhone. An empty table or a slice with no
+matching elements displays a plain note.
+At the text door, including Home, the Body joins current card facts and puts any peer provenance,
+including signatures on attached arrows, before the page headings and outside
+line clipping. If the Desk journal is unreadable, board marks and signatures
+remain readable and linked items show that their facts are unavailable.
+The leaf retains its `alt` words for unavailable board readings and older clients.
 A successful table act clears the board's feedback line; a failure shows one plain sentence until the next successful act.
 The agent places and moves elements with `table.put`. `make.add {ref:"table"}` is refused with the table actions named.
 Ordinary board pieces keep their whole-document saves and rebasing below.
 A contact admitted to read the Desk also reads the standing board with
-`agent_desk {piece:"table"}`, including its document and live card facts.
+`agent_desk {piece:"table"}`. It returns the same spatial `reading` alongside
+the paged document in `text` and live card facts.
 Each stroke's read-time facts include `around` alongside the stored `by`; `around` is never stored on the board.
 `around` lists shape, text and container ids whose frame centers lie inside or on the stroke's bounding box:
 the box is at least 24 board points wide and high, and the final point is within 24 board points of the first.
@@ -333,8 +432,7 @@ the row's `desk.close`. An open item that holds steps, or is a plan or project,
 also offers **Add a step**, a form whose one field is the title of
 `desk.add {parent, kind:"plan", project}`. Done shows the eight steps closed
 most recently and the open columns their first 64, each footer counting the
-rest, which `desk.read` lists. One `desk.breakdown {project, title,
-children:[{title}, …]}` lays a whole plan out.
+rest, which `desk.read` lists.
 
 An agent reads an item two ways, and neither changes the window's selection.
 `desk.read {handle}` gives the item's record, its steps and what is on the
@@ -382,11 +480,8 @@ Rooms use the canonical returned `display_status` and continuations.
 
 A committed mutation whose confirmation read fails reports the Desk read's
 cause with `effects:occurred`; read its handle before repeating the mutation.
-Equivalent creation and plan breakdown use the same locked store transaction,
-matching kind, parent, lane, assignee, project and title. Breakdown retains
-every returned handle, alias and reuse flag in `committed`, and completed
-sequencing operations in `committed_operations`, including when its final
-readback fails. A partial receipt does not depend on another successful read.
+Equivalent creation matches kind, parent, lane, assignee, project and title
+in the locked store transaction.
 `desk.blocked_on` requires its `blocked_on` string and `desk.defer` its `until`
 string; an explicit empty string clears, while absence or an invalid type
 refuses before mutation. Direct tools, the app door and part/ability calls
@@ -403,25 +498,9 @@ with each intention's name, words, filing time and outstanding waits.
 
 With `include_archived:true`, `archives` contains its own paged `items`,
 `limit`, `offset`, `total`, `count`, and `has_more`. Its initial offset is the
-ordinary `offset`; `next_archive_read` carries the separate `archived_offset`
-for continuation. The shared task ledger also accepts `limit`/`offset` and
-returns `total`, `has_more`, and `next_offset` for summaries and an exact
-task's events (`next_offset` is null on the final page). The home room offers
-**More shared work** and **More timeline events** from that continuation,
-preserving the task, page size, and finished-work filter.
-Archive and shared-ledger histories decode every record and link, or expose
-that history as unavailable with its cause and repair. The shared ledger's
-actor is `agent`, `user` or one saved contact as `peer:<id>`; its compaction
-base requires its recorded operation count.
-
-The `task-ledger` CLI parses every option, including `--data-root`, before
-accessing the ledger. A value option followed by another `--option` or the end
-of the command is refused; literal values beginning with `--` use equals,
-for example `--note='--literal text'`. Single-value options cannot repeat;
-`--ref` may repeat. Empty `--data-root` and `--task-id`, unknown options and
-options belonging to another command are refused before ledger access.
-Omit `--task-id` to list active tasks (or all tasks with `--include-done`)
-or let a `created` append allocate its task ID.
+ordinary `offset`. Use `next_archive_read` to continue with the separate
+`archived_offset`. Archive reads decode every record and link or report why
+the history is unavailable and how to repair it.
 
 The snooze choices are **Defer to tomorrow** and **Defer a week**. Deferring a
 one-time MY QUEUE step (`at`) without a habit moves its scheduled moment and

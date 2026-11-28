@@ -5,7 +5,6 @@ import Foundation
 
 struct ProviderConfigSheet: View {
     let providerID: String
-    var entryAuthMode: String? = nil
     let onDone: () -> Void
 
     @Environment(AppModel.self) private var appModel
@@ -14,11 +13,10 @@ struct ProviderConfigSheet: View {
 
     @ViewBuilder
     private var entry: some View {
-        // The protected window lives beyond a save; its baseline is the provider owner's current publication.
         if let provider = appModel.face.slot(.settings).select("providers.account.\(providerID)", as: SettingsFace.self, {
             $0?.providers.snapshot?.providers.first { $0.provider_id == providerID }
         }) {
-            ProviderConfigEditor(provider: provider, entryAuthMode: entryAuthMode, onDone: onDone).id(provider.provider_id)
+            ProviderConfigEditor(provider: provider, onDone: onDone).id(provider.provider_id)
         } else {
             VStack(spacing: 12) {
                 NativeEmptyState(title: "Account unavailable", detail: appModel.providerSettingsIssue
@@ -40,11 +38,10 @@ private struct ProviderConfigEditor: View {
     @State private var session = FacePageSession()
     @State private var testingClaude = false
     @State private var claudeTestResult: String?
-    private let entryAuthMode: String?
     private let key = "provider.connection"
 
-    init(provider: ProviderInfo, entryAuthMode: String?, onDone: @escaping () -> Void) {
-        self.provider = provider; self.entryAuthMode = entryAuthMode; self.onDone = onDone
+    init(provider: ProviderInfo, onDone: @escaping () -> Void) {
+        self.provider = provider; self.onDone = onDone
         _baseline = State(initialValue: provider)
     }
 
@@ -52,8 +49,7 @@ private struct ProviderConfigEditor: View {
         .init(advertisedModes: baseline.auth_modes, savedMode: baseline.auth_mode)
     }
     private var seedMode: String {
-        if baseline.auth_mode == nil, let entryAuthMode, modes.supportedModes.contains(entryAuthMode) { return entryAuthMode }
-        return modes.selectedMode
+        modes.selectedMode
     }
     private var modeField: PartFace.FormField {
         .init(id: "authMode", label: "How to sign in", kind: "choice", value: .string(seedMode), required: true,
@@ -68,14 +64,37 @@ private struct ProviderConfigEditor: View {
         if displayedMode == "api_key" {
             fields.append(.init(id: "key", label: "Key", kind: "secret", placeholder: "Leave empty to keep the saved key"))
         }
-        // The rows this slot may hold (`ModelSlot.mayHold`): offered ones, and the saved default itself with its note, so Save and Test keep it.
-        let saved = baseline.default_model
-        let holdable = baseline.models.filter { row in
-            (row.supported_reasoning_efforts != nil || row.id == saved) && ModelSlot.mayHold(row.id, row: row, savedInSlot: saved)
-        }
-        fields.append(.init(id: "model", label: "Default model", kind: "choice", value: saved.map(PartFace.Value.string),
-            options: holdable.map { row in .init(id: row.id, label: row.offer_note.map { note in "\(row.name) (\(note))" } ?? row.name) }))
         return fields
+    }
+    private var modelRow: PartFace.Row {
+        let routing = appModel.face.slot(.settings).select("providers.chatRouting", as: SettingsFace.self) { $0?.providers.snapshot?.routing }
+        let current = currentModel(for: provider, in: routing)
+        let options = provider.models.compactMap { row -> PartFace.Control.Option? in
+            guard row.id == current || (ModelSlot.mayHold(row.id, row: row, savedInSlot: current)
+                && chatChoice(for: row, providerID: provider.provider_id) != nil) else { return nil }
+            return .init(id: row.id, label: row.offer_note.map { "\(row.name) (\($0))" } ?? row.name)
+        }
+        let detail: String?
+        if !provider.auth_status.eligible {
+            detail = "Connect this account before choosing a model for Chat."
+        } else if options.isEmpty {
+            detail = provider.offeredModels.isEmpty ? ModelSlot.refusal(note: provider.models_note, accountName: provider.display_name)
+                : "This account has no models with a usable thinking default. Refresh its models in Providers."
+        } else {
+            detail = nil
+        }
+        return .init(id: "provider.chat_model", title: "Default model for Chat", detail: detail,
+            control: detail == nil ? .choice(options, selected: current, call: .init("provider.chat_model")) : nil)
+    }
+    private func currentModel(for account: ProviderInfo, in routing: ProviderRoutingSnapshot?) -> String? {
+        guard let routing, routing.activeProviders["chat"] == account.provider_id else { return nil }
+        if let model = routing.preferences["chat"]?.model, !model.isEmpty { return model }
+        return routing.pinnedModels["chat"]
+    }
+    private func chatChoice(for row: ProviderModelInfo, providerID: String) -> ProviderTurnChoice? {
+        guard let efforts = row.supported_reasoning_efforts, let effort = row.default_reasoning_effort, !effort.isEmpty,
+              efforts.isEmpty || efforts.contains(effort) else { return nil }
+        return .init(provider: providerID, model: row.id, reasoningEffort: effort, fast: false)
     }
     private var entryIssue: String? {
         if modes.supportedModes.isEmpty { return "This account offers no sign-in method. Read it again before saving." }
@@ -110,6 +129,8 @@ private struct ProviderConfigEditor: View {
                         }
                     }
                 } else if let oauth = oauthProvider { OAuthSignInButton(provider: oauth) }
+                FaceView(face: .init(sections: [.init(id: "provider.chat_model", rows: [modelRow])]),
+                    door: ClosureFaceDoor(open: { _ in }, waitingOn: "the Chat model", perform: chooseModel), session: session)
             }
         }
         .padding(20).frame(minWidth: 480, minHeight: 420)
@@ -129,19 +150,75 @@ private struct ProviderConfigEditor: View {
         }
         return revision
     }
-    private func readAccount() async throws -> ProviderInfo {
+    private func readAccount() async throws -> (account: ProviderInfo, snapshot: ProviderSettingsSnapshot, chatChoice: ProviderTurnChoice?) {
         let reply = try await appModel.protectedFormAct(.readProviderAccount(id: provider.provider_id))
-        guard case .provider(let saved) = reply,
-              let current = saved.snapshot?.providers.first(where: { $0.provider_id == provider.provider_id }) else {
+        guard case .provider(let saved) = reply, let snapshot = saved.snapshot,
+              let current = snapshot.providers.first(where: { $0.provider_id == provider.provider_id }) else {
             throw WireFailure(code: "provider_unavailable", message: "This account has not been read.", cause: nil, effects: .none)
         }
-        return current
+        return (current, snapshot, saved.chatChoice)
+    }
+    private func chooseModel(_ input: FaceActSubmission) async -> FaceActOutcome {
+        guard let model = input.value, !model.isEmpty else {
+            return .interrupted(WireFailure(code: "model_required", message: "Choose a model for Chat.", cause: nil, effects: .none))
+        }
+        let id = provider.provider_id
+        var writeBaseline: ProviderRoutingSnapshot?
+        do {
+            let read = try await readAccount()
+            let row = read.account.models.first { $0.id == model }
+            let requested = row.flatMap { chatChoice(for: $0, providerID: id) }
+            var routing = read.snapshot.routing
+            if !input.checking {
+                let current = currentModel(for: read.account, in: routing)
+                guard ModelSlot.mayHold(model, row: row, savedInSlot: current) else {
+                    throw WireFailure(code: "provider_model_unavailable",
+                        message: ModelSlot.refusal(note: read.account.models_note, accountName: read.account.display_name),
+                        cause: nil, effects: .none)
+                }
+                guard read.account.auth_status.eligible else {
+                    throw WireFailure(code: "provider_not_connected", message: "Connect this account before choosing a model for Chat.",
+                        cause: nil, effects: .none)
+                }
+                guard let requested else {
+                    throw WireFailure(code: "provider_thinking_unavailable", message: "This model has no usable thinking default. Refresh its models in Providers.",
+                        cause: nil, effects: .none)
+                }
+                try Task.checkCancellation()
+                writeBaseline = routing
+                let reply = try await appModel.chatAct(.saveChatChoice(.init(choice: requested, expectedBaseline: read.chatChoice,
+                    expectedRevision: routing.revision)))
+                guard case .provider(let readback) = reply, let snapshot = readback.snapshot else { throw unconfirmed() }
+                routing = snapshot.routing
+            }
+            guard let requested, let saved = routing.preferences["chat"],
+                  routing.activeProviders["chat"] == id, routing.pinnedModels["chat"] == model,
+                  saved.reasoningEffort == requested.reasoningEffort, saved.serviceTier == "default" else {
+                return .init(words: "Could not confirm this model and its settings as the saved Chat default.", effects: .unknown)
+            }
+            return .init(words: "Chat model saved.", effects: .known, accepted: true, committed: [.init(id: "value", value: .string(model))])
+        } catch {
+            let outcome = FaceActOutcome.interrupted(error)
+            guard var failure = outcome.failure else { return outcome }
+            if failure.code == "body_act_failed" { failure.message = failure.cause ?? failure.message }
+            if let writeBaseline {
+                if failure.code == "body_act_failed", let current = try? await readAccount(),
+                   current.snapshot.routing == writeBaseline {
+                    failure.effects = .none
+                }
+            } else if !input.checking {
+                if error is CancellationError { failure.message = "Cancelled before saving the Chat model." }
+                else if failure.code == "page_reply_unconfirmed" { failure.message = "Could not read the account before saving the Chat model." }
+                failure.effects = .none
+            }
+            return .interrupted(failure)
+        }
     }
     private func perform(_ input: FaceProtectedSubmission) async -> FaceActOutcome {
         let submission = input.submission
         do {
             if submission.action == "read" || (submission.checking && submission.action == "test") {
-                let current = try await readAccount()
+                let current = try await readAccount().account
                 if submission.checking {
                     return .init(words: "Couldn't confirm the test result. Test again.", effects: .unknown)
                 }
@@ -161,7 +238,7 @@ private struct ProviderConfigEditor: View {
                 guard outcome.accepted, !outcome.unresolved else { return outcome }
                 baseline.connectionRevision = nil
                 if outcome.failure == nil {
-                    do { baseline = try await readAccount() }
+                    do { baseline = try await readAccount().account }
                     catch {
                         outcome.failure = WireFailure(code: "provider_readback_failed",
                             message: "Sign-in was removed, but the updated account could not be read. Read the account again before saving or testing.",
@@ -173,11 +250,9 @@ private struct ProviderConfigEditor: View {
             guard case .string(let mode)? = submission.values?["authMode"] else {
                 throw WireFailure(code: "provider_mode_required", message: "Choose a sign-in method.", cause: nil, effects: .none)
             }
-            let model: String
-            if case .string(let value)? = submission.values?["model"] { model = value } else { model = "" }
             let secret = mode == "api_key" ? input.secrets["key"] : nil
             if submission.checking {
-                let request = ProviderConnectionWrite(id: provider.provider_id, secret: secret, authMode: mode, defaultModel: model, expectedRevision: nil)
+                let request = ProviderConnectionWrite(id: provider.provider_id, secret: secret, authMode: mode, defaultModel: "", expectedRevision: nil)
                 return try FaceActOutcome.reply(await appModel.protectedFormAct(.readCredential(.provider(request))))
             }
             if submission.action == "test" {
@@ -186,12 +261,11 @@ private struct ProviderConfigEditor: View {
                 return .init(words: words, effects: .none, accepted: true)
             }
             let reply = try await appModel.protectedFormAct(.saveProviderConnection(.init(id: provider.provider_id,
-                secret: secret, authMode: mode, defaultModel: model, expectedRevision: try revision())))
+                secret: secret, authMode: mode, defaultModel: "", expectedRevision: try revision())))
             guard case .provider(let committed) = reply,
                   let saved = committed.snapshot?.providers.first(where: { $0.provider_id == provider.provider_id }) else { throw unconfirmed() }
             baseline = saved
-            var fields: [FaceCommittedField] = [.init(id: "authMode", value: saved.auth_mode.map(PartFace.Value.string)),
-                .init(id: "model", value: saved.default_model.map(PartFace.Value.string))]
+            var fields: [FaceCommittedField] = [.init(id: "authMode", value: saved.auth_mode.map(PartFace.Value.string))]
             if mode == "api_key" { fields.append(.init(id: "key")) }
             return .init(words: "Saved to this Mac. Not tested.", effects: .known, accepted: true, committed: fields)
         } catch { return .interrupted(error) }

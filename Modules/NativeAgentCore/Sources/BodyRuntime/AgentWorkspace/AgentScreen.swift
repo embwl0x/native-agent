@@ -1,5 +1,4 @@
 import SenseCore
-import AppKit
 import Foundation
 import Synchronization
 import NativeAgentCore
@@ -8,6 +7,7 @@ import MindCore
 import PersistenceCore
 import DeskCore
 import NativeAgentShared
+import AppKit
 // Blueprint: | `AgentScreen.swift` | AgentScreen resolves pages and actions, including the shared recent-life item |
 
 package enum AgentScreen {
@@ -170,7 +170,7 @@ package enum AgentScreen {
                 return .page(await elsewhereRoom(workspace: workspace, dataRoot: dataRoot, scope: scope))
             }
             let cachedName = name.hasPrefix("elsewhere.") ? scope + "\u{0}" + name : name
-            if let page = AgentItemPages.shared.page(dataRoot, cachedName) { return .page(page) }
+            if let page = itemPages.value(dataRoot, cachedName) { return .page(page) }
             if name == "elsewhere" { return .page(await elsewhereRoom(workspace: workspace, dataRoot: dataRoot, scope: scope)) }
             if let action = try namedAction(workspace: workspace, name, dataRoot: dataRoot, scope: scope) {
                 if case .open(let place) = action, case .record = place { return open(place) }
@@ -262,15 +262,19 @@ package enum AgentScreen {
     static func home(workspace: WorkspaceOperation, dataRoot: URL, scope: String, browserPages: [AgentWorkspaceLocation],
                      now: Date = Date(), markSeen: Bool = true) async -> String {
         var sharedFace: PartFace?
+        var tableReadings: [String: PartFace.TableReading] = [:]
         do {
             let layout = SurfaceLayoutStore.layout(dataRoot: dataRoot)
             let (agent, person) = names(dataRoot)
             let world = await readWorld(workspace: workspace, dataRoot, now: now)
             let face = try await HomeFace.door(dataRoot: dataRoot)
             sharedFace = face
+            var visible = face.sections.filter { $0.id != "changed" }
+            tableReadings = await NativeAgentEngine.forRoot(dataRoot).tableTextReadings(
+                for: PartFace(sections: visible), includeStandingTable: false)
             let seen = await lastSeen(dataRoot)
             let presence = PersonPresence.read(dataRoot: dataRoot, now: now)
-            let connected = BrowserConnectionMirror.connected == true
+            let connected = BrowserConnectionMirror.connected
             let page = ChromePageMirror.page(tab: nil, dataRoot: dataRoot, session: scope)
             var marks = try worldMarks(workspace: workspace, world, dataRoot: dataRoot, person: person, now: now)
             try preserveUnreadMarks(&marks, seen: seen, world: world, workspace: workspace, dataRoot: dataRoot)
@@ -279,9 +283,13 @@ package enum AgentScreen {
                 let word = transition.here ? " here" : " away"
                 shown["home:presence"] = Mark(fp: word, line: person + word, at: now.timeIntervalSince1970, what: transition.here ? "here" : "away")
             }
-            shown["home:browser"] = Mark(fp: connected ? "on" : "off",
-                line: "browser: " + (connected ? person + "'s Chrome connected" : "Chrome not connected"), at: now.timeIntervalSince1970,
-                what: connected ? "connected" : "not connected")
+            if let connected {
+                shown["home:browser"] = Mark(fp: connected ? "on" : "off",
+                    line: "browser: " + (connected ? person + "'s Chrome connected" : "Chrome not connected"), at: now.timeIntervalSince1970,
+                    what: connected ? "connected" : "not connected")
+            } else {
+                marks["home:browser"] = seen?.marks["home:browser"]
+            }
             for name in ["calendar", "reminders"] {
                 let words = AgentReadBadges.shared.latest(name, dataRoot: dataRoot)
                     .flatMap { Calendar.current.isDate($0.at, inSameDayAs: now) ? $0.words : nil }
@@ -304,13 +312,12 @@ package enum AgentScreen {
             if !baseline { marks.merge(shown) { a, _ in a } }
 
             let outside: Set<String> = ["people", "helpers", "senses", "elsewhere", "places", "mac"]
-            var visible = face.sections.filter { $0.id != "changed" }
             let book = try withNames(workspace: workspace, dataRoot) { $0 }
             let told = tell(changed, limit: 5, width: 70, book: book)
             let showsChanged = layout.contentNames("home", profile: SurfaceLayoutStore.profile).contains("changed")
             var acknowledged: Set<String> = presence.transition == nil ? [] : ["home:presence"]
             if showsChanged { acknowledged.formUnion(told.names) }
-            let compared = PartFace(sections: visible.filter { outside.contains($0.id) }).text()
+            let compared = PartFace(sections: visible.filter { outside.contains($0.id) }).text(tableReadings: tableReadings)
             var same: String?
             let outsideUnsettled = visible.filter { outside.contains($0.id) }.flatMap(\.rows).contains {
                 $0.tone == .failed || $0.tone == .attention
@@ -321,7 +328,8 @@ package enum AgentScreen {
                 same = "SAME · people, helpers, places and Mac as on the home you saw " + age(now.timeIntervalSince1970 - whole) + " ago"
             }
             let rule = String(repeating: "─", count: 61)
-            var lines = [agent.uppercased() + " · Snapshot as of " + now.formatted(.iso8601), rule]
+            let drawn = PartFace(sections: visible)
+            var lines = drawn.tableBoundaries(tableReadings) + [agent.uppercased() + " · Snapshot as of " + now.formatted(.iso8601), rule]
             if let problem = seen?.problem { lines.append(problem) }
             else if let seen {
                 lines.append("since you looked \(age(now.timeIntervalSince1970 - seen.at)) ago: "
@@ -330,7 +338,7 @@ package enum AgentScreen {
             if showsChanged {
                 lines += section("CHANGED", ["Tracked home records since last look; not all activity."] + told.lines.map { "● " + $0 })
             }
-            lines.append(PartFace(sections: visible).text(door: true))
+            lines.append(drawn.text(door: true, tableReadings: tableReadings, includeTableBoundaries: false))
             if let same { lines.append(same) }
             lines.append(freshness(world))
             if let failure = layout.failure { lines.append(failure.localizedDescription) }
@@ -352,7 +360,8 @@ package enum AgentScreen {
             }
             do {
                 let room = try await BodyField.require(workspace.bodyField).macRoom(dataRoot)
-                lines.append("This Mac · " + macFront(person, room: room) + " · app {page:\"home\", item:\"mac\"}")
+                lines.append((["This Mac"] + macFront(person, room: room, now: now)
+                    + ["app {page:\"home\", item:\"mac\"}"]).joined(separator: " · "))
             } catch { lines.append("This Mac · " + nameFailure(error)) }
             lines.append(rule)
             lines += homeFooter
@@ -369,7 +378,9 @@ package enum AgentScreen {
             }
             if visible.contains(where: { $0.id == "places" }) {
                 let places = Set(layout.contentNames("places", profile: SurfaceLayoutStore.profile).map(AppDoorNames.resolve))
-                for place in ["browser", "calendar", "reminders"] where places.contains(place) { acknowledged.insert("home:" + place) }
+                for place in ["browser", "calendar", "reminders"] where places.contains(place) && (place != "browser" || connected != nil) {
+                    acknowledged.insert("home:" + place)
+                }
                 if places.contains("browser"), let page { acknowledged.insert(ownTabs + "tab:" + String(page.tab)) }
             }
             if markSeen, seen.map({ $0.form == Seen.form }) ?? true || world.pending.isEmpty && world.unread.isEmpty {
@@ -386,7 +397,8 @@ package enum AgentScreen {
                 .init(id: "changed.failed", title: "This Home look is incomplete", detail: nameFailure(error), tone: .failed),
             ])
             return PartFace(title: face.title, line: face.line,
-                sections: [failedLook] + face.sections.filter { $0.id != "changed" }, opened: face.opened).text(door: true)
+                sections: [failedLook] + face.sections.filter { $0.id != "changed" }, opened: face.opened)
+                .text(door: true, tableReadings: tableReadings)
                 + "\nNothing was marked seen.\n" + homeFooter.joined(separator: "\n")
         }
     }
@@ -406,7 +418,7 @@ package enum AgentScreen {
         for item in open {
             if OwnerAttentionPolicy.waitsOnOwner(item) { split.waiting.append(item); continue }
             let running = !DeskParking.subtreeHandles(item.handle, in: plan.children).isDisjoint(with: live)
-            if DeskParking.parking(item, in: state, plan: plan, live: running, now: now).parked { split.parked.append(item) }
+            if DeskParking.parking(item, plan: plan, live: running, now: now).parked { split.parked.append(item) }
             else { split.active.append(item) }
         }
         split.quietDays = split.parked.compactMap { DeskParking.lastTouch($0, in: plan.children) }.max()
@@ -502,9 +514,9 @@ package enum AgentScreen {
         }
     }
 
-    static func latest(_ contact: Contact, records: [AgentConversationRecord], label: String? = nil) -> AgentConversationRecord? {
+    static func latest(_ contact: Contact, records: [AgentConversationRecord]) -> AgentConversationRecord? {
         var newest: AgentConversationRecord?
-        for record in records where label == nil || record.label == label {
+        for record in records {
             guard record.agent.caseInsensitiveCompare(contact.id) == .orderedSame || contact.agents.contains(record.agent) else { continue }
             if let newest, record.updatedAt <= newest.updatedAt { continue }
             newest = record
@@ -757,7 +769,7 @@ package enum AgentScreen {
         let evidence: JSONValue
         if case .object(let fields) = value {
             let keys: Set<String> = ["status", "reason", "failure_code", "error_code", "code", "detail", "message", "error",
-                "effects", "remedy", "fix", "hint", "owner", "next_call", "tap", "not_run_status", "provenance", "input_excerpt",
+                "effects", "remedy", "fix", "hint", "owner", "next_call", "tap", "not_run_status", "provenance",
                 "recovery_hint", "argument_path", "accepted", "connected", "needs", "needs_input", "needs_authentication",
                 "gaps", "unresponsive_engines", "total_is_complete"]
             evidence = .object(fields.filter { keys.contains($0.key) && $0.value != .null })

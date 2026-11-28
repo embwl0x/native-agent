@@ -87,43 +87,36 @@ public struct DeskOp: Sendable, Equatable {
             "handle": .string(handle),
         ]
         if !workAttempts.isEmpty { obj["workAttempts"] = .array(workAttempts.map { $0.toJSON() }) }
-        func put(_ k: String, _ v: String?) { if let v, !v.isEmpty { obj[k] = .string(v) } }
         switch body {
         case let .createItem(alias, kind, project, title, parent, summary, assignee, laneOf, origin, pursuit, findingKey):
             obj["alias"] = .string(alias)
             obj["kind"] = .string(kind.rawValue)
             obj["project"] = .string(project)
             obj["title"] = .string(title)
-            put("parent", parent)
-            put("summary", summary)
-            put("assignee", assignee)
-            put("laneOf", laneOf)
-            put("findingKey", findingKey)
+            DeskJSON.put(("parent", parent), ("summary", summary), ("assignee", assignee),
+                         ("laneOf", laneOf), ("findingKey", findingKey), in: &obj)
             if origin != .owner { obj["origin"] = .string(origin.rawValue) }
             if let pursuit { obj["pursuit"] = pursuit.toJSON() }
         case let .openPursuit(alias, project, title, summary, pursuit, notify):
             obj["alias"] = .string(alias)
             obj["project"] = .string(project)
             obj["title"] = .string(title)
-            put("summary", summary)
+            DeskJSON.put(("summary", summary), in: &obj)
             obj["pursuit"] = pursuit.toJSON()
             if notify != NotifyPolicy() { obj["notify"] = notify.toJSON() }
         case let .setStatus(status, blockedReason, waitingOn, progress, assignee, laneOf):
             obj["status"] = .string(status.rawValue)
-            put("blockedReason", blockedReason)
-            put("waitingOn", waitingOn)
+            DeskJSON.put(("blockedReason", blockedReason), ("waitingOn", waitingOn), in: &obj)
             if let progress { obj["progress"] = progress.toJSON() }
-            put("assignee", assignee)
-            put("laneOf", laneOf)
+            DeskJSON.put(("assignee", assignee), ("laneOf", laneOf), in: &obj)
         case let .updateTitle(title, summary, refs):
-            put("title", title)
-            put("summary", summary)
+            DeskJSON.put(("title", title), ("summary", summary), in: &obj)
             if let refs { obj["refs"] = .array(refs.map { $0.toJSON() }) }
         case let .addRef(ref):
             obj["ref"] = ref.toJSON()
         case let .appendNote(text, author, releaseCondition, carriedOccurrence):
             obj["text"] = .string(text)
-            put("author", author)
+            DeskJSON.put(("author", author), in: &obj)
             if let releaseCondition { obj["releaseCondition"] = .string(releaseCondition) }
             if let carriedOccurrence { obj["carriedOccurrence"] = .string(carriedOccurrence) }
         case let .vetoPursuit(note):

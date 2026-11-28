@@ -1,7 +1,7 @@
-import MacNerves
 import NativeAgentCore
-import NativeAgentShared
 import PersistenceCore
+import MacNerves
+import NativeAgentShared
 import DeskCore
 import SenseCore
 import Foundation
@@ -46,8 +46,8 @@ extension AppActions {
                   capabilities: [.memoryWrite, .toolCall], warn: "text is the thing itself, one or two sentences, no date, source, ids or preamble; "
                       + "a restore that matches something forgotten stays archived; roots restates every root of yours in one call, one per telling: "
                       + "how is told, noticed, inferred, verified or remembered, by who told you or where your own past was kept, since when you "
-                      + "first knew it (an ISO-8601 date-time or date); roots an untrusted agent steered stay as they are; a rewrite that changes nothing "
-                      + "writes nothing",
+                      + "first knew it (an ISO-8601 date-time or date). In a peer-steered Ask, each stated root needs how told and by one attested peer "
+                      + "(peer ID, raw ID or unambiguous contact name), without since. Carried roots stay as they are. A rewrite that changes nothing writes nothing",
                   // Rewrites and restores need versions because they can overwrite another conversation's correction; commit supersedes is idempotent.
                   tool: "rewrite_memory"),
         AppAction("memory.pin", "memories", """
@@ -68,7 +68,7 @@ extension AppActions {
             "maintenance")),
         AppAction("mind.residual_repair", "diagnostics", "Run eligible bounded residual repair now, satisfying only its quiet wait", tool: "mind_run",
             input: verb("residual_repair")),
-        AppAction("mind.rem", "personality", "Run a REM pass", [.optional("repair", .boolean)], tool: "mind_run", input: verb("rem")),
+        AppAction("mind.rem", "personality", "Run a REM pass now, skipping its weekly wait; Trust and one run at a time still gate it", [.optional("repair", .boolean)], tool: "mind_run", input: verb("rem")),
         AppAction("mind.misses", "today", "Your misses: corrections by lesson, this week against last, each with its history locator",
                  tool: "mind_run", input: verb("misses"), read: true),
         AppAction("mind.think_now", "diagnostics", "Think now", tool: "mind_run", input: verb("think_now")),

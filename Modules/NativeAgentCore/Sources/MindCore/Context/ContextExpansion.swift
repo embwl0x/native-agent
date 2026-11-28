@@ -37,6 +37,7 @@ public enum ContextExpansionError: Error, Equatable, Sendable {
     case staleRuntime(ContextAtomID)
     case secretBearing(ContextAtomID)
     case expired(ContextAtomID)
+    case notYetValid(ContextAtomID)
     case invalidSourceUTF8Range(
         atom: ContextAtomID,
         range: ContextSourceRange,
@@ -79,7 +80,6 @@ public struct ContextExpander: Sendable {
 
     public init() {}
 
-    /// - Parameter offeredSelectedItems: selected representations whose pointers this turn's packet offered. Empty offers no expansions.
     public func expand(
         _ pointer: ContextAtomPointer,
         for need: NeedSignal,
@@ -87,7 +87,8 @@ public struct ContextExpander: Sendable {
         pinnedTo snapshot: ContextGenerationSnapshot? = nil,
         maximumCharacters requestedMaximum: Int? = nil,
         offset: Int = 0,
-        offeredSelectedItems: [ContextPacketItem] = []
+        offeredSelectedItems: [ContextPacketItem] = [],
+        offeredPacket: ContextPacket? = nil
     ) throws -> ContextExpansionResult {
         if let requestedMaximum, requestedMaximum <= 0 {
             throw ContextExpansionError.invalidCharacterLimit
@@ -169,14 +170,17 @@ public struct ContextExpander: Sendable {
             )
         }
         if let failure = ContextSelector.commonEligibilityFailure(
-            for: atom, generationID: generationID, source: source, need: need
+            for: atom, generationID: generationID, source: source, need: need, now: Date()
         ) { throw failure.expansionError }
         // Admission follows the offered representation, not the full body's length: a short summary can omit a body below the render threshold.
         let omittedInPacket = offeredSelectedItems.contains { item in
                 item.pointer == pointer
                     && item.isExpandable(thresholdChars: need.packetAtomExpandThresholdChars)
             }
-        guard omittedInPacket else {
+        guard omittedInPacket || (offeredPacket?.generationID == generationID
+            && offeredPacket?.sourceFingerprint == generation.generation.sourceFingerprint
+            && offeredPacket?.receipt.needFingerprint == need.deterministicFingerprint
+            && offeredPacket?.associationPointers.contains(pointer) == true) else {
             throw ContextExpansionError.atomNotExpandable(policy: atom.draft.injectionPolicy)
         }
 

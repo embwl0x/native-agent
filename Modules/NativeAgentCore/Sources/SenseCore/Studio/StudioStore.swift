@@ -34,7 +34,7 @@ public struct SwiftNativeStudioStore: Sendable {
     }
 
     /// Archive byte-exact overflow before trimming; history reads archives and the hot journal together.
-    public func journalArchivePath(now: Date = Date()) -> URL {
+    public func journalArchivePath(now: Date) -> URL {
         return studioRoot
             .appendingPathComponent("journal", isDirectory: true)
             .appendingPathComponent("journal_archive_\(NativeTimestampFormat.compactUTC(now)).jsonl")
@@ -69,7 +69,7 @@ public struct SwiftNativeStudioStore: Sendable {
     }
 
     /// Sortable, filename-safe IDs keep arbitrary input out of paths.
-    static func newIdentifier(prefix: String, now: Date = Date()) -> String {
+    static func newIdentifier(prefix: String, now: Date) -> String {
         let random = UUID().uuidString.lowercased()
             .replacingOccurrences(of: "-", with: "")
             .prefix(8)
@@ -89,9 +89,9 @@ public struct SwiftNativeStudioStore: Sendable {
         stage: String?,
         constraints: String?,
         priorDiscussion: String?,
-        descriptionOnly: Bool,
-        now: Date = Date()
+        descriptionOnly: Bool
     ) async throws -> StudioConsult {
+        let now = Date()
         let refs = artifactRefs
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
@@ -166,9 +166,9 @@ public struct SwiftNativeStudioStore: Sendable {
         response: String?,
         stance: StudioStanceValue,
         relations: [StudioRelation],
-        tags: [String],
-        now: Date = Date()
+        tags: [String]
     ) async throws -> StudioJournalEntry {
+        let now = Date()
         guard !work.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw StudioError.journalWorkTitleMissing
         }
@@ -224,7 +224,7 @@ public struct SwiftNativeStudioStore: Sendable {
     }
 
     /// Archive the cap owner's selected original rows before append or trim.
-    private func archiveJournalOverflowIfNeeded(_ doomed: [Substring]?, now: Date = Date()) throws {
+    private func archiveJournalOverflowIfNeeded(_ doomed: [Substring]?) throws {
         guard let doomed else {
             throw PersistenceCoreError.ioFailure(
                 "studio journal at \(journalPath.path) is not valid UTF-8 — refusing to trim it")
@@ -233,7 +233,7 @@ public struct SwiftNativeStudioStore: Sendable {
 
         let directory = journalPath.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let archive = journalArchivePath(now: now)
+        let archive = journalArchivePath(now: Date())
         // Preserve raw bytes, including rows this build cannot decode.
         var payload = Data()
         for line in doomed {
@@ -326,9 +326,9 @@ public struct SwiftNativeStudioStore: Sendable {
         entryId: String,
         reason: String,
         supersedes: String?,
-        correction: String,
-        now: Date = Date()
+        correction: String
     ) async throws -> (amendment: StudioAmendment, entry: StudioJournalEntry) {
+        let now = Date()
         let id = try Self.validatedIdentifier(entryId)
         let trimmedReason = reason.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedReason.isEmpty else { throw StudioError.amendmentReasonMissing }
@@ -421,10 +421,14 @@ public struct SwiftNativeStudioStore: Sendable {
             let archive = await self.archivedJournalEntries()
             let hot = try await self.rawJournalEntries(path: self.journalPath)
             // A crash after archiving but before trimming leaves the same entry in both files. It is still one encounter, with one correction view.
-            var seen = Set<String>()
-            let entries = await self.applyAmendments((archive.entries + hot.entries).filter { seen.insert($0.id).inserted })
+            let entries = await self.amendedJournal(archive: archive.entries, hot: hot.entries)
             return (entries, archive.holes + hot.holes)
         }
+    }
+
+    @concurrent private func amendedJournal(archive: [StudioJournalEntry], hot: [StudioJournalEntry]) async -> [StudioJournalEntry] {
+        var seen = Set<String>()
+        return await applyAmendments((archive + hot).filter { seen.insert($0.id).inserted })
     }
 
     /// Absence cannot be concluded over holes in the history.
@@ -459,7 +463,7 @@ public struct SwiftNativeStudioStore: Sendable {
                 throw PersistenceCoreError.ioFailure("Studio intake selected a consult without an unanswered artifact: \(id).")
             }
             return StudioEncounterCandidate(source: .named, reference: consult.artifactRefs.first,
-                originID: id, noticedAt: consult.filedAt)
+                originID: id)
         }
     }
 

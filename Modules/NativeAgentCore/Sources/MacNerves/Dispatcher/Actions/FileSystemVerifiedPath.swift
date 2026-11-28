@@ -1,8 +1,8 @@
 import Foundation
 import ImageIO
-import NativeAgentCore
 import PersistenceCore
 import UniformTypeIdentifiers
+import NativeAgentCore
 import Darwin
 
 // Blueprint: | `FileSystemVerifiedPath.swift` | `VerifiedImageRead`: verified file/Chrome bytes; metadata never claims pixel delivery |
@@ -20,22 +20,18 @@ public enum VerifiedImageRead {
         imageExtensions.contains(url.pathExtension.lowercased())
     }
 
-    private static func failure(_ reason: String) -> JSONValue {
-        .object(["ok": .bool(false), "status": .string("failed"), "error": .string(reason)])
-    }
-
     public static func deliver(data: Data, name: String, sink: LocalToolImage.Sink?) -> JSONValue {
         guard !data.isEmpty, data.count <= LocalToolImage.maximumBytes else {
-            return failure("Image must be a nonempty regular file of at most 8 MiB.")
+            return LocalToolImage.failure("Image must be a nonempty regular file of at most 8 MiB.")
         }
         guard let thumbnail = LocalToolImage.thumbnail(data, maxPixelSize: 2048) else {
-            return failure("Image is unreadable, unsupported, or exceeds the 40-megapixel limit.")
+            return LocalToolImage.failure("Image is unreadable, unsupported, or exceeds the 40-megapixel limit.")
         }
         guard sink != nil else {
             // Derive type and pixels from the admitted bytes; filename extensions cannot prove encoding.
             guard let source = CGImageSourceCreateWithData(data as CFData, nil),
                   let type = CGImageSourceGetType(source) else {
-                return failure("Could not read the image's encoded type.")
+                return LocalToolImage.failure("Could not read the image's encoded type.")
             }
             return .object([
                 "status": .string("ok"), "image_pixels": .bool(false), "read_only": .bool(true),
@@ -49,11 +45,11 @@ public enum VerifiedImageRead {
         let encoded = NSMutableData()
         guard let destination = CGImageDestinationCreateWithData(
                 encoded, UTType.png.identifier as CFString, 1, nil) else {
-            return failure("Could not encode image pixels.")
+            return LocalToolImage.failure("Could not encode image pixels.")
         }
         CGImageDestinationAddImage(destination, thumbnail.pixels, nil)
         guard CGImageDestinationFinalize(destination), encoded.length <= LocalToolImage.maximumBytes else {
-            return failure("Encoded image exceeds the 8 MiB delivery limit.")
+            return LocalToolImage.failure("Encoded image exceeds the 8 MiB delivery limit.")
         }
         let reply = ToolResult(LocalToolImage.deliverPNG(
             encoded as Data, name: name, width: thumbnail.pixels.width, height: thumbnail.pixels.height, sink: sink))

@@ -200,14 +200,7 @@ struct AgentReadArgs: DoorArgs {
         A unique saved participant name or handle, bot:<UUID>, or peer:<UUID> from agent.contacts. Ambiguous names need an exact reference; \
         never guess.
         """).nullable()
-    static let conversationField = DoorFieldDescriptor.string("conversation", """
-        Optional human conversation label, such as browser work, for adapters supporting separate conversations. Omit to use this participant's \
-        current conversation. Home message shortcuts also take args {text, conversation}. Bots have one continuous conversation: omit this \
-        field for bots. Opening a bot by name shows its latest full saved reply. On supported routes, an unused label starts a separate \
-        conversation; on a read it selects an existing one. The app retains the underlying identities.
-        """).nullable()
     static let jobField = DoorFieldDescriptor.string("job", "A job's id from agent.job: reads that job, its state, check, deliverables and diff. Omit for conversations.").nullable()
-    static let detailsField = DoorFieldDescriptor.bool("details").nullable()
     static let waitSecondsField = DoorFieldDescriptor.int("wait_seconds", """
         Wait 1–300 seconds on a named conversation or its retained exact reply IDs. Omit history and listing filters. Untracked IDs are \
         read once without waiting; nothing is resent.
@@ -252,7 +245,7 @@ struct AgentReadArgs: DoorArgs {
         Dot only: exact retained transcript version from next. Changed source requires a fresh read; omit for a fresh window.
         """).nullable()
     static let doorFields = [
-        agentField, conversationField, jobField, detailsField, waitSecondsField, historyBeforeField,
+        agentField, AgentMessageArgs.conversationField, jobField, AgentContactsArgs.detailsField, waitSecondsField, historyBeforeField,
         historyExchangeField, messageIDField, conversationIDField, taskIDField, pageSizeField, pageTokenField,
         contextIDField, statusField, historyLengthField, includeArtifactsField, statusTimestampAfterField,
         limitField, offsetField, maxCharsField, textOffsetField, sourceVersionField,
@@ -282,9 +275,9 @@ struct AgentReadArgs: DoorArgs {
 
     init(door: inout DoorObjectDecoder) throws(DoorDecodeError) {
         agent = try door.string(Self.agentField)
-        conversation = try door.string(Self.conversationField)
+        conversation = try door.string(AgentMessageArgs.conversationField)
         job = try door.string(Self.jobField)
-        details = try door.bool(Self.detailsField)
+        details = try door.bool(AgentContactsArgs.detailsField)
         waitSeconds = try door.int(Self.waitSecondsField)
         historyBefore = try door.string(Self.historyBeforeField)
         historyExchange = try door.string(Self.historyExchangeField)
@@ -308,9 +301,9 @@ struct AgentReadArgs: DoorArgs {
     var wire: [String: JSONValue] {
         var fields: [String: JSONValue] = [:]
         fields[Self.agentField.name] = agent.map(JSONValue.string)
-        fields[Self.conversationField.name] = conversation.map(JSONValue.string)
+        fields[AgentMessageArgs.conversationField.name] = conversation.map(JSONValue.string)
         fields[Self.jobField.name] = job.map(JSONValue.string)
-        fields[Self.detailsField.name] = details.map(JSONValue.bool)
+        fields[AgentContactsArgs.detailsField.name] = details.map(JSONValue.bool)
         fields[Self.waitSecondsField.name] = waitSeconds.map { .int(Int64($0)) }
         fields[Self.historyBeforeField.name] = historyBefore.map(JSONValue.string)
         fields[Self.historyExchangeField.name] = historyExchange.map(JSONValue.string)
@@ -335,23 +328,13 @@ struct AgentReadArgs: DoorArgs {
 
 struct AgentCancelArgs: DoorArgs {
     static let rootSchemaConstraints: [String: JSONValue] = ["additionalProperties": .bool(false)]
-    static let agentField = DoorFieldDescriptor.string("agent", """
-        A unique saved participant name or handle, bot:<UUID>, or peer:<UUID> from agent.contacts. Ambiguous names need an exact reference; \
-        never guess.
-        """).nullable()
-    static let conversationField = DoorFieldDescriptor.string("conversation", """
-        Optional human conversation label, such as browser work, for adapters supporting separate conversations. Omit to use this participant's \
-        current conversation. Home message shortcuts also take args {text, conversation}. Bots have one continuous conversation: omit this \
-        field for bots. Opening a bot by name shows its latest full saved reply. On supported routes, an unused label starts a separate \
-        conversation; on a read it selects an existing one. The app retains the underlying identities.
-        """).nullable()
     static let jobField = DoorFieldDescriptor.string("job", "A job's id from agent.job: stops that job on its agent's own terms. Omit for conversations.").nullable()
     static let clearQueueField = DoorFieldDescriptor.bool("clear_queue").nullable()
     static let conversationIDField = DoorFieldDescriptor.string("conversation_id", "Advanced exact conversation identity of the send to stop. Normally omit; the app retains it.").nullable()
     static let messageIDField = DoorFieldDescriptor.string("message_id", "Advanced exact message identity of the send to stop. Normally omit; the app retains it.").nullable()
     static let taskIDField = DoorFieldDescriptor.string("task_id", "Advanced A2A task identity to cancel. Normally omit; the app retains it.").nullable()
     static let doorFields = [
-        agentField, conversationField, jobField, clearQueueField, conversationIDField, messageIDField,
+        AgentReadArgs.agentField, AgentMessageArgs.conversationField, jobField, clearQueueField, conversationIDField, messageIDField,
         taskIDField,
     ]
     let agent: String?
@@ -363,8 +346,8 @@ struct AgentCancelArgs: DoorArgs {
     let taskID: String?
 
     init(door: inout DoorObjectDecoder) throws(DoorDecodeError) {
-        agent = try door.string(Self.agentField)
-        conversation = try door.string(Self.conversationField)
+        agent = try door.string(AgentReadArgs.agentField)
+        conversation = try door.string(AgentMessageArgs.conversationField)
         job = try door.string(Self.jobField)
         clearQueue = try door.bool(Self.clearQueueField)
         conversationID = try door.string(Self.conversationIDField).flatMap { $0.isEmpty ? nil : $0 }
@@ -374,8 +357,8 @@ struct AgentCancelArgs: DoorArgs {
 
     var wire: [String: JSONValue] {
         var fields: [String: JSONValue] = [:]
-        fields[Self.agentField.name] = agent.map(JSONValue.string)
-        fields[Self.conversationField.name] = conversation.map(JSONValue.string)
+        fields[AgentReadArgs.agentField.name] = agent.map(JSONValue.string)
+        fields[AgentMessageArgs.conversationField.name] = conversation.map(JSONValue.string)
         fields[Self.jobField.name] = job.map(JSONValue.string)
         fields[Self.clearQueueField.name] = clearQueue.map(JSONValue.bool)
         fields[Self.conversationIDField.name] = conversationID.map(JSONValue.string)
@@ -398,7 +381,7 @@ extension AgentCommsActions {
             ActionDescriptor(AgentConnectArgs.self, name: "agent_connect",
                 preflight: { $0.client.agentHostSetupRefusal(tool: $0.tool, input: $1.wire) },
                 approvalReason: { root, canonical, input in
-                    SwiftToolDispatcher.hostApprovalReason(tool: "agent_connect", input: input, dataRoot: root, usesCanonicalBody: canonical)
+                    SwiftToolDispatcher.hostApprovalReason(input: input, dataRoot: root, usesCanonicalBody: canonical)
                 },
                 run: { context, args in
                     let result = try await context.client.impl_agent_connect(context: context, args: args)

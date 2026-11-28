@@ -4,7 +4,6 @@ import Foundation
 public enum MacControlWorkbenchAvailability: Equatable, Sendable {
     case ready
     case disabled(String)
-    public var isEnabled: Bool { if case .ready = self { true } else { false } }
     public var message: String? { if case .disabled(let reason) = self { reason } else { nil } }
 }
 
@@ -13,8 +12,6 @@ public enum MacControlWorkbenchAction: String, CaseIterable, Sendable {
     case fileRead = "file/read"
     case fileWrite = "file/write"
     case notify
-
-    public var path: String { "/v1/mac_control/\(rawValue)" }
 
     /// The execution receipt owns effect evidence; a transport's committed envelope does not.
     public func settlement(_ value: PartFace.Value, fields: [String: PartFace.Value],
@@ -49,12 +46,10 @@ public enum MacControlWorkbenchAction: String, CaseIterable, Sendable {
             cause: receipt["error"]?.stringValue ?? output["detail"]?.stringValue ?? state, effects: effects))
     }
 
-    public func availability(policy: MacControlPolicyWireSnapshot, policySaved: Bool,
-                             hasRequiredInput: Bool = true) -> MacControlWorkbenchAvailability {
+    public func availability(policy: MacControlPolicyWireSnapshot, policySaved: Bool) -> MacControlWorkbenchAvailability {
         guard policySaved else { return .disabled("Save your Mac Control permissions before trying an action.") }
         guard policy.enabled else { return .disabled("Turn on Mac Control before using this action.") }
         guard categoryAllowed(by: policy) else { return .disabled("Enable \(categoryName) in Mac Control categories first.") }
-        guard hasRequiredInput else { return .disabled("Enter the required input before running this action.") }
         return .ready
     }
 

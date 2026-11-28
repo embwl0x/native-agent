@@ -53,7 +53,8 @@ public struct SessionContextMeasurement: Sendable {
     public static func measure(_ request: SessionContextRequest, sessionId: String,
                                model: String, providerID: String?, dataRoot: URL,
                                windowTokens: Int, call: LLMCall) async throws -> Self {
-        try await read(rows: [], sessionId: sessionId, model: model, providerID: providerID,
+        let receipt = try matchingReceipt(sessionId: sessionId, model: model, providerID: providerID, dataRoot: dataRoot)
+        return try await read(rows: [], receipt: receipt, model: model, providerID: providerID,
             dataRoot: dataRoot, windowTokens: windowTokens, call: call, requestBuilder: { _, _, _ in request })
     }
 
@@ -65,9 +66,8 @@ public struct SessionContextMeasurement: Sendable {
             throw ProviderRoutingError.configurationFailed(
                 "The selected model's context window is unavailable. Refresh its catalog in Providers before sending this request.")
         }
-        let measurement = try await read(rows: [], sessionId: sessionId, model: model,
-            providerID: providerID, dataRoot: dataRoot, windowTokens: windowTokens, call: call,
-            requestBuilder: { _, _, _ in request })
+        let measurement = try await measure(request, sessionId: sessionId, model: model,
+            providerID: providerID, dataRoot: dataRoot, windowTokens: windowTokens, call: call)
         let inputBudget = ContextBudgetPolicy.inputTokens(windowTokens: windowTokens, outputTokens: measurement.outputTokens)
         let physicalInputLimit = ContextBudgetPolicy.physicalInputTokens(windowTokens: windowTokens, outputTokens: measurement.outputTokens)
         let fits = measurement.tokens <= physicalInputLimit
@@ -105,11 +105,12 @@ public struct SessionContextMeasurement: Sendable {
     }
 
     public static func read(sessionId: String, model: String, providerID: String?,
-                            dataRoot: URL, windowTokens: Int, call: LLMCall,
-                            requestBuilder: SessionContextRequest.Builder? = nil) async throws -> Self {
+                            dataRoot: URL, windowTokens: Int, call: LLMCall) async throws -> Self? {
+        guard let receipt = try matchingReceipt(sessionId: sessionId, model: model,
+            providerID: providerID, dataRoot: dataRoot) else { return nil }
         let rows = try await readRows(sessionId: sessionId, dataRoot: dataRoot)
-        return try await read(rows: rows, sessionId: sessionId, model: model,
-                              providerID: providerID, dataRoot: dataRoot, windowTokens: windowTokens, call: call, requestBuilder: requestBuilder)
+        return try await read(rows: rows, receipt: receipt, model: model,
+                              providerID: providerID, dataRoot: dataRoot, windowTokens: windowTokens, call: call)
     }
 
     static func readRows(sessionId: String, dataRoot: URL) async throws -> [JSONValue] {
@@ -121,25 +122,28 @@ public struct SessionContextMeasurement: Sendable {
         }
     }
 
-    static func read(rows: [JSONValue], sessionId: String, model: String, providerID: String?,
-                     dataRoot: URL, windowTokens: Int, call: LLMCall,
-                     requestBuilder: SessionContextRequest.Builder? = nil) async throws -> Self {
+    private static func matchingReceipt(sessionId: String, model: String, providerID: String?,
+                                        dataRoot: URL) throws -> Receipt? {
         let path = dataRoot.appendingPathComponent("chat/session_state/\(sessionId)/provider_usage.json")
-        let receipt: Receipt?
+        let receipt: Receipt
         do { receipt = try JSONDecoder().decode(Receipt.self, from: Data(contentsOf: path)) }
-        catch let error as CocoaError where error.code == .fileReadNoSuchFile { receipt = nil }
-        let matching = receipt?.model.caseInsensitiveCompare(model) == .orderedSame && receipt?.provider == providerID
-        if let receipt {
-            guard receipt.lastRequestInputTokens >= 0,
-                  receipt.requestCharacters.map({ $0 >= 0 }) != false else {
-                throw ProviderRoutingError.configurationFailed(
-                    "The provider usage receipt at \(path.path) has invalid counts. Repair it before measuring context.")
-            }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile { return nil }
+        guard receipt.lastRequestInputTokens >= 0,
+              receipt.requestCharacters.map({ $0 >= 0 }) != false else {
+            throw ProviderRoutingError.configurationFailed(
+                "The provider usage receipt at \(path.path) has invalid counts. Repair it before measuring context.")
         }
+        guard receipt.model.caseInsensitiveCompare(model) == .orderedSame, receipt.provider == providerID else { return nil }
+        return receipt
+    }
+
+    private static func read(rows: [JSONValue], receipt: Receipt?, model: String, providerID: String?,
+                             dataRoot: URL, windowTokens: Int, call: LLMCall,
+                             requestBuilder: SessionContextRequest.Builder? = nil) async throws -> Self {
         let ratio: Double
         let calibrated: Bool
         // Without a live builder or saved plan, rendered history uses an explicitly estimated ratio rather than request calibration.
-        if matching, let receipt, requestBuilder != nil || receipt.requestPlan != nil,
+        if let receipt, requestBuilder != nil || receipt.requestPlan != nil,
            receipt.lastRequestInputTokens > 0,
            let characters = receipt.requestCharacters, characters > 0 {
             ratio = Double(characters) / Double(receipt.lastRequestInputTokens)
@@ -153,7 +157,7 @@ public struct SessionContextMeasurement: Sendable {
         let source: String
         let output = try await outputAllowance(model: model, providerID: providerID, dataRoot: dataRoot, call: call)
         if let requestBuilder {
-            let request = try await requestBuilder(rows, windowTokens, matching ? receipt?.requestPlan : nil)
+            let request = try await requestBuilder(rows, windowTokens, receipt?.requestPlan)
             characters = request.characters
             historyCharacters = request.historyCharacters
             source = calibrated ? "provider_calibrated_request" : "rendered_history_estimate"
@@ -162,7 +166,7 @@ public struct SessionContextMeasurement: Sendable {
             guard plan.model.caseInsensitiveCompare(model) == .orderedSame, plan.provider == providerID else {
                 throw ProviderRoutingError.configurationFailed("The provider receipt and its request builder disagree on the selected route.")
             }
-            let request = try plan.build(rows, sessionId: sessionId, dataRoot: dataRoot,
+            let request = try plan.build(rows, dataRoot: dataRoot,
                 windowTokens: windowTokens, outputTokens: output, charactersPerToken: ratio)
             characters = request.characters
             historyCharacters = request.historyCharacters
@@ -178,12 +182,12 @@ public struct SessionContextMeasurement: Sendable {
               let tokens = Int(exactly: value.rounded(.up)), tokens >= 0 else {
             throw ProviderRoutingError.configurationFailed("The built request size is not representable; repair its context measurement.")
         }
-        return Self(tokens: tokens, observedInputTokens: matching ? receipt?.lastRequestInputTokens : nil,
+        return Self(tokens: tokens, observedInputTokens: receipt?.lastRequestInputTokens,
             outputTokens: output, requestCharacters: characters, renderedCharacters: historyCharacters, messageCount: rows.count,
             charactersPerToken: ratio, source: source,
             previousTurnTokens: calibrated ? receipt?.previousTurnInputTokens : nil,
             turnDeltaTokens: calibrated ? receipt?.turnInputDeltaTokens : nil,
-            previousHistoryContextWindow: matching ? receipt?.historyContextWindow : nil)
+            previousHistoryContextWindow: receipt?.historyContextWindow)
     }
 
     /// The readout sizes the conversation under the same input budget as a live request.

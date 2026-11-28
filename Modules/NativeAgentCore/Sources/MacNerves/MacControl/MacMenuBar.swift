@@ -72,14 +72,13 @@ public enum MacMenuBar {
         source: any MacAXElementSource,
         pid: Int32,
         top: String? = nil,
-        until stop: ((Item) -> Bool)? = nil,
         matchingPath: [String]? = nil,
         depth: Int = maxPathDepth,
         context: MacOperationContext
     ) -> Reading {
         do {
             return try MacAccessibilityReader.withReadBudget(context: context) { context in
-                try readChecked(source: source, pid: pid, top: top, until: stop, matchingPath: matchingPath, depth: depth, context: context)
+                try readChecked(source: source, pid: pid, top: top, matchingPath: matchingPath, depth: depth, context: context)
             }
         } catch {
             return Reading(items: [], truncated: true, unavailable: error.localizedDescription)
@@ -87,7 +86,7 @@ public enum MacMenuBar {
     }
 
     private static func readChecked(source: any MacAXElementSource, pid: Int32, top: String?,
-                                    until stop: ((Item) -> Bool)?, matchingPath: [String]?, depth: Int, context: MacOperationContext) throws -> Reading {
+                                    matchingPath: [String]?, depth: Int, context: MacOperationContext) throws -> Reading {
         guard !PersonOnlyWindows.isOwnProcess(pid) else {
             return Reading(items: [], truncated: false, unavailable: "self_process")
         }
@@ -101,7 +100,6 @@ public enum MacMenuBar {
         var attributeGaps: [String] = []
         var truncated = false
         var inMenu = 0
-        var done = false
         let wantedTop = top.map(normalized)
         let wantedPath = matchingPath.map { $0.map(normalized) }
 
@@ -151,7 +149,7 @@ public enum MacMenuBar {
         }
 
         try enqueueChildren(root, role: nil, titles: [], indices: [])
-        while let next = pending.popLast(), !done {
+        while let next = pending.popLast() {
                 try checkDeadline()
                 guard nodeCount < maxNodes else { truncated = true; break }
                 nodeCount += 1
@@ -199,10 +197,6 @@ public enum MacMenuBar {
                     )
                     items.append(item)
                     inMenu += 1
-                    if stop?(item) == true {
-                        done = true
-                        break
-                    }
                     guard followsPath else { continue }
                     if wantedPath?.count == names.count {
                         // Target and same-level siblings establish identity; descendants cannot change it.

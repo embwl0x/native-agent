@@ -24,7 +24,8 @@ enum PeerConversationArgs {
         switch self {
         case .send(let args):
             fields = args.wire
-            fields.removeValue(forKey: "dry_run")
+            // A rehearsal skips the session door that takes these off a live send.
+            for key in ["dry_run", "conversation", "new_conversation", "wait_seconds"] { fields.removeValue(forKey: key) }
             if args.files?.isEmpty != false { fields.removeValue(forKey: "files") }
         case .read(let args): fields = args.wire
         }
@@ -494,13 +495,25 @@ extension SwiftToolDispatcher {
         return .object(["status": .string("grok_send"), "peer_id": .string(peer.id),
             "message_id": .string(id), "asking_session": .string(session), "text": .string(text)])
     }
+    static func hostPullConversation(peer: AgentPeerContact, requested: String?) -> String? {
+        guard peer.transport == .mcpHost, peer.ability == nil, !ChatGPTDotIPCTransport.owns(peer) else { return nil }
+        let held = ContactCaller.held(requested, peer: peer.id)
+        let shared = AgentConversationStore.heldThread(peerID: peer.id)
+        let host = mcpHost(peer)
+        if host?.localChat != nil, held == nil || held == shared { return nil }
+        if held == nil, host?.acp != nil || host?.commandLine != nil { return nil }
+        return held ?? shared
+    }
+
+    private static func mcpHost(_ peer: AgentPeerContact) -> AgentHostRow? {
+        AgentPeerStore.hostRowID(peer.endpoint).flatMap { id in AgentHostDirectory.rows.first { $0.id == id } }
+    }
+
     /// A host's route: its local chat server live, a reconnect to its ACP route, a held pull, or its declared command line.
     private func mcpHostRoute(turn: Turn, invocation: ChatToolInvocation, args: PeerConversationArgs, peer: AgentPeerContact, agent: String,
                               sending: Bool, store: AgentPeerStore, surface: String) async throws -> JSONValue {
         if ChatGPTDotIPCTransport.owns(peer) { return try await chatGPTDotMessage(turn: turn, args, peer: peer, sending: sending) }
-        let row = AgentPeerStore.hostRowID(peer.endpoint).flatMap { id in
-            AgentHostDirectory.rows.first { $0.id == id }
-        }
+        let row = Self.mcpHost(peer)
         // A conversation lives on the door it was opened through. Command hosts run their declared CLI; pull-only hosts, and the threads the
         // contact opened by calling in (its own, or one caller's), retain the message until its next inbound call.
         let heldThread = ContactCaller.held(args.conversationID, peer: peer.id)

@@ -54,8 +54,6 @@ struct SecretRedactor: Sendable {
         values.reduce(text) { $0.replacingOccurrences(of: String(decoding: $1.bytes, as: UTF8.self), with: "[secret:\($1.name)]") }
     }
 
-    func callAsFunction(_ value: JSONValue) -> JSONValue { values.isEmpty ? value : value.mapStrings { self($0) } }
-
     /// HTTP header names are case-insensitive, so match secret forms without case.
     func name(_ text: String) -> String {
         values.reduce(text.lowercased()) { $0.replacingOccurrences(of: String(decoding: $1.bytes, as: UTF8.self).lowercased(), with: "[secret:\($1.name)]") }

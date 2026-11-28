@@ -32,6 +32,28 @@ public struct PartCallError: Error, Codable, Sendable, Equatable, LocalizedError
 
 /// A page's shared presentation. `PartFace.bound` binds row references and calls to the page owner's declared keys.
 public struct PartFace: Codable, Sendable, Equatable {
+    public static func turnSteps(_ steps: [TurnFace.Step]) -> Self {
+        let rows: [Row] = steps.map { step in
+            let (value, tone): (String, Tone) = switch (step.isRunning, step.disposition, step.outcome) {
+            case (true, _, _): ("Running", .live)
+            case (false, .withdrawnBeforeStart, _): ("Withdrawn before start · no effect", .quiet)
+            case (false, .stoppedBeforeStart, _): ("Stopped before start · no effect", .quiet)
+            case (false, .effectsUnconfirmed, _): ("Outcome unconfirmed", .attention)
+            case (false, .stopped, _): ("Stopped", .quiet)
+            case (false, .failedWithoutEffect, _): ("Failed · nothing changed", .failed)
+            case (false, .landed, _): ("Landed", .done)
+            case (false, .noEffect, _): ("No effect", .quiet)
+            case (false, .effectRecorded, _): ("Effect recorded", .attention)
+            case (false, nil, .ok): ("Completed", .done)
+            case (false, nil, .refused): ("Refused", .attention)
+            case (false, nil, .failed): ("Failed", .failed)
+            case (false, nil, nil): ("Outcome unconfirmed", .attention)
+            }
+            return .init(id: step.id, title: step.text, value: value, tone: tone)
+        }
+        return Self(sections: [.init(id: "steps", style: .note, rows: rows)])
+    }
+
     /// How a section reads: a card of rows, a timeline of moments, a flow of pills, label/value rows, a quiet note, or a waiting card.
     public enum Style: String, Codable, Sendable {
         case list, timeline, flow, values, note, waiting
@@ -224,6 +246,7 @@ public struct PartFace: Codable, Sendable, Equatable {
         public let open: String?
         public var actions: [Action]?
         public var control: Control?
+        public private(set) var pageRevision: String?
         public var rows: [Row]?
         /// The child `rows` are this row's own small group of named controls, drawn side by side at its trailing edge on its own line, each
         /// under its short word ("Read", "Write"). Each child stays its own row: its id, control, confirmation and call. Absent, the children
@@ -248,10 +271,12 @@ public struct PartFace: Codable, Sendable, Equatable {
         public var meter: Meter?
         public init(id: String, title: String, detail: String? = nil, value: String? = nil, at: String? = nil, symbol: String? = nil,
                     tone: Tone? = nil, open: String? = nil, actions: [Action]? = nil, control: Control? = nil,
-                    rows: [Row]? = nil, inline: Bool? = nil, expands: Bool? = nil, read: Call? = nil, running: Bool? = nil, meter: Meter? = nil) {
+                    rows: [Row]? = nil, inline: Bool? = nil, expands: Bool? = nil, read: Call? = nil, running: Bool? = nil, meter: Meter? = nil,
+                    pageRevision: String? = nil) {
             (self.id, self.title, self.detail, self.value, self.at) = (id, title, detail, value, at)
             (self.symbol, self.tone, self.open, self.actions, self.control) = (symbol, tone, open, actions, control)
             self.rows = rows; self.inline = inline; self.expands = expands; self.read = read; self.running = running; self.meter = meter
+            self.pageRevision = pageRevision
         }
         /// The children drawn on this row's own line, when it holds them so.
         public var group: [Row] { inline == true ? rows ?? [] : [] }
@@ -262,6 +287,13 @@ public struct PartFace: Codable, Sendable, Equatable {
         /// This row and every row drawn or read as a line of its own beneath it, in order; a group's children ride their parent's line.
         public var lineRows: [Row] { [self] + beneath.flatMap(\.lineRows) }
         public var descendants: [Row] { [self] + (rows ?? []).flatMap(\.descendants) }
+
+        public func stampingPageRevision(_ revision: String?) -> Self {
+            var row = self
+            row.pageRevision = revision
+            row.rows = rows?.map { $0.stampingPageRevision(revision) }
+            return row
+        }
     }
 
     public struct FormField: Codable, Sendable, Equatable, Identifiable {
@@ -313,7 +345,7 @@ public struct PartFace: Codable, Sendable, Equatable {
     public struct Block: Codable, Sendable, Equatable {
         public let kind: String
         public let key: String
-        public let text: String?
+        public var text: String?
         public let format: String?
         public let language: String?
         public let copy: Bool?
@@ -323,11 +355,13 @@ public struct PartFace: Codable, Sendable, Equatable {
         public let leaf: String?
         public let ref: String?
         public let alt: String?
+        public let ids: [String]?
         /// Live board card facts keyed by element id, joined by the page owner.
         public let cards: [String: Value]?
         public let choices: [[String: Value]]?
         public let fields: [FormField]?
         public var submit: [Action]?
+        public fileprivate(set) var pageRevision: String?
         public let protected: Bool?
         public let receiver: String?
         public var secretSet: Bool?
@@ -337,7 +371,8 @@ public struct PartFace: Codable, Sendable, Equatable {
                     language: String? = nil, copy: Bool? = nil, read: Call? = nil, revision: String? = nil,
                     leaf: String? = nil, ref: String? = nil, alt: String? = nil,
                     fields: [FormField]? = nil, submit: [Action]? = nil, protected: Bool? = nil,
-                    receiver: String? = nil, doors: [String]? = nil, cards: [String: Value]? = nil, choices: [[String: Value]]? = nil) {
+                    receiver: String? = nil, doors: [String]? = nil, cards: [String: Value]? = nil, choices: [[String: Value]]? = nil,
+                    ids: [String]? = nil) {
             self.kind = kind; self.key = key; self.text = text; self.format = format
             self.language = language; self.copy = copy; self.read = read; self.revision = revision
             self.leaf = leaf; self.ref = ref; self.alt = alt
@@ -345,6 +380,16 @@ public struct PartFace: Codable, Sendable, Equatable {
             self.receiver = receiver
             self.cards = cards
             self.choices = choices
+            self.ids = ids
+        }
+        public var isTableSlice: Bool { kind == "leaf" && leaf == "table_slice" && ref == BoardDocument.tableRef }
+        public var isStandingTable: Bool {
+            kind == "leaf" && leaf == BoardDocument.type && ref == BoardDocument.tableRef && key == "piece:" + BoardDocument.tableRef
+        }
+        public static func isTableSliceID(_ id: String) -> Bool {
+            !id.isEmpty && id.utf8.count <= 40 && id.utf8.allSatisfy {
+                (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || $0 == 45
+            }
         }
         public func formIssues(values: [String: Value]) -> [String: String] {
             var issues: [String: String] = [:]
@@ -480,6 +525,15 @@ public struct PartFace: Codable, Sendable, Equatable {
             }
             return drawn
         }
+
+        func stampingPageRevision(_ revision: String?) -> Self {
+            var section = self
+            section.rows = rows.map { $0.stampingPageRevision(revision) }
+            if block?.kind == "form", block?.protected != true, block?.fields?.contains(where: { $0.kind == "secret" }) != true {
+                section.block?.pageRevision = revision
+            }
+            return section
+        }
     }
 
     /// What the face is opened on right now: its link in the form a page read uses (`page:desk/<handle>`) and its title in the person's
@@ -501,6 +555,13 @@ public struct PartFace: Codable, Sendable, Equatable {
     public init(title: String? = nil, line: String? = nil, sections: [Section], detail: Detail? = nil, opened: Opened? = nil) {
         self.title = title; self.line = line; self.sections = sections; self.detail = detail; self.opened = opened
     }
+
+    public func stampingPageRevision(_ revision: String?) -> Self {
+        guard let revision else { return self }
+        var face = self
+        face.sections = sections.map { $0.stampingPageRevision(revision) }
+        return face
+    }
 }
 
 /// A page label reads only its owner's title, without holding the page's rows or levers.
@@ -521,10 +582,37 @@ public struct PartFaceSnapshot: FaceValue {
     public let owed: Bool
     public let levers: [PartFace.Section]?
     public let keyLevers: [PartFace.Section]?
+    public var pageRevision: String?
+    public var readingSources: [String: [String]] = [:]
+    private enum CodingKeys: String, CodingKey {
+        case part, version, sourceEpoch, status, face, error, owed, levers, keyLevers, pageRevision
+    }
     public init(part: String, version: String?, sourceEpoch: UInt64, status: Status, face: PartFace?, error: PartCallError?, owed: Bool,
-                levers: [PartFace.Section]? = nil, keyLevers: [PartFace.Section]? = nil) {
+                levers: [PartFace.Section]? = nil, keyLevers: [PartFace.Section]? = nil, pageRevision: String? = nil) {
         self.part = part; self.version = version; self.sourceEpoch = sourceEpoch
         self.status = status; self.face = face; self.error = error; self.owed = owed; self.levers = levers; self.keyLevers = keyLevers
+        self.pageRevision = pageRevision
+    }
+
+    public func sources(in sections: [PartFace.Section]) -> [String] {
+        guard !readingSources.isEmpty else { return [] }
+        let keys = sections.flatMap { section -> [String] in
+            if let block = section.block {
+                return block.text?.isEmpty == false || block.alt?.isEmpty == false ? [block.key] : []
+            }
+            return section.folded == true ? [] : section.allRows.map(\.id)
+        }
+        return Array(Set(keys.flatMap { readingSources[$0] ?? [] })).sorted()
+    }
+
+    public var drawnLevers: [PartFace.Section] {
+        guard let pageRevision else { return levers ?? [] }
+        return (levers ?? []).map { $0.stampingPageRevision(pageRevision) }
+    }
+
+    public var drawnKeyLevers: [PartFace.Section] {
+        guard let pageRevision else { return keyLevers ?? [] }
+        return (keyLevers ?? []).map { $0.stampingPageRevision(pageRevision) }
     }
 
     /// Authored copy carries its preparation failure wherever its words are drawn.
@@ -538,7 +626,7 @@ public struct PartFaceSnapshot: FaceValue {
     public var drawnFace: PartFace? {
         guard status == .ready, let face else { return nil }
         let stemRows = (keyLevers ?? []).flatMap(\.allRows)
-        guard !stemRows.isEmpty else { return face }
+        guard !stemRows.isEmpty else { return face.stampingPageRevision(pageRevision) }
         let riding = Dictionary(stemRows.map { ($0.id, $0.actions ?? []) }, uniquingKeysWith: +)
         let subjects = Dictionary(stemRows.map { ($0.id, $0.title) }, uniquingKeysWith: { first, _ in first })
         let drawn = Set(face.allRows.map(\.id))
@@ -576,7 +664,7 @@ public struct PartFaceSnapshot: FaceValue {
         }
         var drawnFace = face
         drawnFace.sections = sections
-        return drawnFace
+        return drawnFace.stampingPageRevision(pageRevision)
     }
 }
 
@@ -585,6 +673,7 @@ public enum PageFaceKey {
     public static func item(_ page: String, _ item: String) -> FaceKey { .page(page + "/" + item) }
     public static let catalog = FaceKey.page("catalog/own-pages")
     public static func copy(_ key: String) -> FaceKey { .page("copy/" + key) }
+    public static func turnSteps(_ session: String) -> String { "turn-steps/" + session }
     public static func makeTitle(file: URL, revision: Int) -> FaceKey { .page("make-title/\(revision)/" + file.path) }
 }
 

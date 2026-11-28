@@ -100,6 +100,10 @@ the shared credential roots: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.codex`,
 `codex_home` and `codex_child_home`. A root, its descendants and its parents are
 refused, including `/`. The same fence checks the folder a door actually uses,
 including a contact's saved starting folder when `where` is omitted.
+The same Git metadata check runs on the resolved `where` and on the folder the
+door actually uses at start and resume. A working checkout can be selected.
+Git metadata directories, including linked-worktree and separate metadata,
+are refused, as are errors that leave repository discovery indeterminate.
 The commissioning turn's `read_only` defaults job writes
 off and refuses explicit writes; `none` or an invalid file-access mode refuses
 the job. Before resuming, the saved envelope itself is capped by this file access,
@@ -131,8 +135,13 @@ and its complete file-access ceiling through its return, so neither a peer's wor
 reach their hands wider through a line of their own. An act that needs the person raises the same card their turn would, naming the
 line's conversation; answering it continues the line there. Several lines at once is a swarm: each
 runs side by side in its own conversation and each ending wakes the conversation that started
-it with the line's answer. A relaunch continues a working line in its own conversation. A
-helper bot is still its own mind and is not a line.
+it with the line's answer. The live commission can use the filing Ask's task
+elevations. A relaunched own line, a reopened ACP job and a turn reading a
+return carry the commissioning peers as provenance and check Trust afresh.
+A line's report retains the sources it picked up while working. The return,
+`agent.read` and the Desk carry those sources and the recorded commissioning
+peers when they bring the report's words into an Ask. Saved task elevations
+contribute source identities. A helper bot is still its own mind and is not a line.
 
 | Action | Use |
 | --- | --- |
@@ -143,8 +152,10 @@ helper bot is still its own mind and is not a line.
 | `agent.discard {job}` | Drop a settled repo job's worktree, including uncommitted work, and delete its branch. |
 
 What the agent commissions comes back as its own: the deliverable returns as the result of its
-own call and registers with native provenance plus "made by ‹who› for ‹job›". The organ's prose
-comes back labelled as its report. When a job settles it wakes the context that commissioned it.
+call and registers with its job ID, the peer ID when a peer made it, and "made by ‹who› for ‹job›".
+Reading that version's content through the Desk or `files.read` carries the peer source into
+the Ask. The organ's prose comes back labelled as its report. When a job settles it wakes
+the context that commissioned it.
 The stem's Git inventory and capture disable fsmonitor and hooks and do not inspect
 submodule worktrees. The agent's apply still uses their own gated Git call and hooks.
 A2A returned-file decoding or write failures keep the files that did land and their
@@ -165,11 +176,21 @@ An unreadable saved-contact store fails bridge identity resolution with
 `contact_identity_unavailable` (HTTP 503) and a repair
 instruction. It cannot turn a claimed caller into an anonymous one.
 
+Before one of their turns sends or queues a message, the conversation store checks
+its destination, including exact protocol threads and shared held threads, for
+a send they started in another chat after this turn began. If they have yet to see
+it in this turn, nothing goes out or queues. The receipt brings that send and
+the following talk through the contact's usual history view, with only the fact
+and time of the send on a turn steered by another agent. Once that reading
+reaches their turn, they can send again if they still means to.
+
 A waiting exchange remains pending; sending or accepting a message does not make
 it an answer. A send explicitly held for a contact's next call has a pending
-dispatch receipt; it proves neither delivery nor an answer. A follow-up queues
-behind it until settlement or an explicit stop/release. The conversation store owns admission and settlement: a send is
-occupied from its committed admission, including before its task registers.
+dispatch receipt; it proves neither delivery nor an answer. The held send leaves
+the conversation ready, while an active reply watch or a send already in flight
+can keep a follow-up queued until settlement or an explicit stop/release.
+The conversation store owns admission and settlement: a send is occupied from
+its committed admission, including before its task registers.
 A queue reservation names that exact record, skips transport refresh, and
 admits only its oldest eligible message. If settlement races enqueue, the
 caller reads the current record before deciding whether it can send. Store
@@ -748,7 +769,7 @@ without a migration file or a resend.
 Opening Connectors or unfolding Simple's Agents listing inspects contact health
 once per open. Row reads and watcher re-reads only read saved health. Committed
 contact writes wake health directly; conversation changes wake the existing
-continuation. Passive Doctor health-card reads also use saved health.
+continuation.
 Every completed inspection renews `checkedAt`, including unchanged faults, and
 writes `agents/local-health.json`. A caller arriving while an inspection runs asks
 for one more pass and waits for it, so changes made after the running pass read its
@@ -1000,8 +1021,17 @@ identity do not grant owner authority.
 
 Full Mac admits the agent's autonomous actions. macOS privacy permission resets
 still ask the owner. An untrusted agent's card quotes its ask: **Just this** admits
-one call; **For this task** elevates its carried peers for the run. Approve alone
-means Just this. `chat.post` is never held; reading agent words steers nothing.
+one call. **For this task** also elevates its carried peers while the same
+unjoined Ask is still live. Approve alone
+means Just this. `chat.post` is never held.
+When `agent.read {job}` returns an untrusted contact's report, working note or
+job-folder check output, the contact becomes a steering source for that Ask.
+Each job read adds its own author. An own-line report adds its recorded sources
+when read. Stem status and ordinary contact reads carry attribution for reading.
+Both `memory.commit` and `memory.rewrite` use the same rule for peer-steered roots.
+Each root is `told` by one attested peer, without `since`, and retains the Ask's
+full source set. A peer-steered rewrite changing text also supplies explicit
+roots. Pins, restores and other metadata-only writes add no implicit roots.
 Agents enabled in Trust → Connected agents carry the owner's authority on
 authenticated turns; ordinary Trust and domain checks still apply. A contact at
 the table reads the Desk without a turn and gains no authority by it
@@ -1017,12 +1047,18 @@ become model chat messages. AgentScreen's `doorLines` and `otherRoomExchanges` r
 The saved run ID pairs an answer with its input, including when another input
 arrives before the answer. A legacy answer without a run ID pairs with its
 adjacent input even when an older input is still unanswered.
-Turn continuity instead reads their one experience record: exchanges, sends,
-thoughts and happenings share one newest-first character budget. Birth steering
-stamps decide whether each row carries words or shape; peer-steered receiving
-turns carry shapes only, with existing person-door act names. Remember across
-conversations gates the reading. The [turn anatomy](ANATOMY_OF_A_TURN.md#4-the-provider-request-is-assembled)
-owns these bounds. Transcript day, helper and bridge stitching no longer supply
+Turn continuity reads their one experience record. Exchanges, sends, thoughts
+and happenings share one newest-first character budget. Speech lines give the
+direction and kind of party, with the door separately labelled. A contact's
+reply appears in an agent conversation even when the turn runs on `chat`.
+Local contact health appears as a status update. Missing speaker attribution
+reads as an unknown sender. Recorded acceptance determines whether a send
+is described as sent. Birth steering stamps
+and the receiving turn decide whether names and words can appear. Peer-steered
+receiving turns carry shapes only, with existing person-door act names.
+Remember across conversations gates the reading. The
+[turn anatomy](ANATOMY_OF_A_TURN.md#4-the-provider-request-is-assembled) owns
+these bounds. Transcript day, helper and bridge stitching no longer supply
 turn context.
 Phone contact sends retain the action owner's refusal or unconfirmed outcome;
 only an accepted terminal send returns the refreshed thread as success.
@@ -1065,8 +1101,13 @@ returned request and session identities; keep them after an uncertain send.
 Dot's admission record retains the actual terminal failure text.
 Network state and provider-success events never synthesize a cause or start
 another turn. Launch resumes only an accepted arrival whose turn has not
-started and has no saved failure. Completed room cleanup and its seen/marker
-readers are removed; canonical transcript rows remain untouched.
+started and has no saved failure. A failed saved-admission recovery records
+repair for that contact and allows the other contacts to continue. A later
+successful recovery settles that contact's repair. The continuation registers
+its reply clock handler before queue restoration, checks for due replies after
+a queue-resume failure, and reports the failure once that check completes.
+Completed room cleanup and its seen/marker readers are removed; canonical
+transcript rows remain untouched.
 
 Pull hosts receive the full accepted payload from the canonical contact
 transcript, identified by its original send ID. The bounded exchange prompt is
@@ -1258,10 +1299,12 @@ Validating a card's target uses the Desk's ordinary reader, which may repair a d
 journal tail as any Desk read does. Recording a contact's act writes the contact record,
 which refreshes contact health as recording a read does. Every write-path answer,
 including validation refusals, rechecks the contact's table door and trust before returning words.
-Contact signatures in `by`, `changedBy` or `crossedBy` keep exact peer principals
-in each element's `peer_sources`. Every reply for a table version with contact
-content carries `untrusted_remote_data` and `source_boundary` outside the paged
-`text` so the notice travels with every chunk.
+The standing table's `reading` gives the same spatial summary as the Desk page
+for the selected version. The structured board document remains paged in `text`
+using `text_offset`. Contact signatures in `by`, `changedBy` or `crossedBy`
+keep exact peer principals in each element's `peer_sources`. Every reply for a
+table version with contact content carries `untrusted_remote_data` and a named
+signer notice in `source_boundary` outside the paged `text`.
 
 Both table doors require strings for `text`, `color`, `kind`, `size`, `from`, `to`,
 `fromSide`, `toSide`, `label`, `type`, `id`, `item` and `piece`, each at most 2,000 characters

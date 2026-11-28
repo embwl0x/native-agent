@@ -48,6 +48,8 @@ public actor BodyNerve {
     private var again = false
     /// Organs that completed a pass since the last integration.
     private var completed: Set<String> = []
+    /// Organs whose leftover repair has been looked for this launch.
+    private var swept: Set<String> = []
 
     public init(dataRoot: URL) {
         self.dataRoot = dataRoot
@@ -70,6 +72,7 @@ public actor BodyNerve {
     private func integrate() async {
         let read: OrganBody?
         do { read = try await OrganBody.read() }
+        catch is CancellationError { return }
         catch {
             await RepairOwed.owe(dataRoot, id: UUID().uuidString.lowercased(), kind: .run,
                 operation: Self.recordOperation, owner: "mind.body",
@@ -86,6 +89,7 @@ public actor BodyNerve {
         let settled = Set(memory.owed.compactMap { organ, kind in
             completed.contains(organ) || (kind == .stuck && busy.contains(organ)) ? organ : nil
         })
+        let passed = completed
         completed = []
         let unfelt = body.unfelt(memory.felt)
         // Settlement comes first, so a pass and then a fresh fault in one read settle the old repair and owe the new one.
@@ -97,6 +101,14 @@ public actor BodyNerve {
         for line in owing { owed[line.organ] = line.deviation?.kind }
         // A stuck organ that then fails owes the one repair it already owes, now for its failure.
         for line in unfelt where line.deviation?.kind == .failed && owed[line.organ] == .stuck { owed[line.organ] = .failed }
+        // A repair whose organ has since passed clean is settled even when this memory no longer names it: a quit between saving the
+        // memory and settling the repair left such a row open for good. Once a launch for each organ.
+        for organ in passed.subtracting(swept) where memory.owed[organ] == nil {
+            guard let line = body.lines.first(where: { $0.organ == organ }), line.deviation == nil,
+                  line.latest.outcome == .worked || line.latest.outcome == .nothing else { continue }
+            swept.insert(organ)
+            RepairOwed.settle(dataRoot, operation: Self.operation(organ), evidence: .init(source: "beat", id: organ))
+        }
         let next = Memory(felt: body.marks(feeling: unfelt, over: memory.felt), owed: owed)
         guard next != memory else { return }
         do {

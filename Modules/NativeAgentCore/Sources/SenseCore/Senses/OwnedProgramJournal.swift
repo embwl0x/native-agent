@@ -32,7 +32,8 @@ extension OwnedProgramRunner {
         var notebookChanged = false
         var notebookChangeKnown = true
         private var notebookEffect: ToolFailureError.Effects = .none
-        private var lastNotebookWrite: (at: Int, value: JSONValue?)?
+        private var notebookListChange: JSONValue?
+        private var lastNotebookWrites: [String: (at: Int, value: JSONValue?)] = [:]
         var stopped: [String: JSONValue]?
         /// An ordinary script's refused calls by number: each throws to the code, and becomes the stop only if the script ends on it uncaught.
         var refusals: [Int: [String: JSONValue]] = [:]
@@ -62,6 +63,7 @@ extension OwnedProgramRunner {
         /// Replay superseded reads only while the later write's version still verifies the scope originally read.
         let ownWrites: [(at: Int, page: String, item: String?, version: String?)]
         var isCancelled: Bool { Task.isCancelled }
+        private var liveNotebook: Bool { !preview && !(host is OwnedProgramFixtures) }
         init(source: String, preview: Bool, program: OwnedProgram, replay: Replay?,
              host: any OwnedProgramHostProfile, execution: OwnedProgramExecution, actionsInFlight: ActionTasks, notebookRoot: URL, partID: String) {
             self.lines = source.split(separator: "\n", omittingEmptySubsequences: false)
@@ -89,8 +91,9 @@ extension OwnedProgramRunner {
             self.ownWrites = ownWrites
             for (at, entry) in self.replay.enumerated() {
                 guard let fields = entry.objectValue, let call = fields["call"]?.arrayValue, call.count == 4,
-                      call[0] == .string("state"), call[1] == .string("set"), let args = call[2].stringValue,
-                      let values = (try? JSONValue.parse(Data(args.utf8)))?.arrayValue, values.count == 1,
+                      call[0] == .string("state"), let operation = call[1].stringValue, let args = call[2].stringValue,
+                      let values = (try? JSONValue.parse(Data(args.utf8)))?.arrayValue,
+                      let notebook = try? AbilityStore.NotebookCall(operation, values), let key = notebook.writeKey,
                       let out = fields["out"]?.stringValue else { continue }
                 // Older checkpoints know the acknowledged value of a set, but didn't record whether it changed disk.
                 let effects = fields["notebook_effects"]?.stringValue ?? "unknown"
@@ -98,9 +101,11 @@ extension OwnedProgramRunner {
                 if effects == "unknown" { notebookChangeKnown = false }
                 let reply = try? JSONValue.parse(Data(out.utf8))
                 if reply?.objectValue?["ok"] == .bool(true) {
-                    lastNotebookWrite = (at, values[0])
+                    if let value = notebook.writtenValue(reply: reply?.objectValue?["value"]) {
+                        lastNotebookWrites[key] = (at, value)
+                    }
                 } else if effects != "none" {
-                    lastNotebookWrite = (at, nil)
+                    lastNotebookWrites[key] = (at, nil)
                 }
             }
             if let resolutionFailure {
@@ -229,21 +234,47 @@ extension OwnedProgramRunner {
                                "detail": stopped?["detail"] ?? .null, "stopped": .bool(true)], line: line, n: ledger.count + 1)
             }
             let kind = kind == "primitive" && host.primitiveAction(id) == nil ? "action" : kind
+            let notebookCall: AbilityStore.NotebookCall?
+            if kind == "state", stopped == nil {
+                let n = ledger.count + 1
+                do {
+                    guard programEntry != .face else {
+                        return encode(["ok": .bool(false), "reason": .string("projection_only"),
+                            "detail": .string("A face reads only its frozen sources, never a notebook."), "stopped": .bool(true)], line: line, n: n)
+                    }
+                    guard host.allowsNotebook else {
+                        return encode(["ok": .bool(false), "reason": .string("not_declared"),
+                            "detail": .string("This run has no notebook access."), "stopped": .bool(true)], line: line, n: n)
+                    }
+                    let call = try AbilityStore.NotebookCall(id, given)
+                    let value = try call.checkedWriteValue()
+                    try await host.checkNotebook(value, keyedWrite: call.keyedWrite)
+                    notebookCall = call
+                } catch {
+                    let code = (error as? SenseFailure)?.code ?? "bad_state"
+                    return encode(["ok": .bool(false), "reason": .string(code), "detail": .string(error.localizedDescription),
+                        "stopped": .bool(false)], line: line, n: n)
+                }
+            } else { notebookCall = nil }
             do {
             let id = try kind == "action" ? (host.canonicalAction(id)) : id
             guard strict, ["action", "primitive", "read", "find", "decide", "state"].contains(kind), stopped == nil else {
-                return await dispatch(kind: kind, id: id, given: given, line: line)
+                return await dispatch(kind: kind, id: id, given: given, line: line, notebookCall: notebookCall)
             }
-            let evidence = try kind == "action" ? host.callArgumentsForEvidence(id, given: given) : given
+            var evidence = try kind == "action" ? host.callArgumentsForEvidence(id, given: given) : given
+            if case .cas(_, let expected, _, _)? = notebookCall {
+                evidence[1] = .string(try expected.serializedSHA256())
+            }
             let signature = JSONValue.array([.string(kind), .string(id),
                 .string(try JSONValue.array(evidence).serialize(pretty: false)), .int(Int64(line))])
             guard replayed < replay.count else {
                 let rows = ledger.count
-                let out = await dispatch(kind: kind, id: id, given: given, line: line)
+                let out = await dispatch(kind: kind, id: id, given: given, line: line, notebookCall: notebookCall)
                 var entry: [String: JSONValue] = ["call": signature, "out": .string(out),
                     "row": ledger.count > rows ? ledger[ledger.count - 1] : .null,
                     "read_content": readContent, "read_projections": readProjections]
-                if kind == "state", id == "set" { entry["notebook_effects"] = .string(notebookEffect.rawValue) }
+                if notebookCall?.writes == true { entry["notebook_effects"] = .string(notebookEffect.rawValue) }
+                entry["notebook_list_change"] = notebookListChange
                 retain(.object(entry))
                 return out
             }
@@ -288,14 +319,17 @@ extension OwnedProgramRunner {
                     fields["status"] = .string("answered")
                     row = .object(fields)
                 }
-            } else if recheckReads, kind == "state", id == "get" {
-                let now = await dispatch(kind: kind, id: id, given: given, line: line)
+            } else if recheckReads, let notebookCall, !notebookCall.writes {
+                let now = await dispatch(kind: kind, id: id, given: given, line: line, notebookCall: notebookCall)
                 let observed = (try? JSONValue.parse(Data(now.utf8)))?.objectValue?["value"]
+                let saved = (try? JSONValue.parse(Data(out.utf8)))?.objectValue?["value"]
                 let expected: JSONValue?
-                if let later = lastNotebookWrite, later.at >= replayed {
+                if case .get(let key) = notebookCall, let later = lastNotebookWrites[key], later.at >= replayed {
                     expected = later.value
+                } else if case .list(let prefix) = notebookCall {
+                    expected = notebookListAfterWrites(saved, prefix: prefix)
                 } else {
-                    expected = (try? JSONValue.parse(Data(out.utf8)))?.objectValue?["value"]
+                    expected = saved
                 }
                 guard stopped == nil, observed != nil, expected == observed else {
                     return changed("ability notebook",
@@ -427,10 +461,11 @@ extension OwnedProgramRunner {
                            receipt before continuing.
                            """)]
         }
-        func dispatch(kind: String, id: String, given: [JSONValue], line: Int) async -> String {
+        func dispatch(kind: String, id: String, given: [JSONValue], line: Int, notebookCall: AbilityStore.NotebookCall? = nil) async -> String {
             readContent = .null
             readProjections = .array([])
             notebookEffect = .none
+            notebookListChange = nil
             unjournaled = !preview && kind == "primitive" && host.primitiveAction(id)?.journaled == false
             if part, ledgerBytes >= 4 * 1024 * 1024 {
                 stopped = ["reason": .string("output_limit"), "detail": .string("The run's receipt ledger reached 4 MiB; no further call ran.")]
@@ -453,7 +488,7 @@ extension OwnedProgramRunner {
             catch { return job.mark("action_catalog_unavailable", """
                 The action catalog could not be read: \(error.localizedDescription). Repair its source before running this call.
                 """) }
-            if kind == "state" { return notebook(job) }
+            if let notebookCall { return notebook(job, call: notebookCall) }
             if strict, ["step", "expect", "expect_fail", "decide"].contains(kind) { return await strictVerb(job) }
             if let refusal = admitCall(job) { return refusal }
             if let refusal = prepareInput(job, registeredAction: registeredAction) { return refusal }
@@ -558,23 +593,47 @@ extension OwnedProgramRunner {
             return job.answer(["ok": .bool(true), "value": .null])
         }
 
-        /// host.state.get() and host.state.set(value): the part's own notebook, never a face's.
-        private func notebook(_ job: DispatchedCall) -> String {
-            let id = job.id
-            if programEntry == .face { return job.refuse("projection_only", "A face reads only its frozen sources, never a notebook.", stop: true) }
-            let values = job.given
-            guard id == "get" && values.isEmpty || id == "set" && values.count == 1 else {
-                return job.refuse("bad_state", "Use host.state.get() or host.state.set(value).", stop: false)
+        private func notebookListAfterWrites(_ saved: JSONValue?, prefix: String) -> JSONValue? {
+            guard var listing = saved?.objectValue, let rows = listing["keys"]?.arrayValue,
+                  case .int(var bytes)? = listing["total_bytes"] else { return nil }
+            var keys: [String: JSONValue] = [:]
+            for row in rows {
+                guard let key = row.objectValue?["key"]?.stringValue else { return nil }
+                keys[key] = row
             }
+            for entry in replay.dropFirst(replayed) {
+                let fields = entry.objectValue
+                guard let effects = fields?["notebook_effects"], effects != .string("none") else { continue }
+                guard effects == .string("occurred"), let change = fields?["notebook_list_change"]?.objectValue,
+                      let key = change["key"]?.stringValue, let before = change["before"], let after = change["after"],
+                      case .int(let delta)? = change["bytes"] else { return nil }
+                let (total, overflow) = bytes.addingReportingOverflow(delta)
+                guard !overflow else { return nil }
+                bytes = total
+                if key.hasPrefix(prefix) {
+                    guard (keys[key] ?? .null) == before else { return nil }
+                    keys[key] = after == .null ? nil : after
+                }
+            }
+            listing["keys"] = .array(keys.keys.sorted().compactMap { keys[$0] })
+            listing["total_bytes"] = .int(bytes)
+            return .object(listing)
+        }
+
+        private func notebook(_ job: DispatchedCall, call: AbilityStore.NotebookCall) -> String {
             do {
-                let value = try AbilityStore.notebook(dataRoot: notebookRoot, id: partID,
-                    setting: id == "set", value: values.first ?? .null,
+                let listChange: ((JSONValue) -> Void)? = if strict, liveNotebook {
+                    { self.notebookListChange = $0 }
+                } else { nil }
+                let value = try AbilityStore.notebook(dataRoot: notebookRoot, id: partID, call: call,
+                    expectedVersion: liveNotebook && call.writes ? partVersion : nil,
                     writing: { self.notebookChanged = true; self.notebookEffect = .occurred },
                     writeUncertain: { self.notebookChangeKnown = false; self.notebookEffect = .unknown },
-                    failure: { SenseFailure(code: $0, message: $1) })
+                    listChange: listChange)
                 return job.answer(["ok": .bool(true), "value": value])
             } catch {
-                return job.refuse("bad_state", error.localizedDescription, stop: false)
+                return job.answer(["ok": .bool(false), "reason": .string((error as? SenseFailure)?.code ?? "bad_state"),
+                    "detail": .string(error.localizedDescription), "stopped": .bool(false), "effects": .string(notebookEffect.rawValue)])
             }
         }
 
@@ -716,7 +775,7 @@ extension OwnedProgramRunner {
             var callExecution = execution
             callExecution.readContent = readContent
             let receipt: JSONValue
-            if kind == "primitive", preview, write, host.primitiveAction(id)?.program != true {
+            if kind == "primitive", preview, write, id != PartOpenURLRequest.operation, host.primitiveAction(id)?.program != true {
                 receipt = .object(["status": .string("preview"), "execution": .string("preview"), "effects": .string("none"), "result": .null])
             } else if kind == "primitive" {
                 receipt = await actionsInFlight.primitive(id, arguments: given.first ?? .null, preview: preview, host: host, execution: callExecution)
@@ -938,7 +997,6 @@ extension OwnedProgramRunner {
             let withheld = preview && stopped == nil && !timedOut && error?["origin"] == .string("javascript")
                 && ledger.contains { $0.objectValue?["status"] == .string("preview") }
             let status = stopped != nil ? "stopped" : timedOut ? "timed_out" : error != nil && !withheld ? "error" : "ok"
-            let liveNotebook = !preview && !(host is OwnedProgramFixtures)
             let notebookTook = liveNotebook && notebookChanged
             let notebookUnknown = liveNotebook && !notebookChangeKnown
             var out: [String: JSONValue] = [

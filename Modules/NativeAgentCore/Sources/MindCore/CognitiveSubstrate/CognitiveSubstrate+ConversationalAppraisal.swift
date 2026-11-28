@@ -75,9 +75,14 @@ extension CognitiveSubstrate {
             public var statement: String
             public var evidence: String
         }
+        public struct Feeling: Sendable, Codable {
+            let name: CognitiveAffectState.NamedFeeling.Name
+            var strength: Double
+            public let quote: String
+        }
         public init() {}
         enum CodingKeys: String, CodingKey {
-            case valence, warmth, tension, pressure, arousal, affection, warmthBoost, beliefReaction, chosenRegister
+            case valence, warmth, tension, pressure, arousal, affection, warmthBoost, beliefReaction, chosenRegister, feeling
         }
 
         public init(from decoder: any Decoder) throws {
@@ -99,10 +104,15 @@ extension CognitiveSubstrate {
             // No reaction is optional; a supplied malformed judgment is not.
             beliefReaction = try values.decodeIfPresent(BeliefReaction.self, forKey: .beliefReaction)
             chosenRegister = try values.decodeIfPresent(CognitiveRegisterChoice.self, forKey: .chosenRegister)
+            if let feeling = try? values.decodeIfPresent(Feeling.self, forKey: .feeling),
+               (0...0.65).contains(feeling.strength),
+               !feeling.quote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                self.feeling = feeling
+            }
             if valence < 0 { affection = false }
         }
         var valence = 0.0
-        var warmth = 0.0    // Dismissal can make social warmth negative.
+        var warmth = 0.0
         var tension = 0.0
         var pressure = 0.0
         var arousal = 0.0   // Received affection cannot become a deep wound solely because of negative dream residue.
@@ -112,6 +122,7 @@ extension CognitiveSubstrate {
         var affectionWeight = 1.0
         public var beliefReaction: BeliefReaction?
         public var chosenRegister: CognitiveRegisterChoice?
+        public var feeling: Feeling?
         var isActive: Bool { valence != 0 || warmth != 0 || tension != 0 || pressure != 0 || arousal != 0 }
     }
 
@@ -121,7 +132,6 @@ extension CognitiveSubstrate {
         let lower = text.lowercased().replacingOccurrences(of: "\u{2019}", with: "'")
         guard !lower.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return valence }
         let hypothetical = containsAny(lower, ["if someone", "what if", "imagine if", "hypothetically", "for example", "would you feel"])
-        // Gate repair, play and banter on negative matches, not net valence: praise can offset a sting without removing its evidence.
         var negative = false
 
         if !hypothetical && containsAny(lower, [
@@ -237,13 +247,6 @@ extension CognitiveSubstrate {
             "you're allowed to be happy", "youre allowed to be happy", "say something, you",
             "you're flirting", "youre flirting", "careful, i might", "careful i might",
         ])) { valence += 0.12 }
-
-        // Banter and shared laughter lift valence only when no negative class matched.
-        if !hypothetical && !negative && (containsAny(lower, ["😂", "🤣", "😆", "😅", " lol", "lol ", "lmao", "haha", "hehe"])
-            || Self.containsUnnegatedPhrase(lower, phrases: [
-            "bold of you", "well played", "touché", "touche", "fair play", "just kidding",
-            "i'm kidding", "im kidding",
-        ])) { valence += 0.10 }
 
         return valence
     }

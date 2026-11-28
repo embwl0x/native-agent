@@ -170,32 +170,15 @@ extension LLMCall {
         get { self[AnthropicReusePart.self] }
         set { self[AnthropicReusePart.self] = newValue }
     }
-    /// A secondary call retains causal identity, with its own route, layout and allowance.
-    public func unmeasured() -> LLMCall {
-        var call = self
-        call.prefixMeasurement = .unmeasuredRequestShape
-        call.conversationRequest = false
-        call.requestPlan = nil
-        call.systemSegments = nil
-        call.currentUserIndex = nil
-        call.withinTurnReuse = false
-        call.admission = nil
-        call.turn?.tokenBudget = nil
-        return call
-    }
 }
 
 /// Tool totals measure schema-material bytes (name, description and parameter JSON) without retaining content.
 public enum ToolContractWeight {
     public struct Measurement: Sendable, Equatable {
-        public let floorCount: Int
-        public let appendedCount: Int
         public let floorBytes: Int
         public let appendedBytes: Int
 
-        public init(floorCount: Int, appendedCount: Int, floorBytes: Int, appendedBytes: Int) {
-            self.floorCount = floorCount
-            self.appendedCount = appendedCount
+        public init(floorBytes: Int, appendedBytes: Int) {
             self.floorBytes = floorBytes
             self.appendedBytes = appendedBytes
         }

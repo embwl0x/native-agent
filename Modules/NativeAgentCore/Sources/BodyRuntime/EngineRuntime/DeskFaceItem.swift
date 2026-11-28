@@ -6,8 +6,51 @@ import SenseCore
 // Blueprint: | `DeskFaceItem.swift` | The selected Desk item or execution's canonical details, dependencies, pursuit, notes and references as Desk packet facts |
 
 extension NativeAgentEngine {
+    @concurrent public func tableTextReadings(for face: PartFace?, includeStandingTable: Bool) async -> [String: PartFace.TableReading] {
+        let sections = face?.sections.filter {
+            $0.block?.isTableSlice == true || (includeStandingTable && $0.block?.isStandingTable == true)
+        } ?? []
+        guard !sections.isEmpty else { return [:] }
+        do {
+            let studio = MakeStudio(dataRoot: dataRoot)
+            let newest = try studio.readMeta(MakeStudio.tableRef)?.versions.last
+            let board = try newest.map { try studio.board(MakeStudio.tableRef, $0) } ?? BoardDocument()
+            let items = try? await SwiftNativeDeskStore(dataRoot: dataRoot).liveState().items
+            try Task.checkCancellation()
+            let facts = try SwiftToolDispatcher.tableReading(board, items: items, dataRoot: dataRoot, metadata: studio.readMeta)
+            let sourceReading = Self.named(facts.document, facts.signerNames)
+            let prepared = try await Parts(root: dataRoot).prepareFace(id: "native-desk.table-text", input: .object([
+                "reading": sourceReading,
+                "cards": .object(facts.cards.mapValues { Self.named($0, facts.signerNames) }),
+                "signers": .object(facts.signerNames.mapValues(JSONValue.string)),
+            ]))
+            guard let reading = prepared.value.objectValue?["reading"],
+                  let cards = prepared.value.objectValue?["cards"]?.objectValue,
+                  let signers = prepared.value.objectValue?["signers"]?.objectValue else { return [:] }
+            let faceReading = PartFace.Value(reading), faceCards = cards.mapValues(PartFace.Value.init)
+            let signerNames = signers.compactMapValues(\.stringValue)
+            let original = PartFace.Value(sourceReading)
+            var bySelection: [Set<String>?: PartFace.TableReading] = [:]
+            return sections.reduce(into: [:]) { readings, section in
+                let ids = section.block?.ids
+                let selection = ids.map { Set($0) }
+                if let table = bySelection[selection] {
+                    readings[section.id] = table
+                } else {
+                    let table = PartFace.tableReading(board, version: newest?.n ?? 0, reading: original,
+                        cards: faceCards, sliceIDs: ids, signerNames: signerNames, displayReading: faceReading)
+                    let safe = PartFace.TableReading(sourceBoundary: table.sourceBoundary.map(NativeAgentSecretRedactor.redactText),
+                        words: NativeAgentSecretRedactor.redactText(table.words))
+                    bySelection[selection] = safe
+                    readings[section.id] = safe
+                }
+            }
+        } catch { return [:] }
+    }
+
     /// The selection the Desk face opens on: nothing, an execution, or a Desk item, each found in the current reading or named as missing.
-    func deskSelectedFacts(_ snapshot: DeskPageSnapshot, selected: String?, pieces: DeskPieceShelf) -> JSONValue {
+    func deskSelectedFacts(_ snapshot: DeskPageSnapshot, selected: String?, pieces: DeskPieceShelf,
+                           readingSources: inout [String: [String]]) -> JSONValue {
         guard let handle = selected else { return .null }
         let now = snapshot.now
         if handle.hasPrefix("execution:") {
@@ -17,6 +60,8 @@ extension NativeAgentEngine {
                                 "unavailable": faceText(snapshot.agentJobs.unavailableReason)])
             }
             let row = WorkOverviewRead.row(for: job)
+            let sources = job.reportSources
+            if job.state.isTerminal, !sources.isEmpty { readingSources["execution-detail:" + id] = sources }
             return .object(["kind": .string("execution"), "id": .string(id), "found": .bool(true), "title": .string(row.title),
                             "text": .string(WorkOverviewRead.text(for: job)), "asking": faceText(job.request?.title),
                             "state": .string(row.stateLabel(at: now)), "at": .string(row.updatedAt)])
@@ -51,7 +96,16 @@ extension NativeAgentEngine {
                             "text": .string(target.text)])
         }
         let studio = MakeStudio(dataRoot: dataRoot)
-        let opened: [JSONValue] = item.refs.compactMap { pieces.facts($0, studio: studio, opened: true) }
+        let opened: [JSONValue] = item.refs.compactMap { ref in
+            guard let facts = pieces.facts(ref, studio: studio, opened: true) else { return nil }
+            let fields = facts.objectValue
+            if let made = DeskPiece.makeRef(ref), let peer = pieces.metadata[made]?.versions.last?.peerID,
+               fields?["text"]?.stringValue?.isEmpty == false
+                || fields?["table"]?.objectValue?["first"]?.stringValue?.isEmpty == false {
+                readingSources["piece:" + ref.refId] = ["peer:" + peer]
+            }
+            return facts
+        }
         let onBoard = snapshot.boardItems.contains { $0.handle == handle }
         return .object([
             "kind": .string("item"), "handle": .string(item.handle), "found": .bool(true), "onBoard": .bool(onBoard),
@@ -88,7 +142,7 @@ struct DeskPieceShelf: Sendable {
     let fault: String?
     let metadata: [String: MakeStudio.Meta]
 
-    func standingTable(_ items: [DeskItem]?, dataRoot: URL) -> JSONValue {
+    func standingTable(_ items: [DeskItem]?, dataRoot: URL, displayNames: [String: String], selectedItem: String?) -> JSONValue {
         var facts: [String: JSONValue] = ["ref": .string(MakeStudio.tableRef), "version": .string("0")]
         guard loaded else { facts["reason"] = .string("Reading the table…"); return .object(facts) }
         do {
@@ -101,9 +155,31 @@ struct DeskPieceShelf: Sendable {
                 if let fault, meta?.versions.last == nil { throw BoardDocument.Unreadable(message: fault) }
                 return meta
             }
-            facts["elements"] = reading.document.objectValue?["elements"]
-            facts["card_pairs"] = .array(reading.cards.sorted { $0.key < $1.key }.map { .array([.string($0.key), $0.value]) })
-            facts["source_boundary"] = reading.sourceBoundary.map(JSONValue.string)
+            let shown = NativeAgentEngine.named(reading.document, displayNames)
+            let cards = reading.cards.mapValues { NativeAgentEngine.named($0, displayNames) }
+            let faceReading = PartFace.Value(shown), faceCards = cards.mapValues(PartFace.Value.init)
+            let overview = PartFace.tableReading(document, version: newest?.n ?? 0, reading: faceReading,
+                cards: faceCards, signerNames: reading.signerNames)
+            facts["reading"] = .string(overview.text)
+            if let selectedItem {
+                let selected = Set(document.elements.filter { $0.string("item") == selectedItem }.map(\.id))
+                var included = selected
+                for arrow in document.elements where arrow.type == "arrow" {
+                    if let from = arrow.string("from"), let to = arrow.string("to") {
+                        if selected.contains(from) { included.insert(to) }
+                        if selected.contains(to) { included.insert(from) }
+                    }
+                }
+                let ids = document.elements.filter { included.contains($0.id) }.map(\.id)
+                if !selected.isEmpty, ids.count <= 64, ids.allSatisfy(PartFace.Block.isTableSliceID) {
+                    facts["slice"] = .object(["ids": .array(ids.map(JSONValue.string)), "reading": .string(PartFace.tableReading(
+                        document, version: newest?.n ?? 0, reading: faceReading, cards: faceCards,
+                        sliceIDs: ids, signerNames: reading.signerNames).text)])
+                }
+            }
+            facts["elements"] = shown.objectValue?["elements"]
+            facts["card_pairs"] = .array(cards.sorted { $0.key < $1.key }.map { .array([.string($0.key), $0.value]) })
+            facts["source_boundary"] = overview.sourceBoundary.map(JSONValue.string)
         } catch { facts["reason"] = .string("The table could not be read: " + error.localizedDescription) }
         return .object(facts)
     }

@@ -3,18 +3,7 @@ import NativeAgentShared
 import SwiftUI
 // Blueprint: | `TableBoardTools.swift` | The standing table's named tools, element actions and live card picker |
 
-/// The standing table's exclusive hand tool.
-enum TableBoardTool: String, CaseIterable {
-    case select = "Select", note = "Note", card = "Card", pen = "Pen", connect = "Connect"
-    var symbol: String {
-        switch self {
-        case .select: "cursorarrow"
-        case .note: "note.text"
-        case .card: "rectangle.on.rectangle"
-        case .pen: "pencil.tip"
-        case .connect: "arrow.up.right"
-        }
-    }
+private extension TableBoardTool {
     var help: String {
         switch self {
         case .select: "Move a card or drag empty space to pan."
@@ -53,7 +42,7 @@ struct TableBoardTools: View {
             }
         }
         .buttonStyle(.plain).foregroundStyle(.primary).font(ShellType.label).padding(8)
-        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .houseSurface(in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .onChange(of: picking) { _, now in if !now && tool == .card { tool = .select } }
     }
     private var tools: some View {
@@ -119,7 +108,7 @@ struct TableElementTools: View {
             }
         }
         .buttonStyle(.plain).foregroundStyle(.primary).font(ShellType.label).padding(10)
-        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .houseSurface(in: RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 }
 

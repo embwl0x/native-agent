@@ -367,7 +367,6 @@ public struct SenseReadOperation: Sendable {
 public struct SenseFailure: Codable, Sendable, Hashable, Error {
     public var code: String
     public var message: String
-    public var inputExcerpt: String?
     /// Failures need the same producing provenance as served views.
     public var provenance: SenseProvenance?
     public var remedy: JSONValue?
@@ -378,7 +377,6 @@ public struct SenseFailure: Codable, Sendable, Hashable, Error {
         var fields: [String: JSONValue] = ["status": .string(status), "failure_code": .string(code),
             "reason": .string(code), "detail": .string(render(message))]
         fields["remedy"] = remedy
-        if let inputExcerpt { fields["input_excerpt"] = .string(render(inputExcerpt)) }
         if let provenance {
             var value: [String: JSONValue] = ["senseID": .string(provenance.senseID), "version": .int(Int64(provenance.version)),
                 "uses": .int(Int64(provenance.uses)), "corrections": .int(Int64(provenance.corrections))]
@@ -391,8 +389,8 @@ public struct SenseFailure: Codable, Sendable, Hashable, Error {
         return fields
     }
 
-    public init(code: String, message: String, inputExcerpt: String? = nil, provenance: SenseProvenance? = nil, remedy: JSONValue? = nil) {
-        self.code = code; self.message = message; self.inputExcerpt = inputExcerpt
+    public init(code: String, message: String, provenance: SenseProvenance? = nil, remedy: JSONValue? = nil) {
+        self.code = code; self.message = message
         self.provenance = provenance
         self.remedy = remedy
     }
@@ -407,7 +405,7 @@ public struct SenseFailure: Codable, Sendable, Hashable, Error {
 
     public func hash(into hasher: inout Hasher) {
         hasher.combine(code); hasher.combine(message)
-        hasher.combine(inputExcerpt); hasher.combine(provenance)
+        hasher.combine(provenance)
     }
 }
 
@@ -505,11 +503,6 @@ public struct SenseInteractiveView: Codable, Sendable, Hashable {
     public init(senseID: String, version: Int, title: String, html: String) {
         self.senseID = senseID; self.version = version; self.title = title; self.html = html
     }
-}
-
-public enum SenseExportResult: Sendable, Equatable {
-    case approvalNeeded(senseID: String)
-    case exported(URL)
 }
 
 enum SenseRetainedText {

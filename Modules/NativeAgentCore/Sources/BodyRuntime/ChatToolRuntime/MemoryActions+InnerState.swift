@@ -43,7 +43,7 @@ extension MemoryActions {
         [
             ActionDescriptor(InnerStateArgs.self, name: "inner_state",
                 run: { context, input in
-                    await context.client.impl_inner_state(input: input, surface: context.surface)
+                    await context.client.impl_inner_state(input: input, surface: context.surface, turn: context.turn)
                 }, toolClass: .read, capabilities: [.toolCall],
                 description: """
         Read your recorded inner state before describing how you feel. Returns \

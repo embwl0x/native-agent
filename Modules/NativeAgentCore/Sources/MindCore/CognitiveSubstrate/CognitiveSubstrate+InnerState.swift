@@ -26,18 +26,17 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
         }
 
         public let when: Date
-        /// Bound subject labels to 32 characters; node summaries and ids must never name a moment.
-        public let subject: String
+        public let subject: String?
         public let valence: Double
         public let arousal: Double
         public let warmth: Double
         public let selection: Selection
 
-        public init(when: Date, subject: String, valence: Double, arousal: Double,
+        public init(when: Date, subject: String?, valence: Double, arousal: Double,
                     warmth: Double, selection: Selection = .felt) {
             self.selection = selection
             self.when = when
-            self.subject = String(subject.prefix(CognitiveInnerStateReading.subjectLabelCharacters))
+            self.subject = subject.map { String($0.prefix(CognitiveInnerStateReading.careSubjectCharacters)) }
             self.valence = valence.clampedSigned()
             self.arousal = arousal.clamped01()
             self.warmth = warmth.clamped01()
@@ -69,22 +68,24 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
         }
     }
 
-    /// Use only the horizon register's payload-free label, source, sign and due date.
+    /// Use only the horizon register's payload-free label, source, sign and dates.
     public struct Toward: Sendable, Equatable {
         public let label: String
         public let sourceKind: String
         public let valenceSign: Int
-        public let due: Date
+        public let due: Date?
+        public let peerStartedAt: Date?
         /// An overdue open horizon means waiting, never a presumed outcome.
         public let isOverdue: Bool
 
         public init(
-            label: String, sourceKind: String, valenceSign: Int, due: Date, isOverdue: Bool
+            label: String, sourceKind: String, valenceSign: Int, due: Date?, isOverdue: Bool, peerStartedAt: Date? = nil
         ) {
             self.label = String(label.prefix(CognitiveInnerStateReading.subjectLabelCharacters))
             self.sourceKind = sourceKind
             self.valenceSign = valenceSign >= 0 ? 1 : -1
             self.due = due
+            self.peerStartedAt = peerStartedAt
             self.isOverdue = isOverdue
         }
     }
@@ -121,6 +122,7 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
     // MARK: Bounds (design law 6 — everything is bounded)
 
     public static let subjectLabelCharacters = 32
+    public static let careSubjectCharacters = 90
     public static let maximumFeltNodes = 12
     /// The split inside that cap: the week's loudest, then the newest of what is left. `recentFeltNodes` is what guarantees a quiet day is visible.
     public static let strongestFeltNodes = 8
@@ -168,6 +170,10 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
     public let fingerprint: String?
     /// Only a leading felt subject can give the fingerprint aboutness; otherwise leave it absent.
     public let fingerprintSubject: String?
+    /// The feeling her after-turn judgment named, with its strength and when; nil when none holds.
+    public var namedFeeling: CognitiveAffectState.NamedFeeling? = nil
+    /// The feeling words she read on recent turns, by when (epoch seconds); full detail only.
+    public var feltHistory: [Double: String] = [:]
 
     public let moodValence: Double
     public let moodBasis: Int
@@ -244,7 +250,7 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
         self.available = available
         self.fingerprint = fingerprint
         self.fingerprintSubject = fingerprintSubject.map {
-            String($0.prefix(Self.subjectLabelCharacters))
+            String($0.prefix(Self.careSubjectCharacters))
         }
         self.moodValence = moodValence.clampedSigned()
         self.moodBasis = max(0, moodBasis)
@@ -328,13 +334,17 @@ extension CognitiveSubstrate {
         var copied = field
         let nodes = copied.snapshot(at: now, configuration: configuration)
         let felt = CognitiveInnerStateReading.trimmedFelt(
-            innerStateFeltNodes(nodes, at: now, window: CognitiveInnerStateReading.defaultWindowHours),
+            innerStateFeltNodes(nodes, among: Array(cares.values), reachable: [],
+                                at: now, window: CognitiveInnerStateReading.defaultWindowHours),
             cap: CognitiveInnerStateReading.compactFeltNodes)
         guard !felt.isEmpty else { return 0 }
         return min(1, max(0, felt.reduce(0.0) { $0 + $1.warmth } / Double(felt.count)))
     }
 
-    private func innerStateFeltNodes(_ nodes: [CognitiveNode], at now: Date, window: Double) -> [CognitiveInnerStateReading.FeltNode] {
+    private func innerStateFeltNodes(
+        _ nodes: [CognitiveNode], among cares: [CognitiveCare], reachable: Set<UUID>,
+        at now: Date, window: Double
+    ) -> [CognitiveInnerStateReading.FeltNode] {
         let windowSeconds = window * 3600
         let feltCandidates = nodes
             .filter { node in
@@ -358,35 +368,32 @@ extension CognitiveSubstrate {
                 }
                 return lhs.id.uuidString < rhs.id.uuidString
             }
-            // Drop unnameable moments before capping so they cannot consume a visible subject's slot.
-            .compactMap { node -> CognitiveInnerStateReading.FeltNode? in
-                guard let subject = Self.innerStateSubjectLabel(node) else { return nil }
-                return CognitiveInnerStateReading.FeltNode(
-                    when: node.lastActivatedAt,
-                    subject: subject,
-                    valence: node.emotionalValence,
-                    arousal: node.emotionalArousal,
-                    warmth: node.emotionalWarmth,
-                    selection: .felt
-                )
-            }
         // Collapse subject echoes only within `feltEchoInterval`, after strength sorting and before the cap.
+        let interval = CognitiveInnerStateReading.feltEchoInterval
+        let maxCharacters = CognitiveInnerStateReading.subjectLabelCharacters
         var keptAt: [String: [Date]] = [:]
-        let deduped = feltCandidates
-            .filter { candidate in
-                let key = candidate.subject.lowercased()
-                let echoes = keptAt[key] ?? []
-                let interval = CognitiveInnerStateReading.feltEchoInterval
-                guard !echoes.contains(where: {
-                    abs($0.timeIntervalSince(candidate.when)) <= interval
-                }) else { return false }
-                keptAt[key, default: []].append(candidate.when)
-                return true
+        var ranked: [CognitiveInnerStateReading.FeltNode] = []
+        for node in feltCandidates {
+            let when = node.lastActivatedAt
+            let subject: String?
+            let keys: [String]
+            if let exchange = Self.feltExchangeCares(for: node, among: cares, at: now) {
+                subject = feltCareObjectLabel(exchange.primary, reachable: reachable)
+                keys = exchange.ids.map { "care|\($0.uuidString)" }
+            } else {
+                subject = Self.storedFeltSubjectLabel(for: node, maxCharacters: maxCharacters)
+                keys = subject == nil ? [] : ["subject|\(node.subjectReference.stableKey)"]
             }
-
+            guard !keys.contains(where: { key in
+                keptAt[key]?.contains { abs($0.timeIntervalSince(when)) <= interval } == true
+            }) else { continue }
+            for key in keys { keptAt[key, default: []].append(when) }
+            ranked.append(CognitiveInnerStateReading.FeltNode(
+                when: when, subject: subject, valence: node.emotionalValence,
+                arousal: node.emotionalArousal, warmth: node.emotionalWarmth))
+        }
 
         // Strongest moments lead; newest remaining moments fill the cap with selection provenance.
-        let ranked = Array(deduped)
         let strongest = ranked.prefix(CognitiveInnerStateReading.strongestFeltNodes)
         let recent = ranked
             .dropFirst(strongest.count)
@@ -409,7 +416,7 @@ extension CognitiveSubstrate {
         windowHours: Double = CognitiveInnerStateReading.defaultWindowHours,
         detail: CognitiveInnerStateReading.Detail = .compact,
         organism: CognitiveInnerStateOrganismReads = .none,
-        surface: String? = nil,
+        request: CognitiveCapsuleRequest = .init(surface: "inner_state", userMessage: "", turnKind: .live),
         at explicitNow: Date? = nil
     ) async -> CognitiveInnerStateReading {
         let now = explicitNow ?? dependencies.now()
@@ -421,50 +428,65 @@ extension CognitiveSubstrate {
         }
 
         let read = frozenRead(at: now)
+        // Another agent sees only the cares it shares or that are held with no one, and never the full history.
+        let person = request.fromUser ? CognitiveCare.ownerKey : request.speaker.map {
+            CognitiveCareProvenance.personKey($0, aliases: read.carePersonAliases)
+        }
+        let ownerAlias = !request.fromUser && person == CognitiveCare.ownerKey
+        let peer = person.flatMap { CognitiveCareProvenance.independentPersonKey($0) ? nil : $0 }
+        let shownDetail = ownerAlias || peer != nil ? .compact : detail
         // All substrate-owned inputs are captured before the growth face suspends.
         let frozenDisposition = decayedDispositionValence(at: now, dynamics: read.personalityDynamics)
         let frozenDream = innerStateDreamResidue(at: now)
-        let frozenStory = detail == .full ? careStoryLines() : []
-        let frozenSelf = selfKnowledge
+        let frozenStory = shownDetail == .full ? careStoryLines() : []
+        var frozenSelf = selfKnowledge
+        if !request.fromUser, let person {
+            frozenSelf?.people = ownerAlias ? [] : read.personLines[person].map { [.init(person: person, line: $0)] } ?? []
+        }
         let frozenSelfIssue = selfKnowledgeReadFailure
         let frozenPeopleIssue = carePeopleReadFailure
-        let growthInput = detail == .full ? growthWeekInput(at: now) : nil
+        let growthInput = shownDetail == .full ? growthWeekInput(at: now) : nil
         let dyn = read.personalityDynamics
         let mood = read.mood
         // The canonical bounded workspace is selected on a copied field.
         let capsuleItems = read.workspace.items
             .filter { capsuleEligibleWorkspaceNode($0.node) }
 
-        let request = CognitiveCapsuleRequest(
-            surface: "inner_state",
-            userMessage: "",
-            mode: .inspectOnly,
-            organismProjection: organism.projection,
-            allowNonLiveProjection: true,
-            turnKind: .live
-        )
+        var request = request
+        if ownerAlias { request.speaker = nil }
+        request.organismProjection = organism.projection
+        request.toward = organism.toward
         let signals = feltSignalsForCapsule(
             from: capsuleItems, request: request, frozenRead: read)
-        let fingerprintParts = signals.flatMap { Self.feltFingerprintParts(
+        let fingerprintParts = signals.flatMap { Self.feltFingerprint(
             $0, intensityFloor: dyn.feltIntensityFloor) }
-        let fingerprint = fingerprintParts?.text
+        // One feeling, one set of words: the reading says what her frame would say this instant (the named feeling, the counter and
+        // the axes included), so it, her paragraph and the felt history are the same words. Nothing here is recorded as shown.
+        var unshown = read.capsulePresentationState
+        let line = signals.flatMap { feltFingerprintLine(signals: $0, workspaceItems: capsuleItems,
+            reachable: Self.capsuleReachableCares(for: request, from: read), request: request, from: read, turn: nil) }
+        let frameWords = feelingFrame(request: request, read: read, dreamFeeling: "", leadWord: line?.leadWord,
+            counterWord: line?.counterWord, object: line?.object, presentationState: &unshown, turn: nil).words
+        // When the frame says no word (at rest, or with her mood unread) the reading says none either.
+        let fingerprint = frameWords.isEmpty ? nil : frameWords.joined(separator: ", ")
 
         let dominant = Self.feltDominantNode(
             in: feltTintNodes(from: capsuleItems), at: now,
             halfLife: dyn.fingerprintTintHalfLife)
-        let fingerprintSubject = fingerprintParts.flatMap {
-                Self.feltContributingObject(for: dominant, family: $0.family,
-                    maxCharacters: CognitiveInnerStateReading.subjectLabelCharacters)
-            }
-
-        let felt = innerStateFeltNodes(read.snapshot.nodes, at: now, window: window)
+        let reachable = Set(Self.capsuleReachableCares(for: request, from: read).map(\.id))
+        let fingerprintSubject = fingerprintParts.flatMap { parts -> String? in
+            guard !parts.isNamedLead else { return nil }
+            return feltContributingObject(for: dominant, family: parts.family, reachable: reachable,
+                from: read, maxCharacters: CognitiveInnerStateReading.subjectLabelCharacters)
+        }
+        let felt = innerStateFeltNodes(read.snapshot.nodes, among: read.cares, reachable: reachable, at: now, window: window)
         let growthLines: [String]
         if let growthInput { growthLines = await growthWeek(input: growthInput).lines }
         else { growthLines = [] }
 
         var registerChoices: [CognitiveChosenRegister] = []
         var registerChoicesIssue: String?
-        if detail == .full {
+        if shownDetail == .full {
             if let store, configuration.persistenceEnabled {
                 do {
                     registerChoices = try await store.loadRegisterChoices(limit: CognitiveInnerStateReading.maximumFeltNodes)
@@ -473,10 +495,10 @@ extension CognitiveSubstrate {
             } else { registerChoicesIssue = "Register choice history storage is unavailable." }
         }
 
-        return CognitiveInnerStateReading(
+        var reading = CognitiveInnerStateReading(
             generatedAt: now,
             windowHours: window,
-            detail: detail,
+            detail: shownDetail,
             available: true,
             fingerprint: fingerprint,
             fingerprintSubject: fingerprintSubject,
@@ -501,13 +523,16 @@ extension CognitiveSubstrate {
                     sourceKind: $0.sourceKind.rawValue,
                     valenceSign: $0.valenceSign,
                     due: $0.dueAt,
-                    isOverdue: $0.isOverdue
+                    isOverdue: $0.isOverdue,
+                    peerStartedAt: $0.peerStartedAt
                 )
             },
             dream: frozenDream,
             // Computed only when the agent asked for `full` — the projection walks the timeline, and "how are you" must stay cheap.
             growthWeek: growthLines,
-            cares: read.cares.filter { $0.fadedAt == nil }
+            cares: read.cares.filter { care in
+                care.fadedAt == nil && (care.with.isEmpty || (peer.map(care.with.contains) ?? !ownerAlias))
+            }
                 .map { (care: $0, charge: $0.charge(at: now)) }
                 .sorted { abs($0.charge) != abs($1.charge) ? abs($0.charge) > abs($1.charge)
                     : $0.care.updatedAt > $1.care.updatedAt }
@@ -523,6 +548,10 @@ extension CognitiveSubstrate {
             selfKnowledgeIssue: frozenSelfIssue,
             carePeopleIssue: frozenPeopleIssue
         )
+        // What her after-turn judgment named, while it still holds: she can read it where she reads the rest of how she feels.
+        reading.namedFeeling = read.affect.namedFeeling.flatMap { $0.strength >= Self.namedFeelingFloor ? $0 : nil }
+        if shownDetail == .full { reading.feltHistory = read.capsulePresentationState.feltHistory }
+        return reading
     }
 
     // MARK: - Word choice (numbers choose words; nothing else does — design law 1)

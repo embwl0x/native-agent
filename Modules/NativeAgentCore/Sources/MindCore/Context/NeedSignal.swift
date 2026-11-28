@@ -33,7 +33,6 @@ public enum ContextSelectionCacheState: String, Codable, Sendable {
     case miss
     case unavailable
 }
-/// Pure, turn-scoped input to context selection. `selectionTimeBucket` is used instead of wall-clock reads so identical inputs remain restart deterministic.
 public struct NeedSignal: Codable, Equatable, Sendable {
     public let message: String
     public let extractedEntities: Set<ContextEntity>
@@ -183,7 +182,6 @@ public struct NeedSignal: Codable, Equatable, Sendable {
         self.measuredSelectionMicroseconds = measuredSelectionMicroseconds
     }
     public var evaluationTime: Date {
-        // Evaluate at the end of the bucket so expiry fails closed within it.
         Date(timeIntervalSince1970: (Double(selectionTimeBucket) + 1) * Double(timeBucketSeconds))
     }
     public var deterministicFingerprint: String {

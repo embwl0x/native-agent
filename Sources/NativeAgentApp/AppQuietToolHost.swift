@@ -48,25 +48,31 @@ import DeskCore
             throw PartCallError(code: "read_origin_missing", message: "A page read needs its originating turn envelope.")
         }
         let tools = appModel.engine.tools
+        let reading: @Sendable ([String]) -> Void = { sources in
+            for source in sources { turn.peerSteering?.mark(dataRoot: turn.dataRoot, peer: source) }
+        }
         if structured {
             guard offset >= 0 else { throw PartCallError(code: "invalid_cursor", message: "A collection offset must be nonnegative.") }
             let request = FaceReadRequest(id: UUID(), key: item, expectedCall: nil, cursor: offset == 0 ? nil : String(offset))
-            let face = try await pages.presentation(page: page, item: item, request: request, readUsing: { call in
+            let face = try await pages.presentation(page: page, item: item, request: request, reading: reading, readUsing: { call in
                 try await tools.pageRead(call, envelope: envelope, turn: turn)
             })
-            let words = face.text(door: true, page: page)
+            let tableReadings = await appModel.engine.tableTextReadings(for: face, includeStandingTable: page == "desk")
+            let words = face.text(door: true, page: page, tableReadings: tableReadings)
             await pages.releaseItem(page: page, item: request.scope, request: request.id)
             return words
         }
-        return try await pages.body(page: page, item: item, readUsing: { call in
+        return try await pages.body(page: page, item: item, reading: reading, readUsing: { call in
             try await tools.pageRead(call, envelope: envelope, turn: turn)
         })
     }
     func pageItem(page: String, named: String) async -> (id: String, open: String?)? {
         await appModel.engine.pages.shownItem(page: page, named: named)
     }
-    func pageItemText(page: String, item: String, rows: Bool) async -> String? {
-        await appModel.engine.pages.shownText(page: page, item: item, rows: rows)
+    func pageItemText(page: String, item: String, rows: Bool, turn: Turn) async -> String? {
+        await appModel.engine.pages.shownText(page: page, item: item, rows: rows) { sources in
+            for source in sources { turn.peerSteering?.mark(dataRoot: turn.dataRoot, peer: source) }
+        }
     }
     func composerState(sessionId: String, turn: Turn) async -> [String: JSONValue] {
         if let face {
@@ -89,7 +95,7 @@ import DeskCore
         }
         return await QuietComposerCommands.run(
             verb: verb, value: value, choice: choice, sessionId: sessionId,
-            attachments: attachments, reachesUser: reachesUser, turnSessionId: turnSessionId, appModel: appModel, turn: turn
+            reachesUser: reachesUser, turnSessionId: turnSessionId, appModel: appModel, turn: turn
         )
     }
     func runChatSession(verb: String, input: [String: JSONValue], reachesUser: Bool, turn: Turn) async -> JSONValue {
@@ -261,14 +267,14 @@ extension AppQuietToolHost: QuietInboxHost {
     func inboxPresentation(_ item: InboxItemRecord) -> (hidden: Bool, linkedApproval: Bool, actions: [InboxActionRecord]) {
         (item.isHiddenFromDefaultInbox, item.hasLinkedApproval, item.actions)
     }
-    func performInboxAction(_ id: String, action: String, metadata: [String: JSONValue], quiet: Bool, dataRootOverride: URL?, turn: Turn) async throws {
+    func performInboxAction(_ id: String, action: String, quiet: Bool, dataRootOverride: URL?, turn: Turn) async throws {
         if let face {
-            try await InboxCardActions.perform(id, action: action, metadata: metadata, quiet: quiet,
+            try await InboxCardActions.perform(id, action: action, quiet: quiet,
                 dataRootOverride: dataRootOverride, turn: turn,
                 effects: BodyInboxCardActionEffects(engine: appModel.engine, call: { try await face.call($0) }, renderer: face.connection))
             return
         }
-        try await InboxCardActions.perform(id, action: action, metadata: metadata, quiet: quiet,
+        try await InboxCardActions.perform(id, action: action, quiet: quiet,
             dataRootOverride: dataRootOverride, turn: turn,
             effects: AppInboxCardActionEffects(engine: appModel.engine))
     }

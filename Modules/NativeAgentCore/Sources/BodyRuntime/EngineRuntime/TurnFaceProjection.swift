@@ -21,15 +21,17 @@ actor TurnFaceProjection {
     }
 
     private let source: FaceFeedSource
+    private let pages: PartFaces
     private let dataRoot: URL
     private let approvals: ApprovalsFacade
     private let bodyField: BodyField?
     private var sent: [String: TurnFace] = [:]
     private var sentSessions: TurnSessionsFace?
 
-    init(source: FaceFeedSource, dataRoot: URL, approvals: ApprovalsFacade, bodyField: BodyField?) {
+    init(source: FaceFeedSource, pages: PartFaces, dataRoot: URL, approvals: ApprovalsFacade, bodyField: BodyField?) {
         self.bodyField = bodyField
         self.source = source
+        self.pages = pages
         self.dataRoot = dataRoot
         self.approvals = approvals
     }
@@ -62,8 +64,11 @@ actor TurnFaceProjection {
                 case .failed: outcome = .failed
                 case nil: outcome = nil
                 }
-                steps.append(.init(id: state.identity.turnId + "#" + String(activity.id), text: detail, outcome: outcome,
-                                   isRunning: activity.runningCall != nil && !state.presentation.isTerminal, startedAt: activity.occurredAt))
+                let digest = activity.unstartedID.map { SHA256Hex.of(utf8: $0) }
+                let id = state.identity.turnId + "#" + String(activity.id) + (digest.map { "#" + $0 } ?? "")
+                steps.append(.init(id: id, text: detail, outcome: outcome,
+                                   isRunning: activity.runningCall != nil && !state.presentation.isTerminal, startedAt: activity.occurredAt,
+                                   disposition: activity.disposition))
             }
             // While a step runs, that step is what she is doing on every line.
             let doing = turn?.runningStep?.detail
@@ -81,7 +86,6 @@ actor TurnFaceProjection {
                 isInFlight: inFlightSessions.contains(session),
                 card: TurnCardReadout.card(for: state, sessionId: session, personaName: input.name,
                     approvals: approvalSnapshot.records, parseTimestamp: NativeTimestampFormat.parseISO8601FractionalFirst),
-                hasReservation: input.busy.contains(session),
                 isBusy: busy, isStreaming: streams, isReplying: input.replying.contains(session) && !settled,
                 isThinking: (busy || streams) && turn.map { !$0.isTerminal && $0.streamedTextLength == 0 } != false,
                 liveLine: current ?? liveLine,
@@ -92,6 +96,8 @@ actor TurnFaceProjection {
             if sent[session]?.nowOn != value.nowOn { placesChanged = true }
             if sent[session] != value {
                 await source.post(value, at: .turn(session: session))
+                let run = flight.first { $0.sessionId == session && $0.turnId == value.turnID }?.runId
+                await postSteps(value, after: sent[session], run: run)
                 sent[session] = value
             }
             if !sessions.contains(session) { sent[session] = nil }
@@ -110,12 +116,42 @@ actor TurnFaceProjection {
             NotificationCenter.default.post(TurnSessionsFace.Published())
         }
     }
+
+    private func postSteps(_ turn: TurnFace, after previous: TurnFace?, run: String?) async {
+        let subject = Self.liveStepSubject(turn)
+        let prior = previous.flatMap(Self.liveStepSubject)
+        let page = PageFaceKey.turnSteps(turn.sessionID)
+        if prior != nil, prior != subject {
+            await settle { [pages] in await pages.retireTransient(page: page) }
+        }
+        guard let subject, subject != prior || turn.steps != previous?.steps else { return }
+        var actions: [PartFace.Action] = []
+        if let run {
+            let args: [String: PartFace.Value] = ["session": .string(turn.sessionID), "turn": .string(subject), "run": .string(run)]
+            if await ChatTurnSteering.shared.canWithdrawUnstarted(in: .init(sessionId: turn.sessionID, turnId: subject),
+                                                                 run: run, dataRoot: dataRoot) {
+                let withdraw = ChatTurnSteering.OwnerAct.withdrawUnstarted.rawValue
+                actions.append(.init(id: withdraw, label: "Withdraw unstarted steps", role: .primary, doors: ["mac"], call: .init(withdraw, args)))
+            }
+            let stop = ChatTurnSteering.OwnerAct.stop.rawValue
+            actions.append(.init(id: stop, label: "Stop", doors: ["mac"], call: .init(stop, args)))
+        }
+        await pages.publishTransient(page: page, subject: subject,
+            face: .turnSteps(Array(turn.steps.prefix(3).reversed())),
+            levers: actions.isEmpty ? [] : [.init(id: "turn-controls", style: .note,
+                rows: [.init(id: subject, title: "Remaining work", actions: actions)])])
+    }
+
+    private static func liveStepSubject(_ turn: TurnFace) -> String? {
+        guard let id = turn.turnID, turn.activeTurnID == id, turn.phase?.isTerminal == false, !turn.steps.isEmpty else { return nil }
+        return id
+    }
 }
 
 extension TurnsFacade {
     /// Capture owner values on their actor; projection and encoding never run on the drawing thread.
-    func bindTurnFaces(source: FaceFeedSource, approvals: ApprovalsFacade, persona: PersonaFacade, transcripts: TranscriptsFacade) {
-        turnFaceProjection = TurnFaceProjection(source: source, dataRoot: dataRoot, approvals: approvals, bodyField: bodyField)
+    func bindTurnFaces(source: FaceFeedSource, pages: PartFaces, approvals: ApprovalsFacade, persona: PersonaFacade, transcripts: TranscriptsFacade) {
+        turnFaceProjection = TurnFaceProjection(source: source, pages: pages, dataRoot: dataRoot, approvals: approvals, bodyField: bodyField)
         transcripts.bindSessionFaces()
         transcripts.sessionIndexDidPublish = { [weak self, weak persona, weak transcripts] in
             guard let self, let persona, let transcripts else { return }

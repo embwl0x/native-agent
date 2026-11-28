@@ -32,8 +32,7 @@ extension MacFourVerbs {
             if let app { body["app"] = .string(app) }
             let result: MacControlResult
             do { result = try await host.dispatch(action: "menu", body: body, turn: turn, context: context) } catch {
-                return MacFourVerbsReply(ok: false, text: "I couldn't read that app's menu bar: \(error).",
-                                         detail: ["error": .string("menu_unavailable"), "message": .string("\(error)")])
+                return Self.unknownActionReply(error, operation: "reading that app's menu bar", app: app, readOnly: true)
             }
             guard result.ok else {
                 if result.error == "app_not_running", let app {

@@ -20,12 +20,12 @@ extension ChatView {
     @ViewBuilder
     var chatColumn: some View {
         VStack(spacing: 0) {
-            HouseGlassContainer(spacing: 0) {
-                VStack(spacing: 0) {
-                    chatHeader
-                    chatRoom
-                        .overlay(alignment: .bottomTrailing) { latestPillOverlay }
-                }
+            VStack(spacing: 0) {
+                chatHeader
+                chatRoom
+                    .overlay(alignment: .bottomTrailing) {
+                        if chatPageIsVisible { latestPillOverlay }
+                    }
             }
                 .onChange(of: transcriptLatestRequest) { _, _ in
                     guard chatPageIsVisible else { return }
@@ -37,7 +37,6 @@ extension ChatView {
                     transcriptLatestRequest &+= 1
                 }
                 .safeAreaInset(edge: .bottom, spacing: 0) {
-                HouseGlassContainer(spacing: ChatComposerTray.gap * 2) {
                     VStack(spacing: NativeAgentSpacing.xs) {
                         if let toast = toasts.current {
                             NoticePill(text: toast)
@@ -49,46 +48,47 @@ extension ChatView {
                         let screenCaptureAllowed = appModel.settingsScreenCaptureEnabled == true
                         let activeSessionIsRunning = appModel.isBusy || appModel.isChatStreaming
 
-                        VStack(spacing: 0) {
-                            ChatComposerTray(
-                                attachments: pendingAttachments,
-                                onRemoveAttachment: { id in pendingAttachments.removeAll { $0.id == id } },
-                                onGoTo: goToRunningSession
-                            )
+                        HouseGlassContainer(spacing: ChatComposerTray.gap * 2) {
+                            VStack(spacing: 0) {
+                                ChatComposerTray(
+                                    attachments: pendingAttachments,
+                                    onRemoveAttachment: { id in pendingAttachments.removeAll { $0.id == id } },
+                                    onGoTo: goToRunningSession
+                                )
 
-                            // Keep draft observation in the input child so keystrokes cannot invalidate the transcript.
-                            ChatComposerInput(
-                                draft: draft,
-                                placeholder: shellComposerPlaceholder,
-                                isActive: chatPageIsVisible,
-                                recipient: inSimple ? appModel.agentAddressName : nil,
-                                voiceInput: voiceInput,
-                                voiceSessionId: voiceSessionId,
-                                activeSessionId: appModel.activeChatSessionId,
-                                screenCaptureAllowed: screenCaptureAllowed,
-                                screenCaptureDisabled: activeSessionIsRunning || isCapturing || !screenCaptureAllowed,
-                                pendingAttachmentCount: pendingAttachments.count,
-                                hasPendingAttachments: !pendingAttachments.isEmpty,
-                                isRunning: activeSessionIsRunning,
-                                isCapturing: isCapturing,
-                                // Wait for routing writes to settle before sending.
-                                isRoutingSaving: isSavingComposerChoice,
-                                inputFocused: $inputFocused,
-                                onToggleVoice: toggleVoice,
-                                onDiscardVoice: discardDictation,
-                                onCaptureScreen: captureScreen,
-                                onAttach: pickFileToAttach,
-                                onStop: { appModel.stopChatStream() },
-                                onSend: send,
-                                onSlashCommand: { handleSlashCommand($0) },
-                                onDrop: { handleDrop(providers: $0) },
-                                composeVoiceDraft: { composeVoiceDraft($0) }
-                            )
-                            // Publish card height only to the optional Latest inset reader so unrelated hosts remain untouched.
-                            .environment(turnCardClearanceStore)
-                            .environment(composerCardState)
+                                // Keep draft observation in the input child so keystrokes cannot invalidate the transcript.
+                                ChatComposerInput(
+                                    draft: draft,
+                                    placeholder: shellComposerPlaceholder,
+                                    isActive: chatPageIsVisible,
+                                    recipient: inSimple ? appModel.agentAddressName : nil,
+                                    voiceInput: voiceInput,
+                                    voiceSessionId: voiceSessionId,
+                                    activeSessionId: appModel.activeChatSessionId,
+                                    screenCaptureAllowed: screenCaptureAllowed,
+                                    screenCaptureDisabled: activeSessionIsRunning || isCapturing || !screenCaptureAllowed,
+                                    pendingAttachmentCount: pendingAttachments.count,
+                                    hasPendingAttachments: !pendingAttachments.isEmpty,
+                                    isRunning: activeSessionIsRunning,
+                                    isCapturing: isCapturing,
+                                    // Wait for routing writes to settle before sending.
+                                    isRoutingSaving: isSavingComposerChoice,
+                                    inputFocused: $inputFocused,
+                                    onToggleVoice: toggleVoice,
+                                    onDiscardVoice: discardDictation,
+                                    onCaptureScreen: captureScreen,
+                                    onAttach: pickFileToAttach,
+                                    onStop: { appModel.stopChatStream() },
+                                    onSend: send,
+                                    onSlashCommand: { handleSlashCommand($0) },
+                                    onDrop: { handleDrop(providers: $0) },
+                                    composeVoiceDraft: { composeVoiceDraft($0) }
+                                )
+                                // Publish card height only to the optional Latest inset reader so unrelated hosts remain untouched.
+                                .environment(turnCardClearanceStore)
+                                .environment(composerCardState)
+                            }
                         }
-                        // Overlay the working card in the composer's glass container so it can fuse without resizing the viewport.
                         .overlay(alignment: .top) {
                             ChatTurnCardInset(store: turnCardClearanceStore)
                                 .alignmentGuide(.top) { $0[.bottom] }
@@ -100,15 +100,15 @@ extension ChatView {
                         .frame(maxWidth: .infinity, alignment: NativeAgentShellLayout.roomAlignment)
                         .padding(.bottom, 24)
                     }
-                }
-                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
-                    turnCardClearanceStore.measuredComposerHeight = height
-                }
+                    .onGeometryChange(for: CGFloat?.self) { [chatPageIsVisible] in
+                        chatPageIsVisible ? $0.size.height : nil
+                    } action: { height in
+                        if let height { turnCardClearanceStore.measuredComposerHeight = height }
+                    }
                 }
                 // Exclude the reading viewport from mood tint to preserve readability.
                 .moodTintProseGuard(
-                    columnWidth: NativeAgentShellLayout.roomColumn,
-                    leadingInset: NativeAgentShellLayout.roomLeadingInset
+                    columnWidth: NativeAgentShellLayout.roomColumn, visible: chatPageIsVisible
                 )
         }
         // Inset chrome must not widen the column beyond the space the shell gives it.

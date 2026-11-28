@@ -7,7 +7,13 @@ import AppKit
 import ApplicationServices
 import CoreGraphics
 import UserNotifications
+import SenseCore
 // Blueprint: | `MacControl+ClosedLoopAction.swift` | `SwiftNativeMacControl.handleAct`, `MacClosedLoopAct`, `MacActGate`: Same-window live identity and per-step declared effects; the act's outline over its admission gates and effect stages, and the state they share |
+
+struct MacTextRestore: Sendable {
+    let targetHandle: Int
+    let written: String
+}
 
 extension SwiftNativeMacControl {
     struct MacActPerformed {
@@ -36,6 +42,8 @@ extension SwiftNativeMacControl {
         let scrollAmount: Int
         let waitMs: Int
         let background: Bool
+        let after: String?
+        let restoreText: Bool
     }
 
     /// An admission gate of `handleAct` either refuses the act or hands on what it admitted.
@@ -58,6 +66,8 @@ extension SwiftNativeMacControl {
         let scrollAmount: Int
         let waitMs: Int
         let background: Bool
+        let after: String?
+        let restoreText: Bool
         let frontBefore: MacAXAppInfo?
         let entry: MacLookFrameEntry
         let frame: MacLookFrame
@@ -81,6 +91,8 @@ extension SwiftNativeMacControl {
         var menuLeftOpen: Bool?
         var settledTarget: MacAXActTarget?
         var settledVerdict = MacActClosedLoop.ActClassification(status: "acted_unobserved", reason: "effect_unreadable")
+        var afterVerdict: MacActClosedLoop.ActClassification?
+        var settledText: String?
         var effect: [String: JSONValue] = [:]
         var output: [String: JSONValue] = [:]
 
@@ -98,6 +110,8 @@ extension SwiftNativeMacControl {
             self.scrollAmount = request.scrollAmount
             self.waitMs = request.waitMs
             self.background = request.background
+            self.after = request.after
+            self.restoreText = request.restoreText
             self.frontBefore = frontBefore
             self.entry = entry
             self.frame = frame
@@ -121,9 +135,12 @@ extension SwiftNativeMacControl {
 
         // Admission (MacControl+ClosedLoopAction+Admission.swift): each gate refuses before anything is touched.
         let request: MacActRequest
-        switch parseActRequest(body) {
+        switch parseActRequest(body, restoringText: context.textRestore != nil) {
         case .refused(let refusal): return refusal
         case .admitted(let admitted): request = admitted
+        }
+        let stop = request.after == nil ? nil : context.textDeedStop ?? turn.session.flatMap {
+            ChatCancelFlag.registeredStop(dataRoot: turn.dataRoot, sessionId: $0, runId: turn.run)
         }
         let frontBefore = accessibilitySource(context: context).frontmostApp()
 
@@ -155,8 +172,33 @@ extension SwiftNativeMacControl {
         case .refused(let refusal): return refusal
         case .admitted(let admitted): fresh = admitted
         }
+        if let restore = context.textRestore, resolved.target.handle != restore.targetHandle {
+            return injectionRefusal(action: "act", error: "restore_target_changed", status: 409, extra: ["effects": .string("none")])
+        }
+        if request.after != nil {
+            guard fresh.placement == nil, !fresh.entrySecret, !fresh.entry.ambiguous,
+                  resolved.target.role == "AXTextField", turn.macContinuation?.isPending != true else {
+                return injectionRefusal(action: "act", error: "reversible_text_target_required", status: 409,
+                    extra: ["effects": .string("none"), "guidance": .string("Use an unambiguous, non-secret AXTextField. Path placement and continuations are unavailable for deeds.")])
+            }
+            let nodes = identity.identityScoped.snapshot.nodes
+            guard let node = nodes.first(where: { $0.path == resolved.live.path }),
+                  let prior = resolved.target.value, prior.utf8.elementsEqual((node.attributes.value ?? "").utf8),
+                  Self.deedTextIsReadable(prior, at: node, in: nodes) else {
+                return injectionRefusal(action: "act", error: "reversible_text_baseline_unavailable", status: 409,
+                    extra: ["effects": .string("none")])
+            }
+            guard let text = request.text, Self.deedTextIsReadable(text, at: node, in: nodes) else {
+                return injectionRefusal(action: "act", error: "reversible_text_replacement_unreadable", status: 409,
+                    extra: ["effects": .string("none")])
+            }
+            if request.restoreText, MacSavePanelPlacement.isNameField(role: resolved.target.role, label: resolved.target.title),
+               MacSavePanelPlacement.split(prior) != nil {
+                return injectionRefusal(action: "act", error: "reversible_text_baseline_is_path", status: 409,
+                    extra: ["effects": .string("none")])
+            }
+        }
 
-        // Effect (MacControl+ClosedLoopAction+Effect.swift): baseline, observer, one actuation, the settle, the receipt.
         let baseline = actEffectBaseline(body, started: started, frame: anchor.frame, framePid: anchor.framePid, actWindow: windows.actWindow,
             identityLimits: identity.identityLimits, identityRead: identity.identityRead, identityScoped: identity.identityScoped,
             identityPercept: identity.identityPercept)
@@ -173,7 +215,7 @@ extension SwiftNativeMacControl {
         let expect: MacBodyNerve.ExpectationKind = loop.verb == .dismiss ? .dismiss : loop.placement != nil ? .sheet : .elementOrSurface
         let held = await MacBodyNerve.holding(loop.actWindow.identity, turn: turn, context: context, background: loop.background,
                                               expect: expect) { () -> (MacActPerformed, Int, MacAXLimits)? in
-            guard let performed = await actuateAct(loop, turn: turn, context: context) else { return nil }
+            guard let performed = await actuateAct(loop, turn: turn, context: context.with(\.textDeedStop, stop)) else { return nil }
             let (signals, effectWaitMs, limits) = await settleActEffect(loop, performed: performed, textBeforeInput: textBeforeInput,
                 performedAt: performedAt, turn: turn, context: context)
             signals.stop()
@@ -181,6 +223,12 @@ extension SwiftNativeMacControl {
         }
         guard let (performed, effectWaitMs, limits) = held.value else { return actMechanismRefusal(loop) }
         composeActReceipt(loop, performed: performed, performedAt: performedAt, effectWaitMs: effectWaitMs, context: context)
+        var framePredatesCleanup = false
+        if loop.restoreText {
+            let receipt = await cleanupActText(loop, performed: performed, stop: stop, turn: turn, context: context)
+            loop.output["cleanup_receipt"] = .object(receipt)
+            framePredatesCleanup = receipt["ran"] == .bool(true) || receipt["status"] == .string("outcome_unknown")
+        }
         loop.output.merge(held.receipt) { _, new in new }
         let modal = loop.postEffect?.percept.modal
         let isSheet = modal?.role == kAXSheetRole || modal?.subrole == kAXSheetRole
@@ -190,8 +238,10 @@ extension SwiftNativeMacControl {
             if isSheet { loop.output["modal"] = modal?.toJSON(valueChars: limits.valueChars) }
         }
 
-        guard let read = loop.read, let postEffect = loop.postEffect, loop.seam["window_minimized"] != .bool(true) else {
-            return await reportActWithoutFrame(loop, performed: performed)
+        guard !framePredatesCleanup, let read = loop.read, let postEffect = loop.postEffect,
+              loop.seam["window_minimized"] != .bool(true) else {
+            return await reportActWithoutFrame(loop, performed: performed, framePredatesCleanup: framePredatesCleanup,
+                restoringText: context.textRestore != nil)
         }
         return await reportActFreshFrame(loop, performed: performed, read: read, postEffect: postEffect, limits: limits, context: context)
     }

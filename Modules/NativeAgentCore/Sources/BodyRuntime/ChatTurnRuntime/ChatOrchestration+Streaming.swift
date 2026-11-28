@@ -4,6 +4,7 @@ import PersistenceCore
 import DeskCore
 import MindCore
 import ProviderRouting
+import NativeAgentShared
 
 // Blueprint: | `ChatOrchestration+Streaming.swift` | `TurnStreamEvent`; Transient display, never terminal evidence |
 
@@ -15,6 +16,7 @@ public enum TurnStreamEvent: Sendable {
     case replyTextSettled(Bool)
     case toolUse(name: String, input: JSONValue)
     case toolResult(name: String, output: JSONValue)
+    case unstartedStep(id: String, name: String, disposition: TurnFace.Step.Disposition)
     /// Live tool status from ToolNoticeBus is visible during dispatch and never enters the durable reply.
     case notice(kind: String, text: String)
     case final(TurnEngineResult)

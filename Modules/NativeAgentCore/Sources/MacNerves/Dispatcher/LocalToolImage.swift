@@ -244,13 +244,14 @@ public enum LocalToolImage {
         }
     }
 
+    static func failure(_ reason: String) -> JSONValue {
+        .object(["ok": .bool(false), "status": .string("failed"), "error": .string(reason)])
+    }
+
     /// Encoded produced pixels need no path authorization; enforce the delivery ceiling here rather than trust the caller.
     public static func deliverPNG(
         _ data: Data, name: String, width: Int, height: Int, mediaType: String = "image/png", sink: Sink?
     ) -> JSONValue {
-        func failure(_ reason: String) -> JSONValue {
-            .object(["ok": .bool(false), "status": .string("failed"), "error": .string(reason)])
-        }
         guard !data.isEmpty, data.count <= maximumBytes else {
             return failure("Image must be nonempty and at most 8 MiB.")
         }

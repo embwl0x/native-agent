@@ -121,9 +121,6 @@ final class BodySettingsActHandler: FaceActHandler {
         case .refresh(let scope):
             try await refresh(scope)
             return .acknowledged
-        case .declarePreferences(let keys):
-            let values = try await BodySettingsPreferences.refreshPreferences(engine: engine, keys: keys)
-            return .result(.object(values))
         case .setPreference(let key, let value):
             return try await setFacePreference(key, value: value)
         case .openBrowser:
@@ -140,40 +137,16 @@ final class BodySettingsActHandler: FaceActHandler {
         case .answerCard(let answer): return try await cardActions().answer(answer)
         case .verifyCardOnReturn(let card, let session, let revision):
             return try await cardActions().verify(.init(card: card, session: session, revision: revision))
-        case .requestMacOSAccess(let targets, let card):
-            let problems = try await SystemPermissionPreflight.requestMacOSAccess(targets)
-            await engine.macIntegration.refresh()
-            if let card { return try await cardActions().verify(card) }
-            return committed(.object(["problems": .array(problems.map(PartFace.Value.string))]))
-        case .openMacOSSettings(let capability):
-            return try await openFaceMacOSSettings(capability)
         case .runMacControl(let request):
             return try await runFaceMacControl(request)
-        case .notify(let title, let message):
-            let turn = personTurn("mac_control.notify")
-            let result = try await engine.trust.runMacControl(action: .notify, body: ["title": .string(title), "message": .string(message)],
-                notificationCenterAdapter: MacNotificationPosting(turn: turn, deadline: nil), turn: turn)
-            return committed(PartFace.Value(result.toJSON(readContent: nil)))
-        case .runDoctor(let request): return try await runDoctor(request)
-        case .resolveApproval(let id, let decision):
-            let record = try await engine.approvals.resolveApproval(id: id, decision: decision.rawValue, coordinator: .app(),
-                turn: personTurn("approval." + decision.rawValue))
-            return committed(.object(["status": .string(record.status), "decision": record.decision.map(PartFace.Value.string) ?? .null]),
-                identities: [record.id])
         case .importGrokCredentials(let request):
             return try await importFaceGrokCredentials(request)
-        case .setUpChrome:
-            let url = try await ChromeExtensionFolder.setUp(turn: personTurn("chrome.setup"), context: .init(dataRoot: engine.dataRoot))
-            return committed(.string(url.path), identities: ["chrome"])
         case .reindexSpotlight:
             return try await reindexFaceSpotlight()
         case .inboxAction(let id, let action, _):
             return try await runFaceInboxAction(id: id, action: action)
         case .openCard(let id):
             return try await openFaceCard(id)
-        case .restartBody:
-            try Self.restart()
-            return .acknowledged
         default:
             throw PartCallError(code: "act_owner_unmounted", message: "This operation belongs to an area that has not been integrated.")
         }
@@ -223,8 +196,6 @@ final class BodySettingsActHandler: FaceActHandler {
             await engine.transcripts.deliverSessionFaces()
         case .turns, .turn, .counts:
             try await engine.settingsFeed.deliverFaces()
-        case .document:
-            break
         default:
             throw PartCallError(code: "observation_owner_unmounted", message: "This presentation has not been mounted in the body.")
         }
@@ -273,17 +244,6 @@ final class BodySettingsActHandler: FaceActHandler {
         return .committed(.init(identities: [provider], value: saved, revision: nil, effects: .known, publicationFailure: issue))
     }
 
-    /// Open the macOS settings for a recognized permission capability.
-    private func openFaceMacOSSettings(_ capability: String) async throws -> FaceActReply {
-        guard let gate = SystemPermissionPreflight.cardSettingsCapability(capability) else {
-            throw PartCallError(code: "unknown_permission", message: "That macOS permission is not recognized.")
-        }
-        if let failure = await SystemPermissionPreflight.openSettings(gate) {
-            throw PartCallError(code: "permission_settings_failed", message: failure)
-        }
-        return .acknowledged
-    }
-
     /// Run the supported Mac control action under the person's turn.
     private func runFaceMacControl(_ request: MacControlRequest) async throws -> FaceActReply {
         guard let action = MacControlWorkbenchAction(rawValue: request.action) else {
@@ -291,7 +251,7 @@ final class BodySettingsActHandler: FaceActHandler {
         }
         let turn = personTurn("mac_control." + request.action)
         let result = try await engine.trust.runMacControl(action: action, body: request.arguments.mapValues { JSONValue($0) },
-            notificationCenterAdapter: MacNotificationPosting(turn: turn, deadline: nil), turn: turn)
+            notificationCenterAdapter: MacNotificationPosting(turn: turn), turn: turn)
         return committed(PartFace.Value(result.toJSON(readContent: nil)))
     }
 
@@ -430,27 +390,6 @@ final class BodySettingsActHandler: FaceActHandler {
         }
     }
 
-    private func runDoctor(_ request: DoctorRequest) async throws -> FaceActReply {
-        guard engine.doctor.admitRun() else {
-            throw PartCallError(code: "doctor_busy", message: "Health checks are already running.")
-        }
-        do {
-            let scope: DoctorRepairScope
-            switch request.scope {
-            case "automatic": scope = .automatic
-            case "onboarding": scope = .onboarding
-            case "button": scope = .button
-            default: throw PartCallError(code: "unknown_doctor_scope", message: "The requested repair scope is not recognized.")
-            }
-            let report = try await AppDoctorPort(dataRoot: engine.dataRoot).runtime.runDoctor(repair: request.repair, repairScope: scope)
-            engine.doctor.finishRun(report)
-            return .result(try Self.value(report))
-        } catch {
-            engine.doctor.finishRun(nil, failure: error.localizedDescription)
-            throw error
-        }
-    }
-
     private func requireModel() throws -> AppModel {
         guard let appModel else { throw FaceWireError.disconnected }
         return appModel
@@ -467,10 +406,6 @@ final class BodySettingsActHandler: FaceActHandler {
 
     private func committed(_ value: PartFace.Value, identities: [String] = [], publicationFailure: WireFailure? = nil) -> FaceActReply {
         .committed(.init(identities: identities, value: value, revision: nil, effects: .known, publicationFailure: publicationFailure))
-    }
-
-    private static func value<T: Encodable>(_ value: T) throws -> PartFace.Value {
-        PartFace.Value(try JSONValue.fromEncodable(value))
     }
 
     static func restart() throws {

@@ -6,7 +6,7 @@ import NativeAgentCore
 // Blueprint: | `OrganJudge.swift` | `OrganJudge` beat law for the mind's judges; organ names of the clock owners; loop-shaped passes as beats |
 
 /// The mind's judges beat through here. Judges re-judge their organs on every source edge, so the same decision recurs; `OrganPulse.record` keeps the one
-/// news law for every organ: an unchanged outcome, note, yield and cadence writes nothing; live beats still show a stuck organ's run of holds.
+/// news law for every organ: an unchanged outcome, note, yield and cadence writes nothing within the hour; live beats still show a stuck organ's run of holds.
 public enum OrganJudge {
     /// Notes are the organ's own short words; a longer why is cut here so every beat stays a line.
     static let noteLimit = 200

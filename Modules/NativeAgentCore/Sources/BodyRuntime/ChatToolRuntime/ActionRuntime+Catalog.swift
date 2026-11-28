@@ -79,7 +79,7 @@ extension SwiftToolDispatcher {
         fullMacReadOnlyFileToolNames + fullMacWriteFileToolNames
 
     package static let fullMacSystemToolNames: [String] = [
-        "system_info", "mac_volume", "mac_media", "remote_node_list",
+        "system_info", "mac_volume", "remote_node_list",
     ]
 
 
@@ -266,7 +266,8 @@ extension SwiftToolDispatcher {
             return .object(row)
         }
         let listed = Set(catalog.names)
-        let swiftBuilderTools = (Self.fullMacFileToolNames + Self.fullMacSystemToolNames + Self.fullMacBuilderToolNames + Self.fullMacRestartToolNames).sorted()
+        let swiftBuilderTools = (Self.fullMacFileToolNames + Self.fullMacSystemToolNames + Self.fullMacBuilderToolNames + Self.fullMacRestartToolNames)
+            .filter { $0 != "git" }.sorted()
         let availableBuilderTools = swiftBuilderTools.filter { listed.contains($0) }.map { ToolNameAliases.appAction($0) ?? $0 }
         let lockedBuilderTools = swiftBuilderTools.filter { !listed.contains($0) }.map { ToolNameAliases.appAction($0) ?? $0 }
         // Only executors with app actions belong in folded discovery.

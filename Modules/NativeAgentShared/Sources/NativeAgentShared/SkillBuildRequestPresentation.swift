@@ -1,5 +1,5 @@
 import Foundation
-// Blueprint: | `SkillBuildRequestPresentation.swift` | `SkillBuildRequestPresentation`: typed outcome of a Build-a-skill request, shared by the app and the face |
+// Blueprint: | `SkillBuildRequestPresentation.swift` | `SkillBuildRequestPresentation`: typed outcome of the Face's skill-build draft request |
 
 /// Typed outcomes keep a missing session or preserved draft from being called a successful build.
 public enum SkillBuildRequestPresentation {

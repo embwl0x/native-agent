@@ -1156,7 +1156,8 @@ extension SwiftNativeChatOrchestrationClient {
         return count
     }
 
-    private nonisolated static func previewText(_ raw: String) -> String {
+    /// The one preview of a spoken row: the index writer and the launch reconciler both read it, so a row the reconciler rereads agrees.
+    nonisolated static func previewText(_ raw: String) -> String {
         // Redact the whole text before cutting it: a title or preview syncs to the phone apart from the redacted transcript.
         let trimmed = TurnTraceRedactor.redactText(raw).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "" }

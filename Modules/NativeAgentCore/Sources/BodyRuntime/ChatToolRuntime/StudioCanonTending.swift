@@ -19,6 +19,7 @@ public struct StudioCanonTendingReport: Sendable, Equatable {
     public var stagingFailure: String? = nil
     public var proposalFailures: [String] = []
     public var savedCardGaps: [String] = []
+    var stagingCancelled = false
 
     public var failures: [String] {
         [auditReadFailure, auditPersistenceFailure, stagingFailure].compactMap { $0 }
@@ -29,9 +30,7 @@ public struct StudioCanonTendingReport: Sendable, Equatable {
 public enum StudioCanonTending {
     /// Tending stages proposals only; canon membership, journal entries and graph edges require their deciding owners.
     public static func run(
-        turn: Turn?, handsBack: Bool,
         dataRoot: URL,
-        inbox: SwiftNativeApprovalInbox? = nil,
         now: Date = Date(),
         deadlineDate: @Sendable (String) -> Date? = { NativeTimestampFormat.parseISO8601FractionalFirst($0) },
         admitEffects: @Sendable () async throws -> Void,
@@ -82,15 +81,16 @@ public enum StudioCanonTending {
                     auditReadFailure: auditReadFailure, auditPersistenceFailure: auditPersistenceFailure
                 )
             }
-            let inbox = inbox ?? SwiftNativeApprovalInbox(root: dataRoot)
+            let inbox = SwiftNativeApprovalInbox(root: dataRoot)
             var staged: [String] = []
             var duplicates = 0
             var stagingFailure: String?
             var proposalFailures: [String] = []
             var savedCardGaps: [String] = []
+            var stagingCancelled = false
             for draft in drafts {
                 do {
-                    try Task.checkCancellation()
+                    guard !Task.isCancelled else { stagingCancelled = true; break }
                     // Each candidate's fresh listing supplies both capacity and deduplication.
                     let records = try await inbox.list(filter: ApprovalFilter(
                         status: nil, action: StudioCanonProposal.approvalAction
@@ -110,13 +110,15 @@ public enum StudioCanonTending {
                     }
                     guard staged.count < StudioCanonLaw.maximumProposalsPerPass else { break }
                     do { try await admitEffects() }
+                    catch is CancellationError { stagingCancelled = true; break }
                     catch {
                         stagingFailure = "Canon admission closed before staging \(draft.key); this and remaining proposals were not staged."
                         break
                     }
-                    let record = try await StudioCanonProposal.stage(turn: turn, handsBack: handsBack, draft, inbox: inbox)
+                    let record = try await StudioCanonProposal.stage(draft, inbox: inbox)
                     staged.append(record.id)
-                } catch {
+                } catch is CancellationError { stagingCancelled = true; break }
+                catch {
                     stagingFailure = """
                         Studio canon staging stopped for \(draft.key): \(error.localizedDescription). Inspect existing approvals before repeating; \
                         the failed card's write outcome may be unconfirmed.
@@ -132,9 +134,11 @@ public enum StudioCanonTending {
                 audit: audit,
                 auditReadFailure: auditReadFailure, auditPersistenceFailure: auditPersistenceFailure,
                 stagingFailure: stagingFailure,
-                proposalFailures: proposalFailures, savedCardGaps: savedCardGaps
+                proposalFailures: proposalFailures, savedCardGaps: savedCardGaps,
+                stagingCancelled: stagingCancelled
             )
         } catch {
+            if error is CancellationError { throw error }
             let failures = [auditReadFailure, auditPersistenceFailure].compactMap { $0 }
             guard !failures.isEmpty else { throw error }
             throw PersistenceCoreError.ioFailure(([error.localizedDescription] + failures).joined(separator: " "))

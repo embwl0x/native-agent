@@ -1,7 +1,7 @@
 import NativeAgentShared
+import PersistenceCore
 import Foundation
 import NativeAgentCore
-import PersistenceCore
 // Blueprint: | `DeskQuickAction.swift` | `DeskQuickAction`: Desk tool names and dispatch arguments |
 
 public enum DeskQuickAction: Equatable, Sendable {

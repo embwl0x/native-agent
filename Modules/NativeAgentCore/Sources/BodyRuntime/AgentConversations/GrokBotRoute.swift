@@ -327,7 +327,9 @@ public enum GrokBotRoute {
             state = code == 200 ? "accepted" : "webhook refused the request (HTTP \(code))"
         } catch {
             _ = try store.update(messageID, peer: peer.id) { if $0.state == "sending" { $0.state = "outcome_unknown" } }
-            if error is CancellationError { throw error }
+            if error is CancellationError || ((error as? URLError)?.code == .cancelled && Task.isCancelled) {
+                throw CancellationError()
+            }
             let cause = error.localizedDescription
             throw ToolFailureError("Grok webhook acceptance is unknown: " + cause, effects: .unknown,
                 owner: "Grok webhook transport", code: "grok_webhook_transport_failed",

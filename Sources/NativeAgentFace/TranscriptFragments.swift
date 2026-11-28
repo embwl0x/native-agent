@@ -33,22 +33,17 @@ final class TranscriptUserFragment: TranscriptFragment {
         return (text, symbol)
     }()
 
-    override var topMargin: CGFloat { topGap + (tag == nil ? 0 : TranscriptMetrics.tagSpace) + TranscriptMetrics.bubblePadV }
+    override var topMargin: CGFloat { topGap + (tag == nil ? 0 : TranscriptLook.provenanceHeight) + TranscriptMetrics.bubblePadV }
     override var bottomMargin: CGFloat { TranscriptMetrics.bubblePadV }
 
-    /// The text's own extent, padded: the bubble always wraps exactly what is drawn.
-    private var bubbleRect: CGRect {
-        let ink = inkRect
-        guard !ink.isNull else { return .zero }
-        return ink.insetBy(dx: -TranscriptMetrics.bubblePadH, dy: -TranscriptMetrics.bubblePadV)
-    }
+    private var bubbleRect: CGRect { paddedInkRect(horizontal: TranscriptMetrics.bubblePadH, vertical: TranscriptMetrics.bubblePadV) }
 
     private var tagRect: CGRect {
         guard let tag, bubbleRect != .zero else { return .zero }
         let size = tag.text.size()
         let symbolWidth = tag.symbol.map { $0.size.width + 4 } ?? 0
         let width = ceil(size.width + symbolWidth)
-        return CGRect(x: bubbleRect.maxX - width, y: bubbleRect.minY - TranscriptMetrics.tagSpace, width: width, height: ceil(size.height))
+        return CGRect(x: bubbleRect.maxX - width, y: bubbleRect.minY - TranscriptLook.provenanceHeight, width: width, height: ceil(size.height))
     }
 
     override var renderingSurfaceBounds: CGRect { super.renderingSurfaceBounds.union(bubbleRect).union(tagRect) }
@@ -78,7 +73,8 @@ final class TranscriptUserFragment: TranscriptFragment {
 
 /// Fenced code: one paragraph (lines joined by U+2028) on the quiet inset fill across the reply width, its language in a header strip.
 final class TranscriptCodeFragment: TranscriptFragment {
-    override var topMargin: CGFloat { topGap + TranscriptMetrics.codeHeader + TranscriptMetrics.codePadV }
+    var headerHeight: CGFloat { max(TranscriptLook.codeHeaderHeight, ceil(language?.size().height ?? 0) + 8) }
+    override var topMargin: CGFloat { topGap + headerHeight + TranscriptMetrics.codePadV }
     override var bottomMargin: CGFloat { TranscriptMetrics.codePadV }
 
     // The label is set at the reader's text size, so ⌘+ and ⌘− scale it with the code it names.
@@ -107,7 +103,7 @@ final class TranscriptCodeFragment: TranscriptFragment {
             TranscriptShapes.rounded($0, radius: TranscriptMetrics.codeRadius)
         }
         if inset != .zero {
-            let divider = inset.minY + TranscriptMetrics.codeHeader
+            let divider = inset.minY + headerHeight
             context.saveGState()
             context.translateBy(x: point.x, y: point.y)
             context.setFillColor(TranscriptInk.hairline.withAlphaComponent(0.4).cgColor)
@@ -117,7 +113,7 @@ final class TranscriptCodeFragment: TranscriptFragment {
                 let size = language.size()
                 drawAppKit(at: point, in: context) {
                     language.draw(at: CGPoint(x: inset.minX + TranscriptMetrics.codePadH,
-                                              y: inset.minY + (TranscriptMetrics.codeHeader - size.height) / 2))
+                                              y: inset.minY + (headerHeight - size.height) / 2))
                 }
             }
         }

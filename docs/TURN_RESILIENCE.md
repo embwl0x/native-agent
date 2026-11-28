@@ -218,13 +218,16 @@ at once, even when the body ignores cancellation. A call found dead reads
 `status:failed`, `reason:found_dead`, naming what was found dead; one past its
 own declared time reads `status:timed_out`, `reason:ran_out_of_time`. Both
 carry `execution:attempted`, `effects:unknown`, one sentence saying whether it
-took effect is unknown, and a reconcile remedy; a model-facing call's receipt
-also carries its invocation and call IDs and names this turn's dispatch
-receipts. A nested call's receipt reaches its batch or program as that step's
-failed result. The original body retains its checkpoint and records its actual
-receipt through `settle`; `tool.dispatch.settled` carries that receipt with the
-same IDs after actual exit. If it never returns, no settled trace is invented
-and the checkpoint remains unresolved. The turn engine retains the dispatch's
+took effect is unknown, and a reconcile remedy. A resident call's interruption
+receipt carries its invocation and pairing IDs and points to `trace.recent`
+with the original turn id and kind `tool.dispatch.settled`. A nested call's
+receipt reaches its batch or program as that step's failed result. When the
+retained body returns after its waiter was released, `TurnSettle` tries one
+checked write through `settle` for the original turn and invocation. The row
+contains the redacted result or its recovery reference. An unconfirmed write
+reports a settlement failure. Closing dispatch details also carry the invocation
+id. If the body never returns, the checkpoint remains unresolved.
+The turn engine retains the dispatch's
 settlement independently of its caller; Quit joins these bodies and drains
 accepted trace writes before the final mind save and dependency retirement.
 A body that never returns keeps Quit held without a clock. A wait that does not
@@ -236,9 +239,9 @@ counter. The helper refuses nonfinite, negative or unrepresentable seconds
 before constructing a duration.
 Cancellation of that work is not proof that its effects stopped or rolled back.
 
-Tool execution uses exactly the admitted transport grammar: native routes use
-structured call events; the text-marker route uses its offered markers;
-text-only routes execute no calls. JSON call objects in reply text (including
+Tool execution uses the admitted transport grammar. Native routes use
+structured call events. Text-marker routes use their offered markers.
+Text-only routes execute no calls. JSON call objects in reply text (including
 the retired `function_call` form) and malformed-marker salvage are not
 executable. Duplicate invoke parameter names and any non-whitespace content
 outside its parameter elements refuse the round before building arguments.
@@ -320,6 +323,9 @@ change the already settled reply.
 Anthropic's event consumer owns frame validation, timing, text/thinking liveness,
 usage and terminal receipts for both native-tool and OAuth text-marker streams;
 native signed-thinking replay and tool commitment remain payload handling.
+Claude subscription and Codex CLI marker rounds share the local boundary
+reader. It ends model delivery at the first complete call block or standalone
+call and keeps tag text inside JSON arguments as data.
 A call's input as it streams is movement the person sees, never a cut or a
 deadline; [the anatomy](ANATOMY_OF_A_TURN.md#5-the-model-answers-or-requests-a-tool)
 owns how it reaches the working card.
@@ -385,6 +391,10 @@ SSE decoding even before first output. Empty SSE data and protocol control
 frames remain explicit; the shared framer consumes comments as keep-alives.
 Chat Completions sends a call's tool results before any accompanying user
 image message, including screenshots returned to a standing helper.
+Native tool streams reject wrong-type argument fragments. Chat Completions
+accepts JSON null as an absent fragment. Anthropic-compatible streams keep
+a populated tool input from its opening block, accept an equivalent streamed
+copy with the same numeric values, and reject a conflicting copy.
 A malformed frame is not a network outage and does not admit a redial.
 After transport control debris is removed, literal markup is answer text;
 emptiness depends on whitespace, not on removing HTML or XML tags.
@@ -396,9 +406,9 @@ round carrying the [closing record for eligible writes](SURPRISE.md#the-law). A 
 restores the ordinary output requirement for that round. Other requests
 require output unless their caller explicitly declares silence valid. All adapters
 and the stem read that same declaration. Anthropic
-requires `end_turn` with every block closed, Responses requires a completed
-response, Chat Completions requires `stop` and `[DONE]`, and Codex requires EOF
-and successful process exit. Refusal, output limits, incomplete calls and missing
+requires `end_turn` with every block closed. Responses requires a completed
+response. Chat Completions requires `stop` and `[DONE]`. A silent Codex reply
+requires stdout EOF and a successful process exit. Refusal, output limits, incomplete calls and missing
 terminal evidence retain their failure or incomplete boundary. An open stream
 without a terminal remains waiting with Stop available.
 
@@ -510,6 +520,9 @@ Control handoff stops and joins every admitted turn for the destination,
 including arrivals waiting on turn admission. A generation retry registers with
 the turn coordinator before releasing polling. Handoff reads cancellation
 evidence from each turn after it settles.
+Cancellation during a progress card's first send, edit or deletion creates no
+transport error record. The ledger keeps any terminal identity still owed
+delivery.
 Telegram restart repair edits an interrupted progress card in place, clears its
 buttons and removes its ledger row. A saved-answer `/retry` delivers to the same
 chat and topic and leaves the interruption notice in chat.
@@ -620,6 +633,8 @@ Reply owners and the continuation sweep start independently of senses
 registration. A resumed turn that reads a sense waits at that read's owner,
 with the [bounded readiness and repair law](SENSES.md); an unavailable sense
 does not prevent saved answers on other routes from being delivered.
+Reply reconciliation continues to later owners after ordinary failures.
+Cancellation stops admission to the remaining owners.
 Pending checkpoints with no redelivery owner retire at launch with one
 turn.checkpoint_retired trace row; bridge responses and internal helper turns
 leave no pending checkpoint. Scheduled helpers settle through BotRunner.
@@ -641,6 +656,8 @@ fault surfaced by its existing failure logger. A checked session row may still
 establish that an old pin is not the person's direct conversation. Failed
 publication cannot replace damaged anchor bytes. Display-only anchor reads log
 unavailability and omit the pin; that omission never decides retention.
+Orphaned session-state cleanup preserves a directory when its children cannot
+be listed or its newest modification time cannot be established.
 
 Turn cards render an invalid or unrepresentable elapsed interval as
 “Duration unavailable”; a finite saved date alone does not establish a

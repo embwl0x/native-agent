@@ -188,9 +188,6 @@ final class PipeFaceClient: FaceClient {
                         do {
                             try await link.send(.reply(id: id, reply))
                             log?.record("replied request=\(id) result=\(FaceLinkLog.reply(reply))")
-                            if case .closeRenderer = call {
-                                await end(FaceWireError.disconnected, bodyGone: true)
-                            }
                         } catch {
                             // A call the body cancelled owes no reply; its cancellation is that call's end, never the connection's.
                             if !Task.isCancelled { await end(error) }

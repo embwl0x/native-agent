@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import SenseCore
@@ -374,8 +375,7 @@ enum TelegramRichMessageRenderer {
         }
         let start = trimmed.index(trimmed.startIndex, offsetBy: "<summary>".count)
         let end = trimmed.index(trimmed.endIndex, offsetBy: -"</summary>".count)
-        let value = String(trimmed[start..<end]).trimmingCharacters(in: .whitespacesAndNewlines)
-        return value.isEmpty ? nil : value
+        return String(trimmed[start..<end]).trimmedNonEmpty
     }
 
     private static func isTableRow(_ line: String) -> Bool {

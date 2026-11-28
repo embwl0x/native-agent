@@ -429,6 +429,7 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
             do { try await port.reconcileReplyDeliveries(dataRoot: dataRoot) }
             catch {
                 await deferral.requestReplyReconciliation()
+                if Task.isCancelled { return .skipped(reason: "Delegation reply handling cancelled", healthNeutral: true) }
                 return .failed(error: "Reply reconciliation failed: \(error.localizedDescription)")
             }
         }
@@ -575,6 +576,8 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
             }.min()
             // A defer that expired during the read still needs a return pass.
             return [quietEnd, next.map { max($0, now.addingTimeInterval(0.001)) }].compactMap { $0 }.min()
+        } catch is CancellationError {
+            return nil
         } catch {
             await BackgroundLoopLifetimes.shared.recordOutOfBandOutcome(loopId: loopId,
                 outcome: .failed(error: "Desk continuation deadlines are unavailable: \(error.localizedDescription)"))

@@ -52,16 +52,22 @@ public struct AgentConversationContinuation: Sendable {
     /// Resume through the original gated chain without an approval filer; card-requiring sends stay held with their reason.
     private func resumeQueues(workspace: WorkspaceOperation) async throws {
         try Task.checkCancellation()
-        replyWork.state.withLock { state in
+        let restoreQueues = replyWork.state.withLock { state in
             if state.stopped { state.queuesResumed = false }
             state.stopped = false
+            return !state.queuesResumed
+        }
+        let store = store
+        if restoreQueues {
+            await OneClock.at(dataRoot).handle("agent") { _, _ in
+                StoreChangeBus.shared.emit(.init(store: .replyDelivery, path: store.fileURL))
+            }
         }
         await AgentDiscoverySession.shared.watchInstalls(dataRoot: dataRoot)
         try Task.checkCancellation()
         dotTransport.listen()
         try await dot.resumeAdmissions()
         try Task.checkCancellation()
-        let store = store
         await AgentA2APushReceiver.shared.installInvalidator(owner: pushOwner) { peer, task in
             do {
                 for row in try store.records() where row.agent == "peer:" + peer
@@ -78,7 +84,6 @@ public struct AgentConversationContinuation: Sendable {
             }
         }
         try Task.checkCancellation()
-        let restoreQueues = !replyWork.state.withLock { $0.queuesResumed }
         // Load and seed recipes before any contact row reads them.
         if restoreQueues { AgentRecipeStore.load(dataRoot: dataRoot) }
         try await grok.resumeHandOvers(dataRoot: dataRoot, continuation: self)
@@ -112,9 +117,6 @@ public struct AgentConversationContinuation: Sendable {
             }
         }
         replyWork.state.withLock { $0.queuesResumed = true }
-        await OneClock.at(dataRoot).handle("agent") { _, _ in
-            StoreChangeBus.shared.emit(.init(store: .replyDelivery, path: store.fileURL))
-        }
     }
 
     public func stop() async {
@@ -165,7 +167,10 @@ public struct AgentConversationContinuation: Sendable {
     }
 
     package func tick(workspace: WorkspaceOperation) async throws {
-        try await resumeQueues(workspace: workspace)
+        var firstError: Error?
+        do { try await resumeQueues(workspace: workspace) }
+        catch is CancellationError { throw CancellationError() }
+        catch { firstError = error }
         Task.detached(priority: .utility) { await AgentContactHealth.shared.refresh(dataRoot: dataRoot) }
         let dotAgents = Set(try AgentPeerStore(dataRoot: dataRoot).list().filter { $0.ability == nil && ChatGPTDotIPCTransport.owns(
             $0) }.map { "peer:" + $0.id })
@@ -220,6 +225,7 @@ public struct AgentConversationContinuation: Sendable {
                 }
             }
         }
+        if let firstError { throw firstError }
     }
 
     private func readDueReplies(contact: String, noticesOnly: Bool) async throws -> Bool {
@@ -407,7 +413,9 @@ public struct AgentConversationContinuation: Sendable {
                     envelope: turnEnvelope, verifiedSessionID: session, replyRoute: route.chatToolReplyRoute,
                     origin: steeredOrigin, pinnedRunID: runID, codexCompletion: binding, threadKind: .agent,
                     ownedSessionID: peer.map { ContactThread.session(owner: $0.id, conversation: row.conversationID) })
-                let admitted = try await TurnAdmission.admittedRun(turn: request.turn(dataRoot: dataRoot),
+                var incomingTurn = request.turn(dataRoot: dataRoot)
+                if notice == nil, let peer { incomingTurn[HeardSpeaker.self] = (incomingTurn.id, "agent:peer:" + peer.id) }
+                let admitted = try await TurnAdmission.admittedRun(turn: incomingTurn,
                     arrival: request.arrival(retainedReply != nil ? .saved : .shown), dataRoot: dataRoot, waitForCapacity: true) { turn in
                     (try await request.chat(on: client, holding: turn), turn)
                 }

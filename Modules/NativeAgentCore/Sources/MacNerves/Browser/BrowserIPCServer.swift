@@ -170,13 +170,13 @@ public final class BrowserIPCServer: BridgeHTTPServer {
 
     // MARK: - Routing
 
-    public nonisolated func route(conn: NWConnection, method: String, path: String, headers: [String: String], body: Data) {
+    public nonisolated func route(conn: NWConnection, method _: String, path: String, headers: [String: String], body: Data) {
         Task { @MainActor in
-            self.routeIPC(conn: conn, method: method, path: path, headers: headers, body: body)
+            self.routeIPC(conn: conn, path: path, headers: headers, body: body)
         }
     }
 
-    private func routeIPC(conn: NWConnection, method: String, path: String, headers: [String: String], body: Data) {
+    private func routeIPC(conn: NWConnection, path: String, headers: [String: String], body: Data) {
         let timeoutKey = ObjectIdentifier(conn)
         guard connections[timeoutKey] === conn, connectionOperations[timeoutKey] == nil else { return }
         // Allow routed operations 120s rather than the 15s idle limit so slow navigation can finish. A hung callback still releases the connection and task;
@@ -200,7 +200,7 @@ public final class BrowserIPCServer: BridgeHTTPServer {
         let token = ipcToken
         connectionOperations[timeoutKey] = Task {
             let response = await BrowserActionRoutes.authenticatedIPCRoute(
-                method: method, path: path, headers: headers, body: body,
+                path: path, headers: headers, body: body,
                 token: token, effects: effects
             )
             guard !Task.isCancelled, self.connections[timeoutKey] === conn else { return }

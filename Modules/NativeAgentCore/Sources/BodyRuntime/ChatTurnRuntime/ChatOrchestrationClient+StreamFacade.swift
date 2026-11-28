@@ -1,12 +1,10 @@
 import Foundation
-import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import SenseCore
 import DeskCore
 import MindCore
 import ProviderRouting
-import MacNerves
 // Blueprint: | `ChatOrchestrationClient+StreamFacade.swift` | `SwiftNativeChatOrchestrationClient`,`chatStreamExecution`,`ChatStreamExecution` |
 
 /// Join the producer before declaring settlement: terminal events can precede its cancellation/failure transcript write.
@@ -40,16 +38,8 @@ extension SwiftNativeChatOrchestrationClient {
         surface: String,
         suppressUserAppend: Bool,
         replacementAssistantMessageID: String? = nil,
-        /// Pass the route as a parameter so the producer holds the value for its full lifetime.
-        choice: ProviderTurnChoice? = nil,
-        /// Pass the reply route as a parameter so the producer holds the value for its full lifetime.
-        replyRoute: ChatToolSessionContext.ReplyRoute? = nil,
-        /// Pass the service tier as a parameter so the producer holds the value for its full lifetime.
-        serviceTier: String? = nil,
         /// Only the mounted transcript UI declares inline-card rendering; every other consumer defaults to text-only.
         consumerRendersInlineCards: Bool = false,
-        /// Capture the user's takeover location at ingress; carry it on the captured turn.
-        macContinuation: MacWorkContinuation? = nil,
         /// Save under the surface's existing reply-row identity; carry it on the captured turn.
         replyRowID: String? = nil,
         onScreenPreview: (@Sendable (MacScreenPreviewUpdate) async -> Void)? = nil,
@@ -61,13 +51,6 @@ extension SwiftNativeChatOrchestrationClient {
         var held = turn
         held.rows.replacementAssistantMessageID = replacementAssistantMessageID
         held.replyStreamRendersCards = consumerRendersInlineCards
-        if let replyRoute { held.envelope = held.envelope?.withDeliveryRoute(replyRoute) }
-        if let macContinuation {
-            held.macContinuation = macContinuation
-            held.envelope = held.envelope?.withMacContinuation(macContinuation)
-        }
-        if let choice { held.providerChoice = choice }
-        if let serviceTier { held.requestedServiceTier = serviceTier }
         if let onScreenPreview { held.screenPreview = onScreenPreview }
         // Omission clears a parent's mounted row; this stream owns only the row its caller supplied.
         held.replyRow = replyRowID.flatMap { row in

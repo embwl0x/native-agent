@@ -206,13 +206,12 @@ extension ChatToolOutcome {
     package static func outputLooksSuccessful(_ output: JSONValue, verdict: ExactResultClass? = nil) -> Bool {
         let reply = ToolResult(output)
         switch verdict ?? reply.outcome {
-        case .failed, .refused, .timeout, .cancelled: return false
-        case .succeeded: return true
         case .unknown:
             guard case .object(let object) = output, case .string(let status)? = object["status"] else { return true }
             // This predicate historically lowercases without trimming.
             guard status.lowercased() == reply.status else { return true }
             return !reply.said("skipped") && !reply.said("needs_input")
+        case let result: return !result.isFailure
         }
     }
 

@@ -87,6 +87,15 @@ extension Parts {
                                  "validation_evidence", "candidate_validation_evidence", "learned", "run_counts"].contains($0.key) }
         if row["status"] == .string("unavailable") { return .object(read) }
         read["status"] = .string("ok"); read["ability_status"] = row["status"] ?? .null
+        if row["kind"] == .string("ability") {
+            do {
+                let usage = try await AbilityStore.wakeUsage(dataRoot: root, part: id)[id] ?? .init()
+                read["unasked_wakes"] = usage.counts
+                read["last_run_origin"] = .string(usage.lastRunOrigin ?? "unknown")
+            } catch {
+                read["unasked_wakes_error"] = .string(error.localizedDescription)
+            }
+        }
         var declares: [String: JSONValue] = [:]
         for (key, field) in [("params", "params"), ("input_schema", "inputSchema"), ("actions", "actions"), ("reach", "reach"),
                              ("wake", "wake"), ("face", "face"), ("resident", "resident")] { declares[key] = row[field] ?? .null }

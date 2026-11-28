@@ -170,7 +170,12 @@ public struct ChatCompletionsStreamDecoder {
                         }
                         toolAccum[index, default: Accum()].name = name
                     }
-                    if let args = function["arguments"] as? String { toolAccum[index, default: Accum()].arguments += args }
+                    if let value = function["arguments"], !(value is NSNull) {
+                        guard let args = value as? String else {
+                            throw LLMError.providerError(message: "\(providerLabel): tool argument fragment is not a string")
+                        }
+                        toolAccum[index, default: Accum()].arguments += args
+                    }
                 }
                 if let call = toolAccum[index], !call.name.isEmpty {
                     frame.callInput = LLMStreamCallInput(name: call.name, input: call.arguments.utf8)

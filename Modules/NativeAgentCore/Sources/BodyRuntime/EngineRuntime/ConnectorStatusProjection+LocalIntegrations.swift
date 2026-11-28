@@ -83,18 +83,6 @@ enum MacAssistantParts {
     }
 }
 
-extension ConnectorReadiness {
-    public static func actionStatusEvidence(actionID: String, root: URL, platform: AppConnectorStatusPlatform) async throws -> ConnectorActionStatusEvidence? {
-        let connectors = try await ConnectorReadiness.readConnectorRecords(
-            root: root, platform: platform
-        )
-        let actions = ConnectorActionRecord.records(connectors: connectors)
-        return actions.first { $0.id == actionID }.map {
-            ConnectorActionStatusEvidence(connectorStatus: $0.connectorStatus, authState: $0.authState, enabled: $0.enabled)
-        }
-    }
-}
-
 /// Use the Connectors page’s decayed health proof: connected with a successful call within 7 days; read local state once.
 extension ConnectorReadiness {
     static func isProven(id: String, root: URL, platform: AppConnectorStatusPlatform) async throws -> Bool {
@@ -161,15 +149,13 @@ public struct AppConnectorStatusPlatform: Sendable {
 
 public struct AppConnectorActionPlatform: ConnectorActionPlatform {
     let dataRoot: URL
-    private let statusPlatform: AppConnectorStatusPlatform
     private let macAssistant: any MacAssistantStatusClient
     private let notification: @Sendable (NativeAgentNotificationDefaults.Note, Turn) async -> [String: JSONValue]
 
-    public init(dataRoot: URL, statusPlatform: AppConnectorStatusPlatform,
+    public init(dataRoot: URL,
                 macAssistant: any MacAssistantStatusClient,
                 notification: @escaping @Sendable (NativeAgentNotificationDefaults.Note, Turn) async -> [String: JSONValue]) {
         self.dataRoot = dataRoot
-        self.statusPlatform = statusPlatform
         self.macAssistant = macAssistant
         self.notification = notification
     }
@@ -189,9 +175,5 @@ public struct AppConnectorActionPlatform: ConnectorActionPlatform {
     /// Every provider reads local state the app already owns — no network.
     public func macAssistantStatusClient() -> any MacAssistantStatusClient {
         macAssistant
-    }
-
-    public func statusEvidence(actionID: String) async throws -> ConnectorActionStatusEvidence? {
-        try await ConnectorReadiness.actionStatusEvidence(actionID: actionID, root: dataRoot, platform: statusPlatform)
     }
 }

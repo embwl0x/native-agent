@@ -4,15 +4,6 @@ import NativeAgentShared
 
 @MainActor
 extension AppModel {
-    func focusFaceComposer(session: String) -> FaceReply {
-        let detached = DetachedChatWindowController.shared.isDetached(session)
-        guard detached || activeChatSessionId == session else {
-            return .refused(WireFailure(code: "composer_not_mounted", message: "That conversation's composer is not mounted.",
-                                        cause: nil, effects: .none))
-        }
-        return FaceComposerFocus.focus(session: session, detached: detached)
-    }
-
     func composerDraft(for sessionId: String) -> ChatComposerDraft {
         if let draft = chatComposerDrafts[sessionId] { return draft }
         let draft = ChatComposerDraft(sessionId: sessionId)

@@ -81,11 +81,11 @@ public struct DeskContinuation: Codable, Sendable, Equatable {
     }
 
     /// Nested queued, running, unknown or unverified effects cannot settle from the outer receipt alone.
-    public static func receiptIsUnresolved(_ value: JSONValue, depth: Int = 0) -> Bool {
-        guard let path = unresolvedPath(value, depth: depth, path: "") else { return false }
+    public static func receiptIsUnresolved(_ value: JSONValue) -> Bool {
+        guard let path = unresolvedPath(value, depth: 0, path: "") else { return false }
         // A root path starts with "."; only deeper paths reveal missing child evidence in the outer receipt.
         let location = path.split(separator: "=", maxSplits: 1).first.map(String.init) ?? path
-        if depth == 0, location.dropFirst().contains(where: { $0 == "." || $0 == "[" }), case .object(let outer) = value {
+        if location.dropFirst().contains(where: { $0 == "." || $0 == "[" }), case .object(let outer) = value {
             let who = ["action", "tool", "verb", "kind", "source"].compactMap { outer[$0]?.scalarText }.first ?? "?"
             nestedOpenLog("receipt.nested_open who=%@ path=%@ keys=%@", who, path,
                           outer.keys.sorted().prefix(12).joined(separator: ","))

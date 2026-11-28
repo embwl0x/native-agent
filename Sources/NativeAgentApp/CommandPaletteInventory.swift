@@ -48,6 +48,7 @@ struct PaletteItem: Identifiable, Hashable, Sendable {
 
     enum Kind: Hashable, Sendable {
         case tab(SidebarItem)
+        case ownPage(String)
         case railTab(SidebarItem, String)
         case setting(String, tab: String?)
         case chatSession(String)
@@ -83,7 +84,7 @@ enum CommandPalettePresentation {
         let cleanQuery = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !cleanQuery.isEmpty else {
             return Array(pool.filter {
-                if case .tab(let item) = $0.kind { return rail.contains(item) }
+                if case .tab(let item) = $0.kind { return $0.id == "tab." + item.rawValue && rail.contains(item) }
                 return false
             }.prefix(8))
         }
@@ -124,16 +125,37 @@ enum CommandPalettePresentation {
     @MainActor
     static func itemPool(
         layout: SurfaceLayoutAvailability,
+        agentName: String,
+        ownPages: [QuietToolPage],
         settings: [PaletteItem] = [],
         saved: [PaletteItem] = []
     ) -> [PaletteItem] {
         let rail = railItems(layout)
-        let pages = rail.map { item in
+        let pages = (rail + SidebarItem.allCases.filter {
+            !rail.contains($0) && SidebarItem.shellHome(for: $0) == nil && SidebarItem.doorPage($0) != nil
+        }).map { item in
             PaletteItem(id: "tab.\(item.rawValue)", title: item.shellRailTitle, subtitle: nil,
                         systemImage: item.systemImage, kind: .tab(item))
         }
+        let placedNames = ShellSurface.allCases.flatMap { surface -> [PaletteItem] in
+            let item = surface.firstPage
+            let title = surface.title(agentName: "", simple: true)
+            var names = title == item.shellRailTitle ? [] : [title]
+            if surface == .agent {
+                let named = surface.title(agentName: agentName)
+                if named != title, ShellSurface.named(named, agentName: agentName) == .agent { names.append(named) }
+            }
+            return names.enumerated().map { index, name in
+                PaletteItem(id: "place.\(surface.rawValue).\(index)", title: name, subtitle: nil,
+                            systemImage: item.systemImage, kind: .tab(item))
+            }
+        }
+        let authored = ownPages.map { page in
+            PaletteItem(id: SurfaceLayout.pagePrefix + page.id, title: page.title, subtitle: nil,
+                        systemImage: SidebarItem.ownPage.systemImage, kind: .ownPage(page.id), searchText: page.id)
+        }
         // A page's first tab shares its name, so the page row already represents it.
-        let tabs = ShellRailTab.all(layout).flatMap { page, tabs in
+        let tabs = ShellRailTab.all(layout, includeHidden: true).flatMap { page, tabs in
             tabs.filter { $0.title != page.shellRailTitle }.map { tab in
                 PaletteItem(id: "railtab.\(page.rawValue).\(tab.key)", title: tab.title,
                             subtitle: page.shellRailTitle, systemImage: page.systemImage,
@@ -141,7 +163,7 @@ enum CommandPalettePresentation {
             }
         }
         // Destinations win ties so a page name still opens that page.
-        return pages + tabs + settings + saved + CommandPaletteRecentAction.allCases.map { action in
+        return pages + placedNames + tabs + authored + settings + saved + CommandPaletteRecentAction.allCases.map { action in
             let presentation = action.presentation
             return PaletteItem(
                 id: "action.\(action.rawValue)",

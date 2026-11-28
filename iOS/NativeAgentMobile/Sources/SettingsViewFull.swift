@@ -51,6 +51,7 @@ struct SettingsViewFull: View {
 
     let presentation: Presentation
     var opensConnection = false
+    var showAdvanced: (() -> Void)? = nil
     @Environment(\.dismiss) private var dismiss
     @Environment(PairingStore.self) private var pairingStore
     @Environment(MacBridgeClient.self) private var bridgeClient
@@ -69,10 +70,18 @@ struct SettingsViewFull: View {
     var body: some View {
         ScrollViewReader { proxy in
             AlivePage(
-                title: "Settings",
+                title: presentation == .root ? ShellSurface.control.title(agentName: "") : "Settings",
                 line: "This iPhone, its link to the Mac, and the Mac's own settings.",
                 style: presentation == .root ? .root : .pushed
             ) {
+                if let showAdvanced {
+                    Section {
+                        NavigationLink("Trust") { MobileFacePage(page: "trust") }
+                        NavigationLink("Providers") { MobileFacePage(page: "providers") }
+                        NavigationLink("Connectors") { MobileFacePage(page: "connectors") }
+                        Button("Advanced", action: showAdvanced)
+                    }
+                }
                 FaceView(face: appearanceFace, door: localDoor, session: session)
                 FaceView(face: connectionFace, door: localDoor, session: session).id("connection")
                 MobileFaceRows(page: "settings") { pushedFace = $0 }
@@ -154,12 +163,16 @@ struct SettingsViewFull: View {
                 .init(id: "pair", label: "Pair with Mac", call: .init("phone.connection.pair"))]),
             .init(id: "repair", title: "Connection repair", actions: [.init(id: "repair", label: "Repair connection",
                 call: .init("phone.connection.repair"), unavailable: pairingStore.isRepairingConnection ? "Repair is already running." : nil)])]
-        return .init(sections: [.init(id: "mac", title: "Mac", rows: healthRows),
+        var sections: [PartFace.Section] = [.init(id: "mac", title: "Mac", rows: healthRows),
             .init(id: "connection", title: "Connection", footer: "Keep NativeAgent open on the Mac so a current report can reach this iPhone.", rows: rows),
-            .init(id: "on-mac", title: "On your Mac", rows: [
+        ]
+        if presentation != .root {
+            sections.append(.init(id: "on-mac", title: "On your Mac", rows: [
                 .init(id: "connectors", title: "Connectors", detail: "Telegram and the other services I can reach", open: "page:connectors"),
                 .init(id: "providers", title: "Providers", detail: "The models I think with", open: "page:providers")
-            ])])
+            ]))
+        }
+        return .init(sections: sections)
     }
 
     private var aboutFace: PartFace {

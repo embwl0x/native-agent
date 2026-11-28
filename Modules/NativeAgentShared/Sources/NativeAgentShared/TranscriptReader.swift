@@ -7,7 +7,7 @@ import AppKit
 import UIKit
 #endif
 
-// Blueprint: | `TranscriptReader.swift` | `TranscriptReaderCore`: the TextKit 2 document both readers apply press scripts to (paragraph index, script receipt, reader place, paced reveal, folds, hosted-view frames, copy text), with each platform's glass as overridden hooks |
+// Blueprint: | `TranscriptReader.swift` | `TranscriptReaderCore`: the TextKit 2 document both readers apply press scripts to (paragraph index, script receipt, reader place, scroll-mutation scope, paced reveal, folds, hosted-view frames, copy text), with each platform's glass as overridden hooks |
 
 /// The rules where the Mac's and the phone's readers differ, named.
 public struct TranscriptReaderRules: Sendable {
@@ -100,6 +100,7 @@ open class TranscriptReaderCore: NSObject {
     public var readerID = UUID()
     public var appliedScript: UUID?
     public var pendingOpen = true
+    public private(set) var selfMoving = false
     /// Only the reader's own navigation (and opening, Latest, a send) decides whether document growth follows the end.
     public var following = true
     public private(set) var shown = TranscriptDocument.empty
@@ -141,7 +142,12 @@ open class TranscriptReaderCore: NSObject {
     open var isCurrentReader: Bool { false }
 
     /// Runs a change the reader's own edits and scrolls make, so layout it triggers is not taken for the reader moving.
-    open func moving(_ change: () -> Void) { change() }
+    public final func moving<Result>(_ change: () -> Result) -> Result {
+        let enclosing = selfMoving
+        selfMoving = true
+        defer { selfMoving = enclosing }
+        return change()
+    }
     /// Scrolls the reading area by `shift` points.
     open func shiftScroll(by shift: CGFloat) {}
     /// Seats the document's end at the reading bottom.

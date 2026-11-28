@@ -6,9 +6,8 @@ import BodyRuntime
 import NativeAgentShared
 import NativeAgentCore
 
-// Blueprint: | `InlinePreviewCards.swift` | Inline approval resolve, durable-decision toasts and resolution messages retained by chat and Trust |
+// Blueprint: | `InlinePreviewCards.swift` | Notification approval resolution, approval refresh and durable-decision toasts |
 
-/// Share resolve → toast → approvals/health refresh ordering so every approval surface exposes the same outcome.
 enum ApprovalDecisionAction {
     @MainActor static func resolve(
         id: String,
@@ -23,7 +22,16 @@ enum ApprovalDecisionAction {
             )
             ApprovalDecisionToastPresentation.publish(toast, to: appModel.systemToasts)
             await appModel.engine.approvals.refresh()
-            await appModel.loadHealthCard()
+            if !Task.isCancelled {
+                do {
+                    _ = try await appModel.engine.approvals.list()
+                } catch {
+                    if !Task.isCancelled {
+                        print("[NativeAgent] getApprovals failed: \(error)")
+                        appModel.setFailureStatus(error, action: "load approvals")
+                    }
+                }
+            }
             return toast.kind == .error ? toast.text : nil
         } catch {
             let toast = ApprovalDecisionToastPresentation.unavailable(error)

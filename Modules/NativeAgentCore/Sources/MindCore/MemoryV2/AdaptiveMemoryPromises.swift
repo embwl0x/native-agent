@@ -28,8 +28,9 @@ extension AdaptiveMemoryPromoter {
             record["arguments"] = payload["args"]
             record["receipt"] = receipt["resultReceipt"]
             if let result = payload["result"]?.stringValue {
-                record["result"] = .string(String(result.prefix(1024)))
-                record["result_shortened"] = .bool(result.count > 1024)
+                // The judgment is shown a result's first 1,500 characters; the act keeps a little more than that.
+                record["result"] = .string(String(result.prefix(2_048)))
+                record["result_shortened"] = .bool(result.count > 2_048)
             }
             acts.append(MemoryManagerAct(id: actID, record: .object(record)))
         }
@@ -94,6 +95,9 @@ extension AdaptiveMemoryPromoter {
         let words: String
     }
 
+    private static let promiseFilingCancelled = PromiseFailure(
+        cause: nil, words: "Promise filing was cancelled; the judgment is retained for the next drain.")
+
     /// The same application path for a live judgment and a batch's saved meaning. No ambient reflection task or later conversation may lend a promise its
     /// origin.
     func applyPromises(_ interpretation: AfterTurnInterpretation, turn: CognitiveMomentTurn?,
@@ -137,6 +141,8 @@ extension AdaptiveMemoryPromoter {
         let turn: CognitiveMomentTurn
         let envelope: TurnEnvelope?
         let personWords: String
+        let reply: String
+        let redactedQuotes: Bool
         let sources: [String]
         let store: SwiftNativeDeskStore
         let open: [DeskItem]
@@ -203,13 +209,14 @@ extension AdaptiveMemoryPromoter {
             return .failure(await promiseFailure("The retained matching judgment and its candidate identities are incomplete.", work: work, wait: false))
         }
         let envelope = TurnEnvelope.fromPersistedMetadata(turn.envelope)
-        let personWords = Self.settlementWords(turn)
+        let personWords = interpretation.quoteText(Self.settlementWords(turn))
+        let reply = interpretation.quoteText(turn.assistant)
         guard !interpretation.promises.isEmpty || !interpretation.settled.isEmpty || saved.captures != nil else {
             return .success(nil)
         }
         let promises = interpretation.promises
         do {
-            for promise in promises { try promise.validate(reply: turn.assistant) }
+            for promise in promises { try promise.validate(reply: reply) }
         } catch {
             return .failure(await promiseFailure(error.localizedDescription, work: work, owner: "MemoryManagerPromise", cause: .record))
         }
@@ -260,7 +267,7 @@ extension AdaptiveMemoryPromoter {
                 work.matchingBasis = await readBasis(moment, cause: .provider, door: door)
                 do {
                     tracePromise("matching", work: work, turn: turn, envelope: envelope)
-                    let proposed = try await memoryManager.capturePromises(pending.map(\.element), reply: turn.assistant,
+                    let proposed = try await memoryManager.capturePromises(pending.map(\.element), reply: reply,
                         open: open, call: LLMCall(turn: heldTurn, surface: turn.surface, purpose: "memory_promise"))
                     // The settlement is read first: a capture that would refile an item this same interpretation settles is answered by that
                     // settlement and files nothing. Refusing it failed the moment, and every drain matched again and failed the same way.
@@ -294,9 +301,10 @@ extension AdaptiveMemoryPromoter {
             return .failure(await promiseFailure(error.localizedDescription, work: work, wait: false))
         }
         guard !Task.isCancelled else {
-            return .failure(PromiseFailure(cause: nil, words: "Promise filing was cancelled; the judgment is retained for the next drain."))
+            return .failure(Self.promiseFilingCancelled)
         }
-        return .success(PromiseFilingPlan(turn: turn, envelope: envelope, personWords: personWords, sources: sources,
+        return .success(PromiseFilingPlan(turn: turn, envelope: envelope, personWords: personWords, reply: reply,
+            redactedQuotes: interpretation.redactedQuotes == true, sources: sources,
             store: store, open: open, terminal: terminal, archived: archived, landed: landed, identities: identities, captures: captures))
     }
 
@@ -309,6 +317,7 @@ extension AdaptiveMemoryPromoter {
         var failure: PromiseFailure?
         var actEvidence: Result<[MemoryManagerAct], Error>?
         for capture in captures {
+            guard !Task.isCancelled else { return .failure(Self.promiseFilingCancelled) }
             switch capture {
             case .ignore: tracePromise("ignored", work: work, turn: turn, envelope: envelope)
             case .settled(let settlement):
@@ -316,14 +325,16 @@ extension AdaptiveMemoryPromoter {
                 let basis: String
                 switch settlement.evidence {
                 case .personWords(let source):
-                    guard !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, personWords.contains(source) else {
+                    guard !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                          personWords.contains(source) else {
                         return .failure(await promiseFailure("A retained settlement has no exact quote from this turn's person_words.", work: work, cause: .record))
                     }
                     basis = "person_words: \"" + source + "\""
                 case .act(let actID, let source):
                     basis = "act " + actID + " (detail, turn " + (turn.turnId ?? momentID) + "): \"" + source + "\""
                 case .reply(let source):
-                    guard settlement.outcome == .done, MemoryManagerPromise.quoted(source, in: turn.assistant) else {
+                    guard settlement.outcome == .done,
+                          MemoryManagerPromise.quoted(source, in: plan.reply) else {
                         return .failure(await promiseFailure("A retained settlement has no exact quote from this turn's reply.", work: work, cause: .record))
                     }
                     basis = "reply: \"" + source + "\""
@@ -351,10 +362,12 @@ extension AdaptiveMemoryPromoter {
                                 }
                                 let acts = try reading.get()
                                 guard settlement.outcome == .done,
-                                      let act = acts.first(where: { $0.id == actID }), act.contains(source) else {
+                                      let act = acts.first(where: { $0.id == actID }),
+                                      (plan.redactedQuotes ? act.digestEvidence : act).contains(source) else {
                                     throw ToolFailureError("The retained completed act evidence is unavailable; work stays open.", effects: .none)
                                 }
                             } catch {
+                                if Self.isCancellation(error) { return .failure(Self.promiseFilingCancelled) }
                                 failure = PromiseFailure(cause: .record, words: error.localizedDescription)
                                 tracePromise("failed", work: work, turn: turn, envelope: envelope, id: id, reason: error.localizedDescription)
                                 _ = await promiseFailure(error.localizedDescription, work: work, owner: "TurnTrace", cause: .record, wait: false)
@@ -363,7 +376,10 @@ extension AdaptiveMemoryPromoter {
                         }
                         guard let item = open.first(where: { $0.handle == id }), item.updatedAt == updatedAt,
                               let entry = MyQueue.entry(item) else { throw MyQueue.Superseded() }
-                        if let conflict = try await store.runHold(id) {
+                        try Task.checkCancellation()
+                        let conflict = try await store.runHold(id)
+                        try Task.checkCancellation()
+                        if let conflict {
                             throw ToolFailureError(try conflict.refusal(entry.name).serialize(pretty: false), effects: .none)
                         }
                         try await MyQueue.finish(entry, dropped: dropped, why: why, store: store)
@@ -373,6 +389,7 @@ extension AdaptiveMemoryPromoter {
                     tracePromise("void", work: work, turn: turn, envelope: envelope, id: id, reason: error.localizedDescription)
                     continue
                 } catch {
+                    if Self.isCancellation(error) { return .failure(Self.promiseFilingCancelled) }
                     failure = PromiseFailure(cause: .desk, words: error.localizedDescription)
                     tracePromise("failed", work: work, turn: turn, envelope: envelope, id: id, reason: error.localizedDescription)
                     _ = await promiseFailure(error.localizedDescription, work: work, owner: "MyQueue", cause: .desk, wait: false)
@@ -382,10 +399,14 @@ extension AdaptiveMemoryPromoter {
                 let captureIDs = candidates.compactMap { identities.indices.contains($0) ? identities[$0] : nil }
                 guard captureIDs.count == candidates.count else { return .failure(await promiseFailure("The promise judgment named an unknown candidate.", work: work, wait: false)) }
                 if captureIDs.allSatisfy(landed.contains) { continue }
+                // A proof she owes the person is her own promise: hers to see and settle, never a moment opened in their conversation. One claimed
+                // to a peer stays that peer's, under that peer's authority.
+                let hers = promise.prove == true && turn.originPrincipal == "person"
                 filings.append(.init(target: target,
                     step: DeskStep(words: promise.words, when: when.stored, card: when.card, source: promise.source, peers: sources,
                         elevated: turn.elevatedSources ?? [], session: turn.sessionId,
-                        origin: turn.originPrincipal, replyRoute: turn.envelope, promiseCaptures: captureIDs)))
+                        origin: hers ? "self" : turn.originPrincipal,
+                        replyRoute: hers ? nil : turn.envelope, promiseCaptures: captureIDs)))
             }
         }
         return .success((filings, failure))
@@ -393,6 +414,7 @@ extension AdaptiveMemoryPromoter {
 
     private func filePromiseCaptures(_ filings: [MyQueue.PromiseFiling], after priorFailure: PromiseFailure?,
                                     plan: PromiseFilingPlan, work: PromiseWork) async -> Result<Void, PromiseFailure> {
+        guard !Task.isCancelled else { return .failure(Self.promiseFilingCancelled) }
         let (momentID, dataRoot) = (work.momentID, work.dataRoot)
         let (turn, envelope, store) = (plan.turn, plan.envelope, plan.store)
         var failure = priorFailure
@@ -410,7 +432,7 @@ extension AdaptiveMemoryPromoter {
                 }
             }
             let captures = Set(plan.identities)
-            let hasCardCaptures = filings.contains { $0.step.card != nil } || plan.open.contains {
+            let hasCardCaptures = filings.prefix(results.count).contains { $0.step.card != nil } || plan.open.contains {
                 guard let step = $0.step, step.card != nil else { return false }
                 return !captures.isDisjoint(with: step.promiseCaptures)
             }
@@ -437,9 +459,10 @@ extension AdaptiveMemoryPromoter {
                     _ = await promiseFailure(gap.words, work: work, owner: "MyQueue", cause: .desk, wait: false)
                 }
             }
+            guard !Task.isCancelled, results.count == filings.count else { return .failure(Self.promiseFilingCancelled) }
         } catch {
             if Self.isCancellation(error) {
-                return .failure(PromiseFailure(cause: nil, words: "Promise filing was cancelled; the retained judgment remains due."))
+                return .failure(Self.promiseFilingCancelled)
             }
             tracePromise("failed", work: work, turn: turn, envelope: envelope, reason: error.localizedDescription)
             return .failure(await promiseFailure(error.localizedDescription, work: work, owner: "MyQueue", cause: .desk, wait: false))

@@ -209,7 +209,14 @@ public actor ActivitySpanStore {
     public func wipeAll() throws -> Int {
         let deleted = try dbQueue.write { db -> Int in
             try db.execute(sql: "DELETE FROM activity_span")
-            return db.changesCount
+            let deleted = db.changesCount
+            if deleted > 0 {
+                try db.execute(
+                    sql: "INSERT INTO activity_compaction_owed (id, since) VALUES (1, ?) ON CONFLICT(id) DO NOTHING",
+                    arguments: [Date().timeIntervalSince1970]
+                )
+            }
+            return deleted
         }
         try checkpointAndVacuum()
         return deleted
@@ -282,7 +289,14 @@ public actor ActivitySpanStore {
                 sql: "DELETE FROM activity_span WHERE bundle_id = ?",
                 arguments: [bundleID]
             )
-            return db.changesCount
+            let deleted = db.changesCount
+            if deleted > 0 {
+                try db.execute(
+                    sql: "INSERT INTO activity_compaction_owed (id, since) VALUES (1, ?) ON CONFLICT(id) DO NOTHING",
+                    arguments: [Date().timeIntervalSince1970]
+                )
+            }
+            return deleted
         }
         try checkpointAndVacuum()
         return deleted

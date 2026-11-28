@@ -1,9 +1,9 @@
-import AppKit
 import Foundation
 import ApplicationServices
 import MacNerves
 import NativeAgentShared
 import SenseCore
+import AppKit
 // Blueprint: | `DesktopComposer.swift` | The compiled desktop routes' shared step failure and exact composer read. |
 
 /// The pieces the compiled desktop routes (`DesktopChatRoute`, the courier's fence, `DesktopRouteObservation`) share: a step's failure in the

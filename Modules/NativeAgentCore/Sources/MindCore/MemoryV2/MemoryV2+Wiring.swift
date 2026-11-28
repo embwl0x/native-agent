@@ -198,12 +198,12 @@ extension SwiftNativeMemoryV2 {
                 targetId: id, expectedContentHash: MemoryStorage.contentFingerprint(row.content),
                 reason: "explicit supersession", restatesOwnPast: context.restatesOwnPast(dataRoot: storage.dataRoot))
         }
-        // Share fingerprinted replacement intent with supersession, including cold admission; reasserting the exact target is duplicate evidence, never
-        // demotion.
-        if let corrects, !supersedes.contains(corrects),
-           let target = existingRows.first(where: {
-               $0.id == corrects && $0.status == "active" && MemoryLifecycle.isRecallEligible($0.lifecycle)
-           }), MemoryStorage.comparisonKey(target.content, mode: .canonical) != MemoryStorage.comparisonKey(content, mode: .canonical) {
+        if let corrects, !supersedes.contains(corrects) {
+            guard let target = existingRows.first(where: {
+                $0.id == corrects && $0.status == "active" && MemoryLifecycle.isRecallEligible($0.lifecycle)
+            }) else {
+                throw MemoryV2Error.staleSupersession("Memory to correct is missing or no longer active: \(corrects)")
+            }
             superseding.append(SupersedingAcceptance(
                 targetId: corrects, expectedContentHash: MemoryStorage.contentFingerprint(target.content),
                 reason: correctionReason ?? "explicit correction", restatesOwnPast: context.restatesOwnPast(dataRoot: storage.dataRoot)))
@@ -221,8 +221,7 @@ extension SwiftNativeMemoryV2 {
         let embedded = try await residentWriteEmbedding(content)
         var admitted = record
         if embedded == nil {
-            // Cold admission preserves caller-owned or replacement identity; corrections still use ordinary duplicate checks.
-            admitted.metadata = MemoryStorage.owingAdmission(record.metadata, preservingID: id != nil || !supersedes.isEmpty,
+            admitted.metadata = MemoryStorage.owingAdmission(record.metadata, preservingID: id != nil || !superseding.isEmpty,
                                                            superseding: superseding)
         }
         admitted.embedding = embedded?.vector

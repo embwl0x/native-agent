@@ -43,6 +43,10 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
         }
         savedAt = try container.decode(Date.self, forKey: .savedAt)
         chemicalState = try container.decode(ChemicalState.self, forKey: .chemicalState)
+        guard (-1...1).contains(chemicalState.warmth) else {
+            throw DecodingError.dataCorruptedError(forKey: .chemicalState, in: container,
+                debugDescription: "Warmth must be in -1...1")
+        }
         bodySchema = try container.decode(BodySchema.self, forKey: .bodySchema)
         field = try container.decode(OrganismField.self, forKey: .field)
         predictionLedger = try container.decode(OrganismPredictionLedger.self, forKey: .predictionLedger)
@@ -161,7 +165,7 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
             (neutralValue + ((value - neutralValue) * factor)).clamped01()
         }
         return ChemicalState(
-            warmth: towardZero(state.warmth, factor: slow),
+            warmth: state.warmth * slow,
             vigilance: towardZero(state.vigilance),
             curiosity: towardZero(state.curiosity, factor: slow),
             fatigue: OrganismChemistry.relaxedFatigue(state.fatigue, elapsed: fatigueElapsed),
@@ -239,7 +243,7 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
         var expiredHorizons = 0
         let decayed = next.predictions.values.map { prediction -> OrganismPrediction in
                 var copy = prediction
-                if copy.status == .pending && copy.dueAt < now && !deferredIDs.contains(copy.id) {
+                if copy.status == .pending && copy.horizon?.peerJobID == nil && copy.dueAt < now && !deferredIDs.contains(copy.id) {
                     // Share live expiry transitions; a passed horizon means waiting, never an incorrect prediction.
                     if OrganismPredictiveBody.applyExpiryTransition(to: &copy, at: now) {
                         expiredKinds.append(copy.kind)

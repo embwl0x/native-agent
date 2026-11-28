@@ -8,17 +8,22 @@ struct GrokSecureSetupCard: View {
     let operation: UUID
     @Environment(AppModel.self) private var appModel
     @State private var session = FacePageSession()
-    private var face: PartFace {
+    private var botRow: PartFace.Row? {
+        appModel.face.slot(.page("connectors")).value(as: PartFaceSnapshot.self)?.drawnFace?.allRows
+            .first { $0.id == "agent-grok-bot:" + contact }
+    }
+    private func face(botRow: PartFace.Row?) -> PartFace {
         PartFace(title: "Routine credentials", sections: [
             .init(id: "grok.bot", rows: [], block: .init(kind: "form", key: "grok.bot", fields: [
                 .init(id: "name", label: "Bot name", required: true)
-            ], submit: [.init(id: "bot", label: "Use this Bot", call: .init("agent.grok_bot"))]))
+            ], submit: [.init(id: "bot", label: "Use this Bot", call: botRow?.control?.call)]))
         ])
     }
     var body: some View {
+        let botRow = self.botRow
         ProtectedFaceEntry {
             VStack(alignment: .leading, spacing: 12) {
-                FaceView(face: face, door: door, session: session)
+                FaceView(face: face(botRow: botRow).stampingPageRevision(botRow?.pageRevision), door: door, session: session)
                 FaceProtectedForm(face: PartFace(sections: [
                     .init(id: "grok.credentials", rows: [], block: .init(kind: "form", key: "grok.credentials", fields: [
                         .init(id: "credentials", label: "Routine credentials", kind: "secret",
@@ -42,16 +47,18 @@ struct GrokSecureSetupCard: View {
                 }
             }
         }
+        .modifier(FaceObservation(demand: .key(.page("connectors"))))
     }
     private var door: ClosureFaceDoor {
         ClosureFaceDoor(open: { _ in }, waitingOn: "Grok setup") { submission in
             do {
                 let value = submission.values?["name"]
-                let call = PartFace.Call("agent.grok_bot", ["agent": .string(contact)])
+                let call = submission.expectedCall
                 let reply = try await appModel.protectedFormAct(.pageAct(.init(page: "connectors",
                     row: "agent-grok-bot:" + contact, action: "set", value: value,
                     expectedRevision: nil, expectedCall: value.map { call.setting($0) } ?? call,
-                    answers: true, operation: submission.id, checking: submission.checking)))
+                    answers: true, operation: submission.id, checking: submission.checking,
+                    expectedPageRevision: submission.expectedPageRevision)))
                 let outcome = try FaceActOutcome.reply(reply)
                 return outcome
             } catch { return .interrupted(error) }

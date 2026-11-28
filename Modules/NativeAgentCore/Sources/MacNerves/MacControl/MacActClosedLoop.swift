@@ -475,6 +475,7 @@ public enum MacActClosedLoop {
     /// The act declares its effect before input. All routes use this judge; pixels and notification counts alone cannot satisfy a declaration.
     enum DeclaredEffect {
         case text(String?)
+        case textDigest(String)
         case placement(MacSavePanelPlacement, String?)
         case selectAll
         case selected
@@ -505,6 +506,16 @@ public enum MacActClosedLoop {
         var unobserved = "The input went out, but the declared effect could not be read back."
         var unobservedReason = "effect_unreadable"
         switch effect {
+        case .textDigest(let expected):
+            readback = "The complete AXValue matches the declared after condition."
+            mismatch = "The complete AXValue does not match the declared after condition."
+            unobserved = "The complete AXValue could not be read back for the declared after condition."
+            unobservedReason = "after_predicate_unobserved"
+            if !redactingText, let value = value(),
+               !MacScreenViewBuilder.isSecretField(role: "AXTextField", subrole: nil, label: nil, value: value) {
+                matches = SHA256Hex.of(utf8: value) == expected
+                if matches == false { return ActClassification(status: "acted_mismatch", reason: "after_predicate_mismatch", note: mismatch) }
+            } else { matches = nil }
         case .text(let expected):
             readback = "The complete AXValue matches the declared edit."
             // Canonical field masking makes the complete text unavailable, including short masked values and fields with no secure subrole.

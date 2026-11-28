@@ -19,12 +19,9 @@ public enum SomaticSignalKind: String, Codable, Sendable, Equatable, CaseIterabl
     case deskItemBlocked
     case deskItemClosed
     case deskItemCancelled
-    case memoryCommitted
-    case memoryCorrected
     case dreamCompleted
     case remIntegrated
     case iPhoneReachable
-    case iPhoneStale
     case phoneDeliveryStarted
     case phoneDeliveryReceived
     case phoneDeliveryFailed
@@ -32,7 +29,6 @@ public enum SomaticSignalKind: String, Codable, Sendable, Equatable, CaseIterabl
     case approvalResolved
     case appWake
     case appSleep
-    case resourcePressureChanged
     /// Horizon refresh changes prediction rows only, without chemistry, body facts, field associations or intrinsic valence.
     case horizonRefresh
     /// One of the agent's organs broke from its record (missed, failed, stuck or off record), felt once at its onset and again as it grows.
@@ -68,21 +64,26 @@ public struct SomaticSignal: Codable, Sendable, Equatable, Identifiable {
         self.intensity = intensity.clamped01()
         self.valence = valence.map { $0.clampedSigned() }
         self.arousal = arousal.map { $0.clamped01() }
-        self.metadata = Self.boundedMetadata(metadata, bounds: bounds)
+        self.metadata = Self.boundedMetadata(metadata, bounds: bounds, kind: kind)
     }
 
     public static func boundedMetadata(
         _ metadata: [String: JSONValue],
-        bounds: OrganismMetadataBounds = .defaults
+        bounds: OrganismMetadataBounds = .defaults,
+        kind: SomaticSignalKind? = nil
     ) -> [String: JSONValue] {
         var out: [String: JSONValue] = [:]
         for key in metadata.keys.sorted().prefix(bounds.maximumKeys) {
             let cleanKey = String(key.trimmingCharacters(in: .whitespacesAndNewlines).prefix(80))
             guard !cleanKey.isEmpty else { continue }
+            var keyBounds = bounds
+            if kind == .horizonRefresh, key == OrganismHorizonRegister.peerJobsKey {
+                keyBounds.maximumArrayItems = OrganismHorizonRegister.maximumPeerJobs
+            }
             // Share metadata redaction and depth bounds across organism, substrate and continuity paths.
             out[cleanKey] = JSONValueBounding.bounded(
                 metadata[key] ?? .null,
-                bounds: bounds,
+                bounds: keyBounds,
                 keyPath: cleanKey.lowercased(),
                 depth: 0
             )
@@ -136,7 +137,7 @@ public struct ChemicalState: Codable, Sendable, Equatable {
         novelty: Double = 0,
         urgency: Double = 0
     ) {
-        self.warmth = warmth.clamped01()
+        self.warmth = warmth.clampedSigned()
         self.vigilance = vigilance.clamped01()
         self.curiosity = curiosity.clamped01()
         self.fatigue = fatigue.clamped01()
@@ -160,11 +161,6 @@ public enum OrganismResourcePressure: String, Codable, Sendable, Equatable, Case
     case elevated
     case high
     case critical
-
-    static func from(metadata: [String: JSONValue]) -> Self? {
-        guard case .string(let raw)? = metadata["resourcePressure"] else { return nil }
-        return Self(rawValue: raw)
-    }
 }
 
 public struct BodySchema: Codable, Sendable, Equatable {
@@ -288,19 +284,25 @@ public struct OrganismReadout: Sendable, Equatable {
     public var bodySchema: BodySchema
     /// The fingerprint reads the body's diurnal clock here; nil means no configured clock or a disabled organism.
     public var diurnal: OrganismDiurnalRead?
+    public var prospect: OrganismProspect?
+    public var tenderNamed: Bool
 
     public init(
         generatedAt: Date,
         bodyLine: String? = nil,
         chemicalState: ChemicalState = .neutral,
         bodySchema: BodySchema = .neutral,
-        diurnal: OrganismDiurnalRead? = nil
+        diurnal: OrganismDiurnalRead? = nil,
+        prospect: OrganismProspect? = nil,
+        tenderNamed: Bool = false
     ) {
         self.generatedAt = generatedAt
         self.bodyLine = bodyLine
         self.chemicalState = chemicalState
         self.bodySchema = bodySchema
         self.diurnal = diurnal
+        self.prospect = prospect
+        self.tenderNamed = tenderNamed
     }
 
     /// A clock alone is not a feeling; unchanged chemistry remains neutral and silent.

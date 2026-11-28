@@ -77,7 +77,7 @@ public actor ChatGPTAccountModelRefresh {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = .infinity
         config.timeoutIntervalForResource = .infinity
-        config.waitsForConnectivity = true
+        config.waitsForConnectivity = false
         return URLSession(configuration: config)
     }
 

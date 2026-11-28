@@ -99,6 +99,7 @@ extension NativeAgentEngine {
                 "postureBucket": .string(DoctorPlainCopy.bucket(for: snapshot.postureStatus)), "bodyState": .string(snapshot.bodyState),
                 "behaviorLine": .string(snapshot.behaviorLine), "deskSummary": .string(snapshot.deskSummary),
                 "approvalsSummary": .string(snapshot.approvalsSummary), "lastDreamSummary": .string(snapshot.lastDreamSummary),
+                "at": DiagnosticsFacts.stamp(cognitionView.livingRefreshStatus?.lastSuccessAt),
             ])
         }
         if let status = cognitionView.livingRefreshStatus { living["failedEndpoints"] = .array(status.failedEndpoints.map(JSONValue.string)) }

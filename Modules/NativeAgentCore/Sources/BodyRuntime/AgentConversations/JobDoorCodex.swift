@@ -93,13 +93,13 @@ struct CodexJobDoor: JobRunner {
         contact.transport == .mcpHost && contact.ability == nil && JobDoors.flags(contact) == .codex
     }
 
-    func start(_ job: JobStart) async throws -> AsyncThrowingStream<JobEvent, Error> { try open(job, resuming: nil) }
+    func start(_ job: JobStart) async throws -> AsyncThrowingStream<JobEvent, Error> { try await open(job, resuming: nil) }
 
-    func resume(_ job: JobStart, session: String) async throws -> AsyncThrowingStream<JobEvent, Error> { try open(job, resuming: session) }
+    func resume(_ job: JobStart, session: String) async throws -> AsyncThrowingStream<JobEvent, Error> { try await open(job, resuming: session) }
 
     func cancel(session: String) async throws { await live.stop(Self.door + ":" + session) }
 
-    private func open(_ job: JobStart, resuming: String?) throws -> AsyncThrowingStream<JobEvent, Error> {
+    private func open(_ job: JobStart, resuming: String?) async throws -> AsyncThrowingStream<JobEvent, Error> {
         let name = job.contact.name
         let record = try JobDoors.Record.read(job, dataRoot: dataRoot)
         let approved = try JobDoors.approved(job.contact)
@@ -107,7 +107,7 @@ struct CodexJobDoor: JobRunner {
         let environment: [String: String]
         do { environment = try row.installation.launchEnvironment() }
         catch { throw JobRefusal("\(name)'s installation could not be read: \(error.localizedDescription). Nothing ran.") }
-        let folder = try JobDoors.folder(job, host: host, dataRoot: dataRoot)
+        let folder = try await JobDoors.folder(job, host: host, dataRoot: dataRoot)
         let process: AgentLineProcess
         do {
             process = try AgentLineProcess(executable: approved.path, arguments: ["app-server"], directory: folder, environment: environment,

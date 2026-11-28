@@ -39,9 +39,9 @@ extension SwiftNativeTurnEngine {
             ]
             // A thought of the agent's carries what it attends.
             if let attended = turn.attended { message["attended"] = attended }
-            try await part.deliver([.object(message)])
+            try await part.deliver([.object(message)], turn: turn)
         } else {
-            inFlight = try await part.resume()
+            inFlight = try await part.resume(turn: turn)
         }
         return inFlight
     }
@@ -210,11 +210,11 @@ extension SwiftNativeTurnEngine {
                 "text": .string(TurnObservation.text(resumed)), "steps": .int(Int64(receipts.count))]
             // Saved receipts retain landed effects even when relaunch lost the result event.
             event["effect"] = Self.landedEffect(.object(["receipts": .array(stem.tally.dispatches.map(\.result))])).map(JSONValue.string)
-            try await stem.part.deliver([.object(event)])
+            try await stem.part.deliver([.object(event)], turn: stem.turn)
         }
     }
 
-    func commitDelivery(_ stem: TurnStem) async throws {
+    func commitDelivery(_ stem: TurnStem, round: ModelRound? = nil) async throws {
         if !stem.owed.familiarOwed.isEmpty, let root = remPinsDataRoot {
             let lines = stem.owed.familiarOwed
             stem.owed.familiarOwed = []
@@ -222,6 +222,11 @@ extension SwiftNativeTurnEngine {
             catch { _ = familiarityFailure(error, root: root, turn: stem.turn) }
         }
         if stem.tally.providerCallCount > 0 {
+            if let round, !round.associationBodies.isEmpty {
+                let delivered = round.associationBodies
+                round.associationBodies.removeAll()
+                await stem.wire.resolvedTurnContext.fluidContextTurn?.recordAssociationDelivery(delivered)
+            }
             if let acknowledge = stem.owed.commitPartsDelivery {
                 stem.owed.commitPartsDelivery = nil
                 acknowledge(Self.deliveredInput(stem.wire.resolvedTurnContext))

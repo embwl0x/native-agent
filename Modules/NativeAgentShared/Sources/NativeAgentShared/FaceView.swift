@@ -12,6 +12,7 @@ public struct FaceView: View {
     private let adapter: any FaceDoor
     private let leaf: ((PartFace.Block) -> AnyView)?
     private let rowFilter: ((PartFace.Row) -> Bool)?
+    private let inline: Bool
     @State private var localSession: FacePageSession
     private let retainedSession: FacePageSession?
     private var session: FacePageSession { retainedSession ?? localSession }
@@ -23,7 +24,7 @@ public struct FaceView: View {
     @Environment(\.faceHoldsDocuments) private var holdsDocuments
 
     public init(face: PartFace, levers: [PartFace.Section] = [], words: String? = nil, keyed: [PartFace.Section] = [],
-                door: any FaceDoor, session: FacePageSession, retaining: Bool = true,
+                door: any FaceDoor, session: FacePageSession, retaining: Bool = true, inline: Bool = false,
                 leaf: ((PartFace.Block) -> AnyView)? = nil, rowFilter: ((PartFace.Row) -> Bool)? = nil) {
         self.face = face
         self.levers = levers
@@ -32,6 +33,7 @@ public struct FaceView: View {
         adapter = door
         self.leaf = leaf
         self.rowFilter = rowFilter
+        self.inline = inline
         retainedSession = retaining ? session : nil
         _localSession = State(initialValue: session)
     }
@@ -40,9 +42,9 @@ public struct FaceView: View {
                 retaining: Bool = true, leaf: ((PartFace.Block) -> AnyView)? = nil) {
         let drawn = snapshot.drawnFace
         let face = drawn ?? PartFace(sections: [])
-        self.init(face: header ? face : PartFace(sections: face.sections, detail: face.detail), levers: snapshot.levers ?? [],
+        self.init(face: header ? face : PartFace(sections: face.sections, detail: face.detail), levers: snapshot.drawnLevers,
                   words: drawn == nil ? snapshot.error?.message ?? title + " is " + snapshot.status.rawValue + "." : nil,
-                  keyed: drawn == nil ? snapshot.keyLevers ?? [] : [], door: door, session: session, retaining: retaining, leaf: leaf)
+                  keyed: drawn == nil ? snapshot.drawnKeyLevers : [], door: door, session: session, retaining: retaining, leaf: leaf)
     }
 
     #if os(iOS)
@@ -78,9 +80,8 @@ public struct FaceView: View {
     }
 
     private func itemDoor(_ request: FaceReadRequest) -> any FaceDoor {
-        for section in sections where section.allRows.contains(where: { $0.id == request.key }) {
-            let raw = section.id.split(separator: ":", maxSplits: 1).dropFirst().joined(separator: ":")
-            if let scope = session.collections.scope(section: raw, row: request.key) { return adapter.scoped(to: scope) }
+        for source in collectionSources where session.collections.section(source).allRows.contains(where: { $0.id == request.key }) {
+            if let scope = session.collections.scope(section: source, row: request.key) { return adapter.scoped(to: scope) }
         }
         return adapter
     }
@@ -142,14 +143,9 @@ public struct FaceView: View {
         Group {
             if inList { contents }
             else {
-                let stack = VStack(alignment: .leading, spacing: NativeAgentSpacing.section) { contents }
+                VStack(alignment: .leading, spacing: NativeAgentSpacing.section) { contents }
                     .modifier(FaceWidth())
                     .modifier(FaceDialogs())
-                #if os(macOS)
-                GlassEffectContainer(spacing: 0) { stack }
-                #else
-                stack
-                #endif
             }
         }
         .onChange(of: visibleRows) { old, new in reconcile(old: old, new: new) }
@@ -169,6 +165,7 @@ public struct FaceView: View {
             session.documents.hold(demands, by: viewer, door: adapter)
         }
         .onDisappear {
+            if inline { session.inlineFocused = false }
             session.documents.release(viewer)
             session.collections.release(viewer)
             session.detach(viewer)
@@ -176,11 +173,17 @@ public struct FaceView: View {
         .onChange(of: controls) { _, new in
             if case .control(let item)? = focus, !new.contains(item), visibleRows.contains(item) { focus = .row(item) }
         }
-        .onChange(of: focus) { _, next in if let item = next?.item { session.selection = item } }
+        .onChange(of: focus) { _, next in
+            if inline { session.inlineFocused = next != nil }
+            if let item = next?.item { session.selection = item }
+        }
         #if os(macOS)
+        .environment(\.faceInlineTextSelection, inline)
         .background {
-            Button("") { session.showsFilter = true; focus = .filter }
-                .keyboardShortcut("f", modifiers: .command).hidden().accessibilityHidden(true)
+            if !inline {
+                Button("") { session.showsFilter = true; focus = .filter }
+                    .keyboardShortcut("f", modifiers: .command).hidden().accessibilityHidden(true)
+            }
         }
         #endif
     }
@@ -254,6 +257,12 @@ public struct FaceView: View {
         }
     }
 }
+
+#if os(macOS)
+extension EnvironmentValues {
+    @Entry var faceInlineTextSelection = false
+}
+#endif
 
 enum FaceTone {
     static func color(_ tone: PartFace.Tone?) -> Color {

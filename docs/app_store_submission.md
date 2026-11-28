@@ -148,8 +148,8 @@ Before submission:
   For this release, verify pairing and a chat round trip; include sharing,
   approval or notification behavior when those areas changed.
 - Capture current iPhone/iPad screenshots with generic data and no pairing
-  keys, private conversations or credentials. Use the current Chat, Activity,
-  Memories, Desk and More screens.
+  keys, private conversations or credentials. Use Together, Table, Today,
+  the named agent tab, and Control.
 - Finalize listing, questionnaire answers, review contact/setup, hosted links,
   and the account owner's upload/submission decision.
 

@@ -144,7 +144,7 @@ public struct ChatGPTDotIPCTransport: Sendable {
               (try? AgentPeerStore(dataRoot: root).list().contains(where: Self.owns)) == true else { return }
         let environment = AgentBridgeRuntime.processEnvironment()
         guard let helper = AgentBridgeRuntime.helperURL(named: "chatgpt_dot_ipc.js", dataRoot: root),
-              let node = AgentBridgeRuntime.executableURL(named: "node", environment: environment) else {
+              let node = AgentBridgeRuntime.executableURL(environment: environment) else {
             return settle(Self.unavailable("Dot messaging helper or Node.js is unavailable."), generation: generation)
         }
         let process = Process(), lifeline = Pipe(), output = Pipe()

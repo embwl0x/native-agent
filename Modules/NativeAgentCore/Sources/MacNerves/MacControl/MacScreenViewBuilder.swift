@@ -19,11 +19,11 @@ public enum MacScreenViewBuilder {
     /// Bound prose so thousands of document text nodes cannot drown the legend.
     public static let hardMaxTextItems = 80
     public static let visualSurfaceRoles: Set<String> = ["AXImage", "AXCanvas"]
+    private static let minimumVisualSurfaceAreaFraction = 0.03
     /// Only substantial visual surfaces earn a pixel budget; small-icon crops lose useful surrounding UI.
     public static func dominantVisualSurface(
         nodes: [MacAXNode],
-        geometry: MacScreenViewGeometry,
-        minimumAreaFraction: Double = 0.03
+        geometry: MacScreenViewGeometry
     ) -> MacAXFrame? {
         let captureArea = geometry.bounds.w * geometry.bounds.h
         guard captureArea > 0 else { return nil }
@@ -49,7 +49,7 @@ public enum MacScreenViewBuilder {
                 - max(frame.x, geometry.bounds.x))
             let clippedH = max(0, min(frame.y + frame.h, geometry.bounds.y + geometry.bounds.h)
                 - max(frame.y, geometry.bounds.y))
-            guard clippedW * clippedH / captureArea >= minimumAreaFraction else { return nil }
+            guard clippedW * clippedH / captureArea >= Self.minimumVisualSurfaceAreaFraction else { return nil }
             return frame
         }.max { lhs, rhs in lhs.w * lhs.h < rhs.w * rhs.h }
     }

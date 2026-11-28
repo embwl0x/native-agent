@@ -9,16 +9,12 @@ import DeskCore
 // Blueprint: | `StudioActions+StudioCanonTools.swift` | `SwiftToolDispatcher`, `impl_studio_canon`, `impl_studio_canon_resolve`; live-turn resolution |
 
 extension SwiftToolDispatcher {
-    private func studioCanonStore() -> SwiftNativeStudioStore {
-        SwiftNativeStudioStore(dataRoot: dataRoot)
-    }
-
     private func studioCanonInbox() -> SwiftNativeApprovalInbox {
         SwiftNativeApprovalInbox(root: dataRoot)
     }
 
     func impl_studio_canon(input: StudioCanonArgs) async throws -> JSONValue {
-        let store = studioCanonStore()
+        let store = studioStore()
         let rows: [StudioCanonRow]
         do {
             rows = try await store.readCanon()
@@ -176,7 +172,7 @@ extension SwiftToolDispatcher {
             switch outcome {
             case .applied(let title, let action, let written):
                 if !written {
-                    guard let persisted = try await studioCanonStore().readCanon().first(where: { $0.proposalID == proposalID }) else {
+                    guard let persisted = try await studioStore().readCanon().first(where: { $0.proposalID == proposalID }) else {
                         throw StudioCanonError.unknownProposal(proposalID)
                     }
                     standing = persisted.standing
@@ -187,7 +183,7 @@ extension SwiftToolDispatcher {
                     "standing": .string(standing.rawValue),
                     "work": .string(title),
                     "row_written": .bool(written),
-                    "canon_path": .string(studioCanonStore().canonPath.path),
+                    "canon_path": .string(studioStore().canonPath.path),
                     "decided_on_surface": .string(provenance.surface),
                 ])
             case .declined(let title):

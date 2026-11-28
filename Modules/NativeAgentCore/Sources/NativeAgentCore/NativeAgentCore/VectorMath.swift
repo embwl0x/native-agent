@@ -48,26 +48,7 @@ public enum VectorMath {
         }
     }
 
-    /// What a similarity decision does, which sets how far past chance its winner must stand.
-    public enum Decision: Sendable {
-        /// Something comes to the agent's attention: a care touched, a memory recalled into the turn, a moment it is reminded of. One deviation past chance.
-        case attention
-        /// Something is done for the agent without asking. Two deviations past chance.
-        case action
-
-        public var margin: Double {
-            switch self {
-            case .attention: return 1
-            case .action: return 2
-            }
-        }
-    }
-
-    /// The chance bar for unsolicited attention and action: the best of `candidates` stands out by about √(2 ln n) deviations by chance alone (the expected
-    /// maximum of n draws), so a candidate counts only when its `standout` reaches that plus the decision's margin. Derived from chance, not fitted, and it
-    /// rises as the candidates grow: 3.5 for attention among 23 cares, 4.0 among 80 memories; 4.0 to 4.6 for an action among 7 to 32. Addressed recall and care
-    /// birth/night use the memory standout bar in ContextSelectionConfiguration instead; ambient touches retain this bar.
-    public static func chanceBar(_ decision: Decision, among candidates: Int) -> Double {
-        decision.margin + (2 * log(Double(max(1, candidates)))).squareRoot()
+    public static func chanceBar(among candidates: Int) -> Double {
+        1 + (2 * log(Double(max(1, candidates)))).squareRoot()
     }
 }

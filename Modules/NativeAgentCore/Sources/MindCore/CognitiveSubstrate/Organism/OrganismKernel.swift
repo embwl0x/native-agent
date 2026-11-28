@@ -1,5 +1,7 @@
 import Foundation
 import PersistenceCore
+import NativeAgentCore
+import NativeAgentShared
 // Blueprint: | `OrganismKernel.swift` | `OrganismKernel` actor; `configure`, `foldTurn` (the body's whole share of one lived moment, with its watermark) |
 
 public struct OrganismDependencies: Sendable {
@@ -7,18 +9,19 @@ public struct OrganismDependencies: Sendable {
     public var makeUUID: @Sendable () -> UUID
     /// Bounded immutable projection of pending tool expectations. The kernel still owns the prediction ledger; readers receive no mutation handle.
     public var predictedToolGroupsSink: @Sendable (Set<String>) -> Void
+    let repair: @Sendable (OrganismDreamRepair.Reading, Turn?) async throws -> OrganismDreamRepair.Plan
 
-    public init(
+    package init(
         now: @escaping @Sendable () -> Date = { Date() },
         makeUUID: @escaping @Sendable () -> UUID = { UUID() },
-        predictedToolGroupsSink: @escaping @Sendable (Set<String>) -> Void = { _ in }
+        predictedToolGroupsSink: @escaping @Sendable (Set<String>) -> Void = { _ in },
+        repair: @escaping @Sendable (OrganismDreamRepair.Reading, Turn?) async throws -> OrganismDreamRepair.Plan
     ) {
         self.now = now
         self.makeUUID = makeUUID
         self.predictedToolGroupsSink = predictedToolGroupsSink
+        self.repair = repair
     }
-
-    public static let live = OrganismDependencies()
 }
 
 public actor OrganismKernel {
@@ -38,7 +41,7 @@ public actor OrganismKernel {
 
     public init(
         configuration: OrganismConfiguration = .disabled,
-        dependencies: OrganismDependencies = .live,
+        dependencies: OrganismDependencies,
         chemicalState: ChemicalState = .neutral,
         bodySchema: BodySchema = .neutral,
         field: OrganismField = .empty,
@@ -63,12 +66,13 @@ public actor OrganismKernel {
     }
 
     /// The person's reaction to the agent's last completion settles the expectation it answers (part of `foldTurn`).
-    private func liveAfterTurnReaction(_ signal: SomaticSignal) {
+    private func liveAfterTurnReaction(_ signal: SomaticSignal, correctionConfidence: Double) {
         guard signal.metadata[OrganismSemanticExpectation.reactionMetadataKey] != nil else { return }
         let before = body.predictionLedger
         var next = body
         OrganismPredictiveBody.resolveSemanticExpectations(
-            signal: signal, ledger: &next.predictionLedger, chemicalState: &next.chemicalState)
+            signal: signal, ledger: &next.predictionLedger, chemicalState: &next.chemicalState,
+            correctionConfidence: correctionConfidence)
         let felt = OrganismResolutionFelt.events(before: before, after: next.predictionLedger, at: dependencies.now())
         next.predictionLedger = felt.stamped
         body = next
@@ -79,7 +83,7 @@ public actor OrganismKernel {
     }
 
     /// Infrastructure signals may update health, predictions and field while feelings follow time alone.
-    public func ingest(_ signal: SomaticSignal, movesFeelings: Bool = true) async {
+    public func ingest(_ signal: SomaticSignal, movesFeelings: Bool = true, parent: Turn? = nil) async throws {
         guard configuration.enabled else { return }
         if signal.kind == .dreamCompleted, body.dreamCompletions?.contains(signal.id) == true { return }
         let ingestedAt = dependencies.now()
@@ -108,24 +112,37 @@ public actor OrganismKernel {
         }
         settleElapsedTime(at: ingestedAt, deferringPredictionExpiry:
             OrganismPredictiveBody.resolvingPredictionIDs(signal: bounded, in: body.predictionLedger))
-        let feltBefore = body.chemicalState
-        defer { if !movesFeelings { body.chemicalState = feltBefore } }
         // Signal density uses ingest time; a nil first gap receives the per-signal share without claiming elapsed time.
-        let elapsedSinceLastSignal = body.lastSignalAt.map {
-            max(0, ingestedAt.timeIntervalSince($0))
+        func derived() -> (updated: (chemicalState: ChemicalState, bodySchema: BodySchema), ledgerBefore: OrganismPredictionLedger,
+                           predicted: (ledger: OrganismPredictionLedger, chemicalState: ChemicalState), field: OrganismField) {
+            let updated = OrganismChemistry.applying(
+                signal: bounded,
+                to: body.chemicalState,
+                bodySchema: body.bodySchema,
+                elapsedSinceLastSignal: body.lastSignalAt.map { max(0, ingestedAt.timeIntervalSince($0)) }
+            )
+            let predicted = OrganismPredictiveBody.applying(
+                signal: bounded,
+                to: body.predictionLedger,
+                chemicalState: updated.chemicalState
+            )
+            return (updated, body.predictionLedger, predicted, OrganismPlasticity.applying(
+                signal: bounded, chemicalState: predicted.chemicalState, bodySchema: updated.bodySchema, to: body.field
+            ))
         }
-        let updated = OrganismChemistry.applying(
-            signal: bounded,
-            to: body.chemicalState,
-            bodySchema: body.bodySchema,
-            elapsedSinceLastSignal: elapsedSinceLastSignal
-        )
-        let ledgerBefore = body.predictionLedger
-        let predicted = OrganismPredictiveBody.applying(
-            signal: bounded,
-            to: body.predictionLedger,
-            chemicalState: updated.chemicalState
-        )
+        var (updated, ledgerBefore, predicted, field) = derived()
+        var repaired: OrganismDreamRepair.Plan?
+        if bounded.kind == .dreamCompleted || bounded.kind == .remIntegrated {
+            while true {
+                let plan = try await dependencies.repair(.init(field: field), parent)
+                try Task.checkCancellation()
+                if signal.kind == .dreamCompleted, body.dreamCompletions?.contains(signal.id) == true { return }
+                // Time passing only fades the field; a decision is stale when the field was written.
+                let decidedOn = field.mutationGeneration
+                (updated, ledgerBefore, predicted, field) = derived()
+                if field.mutationGeneration == decidedOn { repaired = plan; break }
+            }
+        }
         // Notable resolutions carry aboutness into the substrate through a rate-stamped ledger diff and a bounded drain buffer.
         let felt = OrganismResolutionFelt.events(
             before: ledgerBefore,
@@ -137,29 +154,18 @@ public actor OrganismKernel {
         if pendingResolutionFelt.count > Self.pendingResolutionFeltCap {
             pendingResolutionFelt.removeFirst(pendingResolutionFelt.count - Self.pendingResolutionFeltCap)
         }
-        body.chemicalState = predicted.chemicalState
+        if movesFeelings { body.chemicalState = predicted.chemicalState }
         body.bodySchema = updated.bodySchema
-        body.field = OrganismPlasticity.applying(
-            signal: bounded,
-            chemicalState: predicted.chemicalState,
-            bodySchema: updated.bodySchema,
-            to: body.field
-        )
-        let repaired = OrganismDreamRepair.applying(
-            signal: bounded,
-            to: body.field,
-            state: body.dreamRepairState,
-            makeUUID: dependencies.makeUUID
-        )
-        body.field = repaired.field
-        body.dreamRepairState = repaired.state
-        if bounded.kind == .dreamCompleted || bounded.kind == .remIntegrated {
+        if let repaired {
+            OrganismDreamRepair.record(repaired, into: &body, at: bounded.occurredAt, signal: bounded, makeUUID: dependencies.makeUUID)
             // Dream completion resets the separately held wakefulness share as well as reducing total fatigue.
             wakefulnessFatigue = 0
             if bounded.kind == .dreamCompleted {
                 if body.dreamCompletions == nil { body.dreamCompletions = [] }
                 body.dreamCompletions?.insert(bounded.id)
             }
+        } else {
+            body.field = field
         }
         body.signalCount = min(body.signalCount, Int.max - 1) + 1
         // Quiet physiology follows when the signal reached this organism, not an untrusted/delayed source timestamp. The anchor is monotonic so an out-of-order
@@ -170,12 +176,10 @@ public actor OrganismKernel {
 
     public func refreshBodySchema(
         _ read: OrganismBodyRead,
-        integratesChemistry: Bool = true,
         canonicalAffect: OrganismLifeReading? = nil
     ) async {
         applyBodySchema(
             read,
-            integratesChemistry: integratesChemistry,
             canonicalAffect: canonicalAffect,
             at: dependencies.now()
         )
@@ -185,13 +189,11 @@ public actor OrganismKernel {
     /// the returned read remains mutation-free and advisory.
     public func refreshBodySchemaAndFrozenRead(
         _ read: OrganismBodyRead,
-        integratesChemistry: Bool = true,
         canonicalAffect: OrganismLifeReading? = nil,
         fixedAt: Date
     ) -> OrganismFrozenRead {
         applyBodySchema(
             read,
-            integratesChemistry: integratesChemistry,
             canonicalAffect: canonicalAffect,
             at: fixedAt
         )
@@ -200,28 +202,19 @@ public actor OrganismKernel {
 
     private func applyBodySchema(
         _ read: OrganismBodyRead,
-        integratesChemistry: Bool,
         canonicalAffect: OrganismLifeReading?,
         at observedAt: Date
     ) {
         guard configuration.enabled else { return }
         settleElapsedTime(at: observedAt)
-        let nextBodySchema = OrganismBodySchemaSampler.bodySchema(
+        body.bodySchema = OrganismBodySchemaSampler.bodySchema(
             from: read,
             previous: body.bodySchema,
             now: observedAt
         )
-        if integratesChemistry {
-            body.chemicalState = OrganismChemistry.integrating(
-                bodySchema: nextBodySchema,
-                previous: body.bodySchema,
-                into: body.chemicalState
-            )
-        }
-        body.bodySchema = nextBodySchema
         if let canonicalAffect {
             let affect = canonicalAffect.affect
-            body.chemicalState.warmth = affect.socialWarmth.clamped01()
+            body.chemicalState.warmth = affect.socialWarmth.clampedSigned()
             body.chemicalState.urgency = affect.taskPressure.clamped01()
             // A refresh sustains current stakes without erasing lived outcomes or dosing again for another read.
             body.chemicalState.vigilance = max(
@@ -267,7 +260,7 @@ public actor OrganismKernel {
             at: now
         )
         let daily = OrganismCircadian.modulate(
-            anticipated,
+            anticipated.state,
             at: now,
             clock: configuration.diurnalClock
         )
@@ -277,8 +270,9 @@ public actor OrganismKernel {
             bodySchema: bodySchema,
             diurnal: daily.read,
             tenderNamed: body.caringEncounter.lastCaringTurnAt.map {
-                now.timeIntervalSince($0) < OrganismChemistry.tenderNamedWindow
-            } ?? false
+                (0..<OrganismChemistry.tenderNamedWindow).contains(now.timeIntervalSince($0))
+            } ?? false,
+            prospect: anticipated.prospect
         )
     }
 
@@ -288,10 +282,10 @@ public actor OrganismKernel {
     }
 
     /// Read delivery outcomes from this live ledger; decoding its persisted snapshot would bypass newer resident evidence.
-    public func latestPrediction(ofKind kind: OrganismPredictionKind) -> OrganismPrediction? {
+    public func latestPrediction(ofKind kind: OrganismPredictionKind, includingPeerWaits: Bool = true) -> OrganismPrediction? {
         guard configuration.enabled else { return nil }
         return body.predictionLedger.predictions.values
-            .filter { $0.kind == kind }
+            .filter { $0.kind == kind && (includingPeerWaits || $0.horizon?.peerJobID == nil) }
             .max { lhs, rhs in
                 if lhs.lastUpdatedAt != rhs.lastUpdatedAt {
                     return lhs.lastUpdatedAt < rhs.lastUpdatedAt
@@ -322,26 +316,28 @@ public actor OrganismKernel {
         return currentResidualRepairOpportunity(at: now)
     }
 
-    /// Execute one already-due local repair pass. The result is false when the evidence decayed, a newer signal reset the quiet window, or no bounded field
-    /// operation remained. It never recruits a model or dispatches work.
     @discardableResult
-    public func runResidualRepairIfDue(satisfyWait: Bool = false) async -> Bool {
+    public func runResidualRepairIfDue(satisfyWait: Bool = false, parent: Turn? = nil,
+        isAdmitted: @Sendable () async -> Bool) async throws -> Bool {
         guard configuration.enabled else { return false }
         let now = dependencies.now()
         settleElapsedTime(at: now)
         let opportunity = currentResidualRepairOpportunity(at: now, satisfyWait: satisfyWait)
         guard opportunity.ready else { return false }
-        let previous = body.dreamRepairState
-        let repaired = OrganismDreamRepair.applyingResidualPressure(
-            opportunity,
-            at: now,
-            to: body.field,
-            state: body.dreamRepairState,
-            makeUUID: dependencies.makeUUID
-        )
-        body.field = repaired.field
-        body.dreamRepairState = repaired.state
-        return body.dreamRepairState != previous
+        var plan: OrganismDreamRepair.Plan
+        while true {
+            let decidedOn = body.field
+            plan = try await dependencies.repair(.init(field: decidedOn, opportunity: opportunity), parent)
+            try Task.checkCancellation()
+            guard await isAdmitted() else {
+                throw PartCallError(code: "field_changed", message: "Residual repair's admission changed while its part was deciding.")
+            }
+            if body.field.mutationGeneration == decidedOn.mutationGeneration { break }
+        }
+        guard plan.field != body.field else { return false }
+        OrganismDreamRepair.record(plan, into: &body, at: now,
+            residualEvidenceCount: opportunity.evidenceCount, makeUUID: dependencies.makeUUID)
+        return true
     }
 
     /// Drains felt resolutions (relief / disappointment) minted since the last drain. The caller (NativeCognitionRuntime) turns each into a substrate event
@@ -358,10 +354,6 @@ public actor OrganismKernel {
             settleElapsedTime(at: now)
         }
         return renderRead(from: body, at: now).snapshot
-    }
-
-    public func behaviorPosture() async -> OrganismBehaviorPosture? {
-        OrganismBehaviorPosture.from(snapshot: await snapshot())
     }
 
     /// Project from a copy at one time so posture reads cannot settle or rewrite the live kernel.
@@ -503,9 +495,8 @@ public actor OrganismKernel {
                 caring = .coalesced
             }
         }
-        if let reaction = fold.reaction { liveAfterTurnReaction(reaction) }
-        if fold.correctionConfidence > 0 {
-            body.chemicalState.confidence = OrganismChemistry.raise(body.chemicalState.confidence, by: fold.correctionConfidence)
+        if let reaction = fold.reaction {
+            liveAfterTurnReaction(reaction, correctionConfidence: fold.correctionConfidence)
         }
         body.lived = fold.seq
         return .lived(caring: caring)
@@ -527,12 +518,9 @@ public actor OrganismKernel {
 
     /// Only human causes move curiosity, coherence, agency and confidence; positive doses saturate while negative doses lower.
     public func admitHumanCause(
-        curiosity: Double = 0, coherence: Double = 0, agency: Double = 0, confidence: Double = 0,
-        epoch: UInt64? = nil
+        curiosity: Double = 0, coherence: Double = 0, agency: Double = 0, confidence: Double = 0
     ) {
         guard configuration.enabled else { return }
-        // A cause from a turn admitted before the body's last forgetting.
-        if let epoch, epoch != body.epoch { return }
         settleElapsedTime(at: dependencies.now())
         body.chemicalState.curiosity = OrganismChemistry.raise(body.chemicalState.curiosity, by: curiosity)
         body.chemicalState.coherence = OrganismChemistry.raise(body.chemicalState.coherence, by: coherence)

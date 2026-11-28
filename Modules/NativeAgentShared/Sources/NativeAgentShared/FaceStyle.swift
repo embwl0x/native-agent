@@ -6,7 +6,13 @@ import UIKit
 #else
 import AppKit
 #endif
-// Blueprint: | `FaceStyle.swift` | Door-supplied card surface, row density, insets and type |
+// Blueprint: | `FaceStyle.swift` | Door-supplied card surface, row density, insets, type and the Reduce Motion animation gate |
+
+public extension Animation {
+    static func respecting(_ animation: Animation?, reduceMotion: Bool) -> Animation? {
+        reduceMotion ? nil : animation
+    }
+}
 
 public struct FaceStyle: Sendable {
     public let insets: EdgeInsets
@@ -63,6 +69,12 @@ struct FaceCard: ViewModifier {
 extension EnvironmentValues {
     @Entry var faceContainerWidth: CGFloat = 0
     @Entry var faceListWidth: FaceListWidth? = nil
+    @Entry var faceListCompact: FaceListCompact? = nil
+}
+
+struct FaceListCompact: Equatable {
+    let insets: CGFloat
+    let value: Bool
 }
 
 @MainActor @Observable final class FaceConfirmations {
@@ -160,9 +172,12 @@ struct FaceListWidthProbe: ViewModifier {
 
 private struct FaceListHost: ViewModifier {
     @State private var list = FaceListWidth()
+    @Environment(\.faceStyle) private var style
 
     func body(content: Content) -> some View {
-        content.environment(\.faceContainerWidth, list.width)
+        let insets = style.insets.leading + style.insets.trailing
+        let given = list.width + insets
+        content.environment(\.faceListCompact, FaceListCompact(insets: insets, value: given > 0 && given < 420))
             .environment(\.faceListWidth, list)
             .modifier(FaceDialogs())
     }

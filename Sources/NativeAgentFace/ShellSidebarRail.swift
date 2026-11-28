@@ -53,7 +53,7 @@ struct ShellRailItem: View {
                         : (hovering ? NativeAgentShell.text.opacity(0.75) : NativeAgentShell.secondary))
                     // Scope hover animation to the word so selection-bar travel keeps the rail's transaction.
                     .animation(
-                        NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion),
+                        Animation.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion),
                         value: hovering
                     )
                     .lineLimit(1)
@@ -146,6 +146,10 @@ struct ShellSidebarRail: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
+        HouseGlassContainer(spacing: 0) { rail }
+    }
+
+    private var rail: some View {
         // Anchor Diagnostics at the foot so the advanced view stays apart from the places of work.
         SurfaceLayoutContent(appModel.shellLayout) { layout in
         let surfaces = ShellSurface.shown(layout, profile: layoutProfile)
@@ -157,7 +161,7 @@ struct ShellSidebarRail: View {
         }
         // Animate the whole rail in one transaction so departing and arriving bars stay in sync.
         .animation(
-            NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion),
+            Animation.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion),
             value: surface
         )
         }
@@ -192,10 +196,11 @@ struct ShellPlaceRow: View {
     let place: ShellSurfacePages
     let isSelected: Bool
     let barNamespace: Namespace.ID
+    var simple = false
     let onSelect: () -> Void
 
     var body: some View {
-        let title = place.surface.title(appModel)
+        let title = place.surface.title(agentName: appModel.agentDisplayName, simple: simple)
         // The row's help names the pages it holds, in the order its tabs show them.
         let words = ShellPageWords(appModel, pages: place.pages)
         let help = place.pages.map { words.title($0) }.joined(separator: ", ")

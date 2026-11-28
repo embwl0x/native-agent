@@ -26,7 +26,7 @@ struct RhythmRuntimeState: Sendable {
 extension NativeCognitionRuntime {
     func startRhythmObservation() {
         guard !isAdmissionClosed, rhythm.observation == nil else { return }
-        let events = EventDeadlinePhysiology.storeAndFileEvents(paths: [dataRoot.appendingPathComponent("cognition/user_turn.json")])
+        let events = EventDeadlinePhysiology.storeAndFileEvents(paths: [UserTurnStamp.url(dataRoot)])
         rhythm.awakeSince = now()
         rhythm.observation = Task { [weak self] in
             await self?.rhythmChanged()
@@ -83,6 +83,13 @@ extension NativeCognitionRuntime {
         return value
     }
 
+    /// The person's usual quiet inside one gap, for the session bridge. Reads the kept rhythm only: a first rhythm is built by its own refresh, never
+    /// on the turn. An unreadable rhythm is reported and counts as none, as does a missing one: the plain gap rule.
+    func usualQuiet(from: Date, to: Date) -> TimeInterval {
+        do { return try (rhythm.value ?? PersonRhythm.load(dataRoot))?.usualQuiet(from: from, to: to) ?? 0 }
+        catch { reportRhythmFailure(error); return 0 }
+    }
+
     private func refreshRhythmInterval(at: Date) throws {
         var value = try loadRhythm()
         if value.timeZone != TimeZone.current.identifier { try value.recompute(at: at) }
@@ -134,7 +141,7 @@ extension NativeCognitionRuntime {
         rhythm.dirty = false
         rhythm.refresh = Task { [weak self] in
             guard let self else { reply?(.init("unavailable", "The runtime was released.")); return }
-            let result = await self.refreshRhythm(satisfyWait: runNow)
+            let result = await self.refreshRhythm()
             if let reply { reply(result) } else { await self.beat(.rhythm, result) }
             await self.finishRhythmRefresh()
         }
@@ -203,7 +210,7 @@ extension NativeCognitionRuntime {
     func personTurnAt() throws -> Date? {
         struct Stamp: Decodable { let at: Double }
         let data: Data
-        do { data = try Data(contentsOf: dataRoot.appendingPathComponent("cognition/user_turn.json")) }
+        do { data = try Data(contentsOf: UserTurnStamp.url(dataRoot)) }
         catch CocoaError.fileReadNoSuchFile { return nil }
         let stamp = try JSONDecoder().decode(Stamp.self, from: data)
         guard stamp.at.isFinite else { throw CocoaError(.coderReadCorrupt) }
@@ -238,12 +245,12 @@ extension NativeCognitionRuntime {
         } catch { reportRhythmFailure(error) }
     }
 
-    private func refreshRhythm(satisfyWait: Bool = false) async -> MindClockResult {
+    private func refreshRhythm() async -> MindClockResult {
         guard !isAdmissionClosed, !Task.isCancelled else { return .init("stopped", "The person's day refresh stopped.") }
         do {
             try refreshRhythmInterval(at: now())
             struct Stamp: Decodable { var at: Double; var key: String; var door: String? }
-            let path = dataRoot.appendingPathComponent("cognition/user_turn.json")
+            let path = UserTurnStamp.url(dataRoot)
             if FileManager.default.fileExists(atPath: path.path) {
                 let stamp = try JSONDecoder().decode(Stamp.self, from: Data(contentsOf: path))
                 guard stamp.at.isFinite else { throw CocoaError(.coderReadCorrupt) }

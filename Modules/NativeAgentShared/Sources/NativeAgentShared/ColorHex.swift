@@ -16,15 +16,12 @@ public enum NativeAgentSpacing {
     public static let pageInset: CGFloat = 20
     public static let section: CGFloat = 28
     public static let pageTop: CGFloat = 36
-    public static let rowInsetV: CGFloat = 14
     public static let eyebrowGap: CGFloat = 10
     public static let chatRoomWidth: CGFloat = 740
 }
 
 public enum NativeAgentRadius {
-    public static let compact: CGFloat = 4
     public static let control: CGFloat = 6
-    public static let panel: CGFloat = 8
     public static let card: CGFloat = 8
 }
 
@@ -76,14 +73,6 @@ public enum HazeColor: String, CaseIterable, Identifiable, Sendable {
     public init(stored raw: String) { self = HazeColor(rawValue: raw) ?? .unavailable }
 
     public var id: String { rawValue }
-
-    public var name: String {
-        switch self {
-        case .unavailable: return "Unsupported saved color"
-        case .forest: return "Forest green"
-        default: return rawValue.capitalized
-        }
-    }
 
     public var shades: [UInt] {
         switch self {

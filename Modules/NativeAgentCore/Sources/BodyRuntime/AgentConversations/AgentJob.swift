@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 import DeskCore
-// Blueprint: | `AgentJob.swift` | `AgentJob` record, `AgentJobStore` (agents/jobs.json), the `JobRunner` door contract, its refusing stub, `OwnLineRunner` |
+// Blueprint: | `AgentJob.swift` | `AgentJob` record, `AgentJobStore` (agents/jobs.json), the `JobRunner` door contract and its refusing stub |
 
 /// A commission for another agent or the agent's own line, bounded by its envelope and settled with its deliverables and required check.
 public struct AgentJob: Codable, Sendable, Equatable {
@@ -69,6 +69,7 @@ public struct AgentJob: Codable, Sendable, Equatable {
         public var truncated: Bool
         /// The model the organ said it used; it is the organ's, set in its own config by the person.
         public var model: String?
+        public var sources: [String]? = nil
     }
 
     /// The context that commissioned the job, which its settle wakes.
@@ -87,8 +88,6 @@ public struct AgentJob: Codable, Sendable, Equatable {
     public var brief: String
 /// The agent's own line's written self (a researcher, a critic): it stands in place of the agent's persona text. Nil is the agent itself.
     public var instructions: String?
-    /// The peers steering the turn that started the agent's own line, and those the person elevated: the line carries their steering, so a peer's words never
-    /// reach the agent's hands through a line of its own.
     public var peers: [String]?
     public var elevated: [String]?
     /// The commissioning turn's file access bounds the job's envelope or own line. Nil means no turn narrowed it.
@@ -124,6 +123,16 @@ public struct AgentJob: Codable, Sendable, Equatable {
     public static let own = "self"
     public var isOwn: Bool { contact == Self.own }
     public var agent: String { isOwn ? Self.own : "peer:" + contact }
+
+    var provenance: AgentJobProvenance {
+        .init(contact: name, peerID: isOwn ? nil : contact, job: id, brief: brief)
+    }
+
+    var reportSources: [String] {
+        guard let report, !report.text.isEmpty else { return [] }
+        if !isOwn { return [agent] }
+        return Array(Set((peers ?? []) + (elevated ?? []) + (report.sources ?? []))).sorted()
+    }
     /// The record is kept per contact and kind of job.
     public var kind: String { place?.kind.rawValue ?? "none" }
 
@@ -247,6 +256,7 @@ public struct JobStart: Sendable {
     /// The folder the organ works in: the job's place, or for a repo the worktree allocated for it, never the agent's checkout. Nil when the job has no place.
     public let folder: URL?
     public let envelope: AgentJob.Envelope
+    let elevated: [String]
     public let handle: @Sendable (String) throws -> Void
 }
 
@@ -268,8 +278,14 @@ public struct JobDeliverable: Sendable {
     public let report: String?
     public let model: String?
     public let inventoryFailure: String?
+    let sources: [String]?
     public init(artifacts: [URL], report: String? = nil, model: String? = nil, inventoryFailure: String? = nil) {
+        self.init(artifacts: artifacts, report: report, model: model, inventoryFailure: inventoryFailure, sources: nil)
+    }
+
+    init(artifacts: [URL], report: String? = nil, model: String? = nil, inventoryFailure: String? = nil, sources: [String]?) {
         self.artifacts = artifacts; self.report = report; self.model = model; self.inventoryFailure = inventoryFailure
+        self.sources = sources
     }
 }
 
@@ -312,22 +328,13 @@ public struct RefusingJobRunner: JobRunner {
     }
 }
 
-/// The agent's own line: a turn in its own work conversation, whose id is the job's, with the agent's written self when one was given. Its stream reports the
-/// line as a door reports an organ; ending the stream stops the turn.
-public protocol OwnLineRunner: Sendable {
-    /// Throws `JobRefusal` when no turn started.
-    func start(_ job: AgentJob) async throws -> AsyncThrowingStream<JobEvent, Error>
-    /// Continue the line in its own conversation after a relaunch.
-    func resume(_ job: AgentJob) async throws -> AsyncThrowingStream<JobEvent, Error>
-}
-
 public struct AgentJobService: Sendable {
     public let store: AgentJobStore
     let dataRoot: URL
     let ownLine: OwnLineDoor
     private let runners: [any JobRunner]
 
-    init(dataRoot: URL, store: AgentJobStore, own: OwnLineDoor, acpLaunch: @escaping @Sendable (String, String, [String]) async throws -> [String]) {
+    init(dataRoot: URL, store: AgentJobStore, own: OwnLineDoor, acpLaunch: @escaping @Sendable (String, [String], String, [String]) async throws -> [String]) {
         self.dataRoot = dataRoot
         self.store = store
         self.ownLine = own

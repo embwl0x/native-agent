@@ -97,20 +97,21 @@ durable until its completed row is durable ([manifest](skill_manifest_spec.md)).
 
 This is retained evidence, not an estimate of removed history. Empty kinds
 are omitted. Each present kind gets room in the roughly 2,500-character block;
-the non-tool kinds carry counts and up to three examples. An empty reading
+the non-tool kinds carry counts and up to three examples. Swift redacts each
+example before clipping its text. An empty reading
 omits the block. Unreadable or damaged records stop the material read with
 their cause rather than masquerading as an empty day. There is no new
 recorder and no model call to assemble it.
 
-`Resources/prompts/nightly-dream.md` places
+`Resources/abilities/native-dream-cycle.js` places
 `--- WHAT SURPRISED ME (where what I expected didn't happen) ---` after SELF,
 before felt tone and cares. The same dream call may return optional
 `lessons: [{lesson, from, kind: "how"|"fact"}]`, at most five, or `[]`.
 Each is one sentence of their operating knowledge in their voice, grounded in
 the supplied surprise; a failed call alone does not prove a guessed repair.
-An omitted lesson array means none. A malformed present section or entry
-fails payload decoding before the diary or learning commits, with its coding
-path in the failed dream report. Without a surprise block no lessons are kept.
+An omitted or null lesson array means none. Malformed sections or entries, excess
+lessons and lessons that fail the secret or diary markup checks count as drops in
+preview and in saved dream completion. Without a surprise block no lessons are kept.
 
 After the diary is written, lessons settle through `SwiftNativeMemoryV2.store`,
 the canonical memory commit/admission path: ordinary duplicate matching,
@@ -120,8 +121,11 @@ existing `skill` memory kind; `fact` uses `fact`, with the original lesson kind
 retained in metadata. The source names the dream, and its root is `inferred` by
 `self`, with the surprise words as its evidence. The diary also
 keeps their lesson words and the surprise they answer. A self-authored lesson
-roots `through` the dream material's peers, or "unattributed dream material";
-authorship does not attest that the source was clean. Save failures remain
+is their own: a dream names no outside source, because what they dreams
+from is their own mind and conversations they themselves was in (User, 2026-11-26:
+"if they are talking it should be their conversation"). Who said what stays on each
+transcript row and each memory. A memory that came through someone who still
+steers stays out of the dream's memory block. Save failures remain
 visible in the dream report; returned writing settles even if Stop raced it.
 Their existing recall and came-to-mind paths bring admitted lessons back at a
 similar moment. No new retrieval or persona-write path is introduced.
@@ -140,7 +144,7 @@ restatement updates its row, one burst is one commitment, and Desk housekeeping
 creates nothing. Canonical step identities retain each original capture across
 closure and archive, so an unfinished reflection cannot recreate it. Inferred
 steps retain the settled turn's exact recorded queue steer, origin, session and
-reply envelope.
+reply envelope (a proof owed to the person is their own: origin self, no envelope).
 
 ## Their real data (10-28 to 10-30)
 
@@ -247,13 +251,8 @@ Before the practice/read-ahead change, their expectation organs were nearly idle
      reads; if there is no such hand work, it is the single repeated call,
      counted once. Its `practice: ` line uses `FamiliarLines.firstMet` in
      the existing bounded `mind/familiar.bin`.
-   - When an active ability's current learned-use or validation route makes
-     exactly the practice ids in order (its other steps only reads), the note
-     names it: to use next time when its newest covering run's own outcome
-     completed or it passed, else with the step that run failed at, to repair. Declared reach proves no route.
-   - `practice.keep` traces `practice`, `met: first|again`, `noted` and the
-     covering `ability` (`id`, `worked` or `failed`) when there is one;
-     `noted` means the note was sent, not an ability save.
+   - `practice.keep` traces `practice`, `met: first|again` and whether the
+     signal was produced (`noted`).
    - The nerve is in `ChatOrchestration+StreamingToolLoop.swift`, after each
      tool round; there is no private keep call after the reply. The nightly
      compiler and its ledger/tape writers are removed ([Habits H4](HABITS.md#h4--one-crystallizer)).

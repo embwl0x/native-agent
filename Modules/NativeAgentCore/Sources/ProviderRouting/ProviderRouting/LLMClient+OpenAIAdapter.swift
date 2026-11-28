@@ -16,7 +16,7 @@ public final class OpenAITransport: HTTPProviderProfile, LLMTransport {
     public let providerId: String
     private let providerLabel: String
 
-    let session: URLSession
+    let session = ProviderHTTP.session
     private let endpoint: Result<URL, Error>
     private let apiKeyOverride: String?
     /// Injected roots confine credentials; secondary runtimes must supply their own root.
@@ -55,7 +55,6 @@ public final class OpenAITransport: HTTPProviderProfile, LLMTransport {
     }
 
     public init(
-        session: URLSession = ProviderHTTP.session,
         endpoint: URL? = nil,
         apiKeyOverride: String? = nil,
         dataRootOverride: URL? = nil,
@@ -65,7 +64,6 @@ public final class OpenAITransport: HTTPProviderProfile, LLMTransport {
     ) {
         self.providerId = providerId
         self.providerLabel = providerLabel
-        self.session = session
         self.endpoint = Result { try endpoint ?? Self.defaultEndpoint }
         self.apiKeyOverride = apiKeyOverride
         self.dataRootOverride = dataRootOverride

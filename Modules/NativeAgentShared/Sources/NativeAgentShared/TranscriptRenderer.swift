@@ -6,11 +6,14 @@ import AppKit
 import UIKit
 #endif
 
-// Blueprint: | `TranscriptRenderer.swift` | `TranscriptRenderer`, `TranscriptLook`, `TranscriptFoldLink`: one block as one styled paragraph on the press, in each platform's look |
+// Blueprint: | `TranscriptRenderer.swift` | `TranscriptRenderer`, `TranscriptLook`, `TranscriptFoldLink`: one block as one styled paragraph on the press, shared header and provenance heights, and each platform's look |
 
 /// How one platform's transcript reads: its values, its fonts and colours, and the few rules where the Mac and the phone differ.
 /// Each platform builds it inside the press's render call from that call's width, scale or text-size category.
 public struct TranscriptLook {
+    public static let provenanceHeight: CGFloat = 16
+    public static let codeHeaderHeight: CGFloat = 22
+
     /// Room between the text container's edges and the column: the Mac's container includes its gutters, the phone's is the column.
     public var gutter: CGFloat
     /// A user bubble never comes closer than this to the column's leading edge.

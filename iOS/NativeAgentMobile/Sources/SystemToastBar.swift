@@ -32,7 +32,7 @@ public struct iOSSystemToastBar: View {
         .padding(.horizontal, 16)
         .padding(.top, 4)
         .frame(maxWidth: .infinity, alignment: .center)
-        .animation(AppMotion.respecting(AppMotion.snappy, reduceMotion: reduceMotion), value: center.queue.map(\.id))
+        .animation(Animation.respecting(AppMotion.snappy, reduceMotion: reduceMotion), value: center.queue.map(\.id))
         .allowsHitTesting(!center.queue.isEmpty)
         // The overlay caller preserves status-bar safe area so the stack stays beneath it on phone and tablet.
     }
@@ -236,14 +236,14 @@ struct MacSyncErrorBanner: View {
                 .transition(.move(edge: .top).combined(with: .opacity))
             }
         }
-        .animation(AppMotion.respecting(AppMotion.snappy, reduceMotion: reduceMotion), value: sync.syncError)
+        .animation(Animation.respecting(AppMotion.snappy, reduceMotion: reduceMotion), value: sync.syncError)
         .sheet(isPresented: $showsConnection) {
             NavigationStack { SettingsViewFull(presentation: .sheet, opensConnection: true) }
                 .macSyncErrorBanner()
         }
         // Clear dismissal with its condition so a later occurrence of the same sync failure can show again.
         .onChange(of: sync.syncError) { _, newValue in
-            if MacSyncErrorBannerPresentation.normalizedMessage(newValue) == nil {
+            if newValue.trimmedNonEmpty == nil {
                 dismissedMessage = nil
             }
         }
@@ -251,10 +251,6 @@ struct MacSyncErrorBanner: View {
 }
 
 enum MacSyncErrorBannerPresentation {
-    static func normalizedMessage(_ syncError: String?) -> String? {
-        syncError.trimmedNonEmpty
-    }
-
     static func headline(_ message: String) -> (headline: String, detail: String?) {
         guard let end = message.range(of: ". ") else { return (message, nil) }
         let detail = message[end.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
@@ -262,7 +258,7 @@ enum MacSyncErrorBannerPresentation {
     }
 
     static func visibleMessage(syncError: String?, dismissedMessage: String?) -> String? {
-        guard let message = normalizedMessage(syncError), message != dismissedMessage else {
+        guard let message = syncError.trimmedNonEmpty, message != dismissedMessage else {
             return nil
         }
         return message

@@ -1,9 +1,9 @@
 import Synchronization
 import Foundation
-import os
 import NativeAgentCore
 import PersistenceCore
 import MacNerves
+import os
 // Blueprint: | `AgentScreenRooms+Web.swift` | `AgentScreen`: browser rooms and direct named tab reads/actions |
 
 public enum ChromePageMirror {
@@ -196,7 +196,8 @@ extension AgentScreen {
     }
 
     static func browserRoom(workspace: WorkspaceOperation, dataRoot: URL, scope: String, person: String, now: Date) -> String {
-        let link = BrowserConnectionMirror.connected == true ? person + "'s Chrome connected" : "Chrome not connected"
+        let link = BrowserConnectionMirror.connected.map { $0 ? person + "'s Chrome connected" : "Chrome not connected" }
+            ?? "Chrome connection unobserved"
         var verbs: [(String, String)] = [("browser.go", "open a website in my own tab (text: its address)")]
         var tab = ["no page read in this chat · browser.go opens an address"]
         if let page = ChromePageMirror.page(tab: nil, dataRoot: dataRoot, session: scope) {

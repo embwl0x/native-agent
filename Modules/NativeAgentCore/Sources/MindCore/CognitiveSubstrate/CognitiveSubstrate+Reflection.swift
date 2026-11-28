@@ -193,7 +193,7 @@ extension CognitiveSubstrate {
             throw CognitivePersistenceError.artifactWriteFailed(family: "reflection_receipt", detail: "cognition/cognition.sqlite is unavailable")
         }
         try await persistArtifactTransition(artifacts: reflectionEffectArtifacts(receipt, at: dependencies.now()),
-            deletedArtifactIDs: [], at: dependencies.now())
+            at: dependencies.now())
         if durable, !configuration.persistenceEnabled { throw CognitivePersistenceError.storeUnavailable }
     }
 
@@ -246,7 +246,7 @@ extension CognitiveSubstrate {
         let written = disposition
         // On failure the resident values and done flags stay together. The next attempt writes them; it does not apply them again. On restart their atomic
         // receipt is the witness that the effects already landed.
-        try await persistArtifactTransition(artifacts: artifacts, deletedArtifactIDs: [], at: at)
+        try await persistArtifactTransition(artifacts: artifacts, at: at)
         if receipt.journalPending == true, !configuration.persistenceEnabled { throw CognitivePersistenceError.storeUnavailable }
         try requireIntegratedReflectionReceipt(receipt)
         if nudged {

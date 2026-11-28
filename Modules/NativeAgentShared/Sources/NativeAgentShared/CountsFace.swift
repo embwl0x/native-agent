@@ -31,11 +31,7 @@ public struct InboxCountsFace: FaceValue {
 public struct CountsFace: FaceValue {
     public var inbox = InboxCountsFace()
     public var approvals = ApprovalsFace()
-    public var memoryProposals = CountReading()
-    public var helpers = CountReading()
-    public var runningHelpers = CountReading()
     public var deskWaiting = CountReading()
-    public var unreadSessionIDs: Set<String>?
     public var panels = PanelFreshnessFace()
     public var statuses = CountStatusValues()
 

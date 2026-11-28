@@ -202,8 +202,7 @@ public final class SystemMacAXElementSource: MacAXElementSource {
         return CFEqual(left, right)
     }
     public func isTrusted() -> Bool {
-        // Read trust without prompting; only the user may initiate the TCC grant.
-        AXIsProcessTrusted()
+        SystemPermissionPreflight.status(.accessibility) == .granted
     }
     package func nativeApplication(pid: Int32, context: MacOperationContext) -> AXUIElement? {
         guard !PersonOnlyWindows.isOwnProcess(pid), isTrusted() else { return nil }
@@ -422,20 +421,112 @@ public final class SystemMacAXElementSource: MacAXElementSource {
             catch { MacAXAttributeRead.failed(error, context: context); throw error }
         }
     }
-    private func readAttributes(of ref: MacAXElementRef, masking: Bool = false, context: MacOperationContext) throws -> MacAXAttributes {
+    private static let protectedContentAttribute = NSAccessibility.Attribute.containsProtectedContent.rawValue
+    private static let queryPathKeys = [kAXDocumentAttribute, kAXFilenameAttribute, kAXURLAttribute]
+    private static let queryProtectionKeys = [protectedContentAttribute] + queryPathKeys
+    private static let queryTextKeys = [kAXDescriptionAttribute, "AXLabel", kAXHelpAttribute,
+                                        kAXPlaceholderValueAttribute, kAXRoleDescriptionAttribute, kAXIdentifierAttribute]
+
+    private static func checkQueryProtection(_ values: MacAXAttributeRead.Values, role: String,
+                                             retainFrameOf element: AXUIElement?, context: MacOperationContext) throws {
+        let subrole: String?, protected: Bool?
+        do {
+            subrole = try MacAXAttributeRead.string(values[kAXSubroleAttribute], attribute: kAXSubroleAttribute)
+            protected = try MacAXAttributeRead.boolean(values[protectedContentAttribute], attribute: protectedContentAttribute)
+        } catch { throw MacAccessibilityReader.StrictReadCut.protectionUnknown }
+        let secureRole = MacActClosedLoop.secureFieldRoles.contains(role)
+            || subrole.map(MacActClosedLoop.secureFieldRoles.contains) == true
+        guard secureRole || protected != nil else { throw MacAccessibilityReader.StrictReadCut.protectionUnknown }
+        do {
+            if let title = try MacAXAttributeRead.string(values[kAXTitleAttribute], attribute: kAXTitleAttribute),
+               try MacScreenViewTextRedaction.protectedPath(title, dataRoot: context.dataRoot) {
+                throw MacAccessibilityReader.StrictReadCut.protectedContent
+            }
+            for key in queryPathKeys {
+                guard let raw = try values[key] else { continue }
+                if let url = raw as? URL {
+                    if url.isFileURL, try MacScreenViewTextRedaction.protectedPath(url.absoluteString, dataRoot: context.dataRoot) {
+                        throw MacAccessibilityReader.StrictReadCut.protectedContent
+                    }
+                } else if let text = raw as? String {
+                    let path = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if try MacScreenViewTextRedaction.protectedPath(path, dataRoot: context.dataRoot) {
+                        throw MacAccessibilityReader.StrictReadCut.protectedContent
+                    }
+                    if key != kAXURLAttribute, !path.hasPrefix("/"), !path.hasPrefix("~/"), URL(string: path)?.scheme == nil {
+                        throw MacAccessibilityReader.StrictReadCut.protectionUnknown
+                    }
+                } else {
+                    throw MacAccessibilityReader.StrictReadCut.protectionUnknown
+                }
+            }
+            guard secureRole || protected == true else { return }
+            guard let element else { throw MacAccessibilityReader.StrictReadCut.protectedContent }
+            let text = try queryTextKeys.map { try MacAXAttributeRead.string(values[$0], attribute: $0) }
+            if try ([role, subrole] + text).compactMap({ $0 }).contains(where: {
+                try MacScreenViewTextRedaction.protectedPath($0, dataRoot: context.dataRoot)
+            }) {
+                throw MacAccessibilityReader.StrictReadCut.protectedContent
+            }
+            guard values.gaps?.values.isEmpty != false,
+                  let frame = try MacAXAttributeRead.checkedFrame(element, context: context), frame.w > 0, frame.h > 0 else {
+                throw MacAccessibilityReader.StrictReadCut.protectionUnknown
+            }
+            var attributes = MacAXAttributes(role: role, frame: frame)
+            attributes.queryFields = ["redacted": .bool(true)]
+            throw MacAccessibilityReader.StrictReadCut.secureField(attributes)
+        } catch let cut as MacAccessibilityReader.StrictReadCut {
+            throw cut
+        } catch where secureRole || protected == true {
+            try Task.checkCancellation()
+            throw MacAccessibilityReader.StrictReadCut.protectionUnknown
+        }
+    }
+
+    private static func checkQueryElement(_ element: AXUIElement, pid: Int32, retainSecureField: Bool = false,
+                                         context: MacOperationContext) throws {
+        var owner: pid_t = 0
+        guard AXUIElementGetPid(element, &owner) == .success, owner == pid else {
+            throw MacAccessibilityReader.StrictReadCut.protectionUnknown
+        }
+        let keys = [kAXRoleAttribute, kAXSubroleAttribute, kAXTitleAttribute] + queryProtectionKeys
+            + (retainSecureField ? queryTextKeys : [])
+        let checked = try MacAXAttributeRead.checkedBatch(element, keys, context: context)
+        guard let role = try MacAXAttributeRead.string(checked[kAXRoleAttribute], attribute: kAXRoleAttribute) else {
+            throw MacAccessibilityReader.StrictReadCut.protectionUnknown
+        }
+        try checkQueryProtection(checked, role: role, retainFrameOf: retainSecureField ? element : nil, context: context)
+    }
+
+    func checkedQueryAttributes(of ref: MacAXElementRef, pid: Int32, context: MacOperationContext) throws -> MacAXAttributes {
+        guard let element = element(ref) else { throw MacAccessibilityReader.StrictReadCut.protectionUnknown }
+        return try MacAXAttributeRead.node(context: context) { context in
+            try Self.checkQueryElement(element, pid: pid, retainSecureField: true, context: context)
+            return try readAttributes(of: ref, queryPID: pid, context: context)
+        }
+    }
+
+    private func readAttributes(of ref: MacAXElementRef, masking: Bool = false, queryPID: Int32? = nil,
+                                context: MacOperationContext) throws -> MacAXAttributes {
         guard let element = element(ref) else {
             throw MacAccessibilityReader.NativeReadFailure(detail: "Accessibility element reference is unavailable.")
         }
         return try MacAXAttributeRead.collectingAttributeGaps(context: context) { gaps, context in
             // One message carries everything the element's own read needs; a slot is only judged (and only records a gap) when read below.
-            let keys = [kAXRoleAttribute, kAXEnabledAttribute] + MacAXAttributeRead.labelAttributes
+            var keys = [kAXRoleAttribute, kAXEnabledAttribute] + MacAXAttributeRead.labelAttributes
                 + [kAXValueAttribute] + (masking ? [] : [kAXSelectedAttribute, kAXSelectedTextRangeAttribute, "AXARIALive",
                     kAXIdentifierAttribute, kAXMenuItemCmdCharAttribute, kAXMenuItemCmdModifiersAttribute, kAXHiddenAttribute, kAXMenuItemPrimaryUIElementAttribute])
+            if queryPID != nil { keys += [kAXFocusedAttribute] + Self.queryProtectionKeys }
             let metadata = try MacAXAttributeRead.checkedBatch(element, keys, context: context, gaps: gaps)
             guard let role = try MacAXAttributeRead.string(metadata[kAXRoleAttribute], attribute: kAXRoleAttribute) else {
                 throw MacAccessibilityReader.NativeReadFailure(detail: "The element exposes no AXRole (unsupported or no value).")
             }
-            let names = try MacAXAttributeRead.readLabel(element, role: role, values: metadata, context: context, prepare: prepareForRead)
+            let checkRelated: ((AXUIElement, MacOperationContext) throws -> Void)? = queryPID.map { pid in
+                { try Self.checkQueryElement($0, pid: pid, context: $1) }
+            }
+            if queryPID != nil { try Self.checkQueryProtection(metadata, role: role, retainFrameOf: element, context: context) }
+            let names = try MacAXAttributeRead.readLabel(element, role: role, values: metadata, context: context,
+                prepare: prepareForRead, checkRelated: checkRelated)
             let needsRange = !masking && MacAXAttributeRead.placeholderRoles.contains(role)
             // A text value whose subrole went unread is never used: it could be a secure field's.
             let rawValue = try MacAXAttributeRead.valueReadable(role: role, context: context) ? metadata[kAXValueAttribute] : nil
@@ -490,6 +581,25 @@ public final class SystemMacAXElementSource: MacAXElementSource {
                 labelUnreadable: names.unreadable
             )
             attributes.listRead = list.children
+            if queryPID != nil {
+                var fields: [String: JSONValue] = [:]
+                for (key, attribute) in [("description", kAXDescriptionAttribute), ("help", kAXHelpAttribute),
+                                         ("identifier", kAXIdentifierAttribute), ("placeholder", kAXPlaceholderValueAttribute)] {
+                    fields[key] = try MacAXAttributeRead.string(metadata[attribute], attribute: attribute).map(JSONValue.string)
+                }
+                fields["focused"] = try MacAXAttributeRead.boolean(metadata[kAXFocusedAttribute], attribute: kAXFocusedAttribute).map(JSONValue.bool)
+                if names.identity != names.caption { fields["title"] = names.identity.map(JSONValue.string) }
+                let roleDescription = try MacAXAttributeRead.string(metadata[kAXRoleDescriptionAttribute], attribute: kAXRoleDescriptionAttribute)
+                let text = [names.identity, names.display, names.caption, attributes.value, attributes.role, attributes.subrole]
+                    + fields.values.map(\.stringValue)
+                guard gaps.values.isEmpty, !names.unreadable else { throw MacAccessibilityReader.StrictReadCut.protectionUnknown }
+                guard try text.compactMap({ $0 }).allSatisfy({ try !MacScreenViewTextRedaction.protectedPath($0, dataRoot: context.dataRoot) }),
+                    !MacScreenViewTextRedaction.strictSecretField(attributes,
+                    fieldHints: [roleDescription, fields["identifier"]?.stringValue, names.caption]) else {
+                    throw MacAccessibilityReader.StrictReadCut.protectedContent
+                }
+                attributes.queryFields = fields
+            }
             return attributes
         }
     }

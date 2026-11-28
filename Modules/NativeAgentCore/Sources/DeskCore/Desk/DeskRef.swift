@@ -89,26 +89,26 @@ public struct DeskRef: Sendable, Equatable {
             "kind": .string(kind.token),
             "refId": .string(refId),
         ]
-        func put(_ k: String, _ v: String?) { if let v, !v.isEmpty { obj[k] = .string(v) } }
         func putInt(_ k: String, _ v: Int?) { if let v { obj[k] = .int(Int64(v)) } }
         switch kind {
         case let .file(path, line, label):
-            obj["path"] = .string(path); putInt("line", line); put("label", label)
+            obj["path"] = .string(path); putInt("line", line); DeskJSON.put(("label", label), in: &obj)
         case let .commit(sha, repo, label, status):
-            obj["sha"] = .string(sha); put("repo", repo); put("label", label); put("status", status)
+            obj["sha"] = .string(sha); DeskJSON.put(("repo", repo), ("label", label), ("status", status), in: &obj)
         case let .ghIssue(repo, number, title, status):
-            obj["repo"] = .string(repo); obj["number"] = .int(Int64(number)); put("title", title); put("status", status)
+            obj["repo"] = .string(repo); obj["number"] = .int(Int64(number)); DeskJSON.put(("title", title), ("status", status), in: &obj)
         case let .ghPr(repo, number, title, status, checks):
-            obj["repo"] = .string(repo); obj["number"] = .int(Int64(number)); put("title", title); put("status", status); put("checks", checks)
+            obj["repo"] = .string(repo); obj["number"] = .int(Int64(number))
+            DeskJSON.put(("title", title), ("status", status), ("checks", checks), in: &obj)
         case let .url(url, title):
-            obj["url"] = .string(url); put("title", title)
+            obj["url"] = .string(url); DeskJSON.put(("title", title), in: &obj)
         case let .agent(name, handoffId, sessionId):
-            obj["name"] = .string(name); put("handoffId", handoffId); put("sessionId", sessionId)
+            obj["name"] = .string(name); DeskJSON.put(("handoffId", handoffId), ("sessionId", sessionId), in: &obj)
         case let .approval(id, status):
-            obj["id"] = .string(id); put("status", status)
+            obj["id"] = .string(id); DeskJSON.put(("status", status), in: &obj)
         case let .trace(id, kind):
             // traceKind prevents the payload from overwriting the union discriminator.
-            obj["id"] = .string(id); put("traceKind", kind)
+            obj["id"] = .string(id); DeskJSON.put(("traceKind", kind), in: &obj)
         case let .note(text):
             obj["text"] = .string(text)
         case let .step(step):

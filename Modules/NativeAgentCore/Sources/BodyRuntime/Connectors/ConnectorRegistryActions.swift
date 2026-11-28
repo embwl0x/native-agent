@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import DeskCore
-// Blueprint: | `ConnectorRegistryActions.swift` | Ordered registry verification; disconnect intent precedes credential removal |
+// Blueprint: | `ConnectorRegistryActions.swift` | Workspace registry reads and writes; disconnect intent precedes credential removal |
 
 public struct ConnectorRegistryProjectionPort: Sendable {
     public let defaultName: @Sendable (String) -> String
@@ -163,8 +163,12 @@ public enum ConnectorRegistryActions {
     }
 
     public static func listWorkspaces(root: URL) async throws -> [WorkspaceRecord] {
-        let rows = try await SwiftNativeConnectorsClient(root: root).listWorkspaces()
-        return try JSONDecoder().decode([WorkspaceRecord].self, from: JSONValue.array(rows).serializedData(pretty: false))
+        let path = root.appendingPathComponent("connectors/workspaces.json")
+        let raw = try await SwiftNativePersistenceCore.readJSON(path, ifMissing: .array([]))
+        guard case .array = raw else {
+            throw PersistenceCoreError.ioFailure("\(path.path) is not a list of workspaces; repair it before using workspaces")
+        }
+        return try JSONDecoder().decode([WorkspaceRecord].self, from: raw.serializedData(pretty: false))
     }
 }
 

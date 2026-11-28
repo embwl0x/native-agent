@@ -46,8 +46,20 @@ extension EngineDoctorRuntime {
             } else {
                 do {
                     rows = try await storage.quickCheck()
+                } catch let interrupted as MemoryStorage.QuickCheckInterrupted {
+                    return CheckResult(source: "memory/memory.sqlite",
+                        id: "live.memory", title: title, status: "fail",
+                        detail: """
+                            quick_check on \(path) reported: \(safeDoctorDetail(interrupted.rows.joined(separator: "; "))). \
+                            \(safeDoctorDetail(interrupted.detail))
+                            """,
+                        harm: "Damage to the memory store was confirmed and recovery is unresolved."
+                    )
                 } catch {
-                    rows = ["quick_check could not run: \(error)"]
+                    return CheckResult(source: "memory/memory.sqlite",
+                        id: "live.memory", title: title, status: "unmeasured",
+                        detail: "quick_check on \(path) could not be completed: \(safeDoctorDetail(String(describing: error)))"
+                    )
                 }
                 liveMemoryQuickCheck.withLock { $0 = (Date(), rows) }
             }
@@ -57,8 +69,9 @@ extension EngineDoctorRuntime {
                     detail: "quick_check on \(path) reported: \(safeDoctorDetail(rows.joined(separator: "; ")))",
                     harm: "The agent's saved memories may be damaged and further writes could lose them.",
                     human_action: """
-                        Open Trust → Advanced → Backups, select a verified backup containing memory/memory.sqlite, then choose Restore → Restore backup \
-                        before further writes.
+                        NativeAgent automatically rebuilds damaged derived search indexes from their source tables. Damage remains, and further writes could \
+                        lose saved memories. Restoring an older backup can lose memories saved after it. Before further writes, open Trust → Backups → \
+                        Restore points, select a verified backup containing memory/memory.sqlite, then choose Restore backup.
                         """,
                     ask: .permission
                 )
@@ -579,22 +592,7 @@ extension EngineDoctorRuntime {
     }
 
     public func doctorBackgroundLoopsCheck() async -> CheckResult {
-        let observations = await port.doctorManager.status()
-        let receipts: [String: [DoctorLoopHealth.FailureIncident]]
-        do {
-            receipts = try await DoctorLoopHealth.recentFailureDates(dataRoot: dataRoot)
-        } catch {
-            return CheckResult(source: "Loop failure details",
-                id: "background_loops", title: "Background loops", status: "fail",
-                detail: "Loop failure history is unavailable: \(error.localizedDescription)")
-        }
-        let now = Date()
-        await MainActor.run {
-            port.doctorEngine.doctor.loopVerdicts = DoctorLoopHealth.evaluate(
-                observations: observations, recentFailureDates: receipts, now: now)
-        }
-        return DoctorLoopHealth.doctorCheck(
-            observations: observations, recentFailureDates: receipts, now: now)
+        await doctorBackgroundLoopReadings(includeDetails: false).aggregate
     }
 
     public func doctorBackgroundLoopChecks() async -> [CheckResult] {
@@ -603,6 +601,41 @@ extension EngineDoctorRuntime {
             dataRoot: dataRoot,
             friendlyLoopName: DoctorPlainCopy.friendlyLoopName
         )
+    }
+
+    func doctorBackgroundLoopReadings(
+        includeDetails: Bool = true
+    ) async -> (aggregate: CheckResult, details: [CheckResult]) {
+        let manager = port.doctorManager
+        let reading = includeDetails ? await DoctorLoopRecovery.readRegistrations(manager: manager) : nil
+        let observations: [LoopStatus]
+        if let reading {
+            observations = reading.statuses
+        } else {
+            observations = await manager.status()
+        }
+        let receipts: [String: [DoctorLoopHealth.FailureIncident]]
+        do {
+            receipts = try await DoctorLoopHealth.recentFailureDates(dataRoot: dataRoot)
+        } catch {
+            let aggregate = CheckResult(source: "Loop failure details",
+                id: "background_loops", title: "Background loops", status: "fail",
+                detail: "Loop failure history is unavailable: \(error.localizedDescription)")
+            let details = includeDetails ? [DoctorLoopRecovery.failureHistoryUnavailable(error)] : []
+            return (aggregate, details)
+        }
+        let now = Date()
+        let verdicts = DoctorLoopHealth.evaluate(observations: observations, recentFailureDates: receipts, now: now)
+        await MainActor.run { port.doctorEngine.doctor.loopVerdicts = verdicts }
+        let aggregate = DoctorLoopHealth.doctorCheck(observations: observations, verdicts: verdicts, now: now)
+        guard let reading else { return (aggregate, []) }
+        let details = await DoctorLoopRecovery.checks(
+            reading: reading,
+            receipts: receipts,
+            dataRoot: dataRoot,
+            friendlyLoopName: DoctorPlainCopy.friendlyLoopName
+        )
+        return (aggregate, details)
     }
 
     /// The Body view: the same projection the agent reads in `mind.body`, line for line, deviations first.
@@ -619,7 +652,8 @@ extension EngineDoctorRuntime {
         return CheckResult(source: "Organ beats", id: "live.pulses", title: "Body",
                            status: body.lines.isEmpty && body.unreadable.isEmpty ? "unmeasured"
                                : body.felt.isEmpty && body.unreadable.isEmpty ? "ok" : "warn",
-                           detail: (body.lines.isEmpty ? "No organ has a readable beat yet, so nothing else is known about the body."
+                           detail: "Organ beats read at \(NativeTimestampFormat.plainZulu(body.at)). "
+                               + (body.lines.isEmpty ? "No organ has a readable beat yet, so nothing else is known about the body."
                                : body.lines.map { $0.words(now: now) }.joined(separator: "; ") + ".") + gaps)
     }
 

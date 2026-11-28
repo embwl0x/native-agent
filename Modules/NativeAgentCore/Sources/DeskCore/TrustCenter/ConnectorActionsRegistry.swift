@@ -18,7 +18,6 @@ public struct ConnectorActionDescriptor: Codable, Sendable, Equatable {
     public var dryRunAvailable: Bool
     public var requiresApproval: Bool
     public var category: String?
-    public var statusEndpoint: String?
     public var inputSchema: JSONValue?
 
     public init(
@@ -31,7 +30,6 @@ public struct ConnectorActionDescriptor: Codable, Sendable, Equatable {
         dryRunAvailable: Bool,
         requiresApproval: Bool,
         category: String? = nil,
-        statusEndpoint: String? = nil,
         inputSchema: JSONValue? = nil
     ) {
         self.id = id
@@ -43,7 +41,6 @@ public struct ConnectorActionDescriptor: Codable, Sendable, Equatable {
         self.dryRunAvailable = dryRunAvailable
         self.requiresApproval = requiresApproval
         self.category = category
-        self.statusEndpoint = statusEndpoint
         self.inputSchema = inputSchema
     }
 }
@@ -87,7 +84,6 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
                 """,
             risk: "low", dryRunAvailable: true, requiresApproval: false,
             category: "work_journal",
-            statusEndpoint: "/v1/codex/handoff",
             inputSchema: schema([
                 ("includeText", prop("boolean")),
                 ("maxChars", prop("integer")),

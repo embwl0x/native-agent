@@ -149,7 +149,7 @@ final class BodyFaceTranscripts {
                 }
                 text = live
             } else { text = message.content }
-            await TurnFirstRenderRegistry.shared.observeFirstRender(role: message.role, content: text, isLastAssistant: true,
+            await TurnFirstRenderRegistry.shared.observeFirstRender(role: message.role, content: text,
                 messageSessionID: message.sessionId, messageTurnID: receipt.turn, activeSessionID: receipt.session,
                 observedBy: "NativeAgentFace.TranscriptDocumentView")
             return .acknowledged
@@ -167,12 +167,6 @@ final class BodyFaceTranscripts {
             await engine.transcripts.prepareToolFold(messages, expanded: expanded)
             await words(reader: id, messages: all)
             return .acknowledged
-        case .requestCopy(let keys):
-            let values = await engine.transcripts.presentation.words(keys)
-            guard keys.allSatisfy({ values[$0] != nil }) else {
-                throw BodyFaceServices.failure("copy_words_waiting", "The requested words have not been prepared by their presentation owner.")
-            }
-            return .result(.object(values.mapValues(PartFace.Value.string)))
         case .exportConversation(let request): return try await export(request)
         case .observe(let id, .key(.conversation(let session))):
             guard NativeAgentChatSessionID.normalizedPathComponent(session) == session else {
@@ -348,8 +342,7 @@ final class BodyFaceTranscripts {
             await engine.contactThreadDocument(contact)
         }, publish: { value in
             guard readers[id]?.lifetime == reader.lifetime else { return }
-            enqueueConversation(ConversationFace(session: request.session, state: value.face.state, cacheReady: value.face.state == .ready,
-                actions: [], attachments: [], otherRoomExchanges: [], transcriptComplete: value.face.state == .ready))
+            enqueueConversation(ConversationFace(session: request.session, state: value.face.state, actions: [], attachments: []))
         })
         let input = TranscriptPressInput(session: request.session, presentation: request.presentation,
             groups: Array(MessageGrouper.projection(for: document.messages)), exchanges: [], cards: [:], faceEpoch: "contact",
@@ -450,12 +443,11 @@ final class BodyFaceTranscripts {
         }
         if let trouble = ChatTurnFailure.read(messages) {
             attachments.append(.init(id: TranscriptBlockID.trouble, message: trouble.message.id, kind: "trouble", title: "Reply failed",
-                text: trouble.failure.line(model: nil), resource: nil, card: nil, failure: nil))
+                text: trouble.failure.line(), resource: nil, card: nil, failure: nil))
         }
         let actions = messages.map { message in
             MessageActionFace(message: message.id, canRetry: ChatTurnFailure.isFailed(message),
-                canContinue: ChatTurnFailure.isFailed(message), canRemember: message.role == "assistant",
-                retryDraft: nil, failure: nil)
+                canRemember: message.role == "assistant")
         }
         let waiting = messages.contains {
             $0.metadata?.isPendingApproval == true || $0.inlineCards.contains { $0.model.needsAttention }
@@ -463,10 +455,8 @@ final class BodyFaceTranscripts {
         let target = messages.last(where: { $0.role == "assistant" }).flatMap { message in
             message.metadata?.turnTraceId.map { VisibleReplyTarget(message: message.id, turn: $0) }
         }
-        var face = ConversationFace(session: session, state: .ready, cacheReady: engine.transcripts.hasCachedTranscript(for: session),
-            actions: actions, attachments: attachments, otherRoomExchanges: [],
-            waitingForPerson: waiting ? true : (transcript.isComplete ? false : nil), visibleReply: target,
-            transcriptComplete: transcript.isComplete)
+        var face = ConversationFace(session: session, state: .ready, actions: actions, attachments: attachments,
+            waitingForPerson: waiting ? true : (transcript.isComplete ? false : nil), visibleReply: target)
         face.contactName = contact?.name
         return face
     }
@@ -479,8 +469,7 @@ final class BodyFaceTranscripts {
     private func failed(_ session: String, error: any Error) async {
         var value = ConversationFace(session: session, state: .unavailable(.init(code: "conversation_read_failed",
             message: "The conversation could not be read.", cause: NativeAppSecretRedactor.redactText(error.localizedDescription),
-            effects: .none)), cacheReady: false,
-            actions: [], attachments: [], otherRoomExchanges: [], transcriptComplete: false)
+            effects: .none)), actions: [], attachments: [])
         let contact = conversationContact(session)
         value.contactName = contact?.name
         conversationRead(session).write { enqueueConversation(value) }

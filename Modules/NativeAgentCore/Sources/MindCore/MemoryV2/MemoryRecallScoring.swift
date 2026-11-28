@@ -15,7 +15,7 @@ public let memoryNearVerbatimSimilarity: Double = 0.96
 public let memoryDecayHalfLifeDays: [String: Double] = [
     "volatile": 60, "project": 60, "operational": 60,
     "decision": 180, "note": 180, "incident": 180,
-    // Moment age decay reads updatedAt; recall changes only use_count and last_used_at, so access does not refresh this clock.
+    // Moment age decay reads updatedAt; recall changes only last_used_at, so access does not refresh this clock.
     "moment": 60,
 ]
 
@@ -38,6 +38,11 @@ public enum MemoryRecallScoring {
     /// Accept both fractional and plain ISO8601 forms written by the owners.
     public static func parseTimestamp(_ s: String) -> Date? {
         NativeTimestampFormat.parseISO8601FractionalFirst(s)
+    }
+
+    public static func hasStarted(validFrom: String?, at now: Date) -> Bool {
+        guard let validFrom else { return true }
+        return parseTimestamp(validFrom).map { $0 <= now } == true
     }
 
     /// Only configured kinds with readable timestamps decay; all others retain full relevance.

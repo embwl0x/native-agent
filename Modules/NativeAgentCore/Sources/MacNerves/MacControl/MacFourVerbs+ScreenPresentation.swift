@@ -303,10 +303,11 @@ extension MacFourVerbs {
         ]))
     }
 
-    static func unknownActionReply(_ error: any Error, operation: String = "the action", app: String?) -> MacFourVerbsReply {
-        let cause = error.localizedDescription
+    /// `readOnly` is for a read that threw (a look, a menu listing): it changed nothing, so it is not an unknown outcome to inspect.
+    static func unknownActionReply(_ error: any Error, operation: String = "the action", app: String?, readOnly: Bool = false) -> MacFourVerbsReply {
+        let cause = readOnly && error is CancellationError ? "Stop arrived before it finished." : error.localizedDescription
         let evidence = error as? ToolFailureError
-        let effects = evidence?.effects ?? .unknown
+        let effects = evidence?.effects ?? (readOnly ? .none : .unknown)
         let status = evidence?.status.rawValue ?? (error is CancellationError ? "cancelled" : "outcome_unknown")
         let outcome = effects == .none ? "\(operation) stopped" : "The outcome of \(operation) is unknown"
         let code = evidence?.code ?? (error is CancellationError ? "cancelled" : "mac_action_result_unavailable")
@@ -316,7 +317,7 @@ extension MacFourVerbs {
             if fix != .null { remedy = fix }
         }
         return MacFourVerbsReply(ok: false,
-            text: "\(outcome): \(cause)\nInspect \(app ?? "the affected app") before another action.",
+            text: "\(outcome): \(cause)" + (readOnly ? "" : "\nInspect \(app ?? "the affected app") before another action."),
             detail: ["status": .string(status),
                 "reason": .string(code), "error": .string(code),
                 "detail": .string(cause), "message": .string(cause), "effects": .string(effects.rawValue),

@@ -232,8 +232,8 @@ public enum NativeAgentA2AWire {
         guard let n = value as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() else { return false }
         return n.doubleValue >= 0 && n.doubleValue <= Double(Int32.max) && n.doubleValue.rounded() == n.doubleValue
     }
-    public static func card(port: UInt16, version: String = "1.0", agentName: String? = nil, extended: Bool = false) -> [String: Any] {
-        let agent = agentName ?? PeerFacingIdentity.agentName
+    public static func card(port: UInt16, version: String = "1.0", extended: Bool = false) -> [String: Any] {
+        let agent = PeerFacingIdentity.agentName
         var card: [String: Any] = ["protocolVersion": "0.3.0", "name": agent, "version": "1.0.0",
          "description": """
              Talk, hand over jobs for files back, share files and receive replies as they are written. Reconnect to ongoing work or cancel it. \

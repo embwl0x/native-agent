@@ -1,13 +1,13 @@
 import Synchronization
 import NativeAgentShared
 import Foundation
-import os
-import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import MacNerves
 import MindCore
 import SenseCore
+import os
+import CryptoKit
 // Blueprint: | `AgentConversationRelease.swift` | Stamped message births and positive owner evidence settle retained sends |
 
 extension AgentConversationStore {
@@ -172,7 +172,8 @@ extension AgentConversationStore {
                             "answer": .init(to: destination)], steeredBy: birth?.id == item.id ? birth?.sources : ["unrecorded"])
                     if try await store.experience(experience.id) == nil { try await store.begin(experience) }
                     let words = item.text + (item.held.map { "\n\n" + $0 } ?? "")
-                    try await store.append([.face(.init(words: TurnSecretRedactor.redactText(words), artifacts: []))], to: item.id)
+                    try await store.append([.face(.init(words: TurnSecretRedactor.redactText(words), artifacts: [],
+                        from: item.byPerson == true ? "person" : "self"))], to: item.id)
                     if item.notSentReason != nil, let current = try await store.experience(item.id) {
                         try await Self.settleExperience(current, in: store, accepted: false, evidence: evidence, reason: .failed)
                     }
@@ -190,7 +191,7 @@ extension AgentConversationStore {
                     try await store.append([.evidence(mark)], to: experience.id)
                 }
                 let held = try await store.experience(experience.id)?.evidence.contains(mark) == true
-                let delivery = AgentConversationDelivery.of(row, read: false)
+                let delivery = AgentConversationDelivery.of(row)
                 if !held, [.failed, .notDelivered, .unanswered].contains(delivery) {
                     if let current = try await store.experience(experience.id) {
                         try await Self.settleExperience(current, in: store, accepted: false, evidence: evidence,
@@ -202,8 +203,9 @@ extension AgentConversationStore {
                     try await store.append([.obligation(key: "accept", phase: .accepted,
                         evidence: .init(source: "agents/conversations", id: row.id))], to: experience.id)
                 }
+                let byPerson = exchange?.byPerson ?? row.personInitiated
                 try await store.append([.face(.init(words: TurnSecretRedactor.redactText(exchange?.prompt ?? ""),
-                    artifacts: []))], to: experience.id)
+                    artifacts: [], from: byPerson == true ? "person" : "self"))], to: experience.id)
                 if held, let now = try await store.experience(experience.id) {
                     try await HeldSends.settle(now, in: store, dataRoot: root)
                     continue

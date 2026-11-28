@@ -162,8 +162,10 @@ arrives during a transfer; it does not release/reload the resident model.
 The engine's independent launch work still requests checked epoch convergence.
 Configured but unreadable/invalid descriptors leave embedding bring-up unavailable
 instead of selecting bundled mode. Only genuinely absent download parts start at
-zero; failed part reads retain their actual error. Release and install scripts
-do not mutate the user's model cache.
+zero; failed part reads retain their actual error. When Pause cancels the
+transfer, Settings shows it as paused and the saved download parts are kept
+for resume. A failure writing the pause marker is shown in Settings. Release
+and install scripts do not mutate the user's model cache.
 
 To use the downloader in a development install, supply the release descriptor:
 

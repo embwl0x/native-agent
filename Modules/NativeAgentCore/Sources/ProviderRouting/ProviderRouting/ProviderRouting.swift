@@ -81,8 +81,8 @@ public actor SwiftNativeProviderRouting: Sendable {
         let savedActive = (try? Self.loadActiveProviderStateChecked(at: activeProviderPath)) ?? [:]
         let soleConnected = soleConnectedProviderID()
         let providers = try nativeListProviders(
-            openRouterModels: OpenRouterModelCatalog.readCache(dataRoot: dataRoot)?.map { $0.providerJSON() },
-            moonshotModels: MoonshotModelCatalog.readCache(dataRoot: dataRoot)?.map { $0.providerJSON() }
+            openRouterModels: OpenRouterModelCatalog.cache.currentModels(dataRoot: dataRoot)?.map { $0.providerJSON() },
+            moonshotModels: MoonshotModelCatalog.cache.currentModels(dataRoot: dataRoot)?.map { $0.providerJSON() }
         ).providers
         for (surface, value) in surfaces {
             let model: String?
@@ -336,7 +336,7 @@ public actor SwiftNativeProviderRouting: Sendable {
             entry["reasoningEffort"] = .string("medium")
         }
         if let serviceTier {
-            entry["serviceTier"] = .string(normalizeServiceTierStatic(serviceTier))
+            entry["serviceTier"] = .string(TextNormalization.trimmedLowercased(serviceTier))
         } else if seedMissingControls, entry["serviceTier"] == nil {
             entry["serviceTier"] = .string("default")
         }

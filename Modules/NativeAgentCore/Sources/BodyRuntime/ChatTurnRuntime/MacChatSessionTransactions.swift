@@ -13,7 +13,7 @@ public protocol MacChatSessionStore: AnyObject {
     func hasCachedTranscript(for sessionID: String) -> Bool
     func list() async throws -> [NativeAgentShared.ChatSession]
     func create(title: String, sourceKey: String?) async throws -> NativeAgentShared.ChatSession
-    func update(id: String, title: String?, archived: Bool?) async throws -> NativeAgentShared.ChatSession
+    func update(id: String, title: String?) async throws -> NativeAgentShared.ChatSession
 }
 
 /// Selection is admitted in Core; committing bubbles, receipts, defaults and
@@ -168,7 +168,7 @@ public final class MacChatSessionTransactions {
             return
         }
         do {
-            let updated = try await store.update(id: sessionId, title: cleanTitle, archived: nil)
+            let updated = try await store.update(id: sessionId, title: cleanTitle)
             indexRead.write {
                 if let index = store.sessions.firstIndex(where: { $0.id == sessionId }) { store.sessions[index] = updated }
             }

@@ -294,15 +294,17 @@ extension SwiftNativePersonaEngine {
                 updatedAt: NativeTimestampFormat.fractionalZulu(mtime)
             )
             // Activity remains separately owed; its failure cannot invite duplicate document append.
-            do {
-                try await self.recordPersonaDocActivity(docId: docId)
-                RepairOwed.settle(activityDataRoot, operation: "persona.document_activity",
-                    evidence: .init(source: "persona", id: docId))
-            } catch {
-                RepairOwed.owe(activityDataRoot, id: "persona-activity:" + docId, kind: .act,
-                    evidence: [.init(source: "persona", id: docId)],
-                    operation: "persona.document_activity", owner: activityPath.path,
-                    words: "\(docId).md was saved; its activity recording failed: \(error.localizedDescription)")
+            await settle {
+                do {
+                    try await self.recordPersonaDocActivity(docId: docId)
+                    RepairOwed.settle(activityDataRoot, operation: "persona.document_activity",
+                        evidence: .init(source: "persona", id: docId))
+                } catch {
+                    RepairOwed.owe(activityDataRoot, id: "persona-activity:" + docId, kind: .act,
+                        evidence: [.init(source: "persona", id: docId)],
+                        operation: "persona.document_activity", owner: activityPath.path,
+                        words: "\(docId).md was saved; its activity recording failed: \(error.localizedDescription)")
+                }
             }
             return spec
         }
@@ -380,27 +382,6 @@ extension SwiftNativePersonaEngine {
 }
 
 // MARK: - The shared (Mac and phone) profile shape
-
-extension SwiftNativePersonaEngine {
-    /// Use JSON decoding's Foundation leaf types for full-profile save.
-    public func savePersonality(_ profile: PersonalityProfile) async throws -> CompiledPersonalityProfile {
-        let body: [String: Any] = [
-            "name": profile.name,
-            "personaKind": profile.personaKind,
-            "traits": [
-                "warmth": profile.traits.warmth,
-                "directness": profile.traits.directness,
-                "humor": profile.traits.humor,
-                "proactivity": profile.traits.proactivity,
-                "rigor": profile.traits.rigor,
-                "autonomy": profile.traits.autonomy,
-                "creativity": profile.traits.creativity,
-                "brevity": profile.traits.brevity
-            ]
-        ]
-        return try await savePersonality(body: NativeActionWire.jsonValueBody(body))
-    }
-}
 
 extension CompiledPersonalityProfile {
     /// Share one profile shape across Mac/phone loading and saving.

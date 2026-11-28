@@ -22,21 +22,6 @@ enum PersonalityDocumentsReloadOutcome: Equatable {
 @MainActor
 extension AppModel {
 
-    /// Preserve persistence errors in the save result.
-    @MainActor
-    func savePersonalityChecked(_ profile: PersonalityProfile) async throws {
-        do {
-            let previousName = engine.persona.profile?.name
-            try await engine.persona.saveProfile(profile)
-            teachMemoryHygieneName(previousName: previousName)
-            statusText = "Personality saved"
-            await refreshAll()
-        } catch {
-            setFailureStatus(error, action: "save the personality")
-            throw error
-        }
-    }
-
     @discardableResult
     func savePersonalityName(_ rawName: String) async -> PersonalityNameSaveOutcome {
         do {
@@ -179,21 +164,29 @@ extension AppModel {
     /// Keep dream-run errors on the Dreams tab and reload only after success so failures remain visible. busy names effects kept owed
     /// because a shared slot was held: the run succeeded, and those wait for the next one.
     @MainActor
-    func runDreamPassForDreams(parent: Turn? = nil) async -> (ok: Bool, busy: [String]) {
+    func runDreamPassForDreams(parent: Turn? = nil) async -> (ok: Bool, busy: [String], stopped: Bool) {
         dreamError = nil
         do {
             let result = try await NativeAgentEngine.runDream(dataRoot: engine.dataRoot, trigger: .manual, parent: parent)
+            if result["status"] as? String == "stopped" {
+                statusText = (result["entriesWritten"] as? Int ?? 0) > 0
+                    ? "Dream cycle stopped after writing a diary entry" : "Dream cycle stopped"
+                return (true, [], true)
+            }
             if let detail = DreamReport.completionFailure(result) {
                 dreamError = "Dream cycle failed: \(detail)"
                 statusText = "Dream cycle failed"
-                return (false, [])
+                return (false, [], false)
             }
             statusText = DreamReport.statusText(result)
-            return (true, result["busy"] as? [String] ?? [])
+            return (true, result["busy"] as? [String] ?? [], false)
+        } catch is CancellationError {
+            statusText = "Dream cycle stopped"
+            return (true, [], true)
         } catch {
             dreamError = UserFacingError.message(error, action: "run the dream cycle")
             statusText = "Dream cycle failed"
-            return (false, [])
+            return (false, [], false)
         }
     }
 

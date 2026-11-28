@@ -142,48 +142,14 @@ public struct OpLogHealthCheck: DoctorCheck {
     }
 
     public func run() async -> CheckResult {
-        var lines: [String] = []
-        var damaged: [URL] = []
-        var blocked: [URL] = []
-        var warned = false
-
-        func record(_ health: SnapshotTailOpLog.OpLogHealth) {
-            lines.append(health.detailLine)
-            switch health.status {
-            case .blocked: blocked.append(health.path)
-            case .warn: warned = true
-            case .ok: break
-            }
-        }
-
-        // A failed feed read contributes its own finding without aborting the remaining probes.
+        let health: SnapshotTailOpLog.OpLogHealth
         do {
-            record(try await SwiftNativeDeskStore(dataRoot: root, changeBus: StoreChangeBus()).opLogHealth())
+            health = try await SwiftNativeDeskStore(dataRoot: root, changeBus: StoreChangeBus()).opLogHealth()
         } catch {
-            damaged.append(root.appendingPathComponent("desk/desk_ops.jsonl"))
-            lines.append("DeskStore: unreadable — \(error)")
-        }
-        do {
-            record(try await SwiftNativeTaskLedger(dataRoot: root).feedHealth())
-        } catch {
-            damaged.append(root.appendingPathComponent("orchestration/task_ledger.jsonl"))
-            lines.append("TaskLedger: unreadable — \(error)")
-        }
-
-        let detail = lines.joined(separator: "; ")
-        if let file = blocked.first {
-            // Rows a newer build wrote are valid; only a build that reads them can compact them.
+            let file = root.appendingPathComponent("desk/desk_ops.jsonl")
             return CheckResult(source: file.path,
                 id: id, title: title, status: "fail",
-                detail: "Op-log compaction is blocked: \(detail)",
-                harm: "Saved work may be unreadable and its history will keep growing.",
-                owner: .builder
-            )
-        }
-        if let file = damaged.first {
-            return CheckResult(source: file.path,
-                id: id, title: title, status: "fail",
-                detail: "An op-log feed is unreadable: \(detail)",
+                detail: "An op-log feed is unreadable: DeskStore: unreadable — \(error)",
                 harm: "Saved work may be unreadable and its history will keep growing.",
                 human_action: ToolFailureError.fileRepairInstruction(file,
                     shape: """
@@ -191,13 +157,24 @@ public struct OpLogHealthCheck: DoctorCheck {
                         and payloads, including rows from newer versions.
                         """))
         }
-        if warned {
-            return CheckResult(source: "desk/desk_ops.jsonl",
-                id: id, title: title, status: "warn",
-                detail: "An op-log feed has grown well past its compaction threshold: \(detail)",
+
+        switch health.status {
+        case .blocked:
+            // Rows a newer build wrote are valid; only a build that reads them can compact them.
+            return CheckResult(source: health.path.path,
+                id: id, title: title, status: "fail",
+                detail: "Op-log compaction is blocked: \(health.detailLine)",
+                harm: "Saved work may be unreadable and its history will keep growing.",
                 owner: .builder
             )
+        case .warn:
+            return CheckResult(source: "desk/desk_ops.jsonl",
+                id: id, title: title, status: "warn",
+                detail: "An op-log feed has grown well past its compaction threshold: \(health.detailLine)",
+                owner: .builder
+            )
+        case .ok:
+            return CheckResult(source: "desk/desk_ops.jsonl", id: id, title: title, status: "ok", detail: health.detailLine)
         }
-        return CheckResult(source: "desk/desk_ops.jsonl", id: id, title: title, status: "ok", detail: detail)
     }
 }

@@ -2495,8 +2495,5 @@
   function normalizedText(value) { return String(value).replace(/\s+/g, " ").trim(); }
   function bounded(value, maximum) { return String(value).slice(0, maximum); }
   function finite(value) { return Number.isFinite(Number(value)) ? Number(value) : 0; }
-  function clampInteger(value, minimum, maximum, fallback) {
-    return Number.isInteger(value) ? Math.min(maximum, Math.max(minimum, value)) : fallback;
-  }
   function pageError(code, message) { return Object.assign(new Error(message), { code }); }
 })();

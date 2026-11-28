@@ -89,7 +89,7 @@ extension SwiftNativeChatOrchestrationClient {
         let failed = result.toolDispatches.filter {
             let reply = ToolResult($0.result)
             return !ChatToolOutcome.outputLooksSuccessful(reply.payload, verdict: reply.outcome)
-                && !ChatToolOutcome.isPersonArrivalHandBack($0.result)
+                && !ChatToolOutcome.isToolHandBack($0.result)
                 && reply.outcome != .cancelled
                 && !ChatToolOutcome.isWaitingOnPerson(reply.payload, verdict: reply.outcome)
         }.count
@@ -126,6 +126,7 @@ extension SwiftNativeChatOrchestrationClient {
             payload["contextSelectedAtomCount"] = .int(Int64(observation.contextSelectedAtomCount))
             payload["contextPacketCharacters"] = .int(Int64(observation.contextPacketCharacters))
             payload["contextExpandablePointerCount"] = .int(Int64(observation.contextExpandablePointerCount))
+            if let walk = observation.contextAssociationWalkMicroseconds { payload["contextAssociationWalkMicroseconds"] = .int(Int64(walk)) }
         }
         return TurnTraceEvent(
             turnId: turnId,
@@ -490,8 +491,6 @@ extension SwiftNativeChatOrchestrationClient {
             uniquingKeysWith: { a, _ in a }
         )
         let weight = ToolContractWeight.Measurement(
-            floorCount: ordering.floor.count,
-            appendedCount: ordering.appended.count,
             floorBytes: ordering.floor.reduce(0) { $0 + (bytesByName[$1] ?? 0) },
             appendedBytes: ordering.appended.reduce(0) { $0 + (bytesByName[$1] ?? 0) }
         )

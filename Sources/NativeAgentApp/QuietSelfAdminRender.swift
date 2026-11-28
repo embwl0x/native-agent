@@ -17,20 +17,25 @@ import MindCore
 enum QuietSelfAdminRender {
     /// Read through the page's owner.
     static func pageRead(for page: QuietPage, appModel: AppModel, turn: Turn? = nil, face: BodyFacePresentation? = nil) async -> [JSONValue] {
-        var content = await pageProjection(for: page, appModel: appModel, turn: turn, face: face)
+        let reading = await pageProjection(for: page, appModel: appModel, turn: turn, face: face)
+        var content = reading.content
         if let failure = appModel.engine.layout.availability.failure {
             content.insert(layoutIssue(failure), at: 0)
+        }
+        if !reading.boundaries.isEmpty {
+            content.insert(.object(["lines": .array(reading.boundaries.map(JSONValue.string))]), at: 0)
         }
         return content
     }
 
-    private static func pageProjection(for page: QuietPage, appModel: AppModel, turn: Turn?, face: BodyFacePresentation?) async -> [JSONValue] {
-        if page.id == "chat" { return await chatProjection(appModel: appModel, turn: turn, face: face) }
+    private static func pageProjection(for page: QuietPage, appModel: AppModel, turn: Turn?, face: BodyFacePresentation?)
+        async -> (content: [JSONValue], boundaries: [String]) {
+        if page.id == "chat" { return (await chatProjection(appModel: appModel, turn: turn, face: face), []) }
         guard page.item == .ownPage || QuietPages.shown(page.item)?.id == page.id else {
             // An app whose access the person sets on Trust reads Trust's rows for it, as Trust draws them now.
             let access: DoorPageAccess
             if page.item == .trust { access = .trust(await appModel.engine.pages.refresh(page: "trust")) } else { access = .notOnTrust }
-            return AppToolExecutor.doorPageRead(page.value, access: access)
+            return (AppToolExecutor.doorPageRead(page.value, access: access), [])
         }
         // A page of the agent's own reads itself through engine.pages; the others load their shared data first.
         if page.item != .chat, page.item != .activity, page.item != .memories, page.item != .bots, page.item != .ownPage {
@@ -38,15 +43,22 @@ enum QuietSelfAdminRender {
         }
         guard let snapshot = await appModel.engine.pages.refresh(page: page.id) else {
             if page.id == "today" {
-                return [.object(["heading": .string(page.title), "lines": .array([.string("Reading Today…")])])]
+                return ([.object(["heading": .string(page.title), "lines": .array([.string("Reading Today…")])])], [])
             }
-            return [issue(page.title, reason: "page_unavailable", detail: "\(page.id) has not published its required face.",
+            return ([issue(page.title, reason: "page_unavailable", detail: "\(page.id) has not published its required face.",
                 instruction: "Read this page again after its owner publishes; preserve the owner's failure if it remains unavailable.",
-                next: ["page": .string(page.id)])]
+                next: ["page": .string(page.id)])], [])
         }
         var untitled: String? = page.title
         var sections: [JSONValue] = []
-        for block in snapshot.text(title: page.title, door: true, page: page.id).components(separatedBy: "\n\n") where !block.isEmpty {
+        let drawn = snapshot.drawnFace
+        if let turn, let drawn {
+            for source in snapshot.sources(in: drawn.sections) { turn.peerSteering?.mark(dataRoot: turn.dataRoot, peer: source) }
+        }
+        let tableReadings = await appModel.engine.tableTextReadings(for: drawn, includeStandingTable: page.id == "desk")
+        let boundaries = drawn?.tableBoundaries(tableReadings) ?? []
+        let words = snapshot.text(title: page.title, door: true, page: page.id, tableReadings: tableReadings, includeTableBoundaries: false)
+        for block in words.components(separatedBy: "\n\n") where !block.isEmpty {
             var lines = block.components(separatedBy: "\n")
             var heading: String?
             if let first = lines.first, first == snapshot.face?.title || first.hasSuffix(":") {
@@ -76,7 +88,7 @@ enum QuietSelfAdminRender {
         if let drawer = await appModel.engine.pages.drawer(page: page.id) {
             sections.append(.object(["heading": .string("How this page changes"), "lines": .array([.string(changeLine(drawer))])]))
         }
-        return sections
+        return (sections, boundaries)
     }
 
     /// One line on how the agent changes a shown page: the part that draws it and the calls that revise it, or that Swift draws it and what

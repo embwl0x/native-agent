@@ -194,6 +194,22 @@ public struct CodexCompletionLifecycle: Sendable {
         }
     }
 
+    func attachRoute(_ route: AgentBridgeCompletionRoute, deliveryId: String, requestDigest: String, sessionId: String) async throws -> Bool {
+        let path = stateURL(deliveryId)
+        return try await SwiftNativePersistenceCore.withFileLock(path) {
+            guard var state = try await loadState(path), state.route == nil else { return false }
+            try Self.requireDigest(state, requestDigest)
+            guard state.sessionId == sessionId, state.response != nil, state.artifacts.isEmpty,
+                  state.delivery?.status == "owed" || (state.phase == .responseCached && state.delivery == nil) else {
+                throw LifecycleError.requestConflict
+            }
+            state.route = route
+            state.updatedAt = Self.nowISO()
+            try await write(state, to: path)
+            return true
+        }
+    }
+
     /// Only a proven pre-run failure or admission rejection can release a claim for retry. A started or uncertain turn must never use this edge.
     public func markNotStarted(deliveryId: String, requestDigest: String,
                                detail: String = "bridge_admission_full_before_model_start") async throws {
@@ -292,7 +308,8 @@ public struct CodexCompletionLifecycle: Sendable {
                 } catch {
                     Self.logLifecycleIsolationFailure(error, url: url)
                 }
-            } catch {
+            } catch is CancellationError { throw CancellationError() }
+            catch {
                 // Isolate filesystem failures per delivery, preserving damaged bytes while healthy claims reconcile.
                 Self.logLifecycleIsolationFailure(error, url: url)
             }

@@ -2,7 +2,7 @@ import NativeAgentShared
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `DeskText.swift` | `DeskPage`: compact board and exact-record text, sequencing segments, duration and archive presentation |
+// Blueprint: | `DeskText.swift` | `DeskPage`: compact board and exact-record text, sequencing segments and duration presentation |
 
 // MARK: - DeskPage — pure DeskState -> compact text renderer
 // State is authoritative; inject now so presentation ages consistently.
@@ -16,8 +16,7 @@ public enum DeskPage {
 
     public static func render(
         _ state: DeskState,
-        now: Date = Date(),
-        archiveGrace: TimeInterval = SwiftNativeDeskStore.defaultArchiveGrace
+        now: Date = Date()
     ) -> String {
         let plan = DeskSequencing.compute(state, now: now)
         var lines: [String] = []
@@ -26,7 +25,7 @@ public enum DeskPage {
             + " · held (derived: now/next that is blocked or deferred)")
 
         for item in cappedTopLevel(plan.children) {
-            lines.append(renderTopLevel(item, in: state, now: now, archiveGrace: archiveGrace, plan: plan))
+            lines.append(renderTopLevel(item, in: state, now: now, plan: plan))
             if let note = noteLine(item) { lines.append(note) }
             let kids = plan.children[item.handle] ?? []
             let listKids = kids.count >= 2 || (kids.count == 1 && childHighlight(item, plan: plan) == nil)
@@ -118,7 +117,6 @@ public enum DeskPage {
         _ item: DeskItem,
         in state: DeskState,
         now: Date,
-        archiveGrace: TimeInterval,
         plan: DeskSequencing.Plan
     ) -> String {
         let token2 = statusToken(item, plan: plan)
@@ -146,9 +144,6 @@ public enum DeskPage {
         if let stale = staleSegment(item, now: now) {
             segs.append(stale)
         }
-        if let archives = archiveCountdown(item, in: plan.children, now: now, archiveGrace: archiveGrace) {
-            segs.append(archives)
-        }
         if item.cadence.mode == .event {
             segs.append("\(item.notify.level.rawValue)/event")
         }
@@ -173,8 +168,6 @@ public enum DeskPage {
         return "  note: \(last.text)"
     }
 
-    // MARK: - Staleness / archive countdown
-
     static func staleSegment(_ item: DeskItem, now: Date) -> String? {
         // Deferred work suppresses staleness consistently across callers.
         guard !DeskSequencing.isDeferred(item, now: now) else { return nil }
@@ -185,18 +178,6 @@ public enum DeskPage {
         let elapsed = now.timeIntervalSince(last)
         guard elapsed > threshold else { return nil }
         return "stale:\(humanDuration(elapsed))"
-    }
-
-    /// Eligibility does not archive work; archival remains explicit.
-    static func archiveCountdown(_ item: DeskItem, in children: [String?: [DeskItem]], now: Date, archiveGrace: TimeInterval) -> String? {
-        guard item.status.isTerminal, item.kind != .standing, !item.pinned,
-              item.continuation?.pending.isEmpty ?? true,
-              let closedRaw = item.closedAt, let closed = DeskClock.parseISO(closedRaw) else { return nil }
-        guard !SwiftNativeDeskStore.descendants(of: item.handle, in: children).contains(where: {
-            $0.kind == .standing || !$0.status.isTerminal || !($0.continuation?.pending.isEmpty ?? true)
-        }) else { return nil }
-        let remaining = archiveGrace - now.timeIntervalSince(closed)
-        return remaining > 0 ? "archive eligible in \(humanDuration(remaining))" : "archive eligible"
     }
 
     // MARK: - Duration helpers

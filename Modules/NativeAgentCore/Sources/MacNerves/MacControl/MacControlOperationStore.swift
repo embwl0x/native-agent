@@ -38,7 +38,6 @@ public struct MacControlOperationRecord: Codable, Sendable, Equatable {
     public var state: MacControlOperationState
     public let acceptedAt: Date
     public var startedAt: Date?
-    public var deadlineAt: Date?
     public var cancelRequestedAt: Date?
     public var terminalAt: Date?
     public var verification: MotorVerificationState
@@ -53,7 +52,6 @@ public struct MacControlOperationRecord: Codable, Sendable, Equatable {
         state: MacControlOperationState,
         acceptedAt: Date,
         startedAt: Date? = nil,
-        deadlineAt: Date? = nil,
         cancelRequestedAt: Date? = nil,
         terminalAt: Date? = nil,
         verification: MotorVerificationState = .notStarted,
@@ -66,7 +64,6 @@ public struct MacControlOperationRecord: Codable, Sendable, Equatable {
         self.state = state
         self.acceptedAt = acceptedAt
         self.startedAt = startedAt
-        self.deadlineAt = deadlineAt
         self.cancelRequestedAt = cancelRequestedAt
         self.terminalAt = terminalAt
         self.verification = verification
@@ -193,8 +190,7 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
     public func begin(
         operationId: String,
         action: String,
-        requestDigest: String,
-        deadlineAt: Date? = nil
+        requestDigest: String
     ) async throws -> MacControlOperationBeginOutcome {
         guard Self.validOperationId(operationId) else {
             throw MacControlOperationStoreError.invalidOperationId
@@ -227,7 +223,6 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
                 requestDigest: requestDigest,
                 state: .accepted,
                 acceptedAt: acceptedAt,
-                deadlineAt: deadlineAt,
                 verification: .notStarted,
                 expectedNextEvidence: "Mac Control execution start"
             )
@@ -310,16 +305,13 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
         return snapshot.operations.first { $0.operationId == operationId }
     }
 
-    /// Restart cannot retain prior-process execution ownership. Mark interrupted rows terminal without replay; full startup recovery and action-scoped bridge
-    /// recovery keep distinct scopes.
     @discardableResult
-    public func recoverInterruptedOperations(action: String? = nil) async throws -> Int {
+    public func recoverInterruptedOperations() async throws -> Int {
         do {
             let count = try await mutate { snapshot in
                 var recovered = 0
                 let timestamp = now()
                 for index in snapshot.operations.indices where !snapshot.operations[index].state.isTerminal || snapshot.operations[index].terminalAt == nil {
-                    if let action, snapshot.operations[index].action != action { continue }
                     let priorState = snapshot.operations[index].state
                     // `accepted` is durably recorded before execution begins, so an interruption there proves no effect started. Once the operation reached
                     // `started` (or cancellation raced it), a restart cannot honestly infer whether the external effect happened. Preserve that ambiguity and
@@ -342,9 +334,7 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
                 return recovered
             }
             // Only whole-owner launch recovery can open admission.
-            if action == nil {
-                Self.recovery.withLock { $0[path] = .ready }
-            }
+            Self.recovery.withLock { $0[path] = .ready }
             return count
         } catch {
             Self.recovery.withLock { $0[path] = .unavailable(error.localizedDescription) }
@@ -361,14 +351,7 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
             domainState: record.state.rawValue,
             verification: record.verification,
             expectedNextEvidence: record.expectedNextEvidence,
-            updatedAt: NativeTimestampFormat.fractionalZulu(record.terminalAt ?? record.cancelRequestedAt ?? record.startedAt ?? record.acceptedAt),
-            cancellationIdentity: record.state.isTerminal ? nil : record.operationId,
-            deadline: record.state.isTerminal ? nil : record.deadlineAt.map { deadlineAt in
-                MotorActionDeadlineReadModel(
-                    scope: .operation,
-                    timeoutSeconds: max(1, Int((deadlineAt.timeIntervalSince(record.acceptedAt)).rounded()))
-                )
-            }
+            updatedAt: NativeTimestampFormat.fractionalZulu(record.terminalAt ?? record.cancelRequestedAt ?? record.startedAt ?? record.acceptedAt)
         )
     }
 

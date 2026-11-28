@@ -198,7 +198,7 @@ final class SettingsFaceUpdates {
             }
         }
         let declared = Self.preferenceDefaults
-        let keys = Set(QuietSettings.defaultsKeys(forPage: "settings", host: AppQuietSettingsHost(appModel))).union(declared.keys)
+        let keys = Set(QuietSettings.defaultsKeys(host: AppQuietSettingsHost(appModel))).union(declared.keys)
         let feed = appModel.engine.settingsFeed
         preferences = Task.detached {
             let changes = EventDeadlinePhysiology.storeAndFileEvents(paths: [], notifications: [UserDefaults.didChangeNotification])

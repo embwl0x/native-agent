@@ -47,14 +47,12 @@ public final class ConnectorReadiness: Sendable {
 
     /// Return this read independently of snapshot publication.
     @discardableResult
-    @MainActor public func refresh(quiet: Bool = false) async -> Result<[ConnectorRecord], Error> {
+    @MainActor public func refresh() async -> Result<[ConnectorRecord], Error> {
         let root = root, platform = platform
         let snapshot = await snapshotRead.read({
             await Task.detached(priority: .userInitiated) {
                 let checked: Result<[ConnectorRecord], Error>
-                do { checked = .success(quiet
-                    ? try Self.checkedConnectorRecords(root: root, platform: platform)
-                    : try await Self.readConnectorRecords(root: root, platform: platform)) }
+                do { checked = .success(try await Self.readConnectorRecords(root: root, platform: platform)) }
                 catch { checked = .failure(error) }
                 return (checked,
                  Result { try Keyring.kept().map { (name: $0.name, hosts: $0.entry.hosts, programs: $0.entry.programs, at: $0.entry.at, account: $0.entry

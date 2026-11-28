@@ -139,9 +139,11 @@ extension SwiftNativeMemoryV2 {
         let (qvec, rewritten, rewrittenEmbedding, embedded, topK, storageTopK, hasUsableVector) = vectors
         let canonicalStorage = storage
         func disclosedRows(_ rows: [ScoredMemoryRecord]) -> [ScoredMemoryRecord] {
+            let now = Date()
             var seen: Set<String> = []
             return rows.sorted { $0.score == $1.score ? $0.record.id < $1.record.id : $0.score > $1.score }.filter { scoredRecord in
-                guard let classification = MemoryRecordDisclosurePolicy.classify(scoredRecord.record) else {
+                guard MemoryRecallScoring.hasStarted(validFrom: scoredRecord.record.validFrom, at: now),
+                      let classification = MemoryRecordDisclosurePolicy.classify(scoredRecord.record, at: now) else {
                     return false
                 }
                 guard classification.permits(surface: query.surface, personaID: query.persona) else {
@@ -260,15 +262,12 @@ extension SwiftNativeMemoryV2 {
             capped = offset > 0 || hasMore
         }
         metrics.timings["selection_ms"] = metrics.milliseconds(since: selectionStarted)
-        metrics.timings["results"] = Double(sorted.count)
         try Task.checkCancellation()
-        let usedIds = recordingUsage ? sorted.map { $0.record.id } : []
-        if !usedIds.isEmpty {
-            try await storage.recordRecallHits(ids: usedIds)
-        }
-        // Shape full text on selected hits without changing ranking, row selection or storage reads.
-        let trust = MemoryDataProvenance.reading(dataRoot: storage.dataRoot, sorted.map { $0.record.extras })
-        let hits: [MemoryRecallHit] = sorted.map { sr in
+        let current = try await storage.checkedRecallRows(sorted, surface: query.surface, persona: query.persona,
+                                                         recordingUsage: recordingUsage)
+        metrics.timings["results"] = Double(current.count)
+        let trust = MemoryDataProvenance.reading(dataRoot: storage.dataRoot, current.map { $0.record.extras })
+        let hits: [MemoryRecallHit] = current.map { sr in
             let canonicalText = MemoryTextClip.memoryDisplayText(
                 sr.record.text,
                 kind: sr.record.memoryKind
@@ -316,9 +315,9 @@ extension SwiftNativeMemoryV2 {
         metrics.timings["total_ms"] = metrics.milliseconds(since: recallStarted)
         return MemoryV2RecallResponse(
             hits: hits,
-            scored: sorted,
-            total: sorted.count,
-            disclosureFilteredCount: disclosureFilteredCount,
+            scored: current,
+            total: current.count,
+            disclosureFilteredCount: disclosureFilteredCount + sorted.count - current.count,
             timings: metrics.timings,
             capped: capped,
             hasMore: hasMore,
@@ -327,9 +326,12 @@ extension SwiftNativeMemoryV2 {
     }
 
     /// Exact-ID recovery for a previously recalled excerpt. Does not embed, rank, enumerate records, or expose an admin/lineage bypass.
-    public func readMemoryRecord(id: String, persona: String? = nil, surface: String) async throws -> MemoryRecord? {
-        let id = id.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !id.isEmpty, id.utf8.count <= 512 else {
+    public func readMemoryRecord(id: String, surface: String) async throws -> MemoryRecord? {
+        try await readMemoryRecord(id: id, surface: surface, includingNoncurrent: false)
+    }
+
+    package func readMemoryRecord(id: String, surface: String, includingNoncurrent: Bool) async throws -> MemoryRecord? {
+        guard let id = Self.exactRecallID(id) else {
             throw ToolFailureError("Memory id must contain 1–512 UTF-8 bytes.", argumentPath: "memory_id",
                 accepted: "an existing memory id, at most 512 UTF-8 bytes", effects: .none,
                 nextCall: ToolFailureError.call("app", ["action": .string("memory.list")]),
@@ -340,10 +342,10 @@ extension SwiftNativeMemoryV2 {
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         try Task.checkCancellation()
         guard let record = try await storage.memory(id: id).map(MemoryRecord.init(stored:)),
+              includingNoncurrent || MemoryRecallScoring.hasStarted(validFrom: record.validFrom, at: Date()),
               record.id == id,
-              persona == nil || record.personaId == persona,
-              let disclosure = MemoryRecordDisclosurePolicy.classify(record),
-              disclosure.permits(surface: surface, personaID: persona),
+              let disclosure = MemoryRecordDisclosurePolicy.classify(record, includingNoncurrent: includingNoncurrent),
+              disclosure.permits(surface: surface, personaID: nil),
               MemoryCandidateQuality.isDurableCandidate(text: record.text) else { return nil }
         let tombstoned = try await storage.isTombstoned(content: record.text)
         guard !tombstoned else { return nil }
@@ -353,7 +355,22 @@ extension SwiftNativeMemoryV2 {
                 instruction: "Check memory admission progress before recalling this record again.", recovery: .inspect)
         }
         try Task.checkCancellation()
-        return record
+        let checked = try await storage.checkedRecallRows([ScoredMemoryRecord(record: record, score: 0)],
+            surface: surface, persona: nil, recordingUsage: false, includingNoncurrent: includingNoncurrent)
+        return checked.first?.record
     }
 
+    package func currentReplacementID(for record: MemoryRecord, surface: String) async throws -> String? {
+        let metadata = record.extras?.objectValue
+        guard let id = metadata?["corrected_by"]?.stringValue ?? metadata?["superseded_by"]?.stringValue,
+              Self.exactRecallID(id) == id, id != record.id else { return nil }
+        guard let storage else { throw MemoryV2Error.storageUnavailable }
+        try Task.checkCancellation()
+        return try await storage.currentRecallID(id: id, surface: surface)
+    }
+
+    private static func exactRecallID(_ id: String) -> String? {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !trimmed.isEmpty && trimmed.utf8.count <= 512 ? trimmed : nil
+    }
 }

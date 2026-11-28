@@ -61,14 +61,20 @@ struct ToolResultPageArgs: DoorArgs {
         Exact original bytes instead of sections, only for reconstruction or oversized values. Separate 8000-byte pages may \
         split sentences/JSON; concatenate from page 0 through raw_page_count pages.
         """).nullable()
+    static let selectField = DoorFieldDescriptor.string("select", """
+        Only these fields of the whole retained result, as comma-separated paths ("rows.id, rows.title, total"); a list reached by name \
+        gives the field of every row. Instead of paging when you need a few fields of a large result.
+        """).nullable()
     static let sessionIDField = DoorFieldDescriptor.string("session_id", "Current conversation id; the app fills this in.").nullable()
-    static let doorFields: [DoorFieldDescriptor] = [resultHandleField, resumeField, pageField, pagesField, queryField, rawField, sessionIDField]
+    static let doorFields: [DoorFieldDescriptor] = [resultHandleField, resumeField, pageField, pagesField, queryField, rawField, selectField,
+                                                    sessionIDField]
     let resultHandle: String?
     let resume: Bool?
     let page: DoorNumberLiteral?
     let pages: DoorNumberLiteral?
     let query: String?
     let raw: Bool?
+    let select: String?
     let sessionID: String?
 
     init(door: inout DoorObjectDecoder) throws(DoorDecodeError) {
@@ -78,6 +84,7 @@ struct ToolResultPageArgs: DoorArgs {
         pages = try door.numberLiteral(Self.pagesField)
         query = try door.string(Self.queryField)
         raw = try door.bool(Self.rawField)
+        select = try door.string(Self.selectField)
         sessionID = try door.string(Self.sessionIDField)
     }
 }

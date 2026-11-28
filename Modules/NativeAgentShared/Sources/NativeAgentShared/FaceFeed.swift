@@ -1,7 +1,7 @@
 import Foundation
 import Observation
 import Synchronization
-// Blueprint: | `FaceFeed.swift` | Finished values, replayable connection sinks and applied-frame barriers for local and remote faces |
+// Blueprint: | `FaceFeed.swift` | Finished values for faces, replayable connection sinks and remote applied-frame barriers |
 
 /// Where a finished value lives on a face. One key, one slot: a change at a key redraws only what reads that key.
 public enum FaceKey: Hashable, Sendable, Codable {
@@ -21,7 +21,6 @@ public enum FaceKey: Hashable, Sendable, Codable {
     case inspectorReplay(day: Date)
     case layout
     case conversation(session: String)
-    case document(UUID)
     case agentScreen(room: String, scope: String?)
     case palette(UUID)
     case deskPalette(UUID)
@@ -38,7 +37,6 @@ public enum FaceKey: Hashable, Sendable, Codable {
     case cognition
     case contextFlowHealth
     case mood
-    case runs
     case run(String)
     case onboarding
     case contextReceipt(session: String)
@@ -81,7 +79,6 @@ public actor FaceFeedSource {
     private var retained = FaceBatch()
     private var sinks: [UUID: FaceFeedSinkState] = [:]
     private var remoteBarriers: [UUID: FaceRemoteBarrier] = [:]
-    private var barriers: [UUID: CheckedContinuation<Void, Error>] = [:]
     private let signal: AsyncStream<Void>.Continuation
     public nonisolated let arrivals: AsyncStream<Void>
 
@@ -207,31 +204,6 @@ public actor FaceFeedSource {
         sinks[epoch] = sink
         sink.continuation.yield(pending)
     }
-
-    /// A capture waits for its queued values to reach the face's frame; cancellation ends the wait without drawing early.
-    fileprivate func flush() async throws {
-        let id = UUID()
-        try await withTaskCancellationHandler {
-            try Task.checkCancellation()
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                let wasEmpty = pending.isEmpty
-                barriers[id] = continuation
-                pending.barriers.append(id)
-                if wasEmpty { signal.yield() }
-            }
-        } onCancel: {
-            Task { await self.cancelBarrier(id) }
-        }
-    }
-
-    fileprivate func applied(_ batch: FaceBatch) {
-        for id in batch.barriers { barriers.removeValue(forKey: id)?.resume() }
-    }
-
-    private func cancelBarrier(_ id: UUID) {
-        pending.barriers.removeAll { $0 == id }
-        barriers.removeValue(forKey: id)?.resume(throwing: CancellationError())
-    }
 }
 
 /// One key's current value on a face. Views observe a slot, so only the views reading this key redraw when it changes.
@@ -317,15 +289,13 @@ public final class FaceSelection<Value: FaceValue, Part: Equatable>: NSObject, F
 @MainActor
 public final class FaceFeed {
     private var slots: [FaceKey: FaceSlot] = [:]
-    private let source: FaceFeedSource?
     private var remoteEpoch: UUID?
     private var remoteSequence: UInt64 = 0
 
-    public init() { source = nil }
+    public init() {}
 
     /// `nextFrame` is the face's own display rhythm (a display link on the Mac, CADisplayLink on the phone).
     public init(source: FaceFeedSource, nextFrame: @escaping @MainActor () async -> Void) {
-        self.source = source
         // The drain ends with the feed: it holds the feed weakly and returns at the next arrival after the feed is gone.
         Task { @MainActor [weak self, source] in
             for await _ in source.arrivals {
@@ -333,7 +303,6 @@ public final class FaceFeed {
                 let batch = await source.take()
                 guard let self else { return }
                 self.apply(batch)
-                await source.applied(batch)
             }
         }
     }
@@ -343,12 +312,6 @@ public final class FaceFeed {
         let slot = FaceSlot()
         slots[key] = slot
         return slot
-    }
-
-    public func flush() async throws {
-        guard let source else { throw FaceWireError.disconnected }
-        try await source.flush()
-        try Task.checkCancellation()
     }
 
     private func apply(_ batch: FaceBatch) {

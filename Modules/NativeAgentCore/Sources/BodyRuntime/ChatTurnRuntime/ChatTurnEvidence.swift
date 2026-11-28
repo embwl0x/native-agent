@@ -78,10 +78,6 @@ public enum UserTurnStamp {
         }
     }
 
-    public static func last(dataRoot: URL) -> Date? {
-        reportedRead(dataRoot).map { Date(timeIntervalSince1970: $0.at) }
-    }
-
     /// The preceding verified user turn marks where this turn's gap opened.
     public static func previous(dataRoot: URL) -> Date? {
         reportedRead(dataRoot)?.previous.map { Date(timeIntervalSince1970: $0) }

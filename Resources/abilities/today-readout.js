@@ -60,7 +60,9 @@ function run(input) {
         const title=t.sourceKind === "stagedApproval" ? "Pending approval"
             : t.sourceKind === "peerReply" ? "Waiting on "+label
             : t.sourceKind === "statedPlan" ? label : undefined;
-        if (title) {
+        if (t.started) {
+            ahead.push(row("facing","Waiting on "+t.label,"since "+t.started,["facing"]));
+        } else if (title) {
             const part=t.hour<12 ? "morning" : t.hour<17 ? "afternoon" : t.hour<21 ? "evening" : "night";
             const due=t.past ? "Still waiting" : t.today ? "This "+part : t.tomorrow ? "Tomorrow "+part : t.weekday+" "+part;
             ahead.push(row("facing",title,due,["facing"]));
@@ -221,6 +223,7 @@ function face(input) {
     // A row that leads somewhere takes the key of the source it leads to; a row holding others leads nowhere itself.
     function drawn(row) {
         const linked=row.rows ? undefined : row.sources.find(key=>open(key)), id=linked || row.id;
+        if (row.id === "facing" && input.toward.started) return {id,title:row.title,value:row.line};
         return {id,title:row.title,detail:row.line,at:at(row.sources),tone:row.failure ? "failed" : undefined,open:linked ? open(linked) : undefined,
             rows:row.rows ? row.rows.map(drawn) : undefined};
     }

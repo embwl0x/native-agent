@@ -350,16 +350,8 @@ public enum VisionColorRegionLayer {
 
     /// Deterministic reading order keeps identical scenes from changing handles.
     static func readingOrder(_ candidates: [VisionCandidate]) -> [VisionCandidate] {
-        VisionRect.readingOrder(candidates, rect: \.rect, tolerance: 2, geometryPrecedes: geometryPrecedes) {
-            $0.rect.area == $1.rect.area ? geometryPrecedes($0, $1) : $0.rect.area > $1.rect.area
+        VisionRect.readingOrder(candidates, rect: \.rect, tolerance: 2, geometryPrecedes: { $0.rect.geometryPrecedes($1.rect) }) {
+            $0.rect.area == $1.rect.area ? $0.rect.geometryPrecedes($1.rect) : $0.rect.area > $1.rect.area
         }
     }
-
-    private static func geometryPrecedes(_ lhs: VisionCandidate, _ rhs: VisionCandidate) -> Bool {
-        if lhs.rect.y != rhs.rect.y { return lhs.rect.y < rhs.rect.y }
-        if lhs.rect.x != rhs.rect.x { return lhs.rect.x < rhs.rect.x }
-        if lhs.rect.w != rhs.rect.w { return lhs.rect.w < rhs.rect.w }
-        return lhs.rect.h < rhs.rect.h
-    }
-
 }

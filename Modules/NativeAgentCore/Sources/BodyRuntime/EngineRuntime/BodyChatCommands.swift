@@ -21,7 +21,7 @@ public final class BodyChatCommands: MacChatTurnPresentationPort {
         Task { await engine.countsStatus.observeToasts(SystemToastCenter.shared) }
     }
 
-    public func handle(_ act: FaceAct, renderer: UUID? = nil) async throws -> FaceActReply {
+    public func handle(_ act: FaceAct, renderer: UUID? = nil, expectedStopRun: String? = nil) async throws -> FaceActReply {
         switch act {
         case .createConversation:
             let session = try await engine.transcripts.sessionTransactions.create(store: engine.transcripts)
@@ -50,9 +50,6 @@ public final class BodyChatCommands: MacChatTurnPresentationPort {
                 }
             })
             return .accepted(session: try result.get(), turn: nil, operation: nil)
-        case .markConversationRead(let session):
-            MacChatUnreadSessions.shared.markRead(session)
-            return .acknowledged
         case .renameConversation(let session, let title):
             let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !clean.isEmpty else { throw EngineFaceActs.failure("empty_title", "Enter a conversation title.") }
@@ -61,7 +58,7 @@ public final class BodyChatCommands: MacChatTurnPresentationPort {
                 throw EngineFaceActs.failure("session_unavailable", "That conversation is not in the current index.")
             }
             if current.title == clean { return try EngineFaceActs.committed(current, identities: [session]) }
-            let saved = try await engine.transcripts.update(id: session, title: clean, archived: nil)
+            let saved = try await engine.transcripts.update(id: session, title: clean)
             return await publishSessionMutation(saved)
         case .archiveConversation(let session):
             let changed = try await engine.archiveMacChatTranscript(port: self, sessionId: session) { id in
@@ -102,26 +99,29 @@ public final class BodyChatCommands: MacChatTurnPresentationPort {
                 || macChatTurns.busySessions.contains(session) || flights.contains(where: { $0.sessionId == session }) else {
                 throw EngineFaceActs.failure("session_unavailable", "That conversation has no checked session or running turn to stop.")
             }
-            if let expected, macChatTurns.activeTurnIDsBySession[session] != expected {
-                throw EngineFaceActs.failure("turn_changed", "That turn is no longer the conversation's current turn.")
+            let runID: String?
+            if let expected {
+                guard macChatTurns.activeTurnIDsBySession[session] == expected,
+                      let lifecycle = macChatTurns.lifecycle(for: session), lifecycle.identity.turnId == expected,
+                      !lifecycle.presentation.isTerminal, lifecycle.cancellationRequestedAt == nil,
+                      let flight = flights.first(where: {
+                          $0.sessionId == session && $0.turnId == expected && (expectedStopRun == nil || $0.runId == expectedStopRun)
+                      }) else {
+                    throw EngineFaceActs.failure("turn_changed", "That turn is no longer the conversation's current turn.")
+                }
+                runID = flight.runId
+            } else {
+                runID = nil
             }
             try await withCheckedThrowingContinuation { (done: CheckedContinuation<Void, Error>) in
-                stopChatStream(sessionId: session, didWrite: { done.resume(with: $0) })
+                stopChatStream(sessionId: session, runID: runID, didWrite: { done.resume(with: $0) })
             }
             ModuleLog.app("[face-act] stop request saved session=\(session)")
             return .acknowledged
-        case .prepareRetryDraft(let session, let message):
-            let (target, messages) = try await messageRow(message, session: session)
-            guard target.metadata?.providerRefusalDraft == true,
-                  let snapshot = MacChatRetrySnapshot.capture(target: target, messages: messages,
-                    sessionId: session, isSyntheticNotice: false), !snapshot.inputHadAttachments else {
-                throw EngineFaceActs.failure("retry_draft_unavailable", "This response has no reusable text draft. Reattach its files before sending.")
-            }
-            return .result(.string(snapshot.priorUserText))
         case .regenerate(let session, let message, let choice):
-            let (target, _) = try await messageRow(message, session: session)
+            let target = try await messageRow(message, session: session)
             if choice == .continueFromResults {
-                return try await send(SendRequest(session: session, text: ChatTurnFailure.continuePrompt, attachments: [], composerRevision: 0,
+                return try await send(SendRequest(session: session, text: ChatTurnFailure.continuePrompt, attachments: [],
                     expectedSelection: nil, options: .init(hideUserBubble: false, choice: nil, continuationReference: nil)), renderer: renderer)
             }
             if target.metadata?.providerRefusal == true {
@@ -139,7 +139,7 @@ public final class BodyChatCommands: MacChatTurnPresentationPort {
                     "phase": phase.map { .string($0.rawValue) } ?? .null]))
             }
         case .revise(let session, let message, let from, let text):
-            let (target, _) = try await messageRow(message, session: session)
+            let target = try await messageRow(message, session: session)
             // Her side is the text the editor started from, so a difference the editor made (folds, spacing) is never the user's choice.
             let hers = from.trimmingCharacters(in: .whitespacesAndNewlines)
             guard target.role == "assistant", !target.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !hers.isEmpty else {
@@ -152,7 +152,7 @@ public final class BodyChatCommands: MacChatTurnPresentationPort {
             let revision = UserEye.Revision(message: message, hers: hers, theirs: text)
             try UserEye.hold(revision, dataRoot: engine.dataRoot, sessionID: session)
             do {
-                let reply = try await send(SendRequest(session: session, text: text, attachments: [], composerRevision: 0,
+                let reply = try await send(SendRequest(session: session, text: text, attachments: [],
                     expectedSelection: nil, options: .init(hideUserBubble: false, choice: nil, continuationReference: nil)), renderer: renderer)
                 if case .refused = reply { UserEye.release(revision, dataRoot: engine.dataRoot, sessionID: session) }
                 return reply
@@ -187,7 +187,7 @@ public final class BodyChatCommands: MacChatTurnPresentationPort {
         case .rejected(let message): return .refused(EngineFaceActs.failure("send_refused", message))
         case .accepted(let session):
             ModuleLog.app("[face-act] send accepted session=\(session)")
-            return try await anchor(session: session, kind: nil, turn: macChatTurns.activeTurnIDsBySession[session])
+            return try await anchor(session: session, turn: macChatTurns.activeTurnIDsBySession[session])
         }
     }
 
@@ -215,20 +215,20 @@ public final class BodyChatCommands: MacChatTurnPresentationPort {
         }
     }
 
-    private func messageRow(_ id: String, session: String) async throws -> (ChatMessage, [ChatMessage]) {
+    private func messageRow(_ id: String, session: String) async throws -> ChatMessage {
         let messages = try await engine.transcripts.loadMessages(sessionId: session, cached: false)
         guard let row = messages.first(where: { $0.id == id }) else {
             throw EngineFaceActs.failure("message_unavailable", "That message is absent from the checked transcript.")
         }
-        return (row, messages)
+        return row
     }
 
-    private func anchor(session: String, kind: ChatThreadKind?, turn: String? = nil) async throws -> FaceActReply {
+    private func anchor(session: String, turn: String? = nil) async throws -> FaceActReply {
         var issue: WireFailure?
         do {
             let root = engine.dataRoot
             try await Task.detached {
-                let checked = try kind ?? SessionConversation.checkedKind(session, dataRoot: root) ?? .unclassified
+                let checked = try SessionConversation.checkedKind(session, dataRoot: root) ?? .unclassified
                 _ = try await ConversationAnchor.publish(sessionId: session, source: "app", conversationKind: checked, dataRoot: root)
             }.value
         } catch {

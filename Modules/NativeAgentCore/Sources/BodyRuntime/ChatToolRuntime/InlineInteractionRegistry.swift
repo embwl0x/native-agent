@@ -281,30 +281,22 @@ public enum InlineInteractionRegistry {
         }
     }
 
-    /// Sign-in cards must use onboarding's OAuth owner; offer paste fields only when that provider supports them.
     public struct ProviderSignIn: Sendable, Equatable {
-        public var oauthProviderID: String
         public var displayShort: String
-        public var pasteLabel: String?
     }
 
     public static func providerSignIn(for rawID: String) -> ProviderSignIn? {
         switch canonicalProviderID(rawID) {
         case "openai":
-            return ProviderSignIn(oauthProviderID: "openai_oauth_direct", displayShort: "ChatGPT",
-                                  pasteLabel: "or paste an API key")
+            return ProviderSignIn(displayShort: "ChatGPT")
         case "openai_oauth_direct", "codex":
-            return ProviderSignIn(oauthProviderID: "openai_oauth_direct", displayShort: "ChatGPT",
-                                  pasteLabel: nil)
+            return ProviderSignIn(displayShort: "ChatGPT")
         case "anthropic":
-            return ProviderSignIn(oauthProviderID: "anthropic_oauth_direct", displayShort: "Claude",
-                                  pasteLabel: "or paste an API key")
+            return ProviderSignIn(displayShort: "Claude")
         case "anthropic_oauth_direct":
-            return ProviderSignIn(oauthProviderID: "anthropic_oauth_direct", displayShort: "Claude",
-                                  pasteLabel: "or paste a setup token (claude setup-token)")
+            return ProviderSignIn(displayShort: "Claude")
         case "xai_oauth_direct":
-            return ProviderSignIn(oauthProviderID: "xai_oauth_direct", displayShort: "xAI Grok",
-                                  pasteLabel: nil)
+            return ProviderSignIn(displayShort: "xAI Grok")
         default:
             return nil
         }

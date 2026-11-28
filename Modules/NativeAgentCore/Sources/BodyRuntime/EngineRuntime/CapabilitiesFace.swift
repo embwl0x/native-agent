@@ -7,9 +7,7 @@ import DeskCore
 // Blueprint: | `CapabilitiesFace.swift` | Owner-backed capability rows, action calls, approval levers and availability |
 
 enum CapabilitiesFace {
-    /// What the page reads beside the owners that push their own changes: ability and sense files (their writes post AbilityStore.DidChange.name;
-    /// run accounting in abilities/state.json does not), the senses' attachment, and the built-in guidance bodies.
-    static let notifications = [AbilityStore.DidChange.name, SensesHub.DidBecomeReady.name]
+    static let notifications = [AbilityStore.DidChange.name, AbilityStore.WakeUsage.didChange, SensesHub.DidBecomeReady.name]
     static func paths(_ root: URL) -> [URL] { [defaultPersonaRoot(dataRoot: root).appendingPathComponent("skills/bodies")] }
 
     @MainActor static func reader(_ engine: NativeAgentEngine) -> PartFaces.Read {
@@ -41,7 +39,7 @@ enum CapabilitiesFace {
         let state = await MainActor.run {
             let trust = engine.trust
             return (summary: trust.capabilitySummary, summaryError: trust.capabilitySummaryError, policy: trust.policy,
-                    policyError: trust.policyReadError ?? trust.securityRefreshError)
+                    policyError: trust.policyReadError)
         }
         var sections: [PartFace.Section] = []
         if let failure = state.summaryError {
@@ -49,7 +47,7 @@ enum CapabilitiesFace {
         } else if state.summary == nil {
             sections.append(.init(id: "inventory-wait", title: "Reading what I can do", style: .waiting, rows: []))
         }
-        let grown = await grownRows(engine.tools)
+        let grown = await grownRows(engine.tools, dataRoot: engine.dataRoot)
         if case .failure(let error) = grown {
             sections.append(issue("abilities-read", "My abilities", "Their versions and switches could not be read: " + error.localizedDescription))
         }
@@ -303,7 +301,7 @@ extension CapabilitiesFace {
             }
             return .init(id: senseRowID(record), title: "\(record.corner.surfaceName) · v\(record.version)",
                 detail: lines.joined(separator: "\n"), value: state,
-                at: record.lastUsedAt.map { ISO8601DateFormatter().string(from: $0) }, tone: record.status == .unavailable ? .attention : nil,
+                at: record.lastUsedAt.map(NativeTimestampFormat.plainZulu), tone: record.status == .unavailable ? .attention : nil,
                 actions: actions.isEmpty ? nil : actions)
         }
         return [.init(id: "senses", title: "Senses", footer: footer,
@@ -324,10 +322,13 @@ extension CapabilitiesFace {
     /// My abilities from the tool registry's checked records, keyed by the inventory record each one is (`tool:<id>`): one row carries it, its
     /// status, an open to its exact version, code and evidence (to read before approving), and the person's Approve and Turn off.
     /// Catalog failures return failure so the page can name the unavailable source.
-    @concurrent nonisolated static func grownRows(_ tools: ToolsFacade) async -> Result<[String: Ability], Error> {
+    @concurrent nonisolated static func grownRows(_ tools: ToolsFacade, dataRoot: URL) async -> Result<[String: Ability], Error> {
         let records: [ToolRecord]
         do { records = try await tools.listAuthored() }
         catch { return .failure(error) }
+        let wakeUsage: Result<[String: AbilityStore.WakeUsage], Error>
+        do { wakeUsage = .success(try await AbilityStore.wakeUsage(dataRoot: dataRoot)) }
+        catch { wakeUsage = .failure(error) }
         return await Task.detached(priority: .userInitiated) {
             Result<[String: Ability], Error>.success(Dictionary(records.map { tool -> (String, Ability) in
                 let status = tool.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -356,7 +357,15 @@ extension CapabilitiesFace {
                     actions.append(.init(id: "ability.off", label: "Turn off", role: .destructive, doors: ["mac"],
                                          call: .init("ability.off", ["id": .string(tool.id)])))
                 }
-                let lines = [firstLine(tool.description)] + (refusal.map { ["Approve unavailable: " + $0] } ?? [])
+                var lines = [firstLine(tool.description)] + (refusal.map { ["Approve unavailable: " + $0] } ?? [])
+                let wakes = tool.fields["wake"]?.arrayValue?.isEmpty == false
+                switch wakeUsage {
+                case .success(let usage):
+                    if let part = usage[tool.id] { lines.append(part.line) }
+                    else if wakes { lines.append(AbilityStore.WakeUsage().line) }
+                case .failure(let error):
+                    if wakes { lines.append("Unasked wake evidence unavailable: " + error.localizedDescription) }
+                }
                 let tone: PartFace.Tone
                 if tool.validationErrors?.isEmpty == false { tone = .failed }
                 else { tone = status == "active" ? .done : status == "disabled" ? .quiet : .attention }
@@ -662,7 +671,7 @@ extension CapabilitiesFace {
             let doctor = engine.doctor, tools = engine.tools
             return ((hardeningRefresh: doctor.hardeningRefresh,
                      productionExports: doctor.productionExports, productionExportWork: doctor.productionExportWork,
-                     productionExportFailure: doctor.productionExportFailure, productionHardening: doctor.productionHardening),
+                     productionExportFailure: doctor.productionExportFailure),
                     (browserDryRunPreview: tools.browserDryRunPreview, browserDryRunError: tools.browserDryRunError,
                      browserDryRunStartedAt: tools.browserDryRunStartedAt, browserStatus: tools.browserStatus))
         }
@@ -697,18 +706,11 @@ extension CapabilitiesFace {
                 tone: work != nil ? .live : failure == nil ? .quiet : .failed,
                 actions: [.init(id: "export.bundle", label: title, call: .init("export.bundle", ["support": .bool(id == "support")]))]))
         }
-        if let hardening = doctor.productionHardening {
-            rows.append(.init(id: "hardening", title: "Release checks", detail: hardening.detail,
-                value: hardening.status, at: hardening.createdAt, tone: tone(hardening.status)))
-            rows += (hardening.release?.items ?? []).map {
-                .init(id: "release:" + $0.id, title: $0.title, detail: $0.detail, value: $0.status, tone: tone($0.status))
-            }
-        }
         if let receipt = doctor.hardeningRefresh, receipt.isStale {
-            rows.append(.init(id: "checks-read", title: "Checks read incomplete",
+            rows.append(.init(id: "checks-read", title: "Export list read incomplete",
                 detail: receipt.failedEndpoints.joined(separator: ", "), tone: .failed))
         } else if doctor.hardeningRefresh == nil {
-            rows.append(.init(id: "checks-unread", title: "Recorded checks and exports have not been read", tone: .quiet))
+            rows.append(.init(id: "checks-unread", title: "Export list has not been read", tone: .quiet))
         }
         return .init(id: "checks", title: "Checks", rows: rows)
     }
@@ -816,7 +818,7 @@ extension CapabilitiesFace {
             guard let destination = try await mac.chooseSenseDestination(name: record.id + ".sense.json") else {
                 return "No place was chosen; nothing was shared."
             }
-            _ = try await registry.exportBundle(id: record.id, to: destination, userApproved: true)
+            try await registry.exportBundle(id: record.id, to: destination)
             return "Shared " + record.corner.surfaceName + " to " + destination.path + "."
         }
     }

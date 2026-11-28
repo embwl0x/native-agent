@@ -3,56 +3,11 @@ import DeskCore
 import SenseCore
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
-// Blueprint: | `AppToolExecutor+MyQueue.swift` | `runMyQueue`, `runHouseFile`; Exact-id intentions, schedules, habits and closure receipts |
+// Blueprint: | `AppToolExecutor+MyQueue.swift` | `runMyQueue`; Exact-id intentions, schedules, habits and closure receipts |
 
 extension AppToolExecutor {
-    @MainActor
-    func runHouseFile(input: [String: JSONValue], surface: String, turn: Turn) async -> JSONValue {
-        guard let title = input["title"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty,
-              let summary = input["summary"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines), !summary.isEmpty,
-              let owner = ["me": BodyFinding.Owner.agent, "builder": .builder, "user": .owner][input["owner"]?.scalarText ?? ""] else {
-            return Self.doorRefusal("invalid_input", "Nothing was filed.", remedy: "fix_args",
-                                    "Pass title, summary and owner: me, builder or user.")
-        }
-        let refs: [DeskRef]
-        if let value = input["refs"] {
-            guard case .array(let values) = value else {
-                return Self.doorRefusal("invalid_input", "Nothing was filed.", remedy: "fix_args", "refs takes an array of Desk refs.")
-            }
-            refs = values.compactMap { value -> DeskRef? in
-                if case .string(let text) = value { return DeskRef(kind: .note(text: text)) }
-                guard case .object(var fields) = value else { return nil }
-                // Creation supplies the new ref's identity. The stored reader never invents an identity for an incomplete saved record.
-                if fields["refId"] == nil { fields["refId"] = .string(DeskClock.newRefId()) }
-                return DeskRef.fromJSON(.object(fields))
-            }
-            guard refs.count == values.count else {
-                return Self.doorRefusal("invalid_input", "Nothing was filed.", remedy: "fix_args",
-                    "Each ref is a string (a note) or {kind: file|url|note|commit|gh_issue|gh_pr|agent|approval|trace, …}.")
-            }
-        } else { refs = [] }
-        do {
-            let key = "agent:" + title.lowercased().split(whereSeparator: \.isWhitespace).joined(separator: " ")
-            let steer = PeerDataTaint.carried(turn: turn, surface: surface)
-            let carried = DeskRef(kind: .step(DeskStep(words: summary, when: "own_turn",
-                peers: steer.sources, elevated: steer.elevated, session: turn.verifiedSessionID,
-                origin: turn.originPrincipal, replyRoute: TurnEnvelope.current(turn: turn, surface: surface).persistedMetadata())))
-            let item = try await BodyQueue.file(BodyFinding(key: key, title: title,
-                summary: summary, owner: owner,
-                // Carry only agent-owned items; builder and user items stay with their owners.
-                refs: refs.filter { $0.kind.token != "step" } + (owner == .agent ? [carried] : []), source: .agent),
-                dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot())
-            let filedOwner = ["agent": "me", "builder": "builder", "owner": "user"][item.assignee ?? ""] ?? item.assignee
-            let ownership = item.assignee == owner.rawValue ? "" : " Owner unchanged: \(filedOwner ?? "unassigned")."
-            return .object(["status": .string("ok"), "id": .string("desk." + item.alias),
-                            "owner": filedOwner.map(JSONValue.string) ?? .null,
-                            "confirmation": .string("Filed: " + item.title + ownership)])
-        } catch { return Self.ownedFailure(error, code: "house_file_failed", owner: "Desk",
-            instruction: "Read the Desk to reconcile this filing and resolve the reported storage error before filing again.",
-            next: ["page": .string("desk")], effects: .unknown) }
-    }
-
     /// A relative amount of time is one moment from now, in words ("in 2 minutes") or as amount fields ({seconds:120}).
     static func relativeMoment(_ text: String) -> TimeInterval? {
         let words = text.lowercased().split(separator: " ").map(String.init)
@@ -82,7 +37,7 @@ extension AppToolExecutor {
     @MainActor
     func runMyQueue(verb: String, input: [String: JSONValue], surface: String, turn: Turn) async -> JSONValue {
         let store = SwiftNativeDeskStore(dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot())
-        let named = Set(input.keys)
+        let named = Set(input.keys).subtracting(["verb", "__session_id", "__sense_address"])
         do {
             if verb == "add" || verb == "update" {
                 return try await addOrUpdateQueueStep(verb: verb, input: input, named: named, surface: surface, turn: turn, store: store)
@@ -130,6 +85,19 @@ extension AppToolExecutor {
         if verb == "update" {
             guard let id = queueText("id", in: input) else {
                 return Self.doorRefusal("invalid_input", "Nothing changed.", remedy: "fix_args", "Pass id: the step's desk.N.")
+            }
+            if let value = input["wait_for"] {
+                let trigger = DeskStep.CausalWait.Trigger(value)
+                guard named == ["id", "wait_for"], value == .null || trigger != nil else {
+                    return Self.doorRefusal("invalid_input", "Nothing changed.", remedy: "fix_args",
+                        "Pass id and wait_for alone. Use {at:<ISO time>}, {happening:{kind:<kind>,subject:<exact subject>}}, {desk:<id>}, or null.")
+                }
+                let steer = PeerDataTaint.carried(turn: turn, surface: surface)
+                let (entry, change) = try await MyQueue.setCausalWait(trigger, on: id, peers: steer.sources,
+                    fileAccess: turn.fileAccessCeiling, store: store)
+                var receipt = JSONValue.objectOrEmpty(queueReceipt(entry, change.rawValue))
+                receipt["wait_for"] = entry.step.causalWait?.trigger.json ?? .null
+                return .object(receipt)
             }
             let alias = id.hasPrefix("desk.") ? String(id.dropFirst(5)) : id
             let state = try await store.liveState()
@@ -227,12 +195,17 @@ extension AppToolExecutor {
         }
         let steer = PeerDataTaint.carried(turn: turn, surface: surface)
         let proposed = DeskStep(words: words, when: when.stored, card: when.card, action: action,
-                                                    peers: steer.sources, elevated: steer.elevated,
+                                                    peers: steer.sources,
                                                     session: turn.verifiedSessionID,
                                                     origin: turn.originPrincipal,
                                                     replyRoute: TurnEnvelope.current(turn: turn, surface: surface).persistedMetadata(),
-                                                    rhythm: rhythm, until: until.stored, say: queueText("say", in: input))
+                                                    rhythm: rhythm, until: until.stored, say: queueText("say", in: input),
+                                                    fileAccessCeiling: turn.fileAccessCeiling)
         if let editing {
+            if editing.step.causalWait != nil, !named.isDisjoint(with: ["action", "say", "when"]) {
+                return Self.doorRefusal("invalid_input", "Nothing changed.", remedy: "fix_args",
+                    "Clear wait_for before changing this step's habit, speech or timing.")
+            }
             if let conflict = try await store.runHold(editing.item.handle) { return conflict.refusal(editing.name) }
             var step = editing.step
             if named.contains("action") { step.action = proposed.action }
@@ -240,7 +213,8 @@ extension AppToolExecutor {
             if named.contains("when") { step.when = proposed.when; step.card = proposed.card; step.rhythm = proposed.rhythm; step.clockStart = nil }
             if named.contains("until") { step.until = input["until"] == .null ? nil : proposed.until }
             // An edit adds its own steerers and never erases the step's: a peer's words stay marked as a peer's.
-            step.peers = Array(Set(step.peers + steer.sources)).sorted(); step.elevated = Array(Set(step.elevated + steer.elevated)).sorted()
+            step.peers = Array(Set(step.peers + steer.sources)).sorted()
+            step.fileAccessCeiling = proposed.fileAccessCeiling
             let updated = try await MyQueue.update(editing, step: step, store: store)
             let change: MyQueue.Change = updated.item.updatedAt == editing.item.updatedAt ? .reused : .updated
             return await queueFilingReceipt(updated, change: change, reportedChange: .updated, store: store)
@@ -378,7 +352,7 @@ extension AppToolExecutor {
                  "queue": .string(change), "owner": .string("agent"),
                  "peerSteering": .object(["sources": .array(entry.step.peers.map(JSONValue.string)),
                                            "elevated": .array(entry.step.elevated.map(JSONValue.string))]),
-                 "when": .string(entry.step.when + (entry.step.card.map { " " + $0 } ?? "")),
+                 "when": .string(entry.step.causalWait?.trigger.words ?? (entry.step.when + (entry.step.card.map { " " + $0 } ?? ""))),
                  "confirmation": .string("\(entry.name) \(change): \"\(entry.step.words)\"")]
         if change == MyQueue.Change.reused.rawValue { fields["effects"] = .string("none") }
         // Return the interpreted local moments so the caller can verify the schedule.

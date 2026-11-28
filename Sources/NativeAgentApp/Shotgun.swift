@@ -66,7 +66,7 @@ final class ShotgunController {
             } catch is CancellationError {
             } catch {
                 appModel.setFailureStatus(error, action: "forward Shotgun to the window")
-                NativeAgentNotifications.post(title: "Shotgun did not open", body: error.localizedDescription, deadline: nil)
+                NativeAgentNotifications.post(title: "Shotgun did not open", body: error.localizedDescription)
             }
         }
     }
@@ -132,8 +132,7 @@ final class ShotgunController {
             if toldTaken.insert(shortcut).inserted {
                 NativeAgentNotifications.post(
                     title: "\(shortcut.title) is taken",
-                    body: "Another app already uses \(shortcut.title), so it can't show Shotgun. Pick another in Settings, or use View ▸ Show Shotgun.",
-                    deadline: nil
+                    body: "Another app already uses \(shortcut.title), so it can't show Shotgun. Pick another in Settings, or use View ▸ Show Shotgun."
                 )
             }
             return

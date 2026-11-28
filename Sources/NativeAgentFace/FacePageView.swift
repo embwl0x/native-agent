@@ -85,7 +85,7 @@ struct FacePageView: View {
 
     @ViewBuilder private func collection(_ snapshot: PartFaceSnapshot, face: PartFace) -> some View {
         if face.detail != nil {
-            let combined = PartFace(title: face.title, line: face.line, sections: (snapshot.levers ?? []) + face.sections, detail: face.detail)
+            let combined = PartFace(title: face.title, line: face.line, sections: snapshot.drawnLevers + face.sections, detail: face.detail)
             FaceSelectionView(face: combined, session: session, selection: $selectedItem, door: door, page: page,
                               leaf: { Self.leaf($0) }) { selected, row in
                 var item = selected
@@ -141,7 +141,7 @@ struct FacePageView: View {
             // Nothing empty takes a section's space: the first thing shown sits at the top, under the rail's tabs when it is a tab.
             VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
                 // A page that shows its face never moves while it re-reads: the read status stands only until the first face arrives.
-                if isReading, snapshot == nil { PageReadStatus(isReading: true, text: "Reading " + title + "…") }
+                if isReading, snapshot == nil { PageReadStatus(text: "Reading " + title + "…") }
                 if let snapshot {
                     FaceView(snapshot: snapshot, title: title, header: false, door: door, session: session, leaf: { Self.leaf($0) }).id(page)
                 } else if let pageIssue {
@@ -176,9 +176,8 @@ struct FacePageView: View {
         appModel.pageDoor(page: page, open: open)
     }
 
-    /// A piece a page lays out (key `piece:…`, ref its Make ref, revision its version) is drawn through the Make pane's granted preview,
-    /// and a board piece (leaf `board`) as a board that holds across its versions; any other leaf reads as its words.
     static func leaf(_ block: PartFace.Block) -> AnyView {
+        if block.isTableSlice { return AnyView(MacTableSlice(block: block)) }
         guard let piece = piece(block) else {
             return AnyView(Text(block.alt ?? PartFace.Block.updateNote).foregroundStyle(.secondary))
         }
@@ -260,7 +259,8 @@ extension AppModel {
                     page: page, row: submission.row, action: submission.action,
                     value: submission.values.map(PartFace.Value.object) ?? submission.value.map(PartFace.Value.string),
                     expectedRevision: submission.formRevision, expectedCall: submission.expectedCall, answers: true,
-                    operation: submission.id, undoOf: submission.undoOf, checking: submission.checking))))
+                    operation: submission.id, undoOf: submission.undoOf, checking: submission.checking,
+                    expectedPageRevision: submission.expectedPageRevision))))
             } catch { outcome = .interrupted(error) }
             return outcome
         })
@@ -277,10 +277,7 @@ enum MacFaceLinks {
             ApplicationLifetime.shared.request(.sidebar(.chat))
             return
         }
-        try FaceWindowReply.check(await appModel.client.act(.pageAct(.init(
-            page: destination.page, row: destination.item ?? "", action: "open", value: nil,
-            expectedRevision: nil, expectedCall: nil))))
-        try openPage(destination.page)
+        try await openPage(destination.page, item: destination.item, appModel: appModel)
     }
 
     @MainActor static func follow(_ link: String, appModel: AppModel, here: (String, String?) -> Bool = { _, _ in false },
@@ -298,10 +295,7 @@ enum MacFaceLinks {
                 ApplicationLifetime.shared.request(.activity(section))
                 return nil
             }
-            try FaceWindowReply.check(await appModel.client.act(.pageAct(.init(
-                page: page, row: item ?? "", action: "open", value: nil, expectedRevision: nil, expectedCall: nil))))
-            try openPage(page)
-            return page
+            return try await openPage(page, item: item, appModel: appModel)
         case .approval(let id): card(.init(kind: .approval, id: id))
         case .card(let id):
             // A card opens in its own conversation, where it is answered; following the link answers nothing.
@@ -314,11 +308,36 @@ enum MacFaceLinks {
         return nil
     }
 
-    @MainActor private static func openPage(_ name: String) throws {
-        guard let page = QuietPages.page(named: name) else {
+    @MainActor @discardableResult
+    private static func openPage(_ name: String, item: String?, appModel: AppModel) async throws -> String {
+        guard let page = QuietPages.navigationPage(named: name, appModel: appModel) else {
             throw PartCallError(code: "page_unavailable", message: "The opened page is absent from my current face.")
         }
-        ApplicationLifetime.shared.request(page.item == .ownPage ? .ownPage(page.id) : .sidebar(page.item))
+        let destination = page.navigationItem
+        if let item {
+            if destination == .desk {
+                try FaceWindowReply.check(await appModel.client.act(.deskCommand(.init(command: "select", handle: item, arguments: [:]))))
+            } else if destination == .memories, let memory = MemoriesFaceTarget(row: item) {
+                try await SettingsLink.openChecked(.memories, tab: "memories", appModel: appModel)
+                appModel.pendingMemoryFaceTarget = .init(page: "memories", item: memory.row, session: nil, message: nil)
+                return page.id
+            } else {
+                let parent = SidebarItem.shellHome(for: destination)?.parent ?? destination
+                if let tab = ShellRailTab.match(item, page: parent, layout: appModel.shellLayout) {
+                    try await SettingsLink.openChecked(parent, tab: tab, appModel: appModel)
+                    return page.id
+                }
+                if destination == .diagnostics {
+                    _ = try FaceWindowReply.value(await appModel.client.act(.readRun(id: item)))
+                    ApplicationLifetime.shared.request(.sidebar(.diagnostics))
+                    appModel.diagnosticsRunID = item
+                    return page.id
+                }
+                throw PartCallError(code: "page_item_unavailable", message: "This page has no current item named " + item + ".")
+            }
+        }
+        ApplicationLifetime.shared.request(destination == .ownPage ? .ownPage(page.id) : .sidebar(destination))
+        return page.id
     }
 }
 
@@ -327,12 +346,9 @@ enum FaceWindowReply {
     static func check(_ reply: FaceActReply) throws {
         switch reply {
         case .refused(let failure), .failed(let failure): throw failure
-        case .committed(let result), .operation(.completed(let result)):
+        case .committed(let result):
             if let failure = result.publicationFailure { throw failure }
         case .acknowledged, .accepted, .result, .observation: break
-        case .operation:
-            throw WireFailure(code: "operation_unsettled", message: "The body operation has not settled.",
-                              cause: nil, effects: .unknown)
         default:
             throw PartCallError(code: "unexpected_face_reply", message: "The body returned a different command's reply.")
         }
@@ -341,7 +357,7 @@ enum FaceWindowReply {
     static func committed(_ reply: FaceActReply) throws -> CommittedResult {
         try check(reply)
         switch reply {
-        case .committed(let result), .operation(.completed(let result)): return result
+        case .committed(let result): return result
         default:
             throw WireFailure(code: "effect_unconfirmed", message: "The body has not confirmed this change.",
                               cause: nil, effects: .unknown)
@@ -352,7 +368,7 @@ enum FaceWindowReply {
         try check(reply)
         switch reply {
         case .result(let value): return value
-        case .committed(let result), .operation(.completed(let result)): return result.value
+        case .committed(let result): return result.value
         default: throw PartCallError(code: "unexpected_face_reply", message: "The body did not return the requested value.")
         }
     }
@@ -362,7 +378,7 @@ enum FaceWindowReply {
         switch reply {
         case .acknowledged, .accepted: return nil
         case .result(.string(let text)): return text
-        case .committed(let result), .operation(.completed(let result)):
+        case .committed(let result):
             if case .string(let text) = result.value { return text }
             return nil
         case .result(.null): return nil

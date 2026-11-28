@@ -73,8 +73,8 @@ night and their own hand, as the brief's law 5 says.
   ("User looks out for me"; compaction/recollection) and kept the six shown
   chess cares apart as facets, because the instruction then read "merge only
   what is truly the same thing". Optional
-  `merge: [{keep: <UUID>, into_it: [UUIDs], why}]` entries are checked together;
-  malformed present learning fails the payload before any commit. A merge keeps the oldest care unless
+  `merge: [{keep: <UUID>, into_it: [UUIDs], why}]` entries are checked individually.
+  Malformed or excess entries are dropped and counted. A merge keeps the oldest care unless
   they names another, unions retained stories, sums folded counts and unions
   movement-day witnesses, takes the deepest depth, and leaves the merged-away cares
   faded with a "became part of <care>" entry and a durable `mergedInto` UUID.
@@ -113,20 +113,33 @@ model call. `CognitiveSelfKnowledge.swift` owns the bounded, atomic file;
 the substrate holds its resident reading:
 
 - **traits as an if-then signature**: at most 5 "when …, I tend to …", each
-  with `shown_by` care UUIDs or exact story-entry references, revisited each
+  with exact shown story-entry references in `shown_by`, revisited each
   night (never an adjective someone typed);
 - **their story**: at most 5 `{line, shown_by}` entries, depth changes and
   changed stances told in their words ("I used to …, now I …"). Only shown
-  depth-change, changed-my-mind or accepted-stance entries can support a story line.
+  typed depth changes and accepted stances can support a nightly story line.
 
-The material reuses the night's care revisions and adds recent changes from
-quiet cares. It shows at most 48 care stories, each with the newest three
-movements and five changes. References identify a care and a digest of the
-exact entry, not a shifting array index. Malformed present learning fails
-payload decoding before any commit; well-formed entries with invented
-references are refused by the care admission boundary.
+The dream reads up to 48 retained care stories within the existing text budget.
+The earlier care-key selection keeps its original candidates, order and budget.
+Live cares with movements at least a week apart can fill remaining story slots
+and contribute exact story references for self-reading. These additional cares
+have no settlement keys. Each story shows the newest three movements and up
+to two additional movements sampled at week intervals. Up to five typed changes
+are shown in time order with the movements. The change sample reserves a place
+for a retained accepted stance at least a week before the latest typed change
+when the most recent five would omit it.
+
+The part asks the model to cite exact earlier and later entries for a trait
+spanning weeks. Swift drops and counts malformed or excess entries and self-readings
+that cite unshown evidence. Trait references must match captured story entries, and
+story references must match shown typed changes. A single valid reference can support a trait. Saved
+traits and pending night deliveries with bare care UUIDs remain readable. The
+date span and the model's reading of the evidence are left to the model. Before
+saving, the care owner also checks that each cited care still
+resolves through any merges. Exact story references contain the care UUID and
+the entry digest.
 Each newer captured reading replaces the previous self-reading, so unsupported or
-omitted traits drop. Tonight's newly applied depth/stance changes are available
+omitted traits drop. A person the night was not shown keeps their line while a care that is not faded still holds them and the reading has room (128 people, and a bound on its size); one who was shown and left out is let go. People are shown the person they are with first, then by most recently moved care. Tonight's newly applied depth/stance changes are available
 to the next dream, not presented as evidence it already saw.
 Capture time travels with pending care work. An older delivery preserves the newer
 self-reading and saves the current owner before acknowledgment. Retained installed
@@ -137,10 +150,11 @@ follow their survivor, retaining the exact entry digest. Turn-time reachability
 follows the same chain for already-saved traits, so a merge cannot hide their
 self-knowledge or bypass the supporting care's privacy.
 
-The capsule-facing turnSelf(for:from:among:) returns one supported trait and
-the current person's relationship line every time it is called. They do not
-compete with care or feeling, need no message match and spend no presentation
-rest. Every supporting care must be in the capsule's admitted reachable set.
+The capsule-facing `turnSelf(for:from:among:)` returns one supported
+trait and the current person's relationship line when evidence supports them.
+These values sit outside care and feeling cue selection, require no message
+match and spend no presentation rest. Each care supporting the trait must be
+in the capsule's admitted reachable set.
 Missing self evidence stays absent; an unreadable reading carries its cause.
 The capsule lane owns rendering those values on every live turn.
 mind.inner_state and the Personality page read the same resident self.
@@ -150,6 +164,13 @@ Accepted stance entries also feed the self-story during the lived fold, before
 night, using their accepted stance's own words and the exact entry
 digest. This adds no model call or persona write. The care saves first;
 refolds and restore can finish an owed self write from the durable care.
+The `native-turn-digest` part proposes the after-turn judgment from evidence
+redacted by Swift. The fold verifies and lives the accepted judgment, including
+stance and self-readings. `native-dream-cycle` shapes the night from redacted
+evidence and selects among verified REM proposals. The stem checks shown story
+references before crediting a successful dream-policy run and rebinds surviving
+references when it writes the self-reading. The diary and approval-gated REM
+growth have their own Swift writers.
 The daily path retains existing traits and relationship lines; a newer dream
 can revise them together with the story. Accepted stance progress is per care;
 a delayed accepted stance on another care still contributes its story line.
@@ -190,7 +211,7 @@ stories get another 16,000 plus unused people space. Only shown people may
 receive a line. Turns resolve the already-known speaker with the frozen alias
 map and read one cached dictionary entry, outside the felt cue competition;
 they read no new file, run no new embedding and make no new model call for it.
-Full `mind.inner_state` exposes every retained person line; compact exposes two.
+Full `mind.inner_state` exposes every retained person line to their own person and to their own turns; compact exposes two. A peer reads at most its own line, in either detail.
 
 ## Order and proof
 

@@ -20,19 +20,15 @@ public final class XAIOAuthTransport: HTTPProviderProfile {
 
     public static let defaultEndpoint = URL(string: "https://api.x.ai/v1/chat/completions")
     public static let clientID = ProviderOAuthConfig.xaiClientID
-    let session: URLSession
-    private let endpoint: URL?
+    let session = ProviderHTTP.session
+    private let endpoint = XAIOAuthTransport.defaultEndpoint
     private let tokenPathOverride: URL?
     public let telemetry: LLMCallTraceRecorder
 
     public init(
-        session: URLSession = ProviderHTTP.session,
-        endpoint: URL? = XAIOAuthTransport.defaultEndpoint,
         tokenPathOverride: URL? = nil,
         telemetryDataRootOverride: URL? = nil
     ) {
-        self.session = session
-        self.endpoint = endpoint
         self.tokenPathOverride = tokenPathOverride
         self.telemetry = LLMCallTraceRecorder(dataRootOverride: telemetryDataRootOverride)
     }
@@ -71,7 +67,7 @@ public final class XAIOAuthTransport: HTTPProviderProfile {
             messages: messages,
             system: system,
             tools: tools,
-            stream: true, call: call,
+            call: call,
             dataRoot: self.tokenPath.deletingLastPathComponent().deletingLastPathComponent()
         )
         req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
@@ -85,16 +81,16 @@ public final class XAIOAuthTransport: HTTPProviderProfile {
         messages: [LLMMessage],
         system: String?,
         tools: [LLMToolSchema]?,
-        stream: Bool, call: LLMCall,
+        call: LLMCall,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) throws -> [String: Any] {
         var body: [String: Any] = [
             "model": model,
             "messages": try OpenAITransport.chatMessages(messages: messages, system: system),
-            "stream": stream,
+            "stream": true,
         ]
         // Streaming requests ask for token usage on the final SSE frame.
-        if stream { body["stream_options"] = ["include_usage": true] }
+        body["stream_options"] = ["include_usage": true]
         try OpenAITransport.applyTools(to: &body, tools: tools)
         try FirstPartyExecutionControls.applyXAIControls(to: &body, model: model, call: call, dataRoot: dataRoot)
         if let allowance = FirstPartyExecutionControls.budgetedOutputTokens(model: model, providerID: "xai_oauth_direct", call: call, dataRoot: dataRoot) {

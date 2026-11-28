@@ -12,11 +12,11 @@ extension AppAction {
     func runsInPreview(args: [String: JSONValue]) -> Bool {
         guard !authored, readOnly(args: args) else { return false }
         switch id {
-        case "agent.introspect", "agent.jobs", "artifact.find", "browser.status",
+        case "agent.introspect", "agent.jobs", "app.anatomy", "artifact.find", "browser.status",
              "calendar.calendars", "calendar.free_busy", "calendar.upcoming", "capabilities.lookup",
              "chat.message", "chat.scratch_read", "chat.search", "contacts.search", "desk.read",
              "files.excerpt", "files.grep", "files.info", "files.list", "files.spotlight",
-             "git.diff", "git.log", "git.status", "git.summary", "ledger.list", "mac.activity",
+             "git.diff", "git.log", "git.status", "git.summary", "mac.activity",
              "mac.clipboard_read", "mac.system_info", "mac.volume", "maps.route", "maps.search",
              "memory.proposals", "mind.dream_diary", "mind.inner_state", "node.list", "persona.doc", "persona.read",
              "queue.list", "reminders.due_today", "reminders.lists", "reminders.query", "reminders.read",
@@ -161,7 +161,7 @@ extension AppToolExecutor {
         let discovery = resolved?.discovery ?? [:]
         let door = DoorBoundCall(action: action, discovery: discovery, input: input, surface: surface, inProcess: inProcess, turn: turn,
             execution: execution, root: root, ownsLever: ownsLever, receipt: receipt)
-        if let refused = try doorAdmitArguments(door) { return refused }
+        if let refused = try await doorAdmitArguments(door) { return refused }
         if let owners = doorOwnersCall(door) { return owners }
         if let early = try await doorBindCall(door) { return early }
         if input["preview"] == .bool(true) { return try await doorPreview(door) }
@@ -225,7 +225,7 @@ extension AppToolExecutor {
 
     /// The call's arguments, read against the action's schema; an argument preflight ends here with its preview.
     @MainActor
-    private func doorAdmitArguments(_ door: DoorBoundCall) throws -> JSONValue? {
+    private func doorAdmitArguments(_ door: DoorBoundCall) async throws -> JSONValue? {
         let action = door.action, discovery = door.discovery, input = door.input, execution = door.execution
         func badArgs(_ reason: String, _ detail: String, _ path: String) -> JSONValue {
             var extra = door.receipt
@@ -235,6 +235,11 @@ extension AppToolExecutor {
             let names = discovery["args_schema"]?.objectValue?["properties"]?.objectValue?.keys.sorted()
             let accepted = names.map { $0.isEmpty ? "args takes no arguments" : "args takes " + $0.joined(separator: ", ") }
             extra["accepted"] = accepted.map(JSONValue.string)
+            if action.id == "ability.save" {
+                return Self.doorRefusal(reason, detail, remedy: "correct_arguments",
+                    "Read ability.save's declared form and correct the named field in your original save.",
+                    next: ["find": .string(action.id)], extra: extra)
+            }
             let advice = AppActions.callAdvice(action, input: input, discovery: discovery)
             extra["try_instead"] = advice
             let call = AppActions.determinedCall(advice)
@@ -271,7 +276,20 @@ extension AppToolExecutor {
             } catch {
                 switch error {
                 case .schemaUnavailable(let failure): throw failure
-                case .badArguments(let problem): return badArgs("bad_input", error.failure.localizedDescription, problem.path)
+                case .badArguments(let problem):
+                    if action.id == "ability.save", !execution.argumentPreflightOnly, input["preview"] != .bool(true),
+                       execution.invocation[AdmittingDoor.self] != nil, !Parts.unknownSaveArguments(args).isEmpty {
+                        let fullMac = await Self.freshQuietPosture(dataRoot: door.root)?.name == Self.fullMacModeName
+                        let steer = Self.skillSteer(surface: door.surface, turn: door.turn)
+                        if let refusal = try Parts(root: door.root).saveArgumentRefusal(args, steer: steer, fullMac: fullMac) {
+                            let failure = refusal.failure
+                            var extra = door.receipt
+                            extra["argument_path"] = .string(problem.path)
+                            extra["remedy"] = Parts.boundedSaveRemedy(failure.remedy)
+                            return ChatToolOutcome.refusedBeforeRunning(code: failure.code, detail: failure.message, extra: extra)
+                        }
+                    }
+                    return badArgs("bad_input", error.failure.localizedDescription, problem.path)
                 }
             }
         }
@@ -669,7 +687,7 @@ extension AppToolExecutor {
             }
             if action.id == "queue.update" {
                 // Omission keeps a field; explicit null clears it.
-                for key in ["action", "say", "until", "when"] { normalized[key] = given[key] }
+                for key in ["action", "say", "until", "when", "wait_for"] { normalized[key] = given[key] }
             }
             // Desk clear/set admission judges the caller's string, not a coerced number. Keep the same raw value for door validation and re-entry.
             if action.id == "desk.blocked_on" { normalized["blocked_on"] = given["blocked_on"] }
@@ -735,6 +753,7 @@ extension AppToolExecutor {
            let input = call["input"]?.objectValue, input["action"] == .string(action.id) {
             fields["try_instead"] = .object(input)
         }
+        if fields["try_instead"] == nil, action.id == "ability.save" { fields["try_instead"] = .null }
         let code = JSONValue.trimmedScalarTextOrEmpty(fields["failure_code"] ?? fields["reason"])
         if fields["try_instead"] == nil,
            fields["argument_path"]?.stringValue != nil || reply.remedy?.objectValue?["kind"] == .string("correct_arguments")

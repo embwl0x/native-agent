@@ -128,7 +128,7 @@ struct BodyQuietChatCommands {
                     return presented
                 }
                 return await QuietComposerCommands.run(verb: verb, value: value, choice: choice, sessionId: sessionID,
-                    attachments: attachments, reachesUser: reachesUser, turnSessionId: turnSessionID,
+                    reachesUser: reachesUser, turnSessionId: turnSessionID,
                     appModel: model, turn: turn, scope: scope)
             }
         } catch { return .refuse(verb, "composer_failed", error.localizedDescription, effects: .unknown) }

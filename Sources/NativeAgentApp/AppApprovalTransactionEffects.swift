@@ -28,10 +28,10 @@ struct AppApprovalTransactionEffects: ApprovalTransactionEffects {
     func runConnectorAction(descriptor: ConnectorActionDescriptor, dryRun: Bool, input: [String: JSONValue],
                             approvedReplayApprovalID: String, dataRoot: URL, turn: Turn) async throws -> ConnectorActionReceipt {
         let engine = NativeAgentEngine.forRoot(dataRoot)
-        return try await engine.withPartDoor(envelope: TurnEnvelope.current(turn: turn, surface: "approval:connector_action"), turn: turn) { door in
+        return try await engine.withPartDoor(envelope: TurnEnvelope.current(turn: turn, surface: "approval:connector_action"), turn: turn) { _ in
             try await ConnectorActions(platform: AppConnectorActionPlatform(engine: engine))
                 .runConnectorAction(descriptor: descriptor, dryRun: dryRun, input: input,
-                                    approvedReplayApprovalID: approvedReplayApprovalID, dataRoot: dataRoot, turn: door.turn)
+                                    approvedReplayApprovalID: approvedReplayApprovalID, dataRoot: dataRoot)
         }
     }
 

@@ -558,6 +558,10 @@ public actor ExperienceStore {
     /// A reader joins queued writes before publication; gaps invalidate projections without changing the producing reply.
     public func projection() async throws -> [Experience] {
         await drained()
+        return try await committedProjection()
+    }
+
+    package func committedProjection() async throws -> [Experience] {
         if let gap { throw NSError(domain: "Experiences", code: 1, userInfo: [NSLocalizedDescriptionKey: gap]) }
         return try await database().read { db in
             try Self.fold(db, matching: "experience.open OR experience.id IN (SELECT id FROM experience ORDER BY updated_at DESC LIMIT 64)")

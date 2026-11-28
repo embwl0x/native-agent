@@ -434,12 +434,14 @@ public actor SwiftNativeDreamREMCycle {
         return try await dreamRunner.runNightlyDreamCycle(trigger: .manual, preview: true)
     }
 
-    public func runDream(force: Bool, trigger: DreamTrigger, delivery: DreamEffectSink? = nil,
+    public func runDream(trigger: DreamTrigger, delivery: DreamEffectSink? = nil,
                          parent: Turn? = nil, beganAt: Date = Date()) async throws -> DreamReport {
         try requireLiveProviders()
         let report: DreamReport
         do {
-            report = try await dreamRunner.runNightlyDreamCycle(force: force, trigger: trigger, delivery: delivery, parent: parent, beganAt: beganAt)
+            report = try await dreamRunner.runNightlyDreamCycle(trigger: trigger, delivery: delivery, parent: parent, beganAt: beganAt)
+        } catch let stopped as CancellationError {
+            throw stopped
         } catch {
             await RepairOwed.owe(dataRoot, id: "dream-repair:" + UUID().uuidString, kind: .run,
                 operation: "dream", owner: "dream cycle", words: error.localizedDescription,
@@ -451,6 +453,11 @@ public actor SwiftNativeDreamREMCycle {
                 error: "dream_cycle_disabled",
                 detail: DreamREMGatePolicy.dreamDisabledDetail
             )
+        }
+        // A stopped dream reports its stop among its errors; a stop is not owed.
+        if report.stopped {
+            if report.entriesWritten == 0, report.effectsSettled == 0, report.lessonsSaved == 0 { throw CancellationError() }
+            return report
         }
         if !report.errors.isEmpty {
             let fields: [String: JSONValue] = if case .object(let fields)? = report.repair { fields } else { [:] }
@@ -485,21 +492,5 @@ public actor SwiftNativeDreamREMCycle {
 
 }
 
-// MARK: - Factory
-
-// Injected gates preserve checked caller authority; otherwise load saved policy.
-// Inject the same approval stager and mood sink so factory runs retain ordinary staging and body effects.
-public func makeDreamREMCycle(
-    root: URL = PersistenceCore.defaultDataRoot(),
-    gate: DreamREMGatePolicy? = nil,
-    remStageApproval: REMApprovalStager? = nil,
-    dreamMoodSink: DreamDatedMoodSink? = nil,
-    lifecycleObserver: (any LLMCallLifecycleObserving)? = nil
-) throws -> SwiftNativeDreamREMCycle {
-    return try SwiftNativeDreamREMCycle(
-        dataRoot: root, gate: gate,
-        dreamMoodSink: dreamMoodSink, remStageApproval: remStageApproval,
-        lifecycleObserver: lifecycleObserver)
-}
 import MindCore
 // Blueprint: | `DreamREMCycle.swift` | `FileBackedDreamDiary`, `SwiftNativeDreamREMCycle`. |

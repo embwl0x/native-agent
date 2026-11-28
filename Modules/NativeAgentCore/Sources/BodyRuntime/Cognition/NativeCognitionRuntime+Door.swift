@@ -146,8 +146,7 @@ extension NativeCognitionRuntime {
         turnIdleObservationTask = nil
         carriedSayTask = nil
         pursuitRefreshTask = nil
-        residualDeadline.invalidate()
-        cognitionDeadline.invalidate()
+        await withdrawCognitionDeadlines()
         await microcycleTask?.value
         microcycleTask = nil
         reflectionEventTask = nil
@@ -485,8 +484,19 @@ extension NativeCognitionRuntime {
             await caringReceiptLog.record(request, heard: heard, model: interpretation.model,
                 surface: interpretation.surface, verdict: interpretation.caring)
         }
+        let turn = row.input?.turn
+        var appraisal = interpretation.affect
+        if let quote = appraisal.feeling?.quote {
+            let reply = turn?.assistant.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let inReply = MemoryManagerPromise.quoted(quote, in: interpretation.quoteText(reply))
+            let inIncoming = !interpretation.appAuthored
+                && MemoryManagerPromise.quoted(quote, in: interpretation.quoteText(turn?.asked ?? ""))
+            if turn?.isCareWake == true || turn?.settlesOnly == true || (!inReply && !inIncoming) {
+                appraisal.feeling = nil
+            }
+        }
         let mind = await substrate.foldTurn(
-            context, record: record, incoming: row.input?.turn?.asked, appraisal: interpretation.affect,
+            context, record: record, incoming: turn?.asked, appraisal: appraisal,
             caring: interpretation.caring, cares: interpretation.cares,
             appAuthored: interpretation.appAuthored, seq: seq, momentID: momentID)
         await caresSourceChanged()
@@ -496,15 +506,12 @@ extension NativeCognitionRuntime {
             enriched.metadata.merge(mind.reaction) { _, new in new }
             reaction = CognitiveSomaticSignals.signal(from: enriched, id: UUID())
         }
-        // Use only the retained interpretation's correction decision to raise confidence from a person's correction.
-        let corrected = context.careWakes.isEmpty && context.event.sourceClass != .imported && interpretation.memories.contains(where: {
-            $0.kind == "correction" && $0.action != .skip && $0.confidence >= MemoryManagerLane.confidenceFloor
-        })
         // A mind fold that did not save (an appraisal failed) folds no body either: the retry folds both, so the body never lives half a turn.
         guard mind.saved else { return false }
         let bodySaved = await foldBody(OrganismTurnFold(
             seq: seq, epoch: context.bodyEpoch, caring: mind.caring, caringWindow: mind.caringWindow,
-            caringWhy: mind.caringWhy, reaction: reaction, correctionConfidence: corrected ? 0.03 : 0))
+            caringWhy: mind.caringWhy, reaction: reaction,
+            correctionConfidence: reaction != nil && mind.event.sourceClass == .userStated ? 0.03 : 0))
         guard bodySaved else { return false }
         row.input?.folded = seq
         do {

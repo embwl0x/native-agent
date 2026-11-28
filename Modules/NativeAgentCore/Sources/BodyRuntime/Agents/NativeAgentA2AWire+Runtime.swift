@@ -310,7 +310,7 @@ enum AgentContactRuntime {
                                 }
                             case .final(let result): final = result
                             case .error(let message): failure = message
-                            case .notice, .toolUse, .replyTextSettled, .writing: break
+                            case .notice, .toolUse, .replyTextSettled, .writing, .unstartedStep: break
                             }
                         }
                     } catch {

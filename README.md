@@ -8,18 +8,14 @@ NativeAgent is a personal agent for Mac: conversation, memory and action in
 one continuous mind. The Mac app owns the Swift runtime in-process; iPhone,
 Telegram, Slack and local agent bridges reach that same runtime.
 
-## First run
+## Get started
 
-1. On an Apple silicon Mac running macOS 26 or newer, download the DMG from the
-   [releases page](https://github.com/embwl0x/native-agent/releases), open it,
-   drag NativeAgent to Applications, and open the app.
-2. Enter your name and the agent's name.
-3. Connect an AI account or add an API key. You can skip setup of the account
-   and connect later in **Providers**; chat needs a connected account.
+Follow [Getting started](docs/GETTING_STARTED.md) to install NativeAgent,
+connect a model, and start your first conversation.
 
 ## Three views
 
-- **Simple** — chat beside the agent's card, four places (Chat, Desk, the
+- **Simple** — chat beside the agent's card, four places (Together, Table, the
   agent's place under its name, and Control) and folded Agents and Helpers
   lists. Choosing a place opens its tabs and pages in place; Settings lives on
   Control's Settings tab (and **Settings…**, ⌘,).
@@ -27,7 +23,7 @@ Telegram, Slack and local agent bridges reach that same runtime.
   Notifications, Helpers); the agent's place (Memories, Personality,
   Capabilities and any page of the agent's own); Control (Providers, Trust,
   Connectors, Settings); and Diagnostics.
-- **Agent** — the agent's own home and rooms; a conversation opened there shows in Simple.
+- **Agent** — the agent's read-only Home and rooms. A conversation opened there shows in Simple.
 
 A view preference that was never set starts in Simple, whatever chats exist. The [User and Agent Guide](docs/USER_GUIDE.md) covers setup and the
 main pages.

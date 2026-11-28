@@ -21,8 +21,12 @@ extension InlineInteractionCoordinator {
     /// Read provenance from the interaction's own preserved row so no second envelope can drift; gates still decide authority.
     public func originEnvelope(
         of id: String, sessionID: String) async throws -> TurnEnvelope? {
+        try await continuationOrigin(of: id, sessionID: sessionID)?.envelope
+    }
+
+    func continuationOrigin(of id: String, sessionID: String) async throws -> (envelope: TurnEnvelope, raisingReceipt: String?)? {
         let read = try await checkedRows(sessionID)
-        return try await Task.detached(priority: .userInitiated) { () throws -> TurnEnvelope? in
+        return try await Task.detached(priority: .userInitiated) { () throws -> (envelope: TurnEnvelope, raisingReceipt: String?)? in
             for row in read.rows.reversed() {
                 guard case .object(let object) = row,
                       case .object(let metadata)? = object["metadata"],
@@ -31,7 +35,8 @@ extension InlineInteractionCoordinator {
                       raw["id"] == .string(id)
                 else { continue }
                 _ = try SwiftNativeChatOrchestrationClient.checkedInlineInteraction(in: row, lifeID: read.lifeID)
-                return TurnEnvelope.fromPersistedMetadata(metadata["envelope"])
+                guard let envelope = TurnEnvelope.fromPersistedMetadata(metadata["envelope"]) else { return nil }
+                return (envelope: envelope, raisingReceipt: metadata["raisingDispatchReceiptId"]?.stringValue)
             }
             return nil
         }.value
@@ -69,7 +74,6 @@ extension InlineInteractionCoordinator {
         _ interaction: InlineInteraction,
         sessionID: String,
         ifRevision expected: Int? = nil,
-        decision: Owed.Phase? = nil,
         expecting: (@Sendable (InlineInteraction) -> Bool)? = nil
     ) async throws {
         try await settle { @MainActor [self] in
@@ -77,10 +81,6 @@ extension InlineInteractionCoordinator {
                 try await SwiftNativeChatOrchestrationClient.persistInlineInteraction(
                     interaction, at: Self.path(sessionID, dataRoot), ifRevision: expected,
                     expecting: expecting)
-                // The saved answer settles before publication or continuation, even if delivery never filed its experience.
-                if let decision {
-                    await recordDecision(interaction, phase: decision, sessionID: sessionID).value
-                }
                 await ApprovalChatCards.publishInteractionChange(id: interaction.id, sessionID: sessionID, dataRoot: dataRoot)
                 // Notify the open conversation after transcript and mirror publication.
                 InlineInteractionDelivery.notify(sessionID: sessionID, dataRoot: dataRoot)
@@ -90,9 +90,9 @@ extension InlineInteractionCoordinator {
         }.get()
     }
     @discardableResult
-    func recordDecision(_ interaction: InlineInteraction, phase: Owed.Phase, sessionID: String, born: Bool = true) -> Task<Void, Never> {
+    func recordDecision(_ interaction: InlineInteraction, phase: Owed.Phase, sessionID: String) -> Task<Void, Never> {
         Owed.record(dataRoot, id: "interaction:" + interaction.id, kind: .decision, key: "decide", to: "person",
-            phase: phase, evidence: [.init(source: "chat/messages/" + sessionID, id: interaction.id)], born: born)
+            phase: phase, evidence: [.init(source: "chat/messages/" + sessionID, id: interaction.id)], born: false)
     }
     /// Reconcile an existing debt from the saved decision alone, never from a live projection or a missing card.
     func reconcileDecision(_ saved: InlineInteraction, sessionID: String) {
@@ -102,7 +102,7 @@ extension InlineInteractionCoordinator {
         case .declined, .superseded: phase = .letGo(.cancelled)
         default: return
         }
-        recordDecision(saved, phase: phase, sessionID: sessionID, born: false)
+        recordDecision(saved, phase: phase, sessionID: sessionID)
     }
     public nonisolated static func receiptEnvelope(_ interaction: InlineInteraction) -> JSONValue {
         SwiftNativeChatOrchestrationClient.inlineInteractionReceiptEnvelope(interaction)

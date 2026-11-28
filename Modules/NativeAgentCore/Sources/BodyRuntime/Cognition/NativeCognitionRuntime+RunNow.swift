@@ -61,7 +61,7 @@ public enum MindClockVerb: String, Sendable {
 
 extension NativeCognitionRuntime {
     /// Satisfy only the selected scheduling wait; evidence, expiry, readiness and person-facing policy use actual time.
-    public func runClockNow(verb: MindClockVerb, input: [String: JSONValue]) async -> MindClockResult {
+    public func runClockNow(verb: MindClockVerb, input: [String: JSONValue], parent: Turn) async -> MindClockResult {
         if input["preview"] == .bool(true) {
             // Refuse preview before bootstrap, flight claims or deadlines because these owners interleave admission with durable effects.
             let why: String
@@ -70,7 +70,7 @@ extension NativeCognitionRuntime {
             case .horizon: why = "Horizon composition updates source deadlines and refresh settles felt resolutions into the live organism."
             case .rhythm: why = "The person's day refresh saves awake history before admitting and consuming pending care-felt breaks."
             case .maintenance: why = "Maintenance consolidates the live substrate and checkpoints it as one transition."
-            case .residualRepair: why = "Residual repair mutates the live organism field while selecting and repairing its targets."
+            case .residualRepair: why = "Residual repair runs with live field admission and a continuity write."
             }
             return Self.recordClockRun(verb.rawValue, .init("preview_refused",
                 why + " This owner cannot yet separate decision from effect; preview was refused before entering it. Nothing was changed.",
@@ -104,17 +104,31 @@ extension NativeCognitionRuntime {
             case .maintenance:
                 result = Self.clockResult(await runMaintenance(reason: "mind.maintenance", runNow: true))
             case .residualRepair:
-                if liveTurnInFlight(besides: input["__session_id"]?.stringValue) {
+                let session = input["__session_id"]?.stringValue
+                if liveTurnInFlight(besides: session) {
                     result = .init("held", "A live turn is in flight.")
-                } else if await organismKernel.runResidualRepairIfDue(satisfyWait: true) {
-                    let saved = await persistOrganismContinuity(reason: "residual_pressure_repair")
-                    result = .init(saved ? "repaired" : "failed", saved
-                        ? "The existing bounded residual repair ran and was saved."
-                        : "Residual repair ran in memory but continuity was not saved.")
+                    await rescheduleResidualRepairDeadline()
                 } else {
-                    result = .init("held", "The organism is disabled or has no eligible repairable evidence.")
+                    var repaired = false
+                    do {
+                        repaired = try await organismKernel.runResidualRepairIfDue(satisfyWait: true, parent: parent) {
+                            !(await self.liveTurnInFlight(besides: session))
+                        }
+                        if repaired {
+                            let saved = await persistOrganismContinuity(reason: "residual_pressure_repair")
+                            result = .init(saved ? "repaired" : "failed", saved
+                                ? "The existing bounded residual repair ran and was saved."
+                                : "Residual repair ran in memory but continuity was not saved.")
+                        } else {
+                            result = .init("held", "No bounded field repair was applied.")
+                        }
+                    } catch is CancellationError {
+                        result = .init("stopped", "Residual repair was stopped before it could commit.")
+                    } catch {
+                        result = .init("failed", DreamPart.redact(error.localizedDescription))
+                    }
+                    await rescheduleResidualRepairDeadline(afterUnappliedPass: !repaired)
                 }
-                await rescheduleResidualRepairDeadline()
             }
         }
         return result.fields["run_id"] != nil ? result : Self.recordClockRun(owner, result, runID: runID)

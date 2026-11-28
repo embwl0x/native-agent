@@ -15,7 +15,7 @@ import Darwin
 import AppKit
 @unsafe @preconcurrency import EventKit
 import MacNerves
-// Blueprint: | `AppModel.swift` | `AppModel`: Composition, shared drafts and owner-derived UI state |
+// Blueprint: | `AppModel.swift` | `AppModel`: Composition and owner-derived UI state |
 
 @MainActor
 @Observable
@@ -150,10 +150,6 @@ final class AppModel: Sendable {
 
 
     var dreamError: String?
-
-    @ObservationIgnored var chatComposerDrafts: [String: ChatComposerDraft] = [:]
-    var chatPendingAttachments: [String: [MultimodalAttachment]] = [:]
-
 
     @ObservationIgnored private var settingsFaceUpdates: SettingsFaceUpdates?
 

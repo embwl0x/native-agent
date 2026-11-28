@@ -77,7 +77,6 @@ package enum AgentWorkspaceArrivals {
         var baselines: [String: String] = [:]
         var initialized: Set<String> = []
         var pending: [Notice] = []
-        var refreshing = false
         var unavailable: Set<String> = []
         var overflow = false
         var eventSources: [String: String] = [:]
@@ -158,8 +157,8 @@ package enum AgentWorkspaceArrivals {
                 input = exact.filter { ["agent", "message_id"].contains($0.key) }
             } else if !row.agent.hasPrefix("bot:") { input["conversation"] = .string(row.label) }
             let location = AgentWorkspaceLocation.record(tool: "agent_read", input: input, title: row.name + " — " + row.label)
-            let fingerprint = try AgentWorkspaceChanges.workspaceChangeObservation(workspace: workspace, row, location: location,
-                previous: nil)?.nextStamp?.fingerprint
+            let fingerprint = try AgentWorkspaceChanges.evaluate(location: location,
+                result: AgentConversationView.conversationPresentation(row), previous: nil)?.nextStamp?.fingerprint
                 ?? StableHash.sortedJSONSHA256(JSONValue.object(receipt.filter { !["updated_at", "read_at", "polled_at"].contains($0.key) }))
             return .init(source: "agents:" + row.id,
                 revision: row.operationID + ":" + row.phase + ":" + fingerprint,
@@ -178,17 +177,17 @@ package enum AgentWorkspaceArrivals {
 }
 
 final class AgentWorkspaceArrivalMonitor: Sendable {
-    private let state = Mutex((dirty: Set(["agents", "human", "bots", "work"]), watcher: Optional<FileChangeWatcher>.none))
+    private let state = Mutex((dirty: Set(["agents", "human", "bots"]), watcher: Optional<FileChangeWatcher>.none))
     init(dataRoot: URL) {
         let paths = ["agents": "agents/conversations.json", "human": "chat/sessions.json",
-                 "bots": "bots/shelf-index.json", "work": "orchestration/task_ledger.jsonl"]
+                 "bots": "bots/shelf-index.json"]
             .mapValues { dataRoot.appendingPathComponent($0) }
         let watcher = FileChangeWatcher(paths: Array(paths.values)) { [weak self] path in
             self?.invalidate(Set(paths.filter { $0.value.standardizedFileURL == path.standardizedFileURL }.keys))
         }
         state.withLock { $0.watcher = watcher }
     }
-    func invalidate(_ sources: Set<String> = ["agents", "human", "bots", "work"]) {
+    func invalidate(_ sources: Set<String> = ["agents", "human", "bots"]) {
         state.withLock { $0.dirty.formUnion(sources) }
     }
     func takeChanged() -> Set<String> {
@@ -197,16 +196,14 @@ final class AgentWorkspaceArrivalMonitor: Sendable {
 }
 
 extension AgentWorkspaceNavigation {
-    func refreshArrivals(workspace: WorkspaceOperation, key: String, scope: String, dataRoot: URL, retryUnavailable: Bool = false) async {
+    func refreshArrivals(workspace: WorkspaceOperation, key: String, scope: String, dataRoot: URL, retryUnavailable: Bool = false) {
         guard sessions[key] != nil else { return }
         if sessions[key]?.arrivals == nil {
             sessions[key]?.arrivals = .init(monitor: AgentWorkspaceArrivalMonitor(dataRoot: dataRoot))
         }
-        guard var state = sessions[key]?.arrivals, !state.refreshing else { return }
+        guard var state = sessions[key]?.arrivals else { return }
         let changed = state.monitor.takeChanged().union(retryUnavailable ? state.unavailable : [])
         guard !changed.isEmpty else { return }
-        let previousIDs = Set(state.pending.map(\.id))
-        state.refreshing = true; sessions[key]?.arrivals = state
         if changed.contains("agents") {
             do { state.accept(try AgentWorkspaceArrivals.conversations(workspace: workspace, dataRoot: dataRoot, scope: scope), owner: "agents") }
             catch { state.unavailable.insert("agents") }
@@ -240,28 +237,6 @@ extension AgentWorkspaceNavigation {
                 state.accept(candidates, owner: "human")
             } catch { state.unavailable.insert("human") }
         }
-        let taskIDs = Set(places.compactMap { place -> String? in
-            guard case .record("task_ledger_list", let args, _) = place else { return nil }
-            return args["task_id"]?.stringValue
-        })
-        if !taskIDs.isEmpty, changed.contains("work") {
-            do {
-                let rows = try await SwiftNativeTaskLedger(dataRoot: dataRoot).listTasks()
-                guard let current = sessions[key]?.arrivals, current.monitor === state.monitor else { return }
-                let retained = Set(current.pending.map(\.id))
-                state.pending.removeAll { previousIDs.contains($0.id) && !retained.contains($0.id) }
-                let candidates = try rows.filter { taskIDs.contains($0.taskId) }.map { row in
-                    AgentWorkspaceArrivals.Candidate(source: "work:" + row.taskId,
-                        revision: try StableHash.sortedJSONSHA256(JSONValue.object((row.toJSON().objectValue ?? [:])
-                            .filter { !["createdTs", "updatedTs"].contains($0.key) })), title: row.title ?? "Shared work",
-                        kind: row.status == .done ? .finished : row.status == .blocked ? .decision : row.status == .cancelled ? .failure : nil,
-                        location: .record(tool: "task_ledger_list", input: ["task_id": .string(row.taskId)], title: row.title ?? "Shared work"),
-                        preview: AgentWorkspaceArrivals.preview(row.lastNote, source: "Recorded work note"),
-                        from: row.owner?.rawValue, status: row.status.rawValue)
-                }
-                state.accept(candidates, owner: "work")
-            } catch { state.unavailable.insert("work") }
-        }
         let bots = Set(places.compactMap { place -> UUID? in
             guard case .record("agent_read", let args, _) = place,
                   let agent = args["agent"]?.stringValue, agent.hasPrefix("bot:") else { return nil }
@@ -285,8 +260,6 @@ extension AgentWorkspaceNavigation {
                 state.accept(candidates, owner: "bots")
             } catch { state.unavailable.insert("bots") }
         }
-        guard sessions[key]?.arrivals?.monitor === state.monitor else { return }
-        state.refreshing = false
         sessions[key]?.arrivals = state
     }
 
@@ -322,7 +295,7 @@ extension AgentWorkspaceNavigation {
         sessions[key]?.arrivals?.pending.removeAll { $0.id == id }
     }
 
-    func arrivalNotice(workspace: WorkspaceOperation, dataRoot: URL, scope: String, announce: Bool = true) async -> JSONValue? {
+    func arrivalNotice(workspace: WorkspaceOperation, dataRoot: URL, scope: String, announce: Bool = true) -> JSONValue? {
         let key = dataRoot.standardizedFileURL.path + "\u{0}" + scope
         if sessions[key] == nil {
             let operation: UUID
@@ -334,7 +307,7 @@ extension AgentWorkspaceNavigation {
 
             end(key: key, operation: operation)
         }
-        await refreshArrivals(workspace: workspace, key: key, scope: scope, dataRoot: dataRoot)
+        refreshArrivals(workspace: workspace, key: key, scope: scope, dataRoot: dataRoot)
         return takeArrivalNotice(workspace: workspace, dataRoot: dataRoot, key: key, announce: announce)
     }
     package func markAnnounced(dataRoot: URL, scope: String, in input: String) {
@@ -344,7 +317,7 @@ extension AgentWorkspaceNavigation {
         sessions[key]?.arrivals = state
     }
     func takeArrivalNotice(workspace: WorkspaceOperation, dataRoot: URL, key: String, announce: Bool = true) -> JSONValue? {
-        guard var session = sessions[key], var state = session.arrivals, !state.refreshing else { return nil }
+        guard var session = sessions[key], var state = session.arrivals else { return nil }
         let pending = state.pending.filter { !$0.announced && !$0.source.hasPrefix("agents:") && !$0.source.hasPrefix("bots:") }
             .sorted { $0.kind.priority < $1.kind.priority }.prefix(4)
         guard !pending.isEmpty else { return nil }

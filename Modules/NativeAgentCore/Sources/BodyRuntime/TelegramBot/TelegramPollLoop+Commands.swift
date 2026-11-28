@@ -61,9 +61,7 @@ extension TelegramPollLoop {
             return false
         }
 
-        if let approvalCommand = TelegramApprovalCommand.parse(
-            command: parsed, addressedBot: TelegramCommandRegistry.addressedBotUsername(text: text)
-        ) {
+        if let approvalCommand = TelegramApprovalCommand.parse(command: parsed) {
             await handleApprovalSlashCommand(
                 approvalCommand,
                 update: update,

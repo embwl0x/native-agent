@@ -136,14 +136,9 @@ public actor BotRunner {
             Execute your standing job now. Complete the work and return its result in this turn; do not invoke or wait on your own \
             Run control.
             """ + woke + ask
-        var turn = parent?.derived() ?? Turn(dataRoot: dataRoot, session: bot.sessionID)
-        turn.session = bot.sessionID
+        var turn = helperTurn(bot, parent: parent, message: message, sources: claimed.steeringSources)
         turn.botEventProvenance = claimed.provenance
-        if !claimed.steeringSources.isEmpty {
-            let steering = turn.peerSteering ?? PeerDataTaint()
-            for source in claimed.steeringSources { steering.mark(dataRoot: turn.dataRoot, peer: source) }
-            turn.peerSteering = steering
-        }
+        if let ceiling = claimed.fileAccessCeiling { turn.fileAccessCeiling = ceiling }
         return try await perform(bot, message: message, requestID: claimed.runID,
             turn: turn, scope: scope.entering(id), judgesCondition: !ask.isEmpty)
     }
@@ -158,9 +153,13 @@ public actor BotRunner {
         defer { queue.finish(bot: id) }
         do { try await prepare(bot, requestID: claimed.runID) }
         catch { throw retireRefusal(claimed, cause: error) }
-        let turn = (parent?.derived() ?? Turn(dataRoot: dataRoot, session: bot.sessionID)).with(\.session, bot.sessionID)
-        return try await perform(bot, message: question, requestID: claimed.runID,
+        let turn = helperTurn(bot, parent: parent, message: question)
+        let entry = try await perform(bot, message: question, requestID: claimed.runID,
             turn: turn, scope: scope.entering(id), asked: true)
+        if let parent, let held = parent.peerSteering, let steering = turn.peerSteering {
+            for source in steering.checkpointSources { held.mark(dataRoot: parent.dataRoot, peer: source) }
+        }
+        return entry
     }
 
     public func resume(bot saved: BotDefinition, message: String, parent: Turn?, scope: BotRunScope,
@@ -172,9 +171,19 @@ public actor BotRunner {
             guard bot == saved, !bot.paused, !(await holdUnattended(bot)) else { throw BotRunnerError.notPermitted }
             try await prepare(bot, requestID: claimed.runID)
         } catch { throw retireRefusal(claimed, cause: error) }
-        let turn = (parent?.derived() ?? Turn(dataRoot: dataRoot, session: bot.sessionID)).with(\.session, bot.sessionID)
+        let turn = helperTurn(bot, parent: parent, message: message)
         return try await perform(bot, message: message, requestID: claimed.runID,
             turn: turn, scope: scope.entering(bot.id))
+    }
+
+    private func helperTurn(_ bot: BotDefinition, parent: Turn?, message: String, sources: [String] = []) -> Turn {
+        var turn = (parent?.derived() ?? Turn(dataRoot: dataRoot)).with(\.session, bot.sessionID)
+        let inherited = parent.map { PeerDataTaint.carried(turn: $0).sources } ?? []
+        let steering = PeerDataTaint(dataRoot: turn.dataRoot, restoring: inherited + sources)
+        steering.keep(line: message)
+        turn.peerSteering = steering
+        turn.origin?.elevatedPeerSources = nil
+        return turn
     }
 
     private func retireRefusal(_ claimed: BotRunQueue.ClaimedRun, cause: Error) -> Error {

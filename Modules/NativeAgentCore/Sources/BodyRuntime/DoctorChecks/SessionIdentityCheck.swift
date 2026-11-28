@@ -22,9 +22,7 @@ public struct SessionIdentityCheck: DoctorCheck {
     }
 
     public func run() async -> CheckResult {
-        let sessionsPath = root
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("sessions.json")
+        let sessionsPath = DataRootPaths.chatSessionIndex(in: root)
         let indexExists = FileManager.default.fileExists(atPath: sessionsPath.path)
 
         let report = SessionIdentityLedger.flappingReport(dataRoot: root)

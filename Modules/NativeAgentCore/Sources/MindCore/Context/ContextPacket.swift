@@ -11,6 +11,10 @@ public struct ContextAtomPointer: Codable, Equatable, Sendable {
     public let headingPath: [String]
     public let sourceRange: ContextSourceRange
 
+    package var lazyLine: String {
+        "- \(atomID.rawValue): " + (headingPath.isEmpty ? kind.rawValue : headingPath.joined(separator: " > "))
+    }
+
     public init(atom: ContextStoredAtom, generationID: Int64) {
         atomID = atom.draft.id
         sourceID = atom.draft.sourceID
@@ -93,13 +97,13 @@ extension ContextPacketItem {
         let source = summary.flatMap { $0.isEmpty ? nil : $0 } ?? text
         // Memory keeps its complete decision clause; other atoms use safe sentences/words.
         let lead = pointer.kind == .memory || pointer.kind == .correction
-            ? source : Self.firstSentences(of: source, upTo: 240)
+            ? source : Self.firstSentences(of: source)
         return lead.count < text.count ? lead : nil
     }
     /// Never cut inside inline code or a URL; an unbroken token has no safe lead.
-    private static func firstSentences(of text: String, upTo limit: Int) -> String {
+    private static func firstSentences(of text: String) -> String {
+        let limit = 240
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard limit > 0 else { return "" }
         guard trimmed.count > limit else { return trimmed }
         let window = String(trimmed.prefix(limit))
 
@@ -149,6 +153,16 @@ public struct ContextPacket: Codable, Equatable, Sendable {
     public let budget: ContextBudgetUsage
     /// Original selection evidence; outcome feedback retains these IDs while serve feedback credits only the verified delivered items.
     public let receipt: ContextSelectionReceipt
+    package var associationWalkMicroseconds: Int?
+
+    private enum CodingKeys: String, CodingKey {
+        case generationID, sourceFingerprint, selectedItems, expandablePointers, degradedSources, budget, receipt
+    }
 
     public var characterCount: Int { budget.usedCharacters }
+
+    public var associationPointers: [ContextAtomPointer] {
+        let ids = Set(receipt.memoryRecall.compactMap { $0.associationSeed == nil ? nil : $0.atomID })
+        return expandablePointers.filter { ids.contains($0.atomID) }
+    }
 }

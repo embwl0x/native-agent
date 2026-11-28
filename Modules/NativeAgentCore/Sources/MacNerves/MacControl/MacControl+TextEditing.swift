@@ -31,7 +31,7 @@ extension SwiftNativeMacControl {
             return outcome
         }
 
-        guard let text, !text.isEmpty else { return nil }
+        guard let text, !text.isEmpty || context.textRestore != nil else { return nil }
         // Type only into editable roles; focusing with AXPress can activate a control and is never typing.
         guard MacActClosedLoop.canType(role: target.role) else { return nil }
         // Password fields are a credential boundary; refuse before every actuation so the person supplies the credential.
@@ -65,6 +65,15 @@ extension SwiftNativeMacControl {
                 ledgeredSetSelectedText: ledgeredSetSelectedText)
         }
         let beforeValueWrite = accessibilityActSource(context: context).reread(target, context: context)?.value
+        if body["after"]?.objectValue != nil {
+            guard let beforeValueWrite,
+                  target.value?.utf8.elementsEqual(beforeValueWrite.utf8) == true,
+                  context.textRestore.map({ beforeValueWrite.utf8.elementsEqual($0.written.utf8) }) != false else {
+                return MacActPerformed(ok: false, method: "none", requestedAction: "type",
+                    error: "reversible_text_baseline_unavailable", target: target, postState: nil, actedHandle: handle,
+                    extra: ["effects": .string("none")])
+            }
+        }
         var valueWrite: MacActPerformed?
         if background || !keystrokes {
             valueWrite = await typeTextWithAXOrBackgroundKeys(text, body: body, framePid: framePid, actWindow: actWindow,

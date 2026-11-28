@@ -42,7 +42,6 @@ public actor SwiftNativeLoopScheduler {
     internal var loops: [String: Registration] = [:]
     private var tasks: [String: Task<Void, Never>] = [:]
     internal var states: [String: LoopState] = [:]
-    internal let clock: @Sendable () -> Date
     internal let dataRoot: URL
     private var running: Bool = false
 
@@ -51,11 +50,11 @@ public actor SwiftNativeLoopScheduler {
     private let jitter: @Sendable (ClosedRange<Double>) -> Double
 
     /// Floor computed delays so work that outruns its interval cannot busy-spin.
-    private let minimumTickSpacing: TimeInterval
+    private static let minimumTickSpacing: TimeInterval = 0.25
 
     /// Durable run stamps preserve the elapsed part of an interval across launches.
-    internal let loopStatePath: URL?
-    private let startupStagger: TimeInterval
+    internal let loopStatePath: URL
+    private static let startupStagger: TimeInterval = 5
     internal var persistedLastRun: [String: Date] = [:]
 
     /// Keep durable completion separate from run stamps so skipped ticks cannot reset dormancy.
@@ -96,22 +95,15 @@ public actor SwiftNativeLoopScheduler {
     internal var lastFailureReceipt: LastFailureReceipt?
     /// Scheduling state stays in its own file; body details belong to the root's one record.
     public init(
-        clock: @escaping @Sendable () -> Date = { Date() },
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        loopStatePath: URL? = nil,
-        startupStagger: TimeInterval = 5,
         failureBackoff: LoopFailureBackoffPolicy = .default,
-        minimumTickSpacing: TimeInterval = 0.25,
         durableFlushImmediateInterval: TimeInterval = SwiftNativeLoopScheduler.healthCheckpointInterval,
         jitter: @escaping @Sendable (ClosedRange<Double>) -> Double = { Double.random(in: $0) }
     ) {
         self.durableFlushImmediateInterval = max(0, durableFlushImmediateInterval)
-        self.clock = clock
+        let dataRoot = PersistenceCore.defaultDataRoot()
         self.dataRoot = dataRoot
-        self.loopStatePath = loopStatePath ?? dataRoot.appendingPathComponent("logs/background_loop_state.json")
-        self.startupStagger = max(0, startupStagger)
+        self.loopStatePath = dataRoot.appendingPathComponent("logs/background_loop_state.json")
         self.defaultFailureBackoff = failureBackoff
-        self.minimumTickSpacing = max(0, minimumTickSpacing)
         self.jitter = jitter
     }
 
@@ -185,7 +177,7 @@ public actor SwiftNativeLoopScheduler {
         // Persist first registration synchronously so relaunch cannot reset its clock.
         let stampedFirstSeen: Bool
         if persistedFirstSeen[id] == nil, persistedStateFault == nil {
-            persistedFirstSeen[id] = clock()
+            persistedFirstSeen[id] = Date()
             stampedFirstSeen = true
         } else {
             stampedFirstSeen = false
@@ -194,7 +186,7 @@ public actor SwiftNativeLoopScheduler {
         if persistedLastRun[id] == nil, let fault = persistedStateFault {
             states[id, default: LoopState(loopId: id)].lastError = fault + "; this loop's last run is unknown"
         } else if persistedLastRun[id] == nil {
-            await recordDurableRun(loopId: id, at: clock())
+            await recordDurableRun(loopId: id, at: Date())
         } else if stampedFirstSeen {
             // A run stamp without firstSeen still needs a synchronous dormancy-floor write.
             await flushLoopState()
@@ -272,34 +264,23 @@ public actor SwiftNativeLoopScheduler {
         return copy
     }
 
-    /// OS wake eligibility reads the canonical durable cadence but still needs shared-gate admission to coalesce races.
-    public func isDue(loopId: String, at requestedNow: Date? = nil) async -> Bool? {
-        await loadPersistedStateIfNeeded()
-        guard let registration = loops[loopId] else { return nil }
-        guard let lastRun = persistedLastRun[loopId] else { return true }
-        let now = requestedNow ?? clock()
-        // An organ that runs on change is never due by a clock.
-        guard let period = registration.loop.wake.period else { return false }
-        return now.timeIntervalSince(lastRun) >= period
-    }
-
     public func nextPhysiologyEligibleAt(
         loopId: String,
         at requestedNow: Date? = nil
     ) async -> Date? {
         guard let registration = loops[loopId] else { return nil }
-        let now = requestedNow ?? clock()
+        let now = requestedNow ?? Date()
         guard let lastTickAt = states[loopId]?.lastTickAt else { return now }
         let streak = consecutiveFailures[loopId] ?? 0
         let spacing: TimeInterval
         if streak > 0 {
             let policy = defaultFailureBackoff
             spacing = max(
-                minimumTickSpacing,
+                Self.minimumTickSpacing,
                 policy.delay(forConsecutiveFailures: streak, jitter: jitter)
             )
         } else {
-            spacing = minimumTickSpacing
+            spacing = Self.minimumTickSpacing
         }
         let eligible = lastTickAt.addingTimeInterval(spacing)
         return eligible > now ? eligible : now
@@ -314,7 +295,7 @@ public actor SwiftNativeLoopScheduler {
         guard let interval = reg.loop.wake.period else { return }
         let capturedLoop = reg.loop
         let capturedRegId = reg.registrationId
-        let now = clock()
+        let now = Date()
 
         // Stagger overdue loops so launch cannot fire every starved body at once.
         let persisted = persistedLastRun[id]
@@ -323,12 +304,12 @@ public actor SwiftNativeLoopScheduler {
         if elapsed {
             overdueStartupSlots += 1
             stagger = Self.randomizedStagger(
-                base: startupStagger,
+                base: Self.startupStagger,
                 slot: overdueStartupSlots,
                 jitter: jitter
             )
         } else {
-            stagger = startupStagger
+            stagger = Self.startupStagger
         }
         let firstDelay = Self.firstTickDelay(
             interval: interval,
@@ -346,7 +327,7 @@ public actor SwiftNativeLoopScheduler {
                     return
                 }
                 if Task.isCancelled { return }
-                let tickStartedAt = await self.currentClock()
+                let tickStartedAt = Date()
                 await reg.wake()
                 // Recheck cancellation after tick returns so a stop racing its suspension cannot schedule another sleep.
                 if Task.isCancelled { return }
@@ -364,9 +345,6 @@ public actor SwiftNativeLoopScheduler {
         states[id] = st
     }
 
-    /// Read the injected clock on its actor rather than sending its closure into the spawned task.
-    private func currentClock() -> Date { clock() }
-
     /// Failure backoff starts at tick end; healthy cadence starts at tick start and resets the failure streak.
     /// Both honor minimum spacing and publish the same jittered delay that Doctor observes.
     private func nextDelay(
@@ -375,18 +353,18 @@ public actor SwiftNativeLoopScheduler {
         let id = loop.loopId
         guard loops[id]?.registrationId == registrationId else { return nil }
         guard let interval = loop.wake.period else { return nil }
-        let now = clock()
+        let now = Date()
         let streak = consecutiveFailures[id] ?? 0
         let delay: TimeInterval
         if streak > 0 {
             let policy = defaultFailureBackoff
             let backoff = policy.delay(forConsecutiveFailures: streak, jitter: jitter)
-            delay = max(minimumTickSpacing, max(interval, backoff))
+            delay = max(Self.minimumTickSpacing, max(interval, backoff))
         } else {
             let elapsed = max(0, now.timeIntervalSince(tickStartedAt))
             // Healthy jitter and published nextTickAt use the same delay.
             delay = Self.jitteredHealthyDelay(
-                base: max(minimumTickSpacing, interval - elapsed),
+                base: max(Self.minimumTickSpacing, interval - elapsed),
                 interval: interval,
                 jitter: jitter
             )

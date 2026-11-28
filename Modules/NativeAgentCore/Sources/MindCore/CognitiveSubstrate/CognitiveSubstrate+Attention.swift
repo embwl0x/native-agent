@@ -114,13 +114,13 @@ extension CognitiveSubstrate {
             let conditions = live.compactMap { care in lookup.falsifiers[care.id].map { (care: care, cosine: VectorMath.cosine(vector, $0)) } }
             if let strongest = conditions.indices.max(by: { conditions[$0].cosine < conditions[$1].cosine }) {
                 let standings = VectorMath.standout(careScores + conditions.map(\.cosine))
-                let bar = VectorMath.chanceBar(.attention, among: standings.count)
+                let bar = VectorMath.chanceBar(among: standings.count)
                 if let standout = standings[careScores.count + strongest], standout.isFinite, standout >= bar {
                     crossed = .init(care: conditions[strongest].care, standout: standout, bar: bar)
                 }
             }
             guard nearest.standout != nil || crossed != nil else { return .unavailable("the cares could not be told apart for this line") }
-            return .touches(care: nearest.care, standout: nearest.standout, bar: VectorMath.chanceBar(.attention, among: live.count),
+            return .touches(care: nearest.care, standout: nearest.standout, bar: VectorMath.chanceBar(among: live.count),
                             charge: nearest.care.charge(at: dependencies.now()), crossed: crossed)
         } catch {
             oweCareEmbedding(error)

@@ -1,5 +1,5 @@
 import Foundation
-// Blueprint: | `ProviderCatalogFaceValues.swift` | Shared provider catalog and credential-status display values |
+// Blueprint: | `ProviderCatalogFaceValues.swift` | Shared provider catalog display values |
 
 public struct ModelCatalogItem: Identifiable, Codable, Hashable, Sendable {
     public var id: String
@@ -54,22 +54,6 @@ public struct ModelCatalogResponse: Codable, Hashable, Sendable {
         self.updatedAt = updatedAt
         self.catalogFreshness = catalogFreshness
         self.catalogNote = catalogNote
-    }
-
-}
-
-public struct CodexAuthStatus: Codable, Hashable, Sendable {
-    public var active: String
-    public var appOwnedLoggedIn: Bool
-    public var sharedLoggedIn: Bool
-    public var codexHome: String
-    public var detail: String
-    public init(active: String, appOwnedLoggedIn: Bool, sharedLoggedIn: Bool, codexHome: String, detail: String) {
-        self.active = active
-        self.appOwnedLoggedIn = appOwnedLoggedIn
-        self.sharedLoggedIn = sharedLoggedIn
-        self.codexHome = codexHome
-        self.detail = detail
     }
 
 }

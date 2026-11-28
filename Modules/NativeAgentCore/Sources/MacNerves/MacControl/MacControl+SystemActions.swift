@@ -4,10 +4,7 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import AppKit
-import IOKit.hidsystem
-import AppKit
-import IOKit.hidsystem
-// Blueprint: | `MacControl+SystemActions.swift` | Lossless file windows, checked mutations, scoped Spotlight, exact media and per-event app scripts |
+// Blueprint: | `MacControl+SystemActions.swift` | Lossless file windows, checked mutations, scoped Spotlight, volume and per-event app scripts |
 
 extension SwiftNativeMacControl {
     // MARK: file/read
@@ -318,54 +315,6 @@ extension SwiftNativeMacControl {
             error: nil, durationMs: Int(now().timeIntervalSince(started) * 1000))
     }
 
-    func handleMedia(_ body: [String: JSONValue], context: MacOperationContext) async throws -> MacControlResult {
-        guard let action = body["action"]?.stringValue?.lowercased(),
-              ["play", "resume", "pause", "toggle", "next", "skip", "previous"].contains(action) else {
-            throw MacControlError.missingField("action: play, resume, pause, toggle, next, skip or previous")
-        }
-        if ["play", "resume", "pause"].contains(action) {
-            return MacControlResult(ok: false, action: "media", output: .object([
-                "action": .string(action), "effects": .string("none"),
-                "message": .string("No idempotent playback action was sent. Use the player's own action; toggle explicitly requests a play/pause toggle.")
-            ]), error: "playback_owner_unavailable", durationMs: 0)
-        }
-        let started = now()
-        let key = ["next", "skip"].contains(action) ? NX_KEYTYPE_NEXT : action == "previous" ? NX_KEYTYPE_PREVIOUS : NX_KEYTYPE_PLAY
-        let events = [0xA, 0xB].compactMap { state in
-            NSEvent.otherEvent(with: .systemDefined, location: .zero,
-                modifierFlags: NSEvent.ModifierFlags(rawValue: UInt(state << 8)), timestamp: 0,
-                windowNumber: 0, context: nil, subtype: 8, data1: (Int(key) << 16) | (state << 8), data2: -1)?.cgEvent
-        }
-        guard events.count == 2 else { throw MacControlError.malformedResponse("system media key could not be created") }
-        // Re-read after admission; no cached player, foreground-app guess or playback-state guess decides which integration owns this command.
-        let pid: Int32
-        do {
-            guard let current = try await MacMediaTarget.currentPID() else {
-                return MacControlResult(ok: true, action: "media", output: .object([
-                    "status": .string("no_player"), "action": .string(action), "effects": .string("none"),
-                    "message": .string("No Now Playing player is available; no media key was sent.")
-                ]), error: nil, durationMs: Int(now().timeIntervalSince(started) * 1000))
-            }
-            pid = current
-        } catch let failure as MacMediaTarget.Failure { return failure.refusal.result(action: "media") }
-        guard let player = NSRunningApplication(processIdentifier: pid), !player.isTerminated,
-              let bundle = player.bundleIdentifier else {
-            return MacAppActGate.unavailable("the Now Playing app with process \(pid) has quit or has no bundle identifier",
-                next: "Ask again for the current player").result(action: "media")
-        }
-        try Task.checkCancellation()
-        if let refusal = MacAppActGate.refusal(pid: pid, context: context) { return refusal.result(action: "media") }
-        for event in events { try await CGEventSink().postNative(event, context: context) }
-        return MacControlResult(ok: true, action: "media",
-            output: .object(["action": .string(action), "key_sent": .string(key == NX_KEYTYPE_PLAY ? "play_pause" : action == "previous" ? "previous" : "next"),
-                "target_pid": .int(Int64(pid)), "bundle_id": .string(bundle), "playback_state_confirmed": .bool(false),
-                "message": .string("""
-                    System media key sent for the observed Now Playing app. Play/pause is a toggle; the key receipt does not confirm playback or a track \
-                    change.
-                    """)]),
-            error: nil, durationMs: Int(now().timeIntervalSince(started) * 1000))
-    }
-
     // MARK: applescript
 
     func handleAppleScript(_ body: [String: JSONValue], context: MacOperationContext) async throws -> MacControlResult {
@@ -385,7 +334,7 @@ extension SwiftNativeMacControl {
             enum Lifetime: Sendable { case finished(JSONValue), takenOver, unwatched }
             let adapter = appleScriptAdapter, store = attentionStore, binding = context.driver
             let finished: JSONValue? = try await ScriptedInputSources.during { try await withThrowingTaskGroup(of: Lifetime.self) { group in
-                group.addTask { .finished(try await adapter.callApp(args, targets: [bundle: "write"], context: context)) }
+                group.addTask { .finished(try await adapter.callAppReportingScriptStop(args, targets: [bundle: "write"], context: context)) }
                 if let binding {
                     group.addTask {
                         for await _ in await store.driverChanges() where !binding.allowsEmission(context: context) { return .takenOver }
@@ -416,6 +365,12 @@ extension SwiftNativeMacControl {
             result = finished
         } catch let refusal as MacAppActRefusal {
             return refusal.result(action: "applescript")
+        } catch var stopped as AppleScriptExecution.ScriptStopped {
+            stopped.durationMs = Int(now().timeIntervalSince(started) * 1000)
+            if operationStore == nil { return stopped.result }
+            throw stopped
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             return MacControlResult(
                 ok: false,
@@ -454,7 +409,7 @@ extension SwiftNativeMacControl {
 
     func handleFocusApp(_ body: [String: JSONValue], turn: Turn, context: MacOperationContext) async throws -> MacControlResult {
         if let rawPid = body["pid"]?.integerValue.flatMap(Int.init(exactly:)) {
-            return await handleFocusExact(pid: Int32(clamping: rawPid), body: body, turn: turn, context: context)
+            return try await handleFocusExact(pid: Int32(clamping: rawPid), body: body, turn: turn, context: context)
         }
         if let continuation = turn.macContinuation, continuation.isPending, body["background"] != .bool(true) {
             if let refusal = continuation.refusal(context: context) {
@@ -467,7 +422,7 @@ extension SwiftNativeMacControl {
                     output: .object(["message": .string(continuation.modelContext(context: context))]), error: "continuation_unavailable",
                     durationMs: 0)
             }
-            return await handleFocusExact(pid: app.processIdentifier, body: body, turn: turn, context: context)
+            return try await handleFocusExact(pid: app.processIdentifier, body: body, turn: turn, context: context)
         }
         let app = try requestedAppName(body)
         let started = now()
@@ -488,11 +443,15 @@ extension SwiftNativeMacControl {
             try Task.checkCancellation()
             failure = nil
             output = appControlOutput(result, status: "focused", verified: true)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let late as OperationWaitBudget.Exceeded {
+            throw late
         } catch {
             failure = error.localizedDescription
             output = [
                 "requested": .string(app),
-                "status": .string(error is CancellationError ? "cancelled" : "failed"),
+                "status": .string("failed"),
                 "error": .string(error.localizedDescription),
             ]
             if let evidence = error as? ToolFailureError {
@@ -503,7 +462,7 @@ extension SwiftNativeMacControl {
             error: failure, durationMs: Int(now().timeIntervalSince(started) * 1000))
     }
 
-    func handleFocusExact(pid: Int32, body: [String: JSONValue], turn: Turn, context: MacOperationContext) async -> MacControlResult {
+    func handleFocusExact(pid: Int32, body: [String: JSONValue], turn: Turn, context: MacOperationContext) async throws -> MacControlResult {
         let started = now()
         func finish(_ status: String, _ extra: [String: JSONValue] = [:]) -> MacControlResult {
             if status == "restore_requested" {
@@ -540,6 +499,7 @@ extension SwiftNativeMacControl {
             // Activate our own app without an AX read of ourselves.
             guard context.driver?.allowsEmission(context: context) == true else { return finish("yielded_to_user") }
             do { return finish(activationStatus, try await MacApplications.activate(app, context: context)) }
+            catch is CancellationError { throw CancellationError() }
             catch { return finish("activation_unconfirmed", ["message": .string(error.localizedDescription)]) }
         }
         let exact = body["frame_id"]?.stringValue
@@ -586,6 +546,7 @@ extension SwiftNativeMacControl {
                 let notes = try await MacApplications.activate(app, context: context)
                 return finish(activationStatus, notes.merging(["window_matched": .bool(false)]) { _, new in new })
             }
+            catch is CancellationError { throw CancellationError() }
             catch { return finish("activation_unconfirmed", ["message": .string(error.localizedDescription)]) }
         }
         if let continuation, let refusal = continuation.refusal(context: context) {
@@ -634,6 +595,8 @@ extension SwiftNativeMacControl {
             output["verified"] = .bool(false)
             return MacControlResult(ok: true, action: "open_target", output: .object(output),
                 error: nil, durationMs: Int(now().timeIntervalSince(started) * 1000))
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             return MacControlResult(ok: false, action: "open_target",
                 output: .object(["status": .string("request_refused"), "verified": .bool(false)]),
@@ -667,6 +630,10 @@ extension SwiftNativeMacControl {
                 error: ok ? nil : "quit_app failed for \(app)",
                 durationMs: Int(now().timeIntervalSince(started) * 1000)
             )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let late as OperationWaitBudget.Exceeded {
+            throw late
         } catch {
             return MacControlResult(
                 ok: false,

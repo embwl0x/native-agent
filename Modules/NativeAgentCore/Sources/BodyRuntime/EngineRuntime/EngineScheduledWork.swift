@@ -45,7 +45,7 @@ extension NativeAgentEngine {
                 return
             }
             // The clock only posts the signal; the run is the part's, on its own gate chain, and recorded on the ability.
-            AbilityStore(dataRoot: root).signal(signal, part: part)
+            AbilityStore(dataRoot: root).signal(signal, part: part, origin: .schedule)
         }
         await clock.handle("watch") { time, _ in await watch(time, dataRoot: root) }
         await clock.handle("scan") { time, _ in await scan(time, dataRoot: root) }
@@ -94,11 +94,15 @@ extension NativeAgentEngine {
         do {
             var response: [String: Any]
             repeat {
-                response = try await runDream(dataRoot: root, force: false, parent: parent, beganAt: beganAt)
-            } while response["remedy"] == nil && response["moreMessagesRemain"] as? Bool == true && response["entriesWritten"] as? Int ?? 0 > 0
+                response = try await runDream(dataRoot: root, parent: parent, beganAt: beganAt)
+            } while response["status"] as? String != "stopped" && response["remedy"] == nil
+                && response["moreMessagesRemain"] as? Bool == true && response["entriesWritten"] as? Int ?? 0 > 0
             guard response["remedy"] == nil, (response["skipReason"] as? String) == "already_running" else { return }
             detail = "another dream run held the reservation while the night began"
         } catch DreamREMCycleError.cycleDisabled(_, _) {
+            return
+        } catch is CancellationError {
+            // Stop is not a failure of the night: nothing is owed for it.
             return
         } catch {
             detail = JSONValue.describe(error)
@@ -111,6 +115,11 @@ extension NativeAgentEngine {
         do {
             _ = try await clockWork(dataRoot: root).surfaceREMResult(try await runRem(dataRoot: root, force: false))
             await RepairOwed.settle(root, operation: "rem", evidence: .init(source: "attention", id: "night")).value
+        } catch DreamREMCycleError.cycleDisabled(_, _) {
+            // REM turned off is a setting, not a failed night.
+            return
+        } catch is CancellationError {
+            return
         } catch {
             await RepairOwed.owe(root, id: "night-rem-repair:" + UUID().uuidString, kind: .run, operation: "rem", owner: "attention > night",
                 words: "The night's REM pass did not complete: " + error.localizedDescription,
@@ -134,6 +143,7 @@ extension NativeAgentEngine {
             try await ScheduledReads.remember(seen: read.seen, read: time, dataRoot: root)
             await RepairOwed.settle(root, operation: operation, evidence: .init(source: "clock", id: time.id)).value
         } catch {
+            // A stop is owed here too: a one-shot read interrupted at shutdown has no other record of being missed.
             await RepairOwed.owe(root, id: "watch-read:" + time.id + ":" + UUID().uuidString, kind: .run, operation: operation,
                 owner: "clock/times.json > " + time.id, words: "The watch \(name) did not read: \(error.localizedDescription)",
                 nextCall: ToolFailureError.call("app", ["action": .string("schedule.list")])).value
@@ -151,6 +161,7 @@ extension NativeAgentEngine {
             try await ScheduledReads.remember(seen: posted, read: time, dataRoot: root)
             await RepairOwed.settle(root, operation: operation, evidence: .init(source: "clock", id: time.id)).value
         } catch {
+            // A stop is owed here too: a one-shot read interrupted at shutdown has no other record of being missed.
             await RepairOwed.owe(root, id: "scan:" + time.id + ":" + UUID().uuidString, kind: .run, operation: operation,
                 owner: "clock/times.json > " + time.id, words: "The proactive scan \(time.id) did not complete: \(error.localizedDescription)",
                 nextCall: ToolFailureError.call("app", ["action": .string("schedule.list")])).value
@@ -159,7 +170,7 @@ extension NativeAgentEngine {
 
     /// A watch's read: its action through the app door, as any of the agent's calls, held to a read. Throws what refused or failed it.
     private static func read(action: String, input: [String: JSONValue]) async throws -> JSONValue {
-        try await NativeAgentEngine.live.withPartDoor(envelope: .native("scheduler:watch:" + action)) { door in
+        try await NativeAgentEngine.live.withPartDoor(envelope: .native("scheduler:watch:" + action), traced: true) { door in
             if let refusal = SchedulerJobNormalizer.watchRefusal(action: action, input: input, turn: door.turn) {
                 throw PartCallError(code: "not_a_read", message: refusal)
             }
@@ -169,7 +180,7 @@ extension NativeAgentEngine {
             let skipped = exactStatus && (reply.said("skipped") || reply.said("needs_input"))
             guard !reply.outcome.isFailure && !(reply.outcome == .unknown && skipped) else {
                 throw PartCallError(code: "read_failed", message: "\(action) did not read: "
-                    + ChatToolOutcome.displaySummary(outcome: .failed, input: nil, result: reply.payload)
+                    + ChatToolOutcome.displaySummary(result: reply.payload)
                     + (ChatToolOutcome.remedy(reply.payload).map { " " + $0 } ?? ""))
             }
             return reply.payload

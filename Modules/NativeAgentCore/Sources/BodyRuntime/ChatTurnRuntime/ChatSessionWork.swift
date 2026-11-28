@@ -1,5 +1,5 @@
-import Foundation
 import NativeAgentCore
+import Foundation
 import NativeAgentShared
 import SenseCore
 import ProviderRouting

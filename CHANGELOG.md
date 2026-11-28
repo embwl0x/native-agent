@@ -4,6 +4,24 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ---
 
+## 0.6.24 — four places, one Table, a Stop that is a stop (2026-11-27)
+
+- Window: Simple shows Together, Table, the agent's own place and Control on Mac and iPhone; Command-K finds every page; one menu-bar line when
+  something waits; a running turn shows its steps with Withdraw and Stop; a click or tap acts only on the page seen; smoother window drags
+- Table: one shared canvas on Mac and iPhone; add, cross out and remove from the paired phone; placement beside, after, under or inside a named
+  item with growing containers; Table slices on pages and Desk cards
+- Agents: a job handed to another agent stays in mind while it is out, with no time estimate; one message is one message across conversations;
+  one unreadable contact no longer blocks the others
+- Stop and Quit: recorded as a stop, never a failure, crash or repair, across Mac actions, scripts, calendar and reminder writes, searches,
+  exports, dreams, Telegram and Slack; a Telegram message arriving during one is kept
+- Memory: a memory can say when it was true; ended and not-yet-started facts are not offered as current; a corrected memory names its successor;
+  a night's work survives one bad item
+- Mac reach: installed apps read without launching; abilities read accessibility elements, open links and hold live connections inside existing
+  access; permission belongs to the request being served
+- Fixed: setup after a sign-in with no models; saved credentials reported as saved; Default model sets Chat; activity history after wake; four
+  window controls open Settings; Text Size followed; documents no longer sent twice; Doctor heals its search index
+- Core: seven unused actions, the task ledger and several thousand unused lines removed; new Getting Started, Settings and Where Things Are guides
+
 ## 0.6.23 — faster reads, a body that knows where it is, a leaner core (2026-11-24)
 
 - Speed: Mail, Messages, Notes and Safari read in about two seconds and see current data while open; independent reads run together; window looks

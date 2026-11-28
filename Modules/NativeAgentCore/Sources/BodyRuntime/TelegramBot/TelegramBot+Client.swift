@@ -10,11 +10,6 @@ import DeskCore
 
 // Blueprint: | `TelegramBot+Client.swift` | `SwiftNativeTelegramBot`: checked status and send lanes |
 
-public protocol TelegramMemoryWriteRef: Sendable {
-    func remember(text: String, source: String, turn: Turn) async throws -> String
-    func note(text: String, kind: String, source: String, turn: Turn) async throws -> String
-}
-
 /// Nil reply means unsupported; a committed restart must terminate after the reply attempt, even on send failure.
 public struct TelegramSlashDispatchOutcome: Sendable {
     public let reply: String?
@@ -28,12 +23,12 @@ public struct TelegramSlashDispatchOutcome: Sendable {
 
 public struct TelegramBotCompletenessDeps: Sendable {
     public let routing: TelegramProviderRoutingBridge?
-    public let memory: (any TelegramMemoryWriteRef)?
+    public let memory: TelegramMemoryWriterBridge?
     public let restart: TelegramRestartBridge?
 
     public init(
         routing: TelegramProviderRoutingBridge? = nil,
-        memory: (any TelegramMemoryWriteRef)? = nil,
+        memory: TelegramMemoryWriterBridge? = nil,
         restart: TelegramRestartBridge? = nil
     ) {
         self.routing = routing

@@ -105,9 +105,9 @@ createdAt. Damaged rows acquire no invented identity or time; opening, last-turn
 and context-statistic reads report unreadable sources rather than certifying
 older or empty history.
 
-`BodyRuntime/EngineRuntime/ChatTranscriptCache.swift` holds decoded full history, its file
-identity and its completed byte offset. Cached full-history reads extend that
-history on the same device/inode after comparing the held final line's exact
+`BodyRuntime/EngineRuntime/ChatTranscriptCache.swift` holds decoded full history, its
+`ContactThread` regular-file revision and its completed byte offset. Cached full-history
+reads extend that history on the same device/inode after comparing the held final line's exact
 bytes at their offset. Transcript edits replace the inode through `ContactThread`;
 appends preserve its prefix. Only the new complete lines reach
 `SessionHistoryReader`'s decoder. Replacement, shrinkage, a changed boundary,
@@ -118,7 +118,7 @@ non-`read_failed` read with unchanged file identity and a final LF is retained.
 The full-history offset is the file size; the last line is read backward from EOF.
 A final CRLF also prevents retention because the reader's String splitter
 does not treat that character as an LF separator. Read errors remain errors.
-Counts, damage evidence, context statistics and mode match a full read of the
+Counts, damage evidence and mode match a full read of the
 same bytes; `sourceBytes` and `bytesRead`
 describe the whole selected file revision. The `transcript-tail` diagnostic
 separately records actual appended bytes and selected new lines. Limited reads
@@ -189,7 +189,9 @@ preserved and posting throws a storage error.
 | `cognition/organism_state.json` | Organism continuity, with the body's forgetting epoch (`epoch`), its lived-moment watermark (`lived`) and its recently-dosed encounters; `BodyRuntime/Cognition/NativeCognitionRuntime+BodyContinuity.swift` (one atomic writer, the persistence drain; persists only after its restore finished) |
 | `clock/times.json` | The one clock's saved Time fields (`id` as `<owner>:<key>`, `rhythm`, `next`, `payload`, optional `delivered` occurrence and `ended` flag); declarations, consumption and local/off-disk capture share its file lock. Ended times retain delivery/withdrawal evidence but are absent from pending listings and deadlines. Both backup forms and production export carry current clock declarations; engine launch does not read a carry-over marker or retired scheduler format. No projection zone or civil occurrence identity is saved, so a time-zone change while quit remains deferred ([clock limitation](AUTOMATED_SYSTEMS.md#8-bounded-inspection)); `DeskCore/TriggerScheduler/OneClock.swift` |
 | `desk/my-queue-carried.json` | MY QUEUE's current run and owed-settlement ledger. Only an absent current file begins an empty ledger; unreadable bytes throw. No retired arrival ledger is read; `DeskCore/Desk/MyQueueCarried.swift` |
+| `orchestration/task_ledger.jsonl`, `orchestration/task_ledger_base.json` | Retired task ledger files. Existing bytes stay in place and have no task reader or writer. Off-disk backup can retain them as files. Local backup, production export and phone sync exclude them. |
 | `attention/notebook.json` | The turn program's notebook, which `weigh` reads as `felt.notebook`; `BodyRuntime/ChatTurnRuntime/TurnPart.swift` |
+| `senses/<id>/state.json` | `AbilityStore` owns the [part notebook](skill_manifest_spec.md#part-notebook). The flat mapping still holds the part's values. Only an empty key, outside the valid notebook key space, holds per-entry revision and expiry metadata. Legacy keys, including `_meta`, remain ordinary values. Notebooks stay local to the Mac and are included in the existing Sense Storage backup scope. |
 | `cognition/user_turn.json` | The person's last turn stamp (`at`, `previous`, `key`, optional `door`) read by Since gap and rhythm; `BodyRuntime/ChatTurnRuntime/ChatTurnEvidence.swift` (`UserTurnStamp`) holds its sidecar file lock across the read/update and writes atomically; a delayed older timestamp cannot replace a newer stamp. Only a missing file bootstraps; unreadable/invalid bytes stay intact and owe repair through Experiences, including unavailable reads |
 | `mind/rhythm.json` | Timestamp/door-only evidence for the person's day: 24 seven-day forgetting bins, 30 days of hourly first activities and starts, standing claims and once-per-kind/local-day break identities. `BodyRuntime/Cognition/NativeCognitionRuntime+Rhythm.swift` is the sole writer, using `MindCore/CognitiveSubstrate/PersonRhythm.swift`; only absence cold-starts from indexed owner history, corrupt bytes remain intact with repair owed. [Rhythm](RHYTHM.md) owns the evidence and admission rules |
 | `mind/self.json` | Their existing dream's evidence-linked self-reading: at most five if-then traits, five story lines and 128 person lines, bounded to 256,000 bytes. `MindCore/CognitiveSubstrate/CognitiveSelfKnowledge.swift` owns the schema and atomic durable write; the substrate is the sole writer/cache owner. Versioned by schema, committed diary source, write time and mind epoch. No persona or memory content is seeded here; corrupt bytes remain intact with repair owed, Clear removes the file and pre-Clear epochs cannot return. [Becoming](BECOMING.md) owns the material windows and turn admission |
@@ -275,11 +277,6 @@ App launch supplies `PersistenceCore.defaultPersonaRoot(dataRoot:)` for this pro
 Onboarding recognizes only a single ordered autogen body and an optional empty
 preamble as reproducible. Foreign headings, comments, preamble content and
 malformed markers are authored content and require the backup-preserving reset path.
-
-Task-ledger compaction bases require faithful decoding, including retained owners,
-reference entries and unknown fields. Only the historical `agent` owner spelling
-and an absent compaction count have explicit decode migrations; failed reads
-preserve the snapshot rather than rewriting a reduced projection.
 
 Slack's policy in `connectors/slack/auth.json` has one checked shape, owned by
 `TransportAllowlist.SlackPolicy`: `allowed_channel_ids` and `allowed_user_ids`

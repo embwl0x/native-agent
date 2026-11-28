@@ -22,18 +22,13 @@ final class TranscriptUserFragment: TranscriptFragment {
 
     private var tagSpace: CGFloat {
         guard let tag else { return 0 }
-        return max(TranscriptMetrics.tagSpace, ceil(max(tag.text.size().height, tag.symbol?.size.height ?? 0)) + 4)
+        return max(TranscriptLook.provenanceHeight, ceil(max(tag.text.size().height, tag.symbol?.size.height ?? 0)) + 4)
     }
 
     override var topMargin: CGFloat { topGap + tagSpace + TranscriptMetrics.bubblePadV }
     override var bottomMargin: CGFloat { TranscriptMetrics.bubblePadV }
 
-    /// The text's own extent, padded: the bubble always wraps exactly what is drawn.
-    private var bubbleRect: CGRect {
-        let ink = inkRect
-        guard !ink.isNull else { return .zero }
-        return ink.insetBy(dx: -TranscriptMetrics.bubblePadH, dy: -TranscriptMetrics.bubblePadV)
-    }
+    private var bubbleRect: CGRect { paddedInkRect(horizontal: TranscriptMetrics.bubblePadH, vertical: TranscriptMetrics.bubblePadV) }
 
     private var tagRect: CGRect {
         guard let tag, bubbleRect != .zero else { return .zero }
@@ -92,7 +87,7 @@ final class TranscriptCodeFragment: TranscriptFragment {
 
     private var header: CGFloat {
         guard let language else { return 0 }
-        return max(TranscriptMetrics.codeHeader, ceil(language.font.lineHeight) + 8)
+        return max(TranscriptLook.codeHeaderHeight, ceil(language.font.lineHeight) + 8)
     }
 
     override var topMargin: CGFloat { topGap + header + TranscriptMetrics.codePad }

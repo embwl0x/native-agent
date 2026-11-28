@@ -32,27 +32,21 @@ public final class ChatGPTTransport: HTTPProviderProfile {
         return "\(codexBackendOriginator)/\(codexClientVersion) NativeAgent/\(nativeAgentVersion)"
     }
     internal let session: URLSession
-    private let endpoint: URL?
-    internal let refreshEndpoint: URL?
+    private let endpoint = URL(string: "https://chatgpt.com/backend-api/codex/responses")
+    internal let refreshEndpoint = URL(string: ProviderOAuthConfig.openai.tokenEndpoint)
     internal let authPathOverride: URL?
     internal let dataRootOverride: URL?
-    internal let openAIPublicClientID: String
+    internal let openAIPublicClientID = ProviderOAuthConfig.openai.clientId
     public let telemetry: LLMCallTraceRecorder
     public init(
         session: URLSession = ChatGPTTransport.productionSession,
-        endpoint: URL? = URL(string: "https://chatgpt.com/backend-api/codex/responses"),
-        refreshEndpoint: URL? = URL(string: ProviderOAuthConfig.openai.tokenEndpoint),
         authPathOverride: URL? = nil,
         dataRootOverride: URL? = nil,
-        openAIPublicClientID: String = ProviderOAuthConfig.openai.clientId,
         telemetryDataRootOverride: URL? = nil
     ) {
         self.session = session
-        self.endpoint = endpoint
-        self.refreshEndpoint = refreshEndpoint
         self.authPathOverride = authPathOverride
         self.dataRootOverride = dataRootOverride
-        self.openAIPublicClientID = openAIPublicClientID
         self.telemetry = LLMCallTraceRecorder(dataRootOverride: telemetryDataRootOverride)
     }
     static func currentPromptCacheKey(call: LLMCall) -> String? {
@@ -131,7 +125,7 @@ public final class ChatGPTTransport: HTTPProviderProfile {
         guard let endpoint else {
             throw LLMError.providerError(message: "ChatGPT response endpoint is invalid; correct its provider configuration.")
         }
-        let coercedModel = try coerceToGPTModel(model)
+        let coercedModel = try coerceToGPTModel(model, preview: call.preview)
         let substitutedFrom = substitutionTrace(requested: model, coerced: coercedModel)
         let requestAccount = OAuthRequestAccount()
         let access: String
@@ -203,7 +197,7 @@ public final class ChatGPTTransport: HTTPProviderProfile {
         return String(value.prefix(maximumCharacters)) + "…"
     }
     /// Only the selected account's catalog can admit a normalized model ID.
-    private func coerceToGPTModel(_ requested: String?) throws -> String {
+    private func coerceToGPTModel(_ requested: String?, preview: Bool) throws -> String {
         guard let r = requested?.trimmingCharacters(in: .whitespaces), !r.isEmpty else {
             throw LLMError.modelUnavailable(provider: "openai_oauth_direct", model: "")
         }
@@ -214,11 +208,8 @@ public final class ChatGPTTransport: HTTPProviderProfile {
             return r
         }()
         // Empty normalization sentinel keeps invalid IDs from becoming a model pick.
-        let normalized = SwiftNativeProviderRouting.normalizeModelIdStatic(
-            stripped,
-            fallback: ""
-        )
-        if accountModel(normalized) != nil {
+        let normalized = SwiftNativeProviderRouting.normalizeModelIdStatic(stripped)
+        if accountModel(normalized, preview: preview) != nil {
             return normalized
         }
         throw LLMError.modelUnavailable(provider: "openai_oauth_direct", model: r)

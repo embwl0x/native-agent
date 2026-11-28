@@ -2,13 +2,6 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-/// The background client owns this operation's persona assembly explicitly.
-public enum PrivateWorkContextAssembly: Sendable {
-    case compilePersona
-    case suppliedPersona
-    case taskOnly
-}
-
 /// Retain the trigger so dream provenance cannot be guessed from time; scheduled runs use the Mac's local clock.
 public enum DreamTrigger: String, Sendable, Equatable, CaseIterable, Codable {
     case schedule
@@ -31,10 +24,12 @@ public struct DreamReport: Sendable, Equatable {
     /// Preview uses real generation and decoding without committing.
     public var preview: JSONValue?
     public var effectsSettled: Int = 0
+    var droppedOptionalItems: Int = 0
     /// Lessons this run committed to memory, from its own dream and any earlier night it settled.
     public var lessonsSaved: Int = 0
 
     public var committed: Bool { entriesWritten > 0 && !disabled && errors.isEmpty }
+    var stopped: Bool { !errors.isEmpty && errors.allSatisfy { $0 == DreamCycleRunner.stopPendingWords } }
 
     public init(
         sessionsProcessed: Int = 0,
@@ -76,7 +71,8 @@ public typealias DreamReceiptSink = @Sendable (_ kind: String, _ payload: JSONVa
 /// Acknowledge dream affect only after dated persistence or an explicitly disabled owner.
 public typealias DreamDatedMoodSink = @Sendable (
     _ affect: Double,
-    _ dateKey: String
+    _ dateKey: String,
+    _ dreamId: UUID
 ) async throws -> DreamEffectResult
 
 /// Save produced reflection judgment before integration so no effect can precede its durable cause.
@@ -85,7 +81,7 @@ public enum DreamEffect: Sendable {
     case reflectionIntegration(CognitiveReflectionReceipt)
     case reflectionAcknowledgment(UUID)
     case care(CognitiveCareNight)
-    case completion(occurredAt: Date, feltSummary: String?)
+    case completion(occurredAt: Date, feltSummary: String?, droppedOptionalItems: Int?)
 }
 
 /// An effect whose shared slot other work holds stays owed and is not a failure; the words name the holder and when to try again.

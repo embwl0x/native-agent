@@ -11,11 +11,9 @@ public actor SettingsFeedProjection {
         case trust(TrustPolicy?, String?)
         case persona(PersonalityProfile?, [PersonaDocSpec], String?, String?)
         case connectors(Result<SlackIngressPolicy, Error>?)
-        case permissions([String: String], String?, Bool)
         case dock(String, PermissionSettingsFace.Dock?)
         case preferences([String: PartFace.Value], [String: String], [String: PartFace.Value])
         case windowLeaves([String], sampling: [String: Double])
-        case search(String?, String?)
         case updates(SoftwareUpdateSettingsFace.Source)
         case delivery(FaceDeliveryReceipt)
     }
@@ -64,10 +62,6 @@ public actor SettingsFeedProjection {
             case nil: break
             }
             current.connectors = value
-        case .permissions(let statuses, let issue, let reading):
-            current.permissions.systemStatuses = statuses
-            current.permissions.issue = issue.map(NativeAppSecretRedactor.redactText)
-            current.permissions.isReading = reading
         case .dock(let key, let value):
             current.permissions.docks[key] = value.map { .init(line: NativeAppSecretRedactor.redactText($0.line), highlight: $0.highlight) }
         case .windowLeaves(let pages, let sampling): current.window = SettingsFace.Window(leaves: pages, sampling: sampling)
@@ -77,13 +71,8 @@ public actor SettingsFeedProjection {
             current.hasReadPreferences = true
             declaredPreferences = declared
             projectTrust()
-        case .search(let value, let issue):
-            current.searchURL = value
-            current.searchIssue = issue.map(NativeAppSecretRedactor.redactText)
         case .updates(let value):
-            current.updates = .init(source: .init(availableVersion: value.availableVersion, canCheck: value.canCheck,
-                automaticChecks: value.automaticChecks, failure: value.failure.map(NativeAppSecretRedactor.redactText),
-                unavailable: value.unavailable))
+            current.updates = .init(source: value)
         case .delivery(let receipt): await receipt.complete(); return
         }
         if sent != current {
@@ -122,14 +111,10 @@ public actor SettingsFeedProjection {
         admission.yield(.persona(profile, documents, profileIssue, documentsIssue))
     }
     public nonisolated func updateConnectors(_ value: Result<SlackIngressPolicy, Error>?) { admission.yield(.connectors(value)) }
-    public nonisolated func updatePermissions(statuses: [String: String], issue: String?, isReading: Bool) {
-        admission.yield(.permissions(statuses, issue, isReading))
-    }
     public nonisolated func updateDock(_ value: PermissionSettingsFace.Dock?, capability: String) { admission.yield(.dock(capability, value)) }
     public nonisolated func updatePreferences(_ values: [String: PartFace.Value], issues: [String: String], declared: [String: PartFace.Value]) {
         admission.yield(.preferences(values, issues, declared))
     }
-    public nonisolated func updateSearch(_ value: String?, issue: String?) { admission.yield(.search(value, issue)) }
     public nonisolated func updateUpdates(_ value: SoftwareUpdateSettingsFace.Source) { admission.yield(.updates(value)) }
 
     public nonisolated func deliverFaces() async throws {

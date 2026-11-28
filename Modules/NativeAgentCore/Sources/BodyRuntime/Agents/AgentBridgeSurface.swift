@@ -13,10 +13,6 @@ import DeskCore
 public enum AgentBridgeSurface {
     public static let id = ConversationSurfaceProfile.agentBridgeID
 
-    public static func isAgentBridge(_ surface: String) -> Bool {
-        ConversationSurfaceProfile(surface).isAgentBridge
-    }
-
     /// Bracket routing context so readers can strip it while preserving the peer’s message.
     /// `conversationID` names a conversation the contact opened by calling in; it stands in for the label, which names only the agent's own threads.
     public static func contactLines(name: String, id: String, conversation: String, conversationID: String? = nil, answering: Bool) -> String {

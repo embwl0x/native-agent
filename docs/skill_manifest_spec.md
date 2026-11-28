@@ -7,7 +7,7 @@ grows), `sense` or `turn`. All kinds have the same header and one
 524,288-byte (512 KB) source limit. An ability is an ability: what it can do
 is what it declares, never which door made it.
 
-`turn` (`abilities/turn.js`) exports `step(state, event) → {state, do:[effects]}`; the stem owns the loop. Events:
+`turn` (`abilities/turn.js`) exports `step(state, event) → {state, do:[effects]}`. The stem owns the loop. Each new event gets a frozen `event.ask` with `id` (the admitted turn's act), `principal`, `steered_by`, `elevated` (the live task elevations at delivery) and `file_access_ceiling` (the complete array of modes). The stem binds each queued effect to the Ask and runs it under the held `Turn` through the existing gates. Events:
 
 - `message`: the moment, read-only: `text`, `surface` (authorizing) and `door` (arrival), `attachments`, `who` (`person`, `self` or `agent:<id>`), `verified` (transport-attested user id or null), `trust`, `steered_by` (steering peers) and `posture` (`full_mac`, `work`, `safe` or `unreadable: <cause>`; the saved posture, which untrusted steering caps to Work at each gate).
   A thought of the agent's own (session `mind`, `who: "self"`) also carries `attended`: `mode` (`awake`, or `waking` for what waited through sleep),
@@ -16,7 +16,7 @@ is what it declares, never which door made it.
   `noop: {tries, empty, lower, stands, silent}`, its class's no-op record by `Expectation`; `silent` is the stem's one draw at the
   rule-of-succession rate, so a replay reads the same. The seed ends the thought on CPU with `reply.end` when `noop.silent` is true.
 - `model`: final text and requested calls, each with `id` and `index`. Visible text streams directly; no chunk events. If readable, untainted words from the person wait before the proposal reaches the part, the stem keeps the prose and delivers an `observation` naming the unstarted calls instead. The part decides again; no turn-program edit is required.
-- `result`: one call's `{index,id,name,ok,effect}`; their own call's result has its `id` and no `index`. A round's last result may carry `practice: {route, hand, loop?: {call, count}, ability?: {id, description, worked?, failed?}}`, the familiarity nerve's signal for their next thought; `ability` names an active ability whose recorded route makes exactly those writes (worked, to use next time; or the step its newest run failed at, to repair). Each operation record keeps its newest run's outcome as `last`. Effect comes from explicit receipts, else `execution:executed`, including batch receipts/script ledgers: an ability's all-read ledger reports `read`; `part` names effectful ability/sense work, else strongest of irreversible/write/read; absent when nothing landed. The broker's per-call class, not declared ability permissions or its prose, decides whether a reached call reads.
+- `result`: one call's `{index,id,name,ok,effect}`; their own call's result has its `id` and no `index`. A round's last result may carry `practice: {route, hand, loop?: {call, count}}`, the familiarity nerve's signal for their next thought. Effect comes from explicit receipts, else `execution:executed`, including batch receipts/script ledgers: an ability's all-read ledger reports `read`; `part` names effectful ability/sense work, else strongest of irreversible/write/read; absent when nothing landed. The broker's per-call class, not declared ability permissions or its prose, decides whether a reached call reads.
   `spoken` records prose streamed to the person. `clean` requires every call in the round to be a reversible,
   non-voice app binding with class `write`, reach `agent` and no `then_say`, even one whose words failed to stand.
   Each receipt must confirm success without a wait, unknown effect, `needs_me`, hand-back or attachment to show.
@@ -71,9 +71,9 @@ attachments, a silent end posts nothing and settles completed. The heard
 experience's `answer` obligation settles `accepted` with silence evidence naming
 the turn ([turn anatomy §6](ANATOMY_OF_A_TURN.md)). Reach: `turn.persona()`,
 `turn.pins()`, `turn.recall()`, `turn.context()` and `turn.body()`. The first uncached reach opens the turn's shared context preparation. Each step
-logs its reach answers, including the body's optional `changed` joint, for replay.
+logs its reach answers, including the optional `changed` body joint and the somatic observation time (`observed_at`) on an available body reading, for replay.
 A silent thought can end before its first reach or model call.
-A first model call can name its exact line in `system.body_anchor`, identifying the changed joint with `(body:<joint>)`. Acceptance credits that joint's logged digest for this conversation only if the composed input carries the line.
+A first `model.call` can name its exact line in `system.body_anchor`, identifying the changed joint with `(body:<joint>)`. The bundled turn dates the somatic line and an observed front title with their observation times. Acceptance credits that joint's logged digest for this conversation only if the composed input carries the line.
 
 <a id="weigh"></a>
 
@@ -88,7 +88,10 @@ stated condition for changing its stance reached the attention bar among all liv
 embedding read leaves the line waiting. Other readings include `yield: {hits, tries}` (thoughts on that node through that
 door within the record's horizon), `presence`, `quiet`, `busy: {open, idleMinutes}`, `mode`, `affect: {arousal, taskPressure, warmth}`, `body:
 {fatigue, curiosity, vigilance, novelty}` or null, and `notebook`. A `night` line from `sense:night` also carries `rest: {awayMinutes, activeShare, hoursSinceNight}`;
-null means the named evidence is absent. An `hour` line from `sense:hour` carries the same `rest` plus `curiosity` (a number or null).
+null means the named evidence is absent. `affect.warmth` spans −1…1 with a neutral value of zero.
+An `hour` line from `sense:hour` carries the same `rest` plus `curiosity` (a number or null).
+For this line `felt.epistemicAppetite` carries `{unfamiliarity, closureRate}` or `"unavailable"`.
+`felt.curiosity` includes the [Hour's epistemic appetite](SUBCONSCIOUS.md#the-hour) when measured.
 Its `self` kind gathers on subject `hour`; `yield` reads that thought class through `sense:hour`.
 The seed gives it worth `2 * curiosity * min(1, (yield.hits + 1) / (yield.tries + 1))`, or zero without curiosity.
 Its ordinary thought carries `attended.hour`, the offered material, alongside its happenings and readings.
@@ -144,7 +147,7 @@ arms the return wake when it expires.
 
 <a id="turn-recovery"></a>
 
-The turn log keeps events, reach answers, started-effect identities and streamed text for identity-matched resume/replay. Payload hashing supplies identity only for effects without an explicit identity; starts do not store a separate digest. Current selection reads `turn.js`; only a missing current slot installs the shipped seed, and that write must succeed before it runs. An unreadable or wrong-kind current slot ends with its storage cause and repair, without consulting another version.
+The turn log keeps events, their Ask descriptions, reach answers, started-effect identities and streamed text for identity-matched replay. Replay uses each recorded description as step input. Events logged before this field existed still replay without it. Effects use the current Ask's live authority. Payload hashing supplies identity only for effects without an explicit identity. Each start records the resulting identity. Current selection reads `turn.js`. Only a missing current slot installs the shipped seed, and that write must succeed before it runs. An unreadable or wrong-kind current slot ends with its storage cause and repair.
 
 Every non-Stop failure of the selected turn program or its helper invokes the one exception in
 [NORTHSTAR clause 2](NORTHSTAR.md#clause-2--no-theater-alive-means-real), including JavaScript exceptions,
@@ -166,15 +169,63 @@ If every available source fails, recovery ends plainly rather than retrying fore
 | **wake** | String array, default `[]` (called only). [Wake signals](#wake-signals) defines names, payloads and delivery. |
 | **face** | `{page?: string, action?: string, projection?: bool}`, default `{}`. An authored tool's action lists on this door page, or diagnostics when absent; `action` claims an unclaimed door id, never beside `answers`. Unknown pages refuse at save. `projection:true` declares `face(input)`; its typed sections/rows are computed from frozen native sources outside view rendering and published through `LatestRead` (contract below). A projection with only a face entry is published as a page. |
 | **answers** | Door verbs the part answers, by action id: `{description, class, args, irreversible?, screen?, summary?}` each, absent when none. `class` is `read`, `write`, `send` or `destructive`; `args` is the verb's JSON Schema (no argument named `verb`). The door registers each verb on `face.page` with that contract and judges it by its class, its Mac integration switch taken from the part's `app_read:`/`app_write:` reach; a verb a native declaration still holds stays native, and a verb two active parts answer is the first by id. The selected handler receives `{verb, ...args}`; the part's input schema is derived from the verbs and takes no `params`. A `read` verb runs read-confined: read-only app events, read actions and read primitives only. A class other than the four refuses at admission. A verb a shipped seed answers keeps that seed's class and irreversibility as its floor: a revision may raise them, never lower them; and every revision's keep passes the one keep gate (the person's card below Full Mac, the agent's own keep under Full Mac). |
-| **state** | Abilities use `host.state.get()` → saved JSON (initially `null`) and `host.state.set(value)` → `null`. One durable notebook owner, shared with senses' keyed `state.get/set`, stores it by ability id at `senses/<id>/state.json` under key `part`; it survives helper restarts and app relaunch, and `ability.drop` deletes it with the ability. Values are limited to 16 KiB and the notebook to 64 KiB. Preview uses a scratch notebook, and each validation fixture shares its own scratch notebook across decision passes. Resume verifies prior notebook reads against the current value or the run's last later set, as applicable, before replaying their answers. Journaled writes return their saved acknowledgement. After the answer, notebook operations run live. State calls do not renew stalled execution. `abilities/state.json` remains lifecycle/run accounting only; there is no authored header `state` key. |
+| **state** | [The part's notebook](#part-notebook) keeps JSON under its own id across runs and relaunch. `host.state.get()` and `host.state.set(value)` still address its page packet at key `part`. |
 | **learned** | Optional arbitrary JSON, preserved verbatim; a declared value teaches nothing, and a declared `trial` is refused at save. The stem projects `learned.use`, `learned.versions`, `learned.trial` and `learned.trials` (below). The former door-prediction layer is [retired](#expansion-a-part-is-a-prediction). |
 
 `id` and integer `version` identify the part and version.
 
 The header and the primitive broker parse the same `PartReachGrant`: a fixed
-flag, `secret:<keyring name>`, `app_read:<id>`, or `app_write:<id>`. An unknown
+flag, `secret:<keyring name>`, `app_read:<id>`, `app_write:<id>`, or `app_url:<id>:<scheme>`. An unknown
 flag or malformed target refuses the declaration, without discarding the bad
 entry or granting access to a different target.
+
+### Part notebook
+
+`AbilityStore` owns `senses/<id>/state.json`. Abilities use `host.state` and senses use
+`sense.state`. Each receives only its own id's notebook. Preview uses scratch,
+and each validation fixture keeps its own scratch notebook across decision passes.
+`native-turn-digest`, `native-dream-cycle` and `native-field-repair` run without
+notebook access, including for edited revisions.
+`ability.drop` removes the notebook with the part. `abilities/state.json` holds
+lifecycle and run accounting. Notebook contents stay out of the stable prompt.
+
+- `get(key)` returns the saved JSON or `null` for an absent or expired key.
+- `set(key, value, options?)` writes JSON, advances the key's revision and
+  returns `null`. `options.ttl_seconds` is an integer from 1 through 31,536,000.
+  Omitting it clears expiration. Reads skip expired keys and writes can remove
+  them in the same durable update.
+- `delete(key)` removes the value and its metadata and returns `null`.
+- `list(prefix?)` returns `{keys, total_bytes, limit_bytes}`. Each matching row
+  has `key`, `bytes`, `rev`, `updated_at` and `expires_at`. The byte total
+  counts the entire live notebook's encoded values and metadata. Existing
+  entries without metadata have revision zero and null dates.
+- `cas(key, expected, value, options?)` compares the live value under the
+  same lock as the write. An absent or expired key compares as `null`.
+  A swap returns `{swapped:true, rev}`. A mismatch returns
+  `{swapped:false, current_rev}`, with a null revision for an absent key.
+
+Keys are 1–256 UTF-8 bytes. Each value is at most 256 KiB and the whole file
+is at most 2 MiB, with up to 256 keys. A retained notebook already above
+256 keys may update or remove its existing keys. Larger artifacts belong
+in a workspace or Desk file under declared reach. Notebook writes screen the
+new value for secret references and recognized credentials, including named
+secret fields in JSON objects. An ability also checks values known to its
+active broker. A declared read verb cannot use keyed mutations in rehearsal
+or in live execution.
+
+Abilities retain `host.state.get()` and `host.state.set(value)` for key `part`.
+An identical legacy set keeps its revision when the key has no expiry.
+It can still prune other expired entries. A page of the agent's own reads the
+object at `part` as its packet, including the face's `keys`. When other
+live entries exist, the reader supplies them together as `input.notebook`,
+which takes precedence over a field named `notebook` in that packet. The
+face chooses what to show from its frozen input.
+
+Resume rechecks keyed gets against the live value or the run's later
+acknowledged write to that key. It rechecks lists after accounting for later
+committed writes by the same run. Journaled mutations replay their
+acknowledgement. After the answer, notebook operations run live. State calls
+give no progress credit.
 
 ### Wake signals
 
@@ -232,7 +283,7 @@ While on and Autonomy allows unattended work, an ability runs as `authored.<id>`
   queue conditions. Unknown/stale phone evidence emits no presence verdict.
   `mac.system_info {person:true}` remains the raw Mac-input fact for hardware
   decisions. [Phone evidence contract](mobile_companion.md#where-the-person-is).
-- `body.changed` carries the joint's `kind`, `bundle_id` and `pid`, plus `window_id` and `has_sheet` when observed.
+- `body.changed` carries the joint's `kind`, `bundle_id`, `pid` and publication `generation`, plus `window_id` and `has_sheet` when observed. Pending wakes coalesce by the structural fields and deliver the generation of the retained wake.
 - `chrome.tab_taken`: `tab_id`, `reason`, `host` when the tab had one, the moment the person selects, touches or navigates one of the agent's Chrome tabs. It
   also posts a world happening (door `chrome`) that attention weighs like any other. The agent's own close and group changes do not post it. The person can
   still take a tab after this has passed, so `tab_not_owned` stays the final answer on a call.
@@ -242,6 +293,31 @@ While on and Autonomy allows unattended work, an ability runs as `authored.<id>`
   settled signal.
 
 `agent` identifies non-owner words (untrusted steering or a non-allowlisted sender). The run uses current Trust and its own gate chain. A tainted signal skips write-capable parts with a trace and no card; trusted-agent signals carry owner authority. A required approval answers pending at once with its card; requests for their use `home.arrive {line}`, deduplicated per ability/day/line on its hop-limited thread (an explicit `event_key` uses durable occurrence deduplication instead).
+
+#### Unasked wake evidence
+
+Terminal ability accounting records the call's origin in the existing
+`experiences.sqlite` detail horizon. A tap by the person or an exact person act
+is `person`, even if a tap did not grant authority. Other calls through a turn
+are `agent`. A part's own clock or signal delivery is
+`schedule` or `signal`, respectively. Runs without recorded origin are unknown.
+Calls a wake makes to another ability and carried Desk habits follow the
+ordinary call rule.
+
+`ability.read` shows the last recorded run's origin as `last_run_origin` and
+its part's `unasked_wakes` counts. Capabilities refreshes the same counts for
+parts with declared or recorded wakes as wake details settle. The preceding
+14 days include all part versions in the detail record. A held delivery's
+refusals, redelivery and any repeat executions count as one wake. An explicit
+`occurred` or `partial` counts as an effect; an explicit `none` counts as
+no effect, even for a refusal or handback. An absent or unknown receipt effect
+counts as unconfirmed unless an effect was recorded for that delivery. Older
+runs supply no origin evidence.
+
+These are counts of retained evidence, not proof that every wake was recorded.
+Recording detail never changes the part's outcome or continuation. The counts
+do not prompt Attention or edit the wake list; Agent can edit it explicitly
+with `ability.save`.
 
 ### Calling a part and projecting its face
 
@@ -300,6 +376,9 @@ base call and form revision before running anything. The Mac carries that object
 `PageActRequest.value`; the signed phone carries its JSON as `values` and the revision
 as `formRevision` inside the existing string-map envelope. Page text lists labels,
 committed values and submit calls; unfinished values belong only to the door session.
+The native page owner supplies the Mac's drawn page revision for row and
+form gestures. It travels separately from the form revision and stays outside
+the authored face grammar.
 The retained operation records each field's submitted edit revision. Only explicit
 owner `committed` fields settle edits; later typing remains and rebases on that committed
 value. A failure keeps the draft and field errors. A known failure with no effect
@@ -308,7 +387,7 @@ keeps the original operation identity and never resubmits it. A failed read keep
 that hold; successful owner evidence or approval execution/decline settles the
 same operation through the shared session. Consent alone proves no execution.
 Cancel awaits the owner's actual settlement.
-A native leaf is `{kind:"leaf",key,leaf,ref,alt,revision?,cards?,choices?}`: the owner resolves its resource;
+A native leaf is `{kind:"leaf",key,leaf,ref,alt,revision?,cards?,choices?,ids?}`: the owner resolves its resource;
 `alt` is its text representation. A missing grant or unsupported leaf shows its words,
 and never opens another resource. Graph is a leaf; its surrounding list and detail remain faces.
 For the Desk's standing board (`leaf:"board", ref:"table"`), `cards` carries
@@ -320,6 +399,13 @@ objects with unique nonempty ids, nonempty labels, string details and exactly on
 nonempty reference. Open Desk items carry stable handles and visible Desk numbers;
 ready pieces on open items carry `make:<ref>` addresses and their kind. The native
 card picker searches the supplied titles and details without reading stores.
+For a live read-only slice, draw a section block like
+`{kind:"leaf",leaf:"table_slice",key:"slice",ref:"table",ids:["e1a2b3c4d5e6"],alt:"The project on the table"}`.
+Only this leaf takes `ids`, an array of at most 64 exact table element IDs of 1–40 ASCII letters, digits or hyphens.
+Omit `ids` for the overview. A selected region includes the elements it contains. A selected set includes enclosing regions and arrows
+connecting its elements. Standard Mac and iPhone pages draw the read-only slice from the standing Desk table and its live card facts.
+A populated slice opens the table fitted to those elements. An empty slice displays a plain note. The Body joins current card facts for the
+text door. Supply meaningful `alt` words for an unavailable table reading or a device without the live drawing.
 A graphic on any page is one of three: a count is a row's `value`; progress is a row's `meter`; a chart or
 picture is a piece: make it (an SVG, or HTML and CSS with no script, since previews run no script; a picture
 file), `make.add` it, then lay it as `{kind:"leaf",key:"piece:<any id>",leaf:"web"|"image",ref:<make.add's ref>,
@@ -517,6 +603,7 @@ before clipping into Home or Today levers and their phone snapshots; the account
 `native-desk`, `native-memories`, `native-personality` and `native-diagnostics`: each page's
 owner registers the part and its packet read (`PartFaces.register(page:part:read:)`:
 facts, record epoch, page and key levers, owed), and `refresh(page:)` reads the packet and projects it.
+Home reads attention directly from cognition and dates the Awake and Asleep rows with that read time. Sense readings show their source read time. For the source gaps supplied to `native-home`, the page labels retained readings while their sources refresh and keeps those notices visible within the section's row limit.
 Authored-page inventory failures reach page discovery and reads even before a first face exists; an unread inventory cannot establish an empty page list.
 Declaration conflicts belong to their page ids: those pages expose their claim failures while unrelated valid pages keep their readers and faces.
 Memories' phone projection uses a separate packet classified for `ios` by the memory owner before facts, keys or levers are built; it never
@@ -525,8 +612,8 @@ through `ContextSecretContentPolicy.redactedFragment`, and character clusters de
 same policy before clipping. This covers kept/search records, pending/rejected proposals, lessons, provenance, queries and failures for both Mac and phone.
 A phone tap reads its disclosed snapshot's own rows and retains the person's Keep / Don't keep decision.
 A part whose face is `{projection:true, page:"<id>"}` is a page of the agent's own, `<id>`
-being a short lowercase id no app page, alias, room or tab uses: its packet is its own notebook
-(`host.state`, an object holding its `keys`), read again whenever the part writes it, and
+being a short lowercase id no app page, alias, room or tab uses. Its packet comes
+from its [notebook](#part-notebook), read again on notebook writes, and
 `layout.write` places it as `page:<id>` on `rail` or `more`. A `face.page` that names an
 app page (with or without projection) is where the part is placed, never a page of its own. Cached Codable `PartFaceSnapshot`s publish
 through `LatestRead`. The Mac holds page-keyed face-feed delivery with its existing
@@ -597,6 +684,37 @@ retain the originating ask.
 Its primitive receipt retains nested tool effects through failure, cancellation
 and JSON validation; missing effect evidence is `unknown`. Offering tools makes
 the call capable of effects for replay, even though thinking itself needs no card.
+
+For `native-turn-digest`, the originating after-turn owner supplies the Memory
+route, the system prompt and redacted evidence within the part runner's 4 MiB
+input limit. Swift uses the pinned revision's declared schema to send either the
+typed packet or the previous flags and text fields. The typed packet includes
+the turn ID when the record supplies one. The part's sole host call is
+`host.model.call({purpose:"turn_digest",prompt})`, available once. The prompt must
+carry the exchange, any prior statement, the redacted ID-and-text memory rows,
+and the serialized settlement evidence intact. Swift verifies the model's
+answer and the part's proposed judgment, including update targets and whether
+the captured mode allows memories and promises. Provenance, route and care
+faults come from Swift. Only the originating after-turn owner can start a digest.
+
+`native-dream-cycle` receives redacted nightly evidence or REM dates and prompt
+parameters from its Swift owner. Its only host call is `host.model.call`, once
+per run. Dream takes `{purpose:"dream",prompt}` with the required evidence
+intact. REM takes `{purpose:"rem",beforeEntries,prompt}` and Swift inserts the
+full redacted diary packet between the two prompt segments. The Swift owner
+supplies the route and system prompt. The part has no app, file or notebook
+access. REM returns a single list of distinct IDs from the proposals Swift
+already bound to the captured evidence. Swift validates the result before
+crediting a successful trial use.
+JavaScript failures and stem validation failures record failed uses. The
+part's evidence stays out of dispatch traces. Dream preview spends provider
+usage and records no trial use.
+
+`native-field-repair` receives a frozen numeric field reading from the
+organism owner. Its only result is a bounded sequence of proposed changes
+addressed to slots in that reading. The part has no host actions, primitives
+or notebook access. A trial credits its result only after the stem checks
+the targets and changes. The kernel commits against the captured body revision.
 
 `app.home.arrive({line,event_key?})` posts the line as a `world` happening from the calling part, keyed by a supplied occurrence key within that
 part, otherwise by local day and line; a repeat is the same happening and writes nothing. Peers that steered the run travel with it as taint; the
@@ -747,6 +865,7 @@ grants nothing that call would not have.
 Reach capability names are `app_data_read`, `app_data_write`,
 `network_localhost`, `network_public`, `network`, `shell`, `computer_files`,
 `arbitrary_file_write`, `app_read:<bundle_id>` and `app_write:<bundle_id>`.
+`app_url:<bundle_id>:<scheme>` declares a target for `host.app.openURL` and carries no secret insertion reach.
 `AbilityStore.reachActions` defines the exact app actions included by a
 capability; page membership never expands reach. `computer_files` and
 `app_data_read` include only `files.read/list/info/excerpt/grep/spotlight`,
@@ -755,8 +874,10 @@ not file reach. The save receipt prints the resulting `actions` (including
 code calls and explicit dynamic dependencies).
 `network_public` excludes loopback, unspecified, private, link-local and shared
 addresses, including IPv4-mapped IPv6 forms. Non-loopback addresses in these
-ranges require full `network` reach for network primitives. A public fetch
-refuses any such resolved address even with full `network` reach.
+ranges require full `network` reach for network primitives. The broker's public
+destination check for fetch, SSE, and WebSocket also refuses the entire
+IPv4-mapped IPv6 prefix, even with full `network` reach. Admitted loopback
+destinations use their own loopback check.
 `network.connect {path}` requires `network` and an exact socket entry in `reach.readPaths`, resolved through symlinks and `~`.
 This includes credential-bearing SSH-agent and Docker sockets. NativeAgent's data root sockets are refused even when declared.
 Loopback reach alone does not admit Unix sockets.
@@ -767,7 +888,8 @@ primitives (`host.model.call`, the PIM door aliases), and `network_public` is
 a connector refuses. A fetch waits for its transport result/error or explicit
 cancellation. NativeAgent adds no response or transport timeout and never resends
 a request after credential rejection. Its admitted transport retains settlement,
-including synchronous DNS. For a modifying request (any method but GET/HEAD),
+including synchronous DNS. For a modifying request (any method but GET/HEAD,
+or any request with `body_base64` or `multipart`),
 settlement saves the complete redacted receipt once at
 `ability_fetches/<uuid>.json` and links it from that experience, then accepts
 its `finish` obligation. A received HTTP response does not prove the service
@@ -776,11 +898,55 @@ inspect service state before another modifying request. Missing/unreadable
 settlement is unavailable evidence, never permission to resend; persistence
 failure owes repair. A pending experience after app termination requires service
 reconciliation, never automatic request replay);
+
+`host.fetch` accepts at most one of `body`, `body_base64`, or `multipart`.
+Request bodies are limited to 4 MiB; `multipart` has 1–32 parts with `name`,
+optional `filename`/`content_type`, and exactly one of `text` or `base64`.
+Only multipart text accepts secret placeholders. `response_encoding:"base64"`
+returns `body_base64`, decoded `bytes`, and `truncated:false` instead of `body`.
+Its 4 MiB response body limit counts decoded HTTP body bytes. Oversize responses
+refuse. Requests that use `body` or omit a body also have a 4 MiB wire limit.
+
+`host.fetch.sse.open({url,method?,headers?,body?,timeout_ms?})` uses fetch's
+reach and resolved-address rules. It returns `{id,status}` for a live
+`text/event-stream`, or a bounded ordinary HTTP response. Use its handle with
+`host.fetch.sse.next({id,timeout_ms?})` for one `{done:false,event,id,retry_ms,data}`
+or `{done:true,reason}`, and `host.fetch.sse.close({id})` to end it. The event's
+`id` is the server's event ID, not the handle. `retry_ms` is data only. Events
+are limited to 256 KiB and the decoded stream to 16 MiB; there are at most four
+open SSE streams.
+
+`host.network.websocket.open({url,headers?,subprotocols?,timeout_ms?})` takes
+`ws` or `wss`, and returns a run-local `id`. As with fetch, a non-loopback
+hostname must resolve exclusively to public addresses, even with full
+`network` reach. An admitted loopback host must resolve only to loopback.
+Send one `text` or `base64` message of at most
+1 MiB with `host.network.websocket.send({id,text|base64})`. Read one message
+with `host.network.websocket.receive({id,timeout_ms?})` and end it with
+`host.network.websocket.close({id,code?,reason?})`. Neither transport follows
+redirects. Both pin the checked address, redact readback, share the broker's
+eight-connection limit and close when the run ends or the ability is disabled
+or replaced, including resident runs. Open and read timeouts use the existing
+call budget, clamp to 50–60,000 ms, and close the affected handle on expiry.
+Open and SSE next default to 15 s. WebSocket receive defaults to 10 s.
+Both WS and WSS also set a 15 s TCP connect timeout. WSS requires TLS 1.2
+or later. WebSocket opens refuse a secret-controlled origin with
+`secret_cannot_alter_host`. Open and send refuse a secret on public plaintext
+with `secret_requires_tls`.
+Send and close inherit the enclosing call's budget. SSE never reconnects
+automatically.
+
+Fetch responses, including the bounded HTTP response from an SSE open,
+carry `data_trust: "untrusted_network"` within the serialized result limit.
+SSE events, WebSocket receive results, and raw network receive results carry
+the same marker. These fields are external data and confer no authority for later calls.
+
 `shell` serves `host.program` (a named program over stdio for the run, ended
 with the run as a shell command is unless a resident ability holds it; a program that deliberately detaches into
 its own session outlives the run, as from the shell), and
 `secret:<name>` lets a call write `{{secret:<name>}}` where a keyring secret's
-value belongs (a fetch's url, headers or body, `network.send` text, a program's
+value belongs (a fetch's URL, headers or text body, a WebSocket's secure or
+loopback URL/headers and send text, `network.send` text, a program's
 args, env or stdin): the broker inserts it only toward a host or program the
 person granted and redacts replies (stream-piece boundaries may expose up to three leading secret bytes before redacting the remainder), in each form
 an insertion writes it (as written, URL-encoded, escaped in a JSON string,
@@ -794,7 +960,8 @@ grant exists; a supplied invalid lifetime refuses the grant or renewal. Device
 authorization requires its server's code lifetime, polls at its valid interval
 (RFC 8628's five seconds only when the interval is omitted), and ends at expiry,
 denial or cancellation. A fetch carrying a
-secret that only reads (GET or HEAD, no body) is a read in Trust, any other call
+secret that only reads (GET or HEAD, no body) is a read in Trust; WebSocket and
+SSE open are external effects, and any other call
 carrying one an effect;
 `AbilityStore` names the full accepted set, including the run's screen watch
 and Mac hands.
@@ -836,20 +1003,23 @@ ability reads expose each ability's reach, wake, face and residency; sense rows
 expose their own `SenseRecord` version, reach and lifetime `mode`, without ability wake
 or residency fields.
 
-`learned.use` projects version totals and bounded recent input/call outcomes;
-its `scope:"current_version"` names the scope of `run_totals` and
+`learned.use` projects version totals and bounded recent input/call outcomes.
+Each operation record keeps its newest run's outcome as `last`.
+Its `scope:"current_version"` names the scope of `run_totals` and
 `rounds_per_use`. List and detail share one store projection,
 `run_counts:{all_versions,current_version}`: `all_versions` reads lifetime
 `useCount`, including versions no longer retained, and `current_version`
 reads the selected file identity's `runs.versions` count. A version with no
 record has zero observed runs; unavailable accounting fails the read rather
 than inventing zero. The list's ambiguous `runs` field is removed.
+
 Every settled run of a retained version writes run accounting, including a
 successful computation with empty `calls`, `effects:none` and `notebook_changed:false`.
 Its version's count, outcome and `first_seen` are evidence for the night reading.
-The notebook owner compares before writing and emits no change for an identical
-value; its committed-write callback supplies `notebook_changed`, including state
-writes outside the call ledger. A computation's accounting does not rewrite its notebook.
+The notebook owner's committed-write callback supplies `notebook_changed`,
+including writes outside the call ledger. An identical legacy set can leave
+the file unchanged. A keyed set or successful compare-and-swap advances the
+key's revision. A computation's accounting does not rewrite its notebook.
 Run accounting retains the terminal refusal's `reason`, `reasons`, `gate_reason`,
 `detail`, `message`, `checker` and `remedy` in `lastRun`, beside status, effects,
 version, calls (metadata only, under the [receipts law](ONE_DOOR.md#authority-and-receipts); a run
@@ -930,8 +1100,7 @@ each tool round the native stem meets the hand work's ordered tool/action ids
 arguments left out), or the one call repeated with the same input 3+ rounds
 when there is no such hand work, as one `practice: ` line through
 `FamiliarLines` in `mind/familiar.bin`. The first meeting only records it.
-A later meeting, unless an active ability's current learned-use or validation
-route covers those ids in order, sends `practice` on that round's last result,
+A later meeting sends `practice` on that round's last result,
 once a turn; the shipped turn makes it their next call's note: keep the route as
 an ability, revise the part they worked around or looped, or keep nothing.
 This uses the same bounded habituation as lines
@@ -1019,14 +1188,52 @@ claiming it, in either spelling.
 
 | Action | Contract |
 |---|---|
-| `ability.save` | `{id, description?, code?, edits?, params?, actions?, fixtures?, name?, triggers?, converts?, create_only?, reach?, wake?, face?, resident?, learned?, choices?, trial?, set_aside?, why?}`. `trial:true` with why makes a revision a trial; `set_aside:true` saves the kept self forward (trials: see `learned.use`). Creates or revises: a new ability needs description and code; a revision inherits everything it does not restate from its latest version; an explicit empty value drops one. Send code or edits, never both. `params` is the description/type map (a leading type word, optionally after `optional`, sets the type; otherwise string; words end at whitespace, commas, colons or parentheses; `?` on the type or the word `optional` marks it optional), `{type, description?}`, or a JSON Schema object (`readOnly:true` declares a read contract); `params` is its sole input-contract argument. Direct app dot/bracket members and reach derive dependencies; `actions` declares indirect calls (literal or computed). Literal calls and declarations are checked before staging; unknown actions and missing dependencies refuse save, while computed names produce warnings and keep runtime checks. Under Full Mac their own save is kept and on in this one act (sealed as kept: its first real run is its proof), with a decided Inbox row; below Full Mac, or when an untrusted agent started the turn, it is a draft. A revision inheriting tape fixtures remains staged until its exact version replays ([tape fixtures](#tape-fixtures)). A revision may name an existing ability by id or name. New ids are normalized by trimming whitespace, lowercasing, replacing runs outside `a-z`, digits, `-` and `_` with `-`, and trimming edge hyphens; the result must be 2–64 characters, a letter first (`^[a-z][a-z0-9_-]{1,63}$`). |
-| `ability.validate` | A read: `effect:none`, `read_only:true`; a reached rehearsal reports `execution:rehearsed` and `effects:none`. Rehearses its waiting version with the shared helper and intercepted replies, on fixtures or one captured run with `input`. A version with tape fixtures replays its recorded calls instead (`candidateValidation` `replayed`). Proves no live behavior; never keeps. |
+| `ability.save` | `{id, description?, code?, edits?, params?, actions?, fixtures?, name?, triggers?, converts?, create_only?, reach?, wake?, face?, resident?, learned?, choices?, answers?, trial?, set_aside?, why?}`. `trial:true` with why makes a revision a trial; `set_aside:true` saves the kept self forward (trials: see `learned.use`). Creates or revises: a new ability needs description and code; a revision inherits everything it does not restate from its latest version; an explicit empty value drops one. Send code or edits, never both. `params` is the description/type map (a leading type word, optionally after `optional`, sets the type; otherwise string; words end at whitespace, commas, colons or parentheses; `?` on the type or the word `optional` marks it optional), `{type, description?}`, or a JSON Schema object (`readOnly:true` declares a read contract). An answering part declares its input through its `answers` verb schemas. Direct app dot/bracket members and reach derive dependencies; `actions` declares indirect calls (literal or computed). Literal calls and declarations are checked before staging; unknown actions and missing dependencies refuse save, while computed names produce warnings and keep runtime checks. Under Full Mac their own save is kept and on in this one act (sealed as kept: its first real run is its proof), with a decided Inbox row; below Full Mac, or when an untrusted agent started the turn, it is a draft. A revision inheriting tape fixtures remains staged until its exact version replays ([tape fixtures](#tape-fixtures)). A revision may name an existing ability by id or name. New ids are normalized by trimming whitespace, lowercasing, replacing runs outside `a-z`, digits, `-` and `_` with `-`, and trimming edge hyphens; the result must be 2–64 characters, a letter first (`^[a-z][a-z0-9_-]{1,63}$`). |
+| `ability.validate` | `{id, input?, capture?, faceSampleInput?}`. A read with `effect:none` and `read_only:true`. Successful validation reports `execution:rehearsed` and `effects:none`. A waiting version rehearses fixtures or captures one run using `input`. Tape fixtures replay recorded calls (`candidateValidation` `replayed`). A declared projection also checks its face, using `faceSampleInput` when supplied. Successful fixture and face checks report `rehearsal: "rehearsed-with-face"`. A failed face reports `bad_face` with the cause. Rehearsal proves no live behavior and never keeps. |
 | `ability.enable`, `ability.restore` | Keeps its waiting version, or turns it back on: theirs under Full Mac for their own work (sealed as kept when never rehearsed); otherwise, once rehearsed, the owner's card for this exact version (code, fixtures and dependency shapes), approvable on the Mac and the phone, or Keep on the Tools page. Code requires `version` equal to its full digest, captured with the displayed code when the card or row was staged and saved with it; self-improvement cards and approval replay carry that same saved digest. A caller without the exact review offers a read rather than executable approval. A version with tape fixtures is kept by no one until its tape replayed (`not_replayed`). Omitting `version` restores only disabled Markdown guidance with no candidate or code fingerprint, checked and written under the ability-store lock. |
 | `authored.<id>` | Its one run, with input by its params, under one signed admission re-verified on every run. `preview:true` passes the same ability gate before its code runs. Its calls report which reads ran live, which steps stayed previewed, and where admission would require a card or hand back. |
 | `ability.resume` | A stopped run_id and bounded answer; optional `id` binds it to that ability, with a mismatch claiming nothing. A rename claims the checkpoint; its bytes are read and verified once. Busy admission or an admission receipt with `execution:not_run` restores the holds and original checkpoint and leaves its Desk step open. Invalid bytes stay claimed for inspection. Completed or deliberately closed runs consume the checkpoint at settlement; cleanup failures stay in `settlement_failures` with cause and remedy. Rechecks selection, host revision and admission and replays prior reads. A woken run resumes with the `input.wake` it stopped on. `preview:true` only reads the checkpoint: it reports the question, input, wake and stopped call, without claiming the run, transferring holds or closing its queued step. |
 | `ability.read` | Every stored kind, including turn and sense: kind, version, declarations, status, retained versions, `run_counts` (all_versions, current_version), evidence and code in pages (`offset`), or one `step`; ordinary abilities also expose waiting/last-clean and converted versions. |
 | `ability.disable`, `ability.drop` | Off with every version kept, as whoever did it (`disabledBy`): `theirs` for their turn or their ability (a trusted agent's turn included), `owner` only for their own surface (the Tools page), `peer` for an untrusted agent's; theirs they turns back on, the owner's is their to lift (`ability.enable` asks on their card); delete it, its versions, its run state and its `host.state` notebook (`pending:true` discards only the waiting version). A built-in skill's own version is the owner's to switch off or drop below Full Mac. |
 | `ability.list` | Every stored part, including turn and sense, in a bounded page (at most 40 rows and a 24 KB row budget), ordered by id. Rows carry kind, version, `run_counts` (all_versions from stored useCount, current_version from the selected version's count) and `last_run_at` from stored `lastUsedAt` (ISO timestamp, null when never run). `count` is the rows printed, `total` is the inventory; follow `next_call`/`next_offset` with `offset` when `has_more`. The Tools page reads this same projection and accepts `args.offset`; a named Tools item accepts a source offset, also reachable by `ability.read`. Full declarations and versions remain on `ability.read`. Unshadowed built-in guidance remains discoverable; unreadable bodies are named in `guidance_gaps` and refuse only their own read. A missing guidance directory is empty; an unreadable one fails with its read error. |
+
+<a id="save-refusals"></a>
+
+**Save refusals**
+
+Recoverable declaration refusals carry `remedy.kind: "correct_arguments"`
+and `remedy.try_instead: {tool:"app", input:{action:"ability.save", args}}`
+when the repair is exact. A revision lists the id and the changed header
+fields. Apply them to the original call to keep its other submitted changes.
+A first save includes the supplied description and a `<keep_your_code>` slot.
+It carries `create_only:true` when the original call supplied it.
+Source aliases also use that slot. Replace it with the original source.
+Missing dependency advice retains the refusal's `actions` argument path and
+carries `next_call` when the header patch is a complete revision. A stale
+call's repair identifies the action, line and `args` field without echoing
+argument values.
+When the encoded remedy reaches 2 KiB, the receipt gives instructions and
+leaves the call pointers null.
+
+Reach and dependency repairs combine retained and submitted declarations after
+the call is admitted. Public argument preflight checks the submitted fields.
+The read-only analyzer locates literal network, AX and URL calls and named
+secret placeholders, including complete placeholders in static template
+segments. For a computed network destination the receipt names the loopback
+and public choices. A private IP literal requires a different destination.
+An `openURL` call with a literal secret placeholder receives the forbidden-secret
+refusal. Exact URL repairs use the app and scheme grants and any required
+shell grant. AX keeps the matching bound-watch alternative.
+`requires_owner_approval` marks added reach beyond the agent's
+own reach when the existing save provenance and posture require the person's
+decision to keep it. Apply patches through the ordinary save gate.
+
+Use `params:null` to clear a conflicting parameter declaration beside
+`answers`. A submitted answer below a shipped verb's floor receives a patch
+raising that verb's class or irreversible flag while retaining the other
+verbs and their argument schemas. Input aliases yield patches when the
+destination is unambiguous. Use `reach.capabilities` for `capabilities`,
+`params` for `inputs` or `schema`, and `code` for `source` or `js`.
 
 An ability save whose syntactically valid, normalized authored source, declarations, fixtures and provenance already match its latest version returns
 `status:ok, effects:none`. It stages, signs and publishes nothing, leaves any open trial and kept baseline intact, and does not enable a draft or
@@ -1077,7 +1284,7 @@ The door checks the registered action against its bound arguments at admission. 
 
 | Decision | Actions | What the reader does |
 | --- | --- | --- |
-| Live | `desk.read`, `queue.list`, `ledger.list`, `schedule.list`, `agent.jobs`, `node.list` | Reads stored work and schedules. Lock-holder stamps are transient. |
+| Live | `desk.read`, `queue.list`, `schedule.list`, `agent.jobs`, `node.list` | Reads stored work and schedules. Lock-holder stamps are transient. |
 | Live | `artifact.find`, `chat.list`, `chat.message`, `chat.scratch_read`, `chat.search`, `claude.worklog`, `record.read`, `result.page`, `trace.model_calls`, `trace.usage` | Reads existing records, transcripts, working text or receipt pages. |
 | Live | `files.excerpt`, `files.grep`, `files.info`, `files.list`, `files.spotlight`, `git.diff`, `git.log`, `git.status`, `git.summary` | Uses the file and repository read handlers. |
 | Live | `calendar.calendars`, `calendar.free_busy`, `calendar.upcoming`, `contacts.search`, `reminders.due_today`, `reminders.lists`, `reminders.query`, `reminders.read`, `photos.count`, `photos.recent` | Queries accessible collections and asset metadata. |
@@ -1204,14 +1411,30 @@ effect classification and redaction share `AuthoredToolEffects`' current
 vocabulary, including fetch's keyless/secret admission identities. Unknown
 calls still withhold arguments and cannot be admitted with withheld input.
 
-`ability.validate` reuses an existing authenticated rehearsal only for its exact
-candidate, fixtures, dependency shapes and host revision. A keep or bundled
-seed seal is not rehearsal. An existing capture must match a requested input;
-an explicit new capture without an existing capture still runs. When rehearsal
-is needed, its fixtures and decision replays share one helper, started lazily
+`ability.validate` reuses an existing authenticated rehearsal for its exact candidate,
+fixtures, dependency shapes and host revision. A keep or bundled seed seal is not rehearsal.
+An existing capture must match a requested input. A callable rehearsal can request a new
+capture when it has no saved capture. Fixtures and decision replays share one helper, started lazily
 at the first run and released at settlement. Every pass has a fresh journal
 and JavaScript context. The scratch notebook is isolated per fixture and
-survives that fixture's decision passes. No save or proof completion waits on a timer.
+survives that fixture's decision passes. Explicit stream fixtures supply the
+handle in the intercepted open result and use that handle for later calls in
+the same fixture. No save or proof completion waits on a timer.
+
+A waiting version with `face.projection:true` checks its face against the current app
+action catalog on each validation, including when fixture evidence is reused. Supply
+`faceSampleInput` when the face needs a separate packet. It passes the same declared
+input requirements as `input`. With no separate packet, the face uses fixture input.
+A face-only version with saved fixtures rehearses those fixtures. With no saved
+fixtures or capture, a separate sample requires `input` or `capture:true` to start a
+fixture run. Each projection uses the live masking step, a fresh JavaScript context and
+the same helper as the fixtures. Validation decodes the face, checks its block kinds,
+and binds it against the packet's `keys` and any published controls from the part's
+page owners. Bound actions must resolve in the catalog or refer to the waiting
+callable version's own `authored.<id>` action. A deferred document
+must bind an action accepted by the live document read check. For a demand-read
+sample, supply its declared read and the completed result in `read`. Successful face
+checks are reported in the validation reply. The saved proof records fixture runs.
 
 Current calls use `ability.*` and `authored.<id>`. Retired `skill.*`,
 `tool.*` and old public tool spellings are unknown calls; they do not execute
@@ -1279,6 +1502,9 @@ checker and remedy to the run receipt before accounting. It counts as refused ev
 if it made no calls or notebook changes; `lastRun` and Home retain that refusal.
 The returned value stays intact, and effects and calls remain the runner's evidence.
 Native value calls, authored actions and resumes pass the originating gated door.
+An `ability.resume` request carries the checkpoint's peer identities as provenance
+and uses only the current Ask's task elevations. Protected effects that need
+additional authority raise the usual card.
 Authored admission carries the run body through that same chain, including its
 consent audit; it has no separate Security Center evaluation path. A selected
 version is rechecked after admission before its body starts. Refusals before
@@ -1340,7 +1566,7 @@ The Tools census's `call_fit` reports static fit, unavailable contracts or the
 exact failure independently of proof/admission errors. Static fit is not a
 claim that the ability is admitted, healthy or has run successfully.
 
-Omitting fixtures captures one bounded rehearsal with supplied input (default `{}`). Page/find/read-only action calls run live through ordinary gates; effects, authored runs and decisions return visible placeholders. Only `host.files.list`, `host.files.count`, `host.files.read` and `host.files.info` primitives read live, under declared reach/admission. Later rehearsals replay the sealed capture. Hand-written fixtures supply `input,calls:[{operation,args,options,result}],answers,expected`; `expected` is the complete returned JSON. Rehearsal never keeps code or proves live effects.
+Omitting fixtures can capture one bounded rehearsal with supplied input (default `{}`). Page/find/read-only action calls run live through ordinary gates; effects, authored runs and decisions return visible placeholders. Only `host.files.list`, `host.files.count`, `host.files.read` and `host.files.info` primitives read live, under declared reach/admission. Later validations reuse the authenticated capture. Hand-written fixtures supply `input,calls:[{operation,args,options,result}],answers,expected`; `expected` is the complete returned JSON. Rehearsal never keeps code or proves live effects.
 
 ### Tape fixtures
 
@@ -1376,7 +1602,43 @@ confer autonomous standing.
 
 Every ability receives frozen input and only declared action dependencies, with named or positional args. A named method call takes its argument
 object and at most one options object (`preview`, `expected_version`, `because`). A supplied nonobject or any surplus argument refuses before execution,
-both in static admission when known and at the live door. Host primitives (`host.model`, `host.fetch`, `host.network`, `host.program`, `host.apps`, `host.files`, `screen.*`, `hand.*`, `host.paths`) require declared reach at the broker.
+both in static admission when known and at the live door. Host primitives (`host.model`, `host.fetch`, `host.network`, `host.program`, `host.apps`, `host.app.openURL`, `host.ax.query`, `host.files`, `screen.*`, `hand.*`, `host.paths`) require declared reach at the host.
+
+`host.app.openURL({bundle_id, url, activate?})` is a write. It requires both
+`app_write:<bundle_id>` and `app_url:<bundle_id>:<scheme>` in `reach.capabilities`.
+For this call, bundle IDs and schemes are ASCII and matched case-insensitively.
+Shell-level bundles or schemes, including Shortcuts, Terminal, System Settings
+and script launchers, also require `shell`. Save checks reach on literal target
+and URL arguments. The host checks reach at call time and requires a unique
+installed match for the bundle ID whose `Info.plist` registers that scheme.
+HTTP(S), file, mail and the other universal schemes are refused, as are secret
+placeholders. `activate` defaults to `false`. A successful call returns `bundle_id`, `scheme`,
+`open_url_class`, `activated` and `pid` directly to the caller. Rehearsal and
+preview validate the request without dispatching it. Live dispatch goes through
+Trust as an app-data write, with shell effects added for shell-level targets.
+
+`host.ax.query({bundle_id, window?, roles?, attributes?, max_depth?, max_nodes?, max_text_chars?})` reads a running app through Trust Full Mac
+Accessibility and an existing macOS Accessibility grant. Declare `app_read:<bundle_id>` or `app_write:<bundle_id>` in `reach.capabilities`. An active
+`screen.watch` from the same run can also supply reach for its exact bundle, window and region. When both grants reach the same window, the query keeps
+the watch's accumulated masks. The watch retains its window identity across later looks. The query never launches or focuses the app, changes renderer
+mode, prompts for macOS permission or performs an act.
+
+`window.index` is a zero-based AX window index from 0 to 199. `window.title_contains` matches a substring of the title returned by the strict legend.
+Without a selector, app reach uses the first AX window. Watch-only reach uses the window bound to the watch. `roles` selects returned roles from the walk.
+`attributes` selects from `role`, `subrole`, `title`, `description`, `value`, `placeholder`, `help`, `enabled`, `focused`, `selected`, `frame`,
+`identifier` and `path`. `path` is relative to the window root and uses the same child addresses as the Mac app map. The defaults are 6 levels, 100
+nodes and 256 characters per text field. The integer limits clamp to 1–12, 1–200 and 32–512, respectively. After admission, the two-second read budget
+includes watch validation and waiting for the shared AX reader. The serialized response cap is 64 KiB.
+
+The result is tagged `data_trust: "untrusted_app_ui"` when it contains nodes. The strict walk requires explicit clear protection evidence for ordinary
+content. A non-root node with a secure role or subrole or a true protected-content flag and verified bounds yields a `redacted: true` row with
+`[REDACTED:secure_field]` placeholders in place of text. The default projection includes a fixed `selected_text` placeholder on that row.
+The walk skips its descendants and uses its bounds to mask overlapping rows and nearby secret-shaped text. It checks the secure node's metadata
+for protected paths before returning the placeholder. A protected root, active secure input, unknown coverage, heuristic protection that cannot confirm
+a secure node, a protected path, or a walk cut withholds the window. Strict path checks include `dataRoot/credentials/`.
+The ordinary caption and mask checks still apply. The legend checks retained text with the run's inserted-secret redactor before applying text caps.
+`redacted_count` counts each returned secure placeholder row once and each string attribute changed by the run's scrubber on other returned rows.
+A withheld window carries its reason and no node text. A missing process or macOS grant returns `status: "unavailable"` with its reason.
 
 Apple Event parameters in `host.apps.call` and `sense.apps.read` use four-character
 keys and JSON primitives, lists, `{type}`, `{enum}`, `{ordinal}`, `{record}`, or

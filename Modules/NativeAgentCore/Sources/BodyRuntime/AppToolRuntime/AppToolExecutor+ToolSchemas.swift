@@ -163,7 +163,7 @@ extension AppToolExecutor {
                     card.request waits and returns the person's answer. Full Mac writes need no approval card. Owner-only or blocked calls still stop at that \
                     line; earlier calls stay done.\u{20}
                     """
-                    + "Permitted reads need no permission: do them.mac.go opens apps, files and folders; content readers only read. "
+                    + "Permitted reads need no permission: do them. mac.go opens apps, files and folders; content readers only read. "
                     + """
                         One action uses app {action:\"files.read\",args:{path:\"README.md\"}}. Put its arguments inside args; page selects a reader, not an \
                         action id. find always discovers actions, including with page:\"home\"; use work.context {query} or chat.search {query} for saved \
@@ -184,8 +184,8 @@ extension AppToolExecutor {
                         ("action", ToolSchema.strSchema("An action id from a read, such as inbox.archive.")),
                         ("args", DoorFieldDescriptor.openObject("args", reason: "The selected action owns its fields.",
                             description: """
-                                          The action's arguments by name, as its id(args) line shows; for a home item, text or fields. A list where the \
-                                          action takes one value (handle:[…]) runs it once per value.
+                                          The action's arguments by name, as its id(args) line shows; for a home item, text or fields. For a read or a folded \
+                                          action, a list where it takes one value (handle:[…]) runs it once per value; any other change takes actions:[…].
                                           """, values: .implicit).schema),
                         ("actions", ToolSchema.obj([("type", .string("array")), ("items", DoorFieldDescriptor.openObject("actions", reason: "Each step is a door call.", values: .implicit).schema), ("maxItems", .int(Int64(
                             AppScriptRunner.actionLimit))),
@@ -200,14 +200,16 @@ extension AppToolExecutor {
                                              true/false by equality, null by nothing being there (missing, null or empty), {exactly: v} by the whole value, {not: shape} by the shape \
                                              not being met; a bare string is looked for in what came back, never in your own arguments. An argument value \
                                              {found: "2.rows.0.id"} takes that value from step 2's result (steps count from 1; or name a step with as: "list" \
-                                             and write list.rows.0.id); a value that is not there stops the deed at that step. cleanup: true marks a step that \
-                                             puts back what the deed moved; it runs even after a stop. preview and expected_version beside it apply to each, a \
-                                             write's new version passing to the next on its page. then_say beside it carries your closing words. To compute \
+                                             and write list.rows.0.id); a value that is not there stops the deed at that step. {only: "2.rows.id"} is found that \
+                                             stops unless a list on its path holds exactly one; expect {count: N} is a list's length when the result has no count of its own. cleanup: true marks a step that \
+                                             puts back what the deed moved; it can run past a stopped deed step, not after the person stops the turn. \
+                                             preview and expected_version beside it apply to each, a write's new version passing to the next on its page. \
+                                             then_say beside it carries your closing words. To compute \
                                              on a result or glue text, use script.
                                              """))])),
                         ("expect", ToolSchema.obj([
                             ("description", .string("With action and then_say: the expected result shape, as for a step in actions.")),
-                            ("anyOf", .array(["object", "string", "number", "boolean"].map { .object(["type": .string($0)]) }
+                            ("anyOf", .array(["object", "string", "number", "boolean", "null"].map { .object(["type": .string($0)]) }
                                 + [.object(["type": .string("array"), "items": .object([:])])])),
                         ])),
                         ("then_say", ToolSchema.strSchema("""
@@ -217,7 +219,7 @@ extension AppToolExecutor {
                             """)),
                         ("with", DoorFieldDescriptor.openObject("with", reason: "The selected action owns its fields.",
                             description: """
-                                          With then_say: fills its {name} slots, each name: {found: "<step>.<path>"} taking a short value (a number, \
+                                          With then_say: fills its {name} slots, each name: {found: "<step>.<path>"} or {only: …} taking a short value (a number, \
                                           true/false or one line of text) from what came back.
                                           """, values: .implicit).schema),
                         ("preview", ToolSchema.boolSchema("""

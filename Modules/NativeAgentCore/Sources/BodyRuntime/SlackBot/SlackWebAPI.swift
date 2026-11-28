@@ -260,7 +260,9 @@ public enum SlackWebAPI {
             return parsed
         }
         catch {
-            await recordConnectionProof(["ok": false, "error": "transport_failed"], dataRoot: dataRoot)
+            if !(error is CancellationError || ((error as? URLError)?.code == .cancelled && Task.isCancelled)) {
+                await recordConnectionProof(["ok": false, "error": "transport_failed"], dataRoot: dataRoot)
+            }
             throw error
         }
     }

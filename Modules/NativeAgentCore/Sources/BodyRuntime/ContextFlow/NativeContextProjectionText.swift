@@ -5,7 +5,7 @@ import NativeAgentShared
 
 package enum NativeContextProjectionText {
     static func requiredDate(_ raw: String?, owner: String) throws -> Date {
-        guard let raw, let date = NativeTimestampFormat.parseISO8601FractionalFirst(raw) else {
+        guard let date = NativeTimestampFormat.parseOptionalISO8601FractionalFirst(raw) else {
             throw ContextFlowStoreError.malformedStoredValue("\(owner): required source date is unavailable or invalid")
         }
         return date

@@ -135,7 +135,7 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
                 human_action: ToolFailureError.fileRepairInstruction(root.appendingPathComponent("cognition/organism_state.json"),
                     shape: """
                         This JSON object retains organism state, including a chemicalState object with finite numeric agency, confidence, coherence \
-                        and warmth values. Recover only values supported by the retained bytes.
+                        and warmth values. Warmth must be in -1...1. Recover only values supported by the retained bytes.
                         """))
         }
 
@@ -267,6 +267,9 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
             guard let number = value.numberValue(coercingStrings: false, finiteOnly: false), number.isFinite else {
                 return .unreadable("carries a non-numeric \(dimension) in chemicalState")
             }
+            if dimension == "warmth", !(-1...1).contains(number) {
+                return .unreadable("carries warmth outside -1...1 in chemicalState")
+            }
             measured[dimension] = number
         }
         guard !measured.isEmpty else {
@@ -294,7 +297,7 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
                 .map { String(format: "%@=%.2f", $0.key, $0.value) }
                 .joined(separator: ", ")
             let pinned = dimensions
-                .filter { $0.value >= pinnedHigh || $0.value <= pinnedLow }
+                .filter { $0.value >= pinnedHigh || $0.value <= ($0.key == "warmth" ? -pinnedHigh : pinnedLow) }
                 .sorted { $0.key < $1.key }
             let missing = chemistryDimensions.filter { dimensions[$0] == nil }
             var sentence = "organism chemistry \(rendered)"

@@ -466,17 +466,18 @@ public struct TelegramUpdateInbox: Sendable {
         return recovered
     }
 
-    func pruneTerminalClaims(dataRoot: URL, keepingNewest keep: Int = 256) async {
+    func pruneTerminalClaims(dataRoot: URL) async {
         do {
             try await SwiftNativePersistenceCore.withFileLock(indexPath) {
-                try await pruneTerminalClaimsLocked(dataRoot: dataRoot, keepingNewest: keep)
+                try await pruneTerminalClaimsLocked(dataRoot: dataRoot)
             }
         } catch {
             nativeLog("Telegram claim retention failed at %@: %@", indexPath.path, error.localizedDescription)
         }
     }
 
-    private func pruneTerminalClaimsLocked(dataRoot: URL, keepingNewest keep: Int) async throws {
+    private func pruneTerminalClaimsLocked(dataRoot: URL) async throws {
+        let keep = 256
         var index = try await loadIndex()
         let terminal = index.entries.values
             .filter { $0.phase == .completed || $0.phase == .failedBeforeAnswer }

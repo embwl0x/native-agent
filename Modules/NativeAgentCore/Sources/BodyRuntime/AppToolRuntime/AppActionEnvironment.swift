@@ -194,7 +194,20 @@ struct AppActionEnvironment: Sendable {
                 }
                 // The deferred body belongs to this admission, not the earlier host composition.
                 var admittedExecution = callExecution
-                admittedExecution.authoredCall = (tool: id, perform: perform)
+                if id == MacAXQuery.operation {
+                    admittedExecution.authoredCall = (tool: id, perform: {
+                        guard try await client.fullMacToolAccess(turn: callTurn, surface: surface).accessibilityAllowed else {
+                            return client.macControlCategoryNeedEnvelope(invocation: callExecution.toolInvocation,
+                                categories: ["accessibility"], mode: .read,
+                                why: "Accessibility lets me read app controls on your Mac.")
+                                ?? ChatToolOutcome.failure(error: AutonomyGateError.toolDenied(
+                                    reason: "Trust Full Mac Accessibility category is not active for host.ax.query"), tool: id)
+                        }
+                        return try await perform()
+                    })
+                } else {
+                    admittedExecution.authoredCall = (tool: id, perform: perform)
+                }
                 let requester = callTurn.partID.map { "\(PersonaCompiler.agentDisplayName(dataRoot: self.securityCenter.dataRoot))'s \($0)" }
                 do { return try await reentry(id, arguments, callTurn.with(\.requester, requester), admittedExecution) }
                 catch { return ChatToolOutcome.failure(error: error, tool: id) }

@@ -1,15 +1,9 @@
 import Foundation
 import NaturalLanguage
-import NativeAgentCore
-import PersistenceCore
 
-// Blueprint: | `CognitiveSubstrate+TopicNaming.swift` | `CognitiveSubstrate`: private noun phrases and persisted-label admission |
+// Blueprint: | `CognitiveSubstrate+TopicNaming.swift` | `CognitiveSubstrate`: privacy-filtered comparison terms for non-chat felt ambivalence |
 
 extension CognitiveSubstrate {
-    // MARK: - Safe object extraction
-
-    /// Drop secret words and their neighborhoods, including redactor markers, so labels cannot reveal credential context. Suspicious text costs one object cue;
-    /// disclosure would cost a secret.
     static let feltSecretContextWords: Set<String> = [
         "password", "passwd", "passphrase", "token", "tokens", "key", "keys",
         "apikey", "secret", "secrets", "credential", "credentials", "auth",
@@ -21,7 +15,6 @@ extension CognitiveSubstrate {
     ]
     static let feltSecretContextRadius = 2
 
-    /// Route names, speech acts and fillers do not name the thing a feeling is about.
     static let feltWeakObjectWords: Set<String> = [
         "chat", "user", "users", "surface", "session", "message", "messages",
         "turn", "turns", "role", "agent", "assistant", "system", "tool",
@@ -33,7 +26,6 @@ extension CognitiveSubstrate {
         "made", "take", "takes", "give", "gives", "send", "sends", "keep",
         "keeps", "going", "gonna", "please", "thanks", "thank", "sure",
         "maybe", "right", "okay", "stuff", "something", "anything",
-        // State-change verbs do not name a subject; a two-word label must name one thing.
         "broke", "broken", "breaks", "failed", "fails", "failing",
         "works", "worked", "working", "runs", "running", "landed",
         "lands", "shipped", "ships", "uses", "used", "using",
@@ -59,20 +51,9 @@ extension CognitiveSubstrate {
         "shes", "hes", "theyre", "youre", "thats", "dont", "didnt", "cant",
     ]
 
-    /// Retain positions so compounds join only adjacent safe words; reject address/pair and secret neighborhoods before naming.
-    struct FeltSafeToken: Sendable, Equatable {
-        var index: Int
-        var word: String
-        /// Tag once in sentence context: modifier eligibility is weaker than standalone noun eligibility, and bare-word tags lose disambiguating context.
-        var standsAlone: Bool = true
-    }
-
-    /// The shared scan. Both the term list (used as a comparison key) and the rendered phrase come from this one walk, so there is no second copy of the
-    /// privacy rules to drift.
-    static func feltSafeTokenScan(in text: String) -> [FeltSafeToken] {
+    static func feltSafeTokenScan(in text: String) -> [String] {
         guard !text.isEmpty else { return [] }
 
-        // Drop bracketed runs whole so transport framing cannot name a subject.
         var scrubbed = ""
         var depth = 0
         for character in text {
@@ -119,7 +100,6 @@ extension CognitiveSubstrate {
             }
         }
 
-        // Felt object candidates are tagged in sentence context to distinguish nouns from verbs and adverbs.
         var tagged = feltWordTagOccurrences(in: scrubbed)
         /// The word's tag in THIS sentence, consumed in order of occurrence. Unknown when the tagger's split and this one disagree about a word.
         func nextTag(_ word: String) -> (known: Bool, tag: NLTag?) {
@@ -128,7 +108,7 @@ extension CognitiveSubstrate {
             return (true, head)
         }
 
-        var out: [FeltSafeToken] = []
+        var out: [String] = []
         for (index, word) in words.enumerated() {
             guard !dropped.contains(index) else { continue }
             let (known, tag) = nextTag(word)
@@ -138,17 +118,11 @@ extension CognitiveSubstrate {
                   !feltWeakObjectWords.contains(word),
                   !isOpaqueIdentifier(word),
                   !(known && feltTagRefusesAThing(tag)) else { continue }
-            out.append(FeltSafeToken(
-                index: index,
-                word: word,
-                // A word the tagger never saw keeps the file's standing rule — unknown is kept — and so may still stand alone.
-                standsAlone: !known || feltTagNamesAThingAlone(tag)))
+            out.append(word)
         }
         return out
     }
 
-    /// Subject labels exclude verbs, adverbs, adjectives and function words; unknown vocabulary stays eligible in context. Tag occurrences are keyed by
-    /// lowercased word so whitespace-based callers can consume them in order.
     static func feltWordTagOccurrences(in text: String) -> [String: [NLTag?]] {
         guard !text.isEmpty else { return [:] }
         let tagger = NLTagger(tagSchemes: [.lexicalClass])
@@ -167,17 +141,6 @@ extension CognitiveSubstrate {
         return out
     }
 
-    /// Standalone labels also refuse verbs and adjectives; modifiers and unknown vocabulary remain eligible.
-    static func feltTagNamesAThingAlone(_ tag: NLTag?) -> Bool {
-        if feltTagRefusesAThing(tag) { return false }
-        switch tag {
-        case .verb?, .adjective?: return false
-        default: return true
-        }
-    }
-
-    /// Function words and adverbs never name a thing; unknown vocabulary stays eligible in context. Verbs and adjectives may modify a compound, while known
-    /// weak verbs are refused by the weak-word set.
     static func feltTagRefusesAThing(_ tag: NLTag?) -> Bool {
         switch tag {
         case .adverb?, .pronoun?, .determiner?, .preposition?, .conjunction?,
@@ -188,150 +151,14 @@ extension CognitiveSubstrate {
         }
     }
 
-    /// Persisted single-word labels must name a thing alone; the node's sentence can vouch for an unknown lexicon word.
-    static func feltWordNamesAThingAlone(_ word: String, vouchedBy sentence: String? = nil) -> Bool {
-        guard !word.isEmpty else { return false }
-        let tagger = NLTagger(tagSchemes: [.lexicalClass])
-        tagger.string = word
-        let tag = tagger.tag(at: word.startIndex, unit: .word, scheme: .lexicalClass).0
-        // Unknown standalone tokens are refused; the node's sentence can still establish their role in context.
-        guard let tag else { return false }
-        if tag == .otherWord {
-            return feltSentenceVouchesForWord(word, in: sentence ?? "")
-        }
-        return feltTagNamesAThingAlone(tag)
-    }
-
-    /// Use the node sentence only to disambiguate an unknown exact token; a still-unknown class cannot establish a standalone subject.
-    static func feltSentenceVouchesForWord(_ word: String, in sentence: String) -> Bool {
-        guard !word.isEmpty, !sentence.isEmpty else { return false }
-        let tagger = NLTagger(tagSchemes: [.lexicalClass])
-        tagger.string = sentence
-        var vouched = false
-        tagger.enumerateTags(
-            in: sentence.startIndex..<sentence.endIndex, unit: .word, scheme: .lexicalClass,
-            options: [.omitWhitespace, .omitPunctuation]
-        ) { tag, range in
-            guard sentence[range].caseInsensitiveCompare(word) == .orderedSame else { return true }
-            if let tag, tag != .otherWord, feltTagNamesAThingAlone(tag) {
-                vouched = true
-                return false
-            }
-            return true
-        }
-        return vouched
-    }
-
-    static func feltWordNamesAThing(_ word: String) -> Bool {
-        guard !word.isEmpty else { return false }
-        let tagger = NLTagger(tagSchemes: [.lexicalClass])
-        tagger.string = word
-        let tag = tagger.tag(at: word.startIndex, unit: .word, scheme: .lexicalClass).0
-        return !feltTagRefusesAThing(tag)
-    }
-
-    /// Comparison terms share the privacy scan but are not rendered labels; deduplication must not invent adjacent phrases.
-    static func feltSafeObjectTerms(in text: String, limit: Int = 3) -> [String] {
-        guard limit > 0 else { return [] }
+    static func feltSafeObjectTerms(in text: String) -> [String] {
         var seen = Set<String>()
         var out: [String] = []
-        for token in feltSafeTokenScan(in: text) {
-            guard seen.insert(token.word).inserted else { continue }
-            out.append(token.word)
-            if out.count >= limit { break }
+        for word in feltSafeTokenScan(in: text) {
+            guard seen.insert(word).inserted else { continue }
+            out.append(word)
+            if out.count >= 3 { break }
         }
         return out
-    }
-
-    /// Renders the first nameable term or adjacent noun phrase, never more than two words.
-    static func feltSafeObjectPhrase(in text: String, maxCharacters: Int) -> String? {
-        let tokens = feltSafeTokenScan(in: text)
-        // Scan every position for an adjacent noun phrase, then a single noun; a leading non-noun does not end the search.
-        var index = 0
-        while index < tokens.count {
-            let token = tokens[index]
-            if index + 1 < tokens.count {
-                let next = tokens[index + 1]
-                // Cross-check a candidate head against standalone naming rules; contextual tags alone can mistake a verb for a noun.
-                if next.index == token.index + 1, token.word != next.word,
-                   next.standsAlone, feltWordNamesAThing(next.word) {
-                    let pair = "\(token.word) \(next.word)"
-                    if pair.count <= maxCharacters, feltPhraseHeadNamesAThing(pair) { return pair }
-                }
-            }
-            // An unmodified label must name a thing by itself; adjectives and verbs yield to the next candidate.
-            if token.standsAlone, token.word.count <= maxCharacters { return token.word }
-            index += 1
-        }
-        // No nameable subject means no object cue.
-        return nil
-    }
-
-    /// True when the LAST word of `phrase`, tagged inside that phrase, can head a noun phrase. Tagged in the phrase rather than bare because the modifier is
-    /// what disambiguates the head ("deploy pipeline").
-    static func feltPhraseHeadNamesAThing(_ phrase: String) -> Bool {
-        let tagger = NLTagger(tagSchemes: [.lexicalClass])
-        tagger.string = phrase
-        var headTag: NLTag?
-        tagger.enumerateTags(
-            in: phrase.startIndex..<phrase.endIndex,
-            unit: .word,
-            scheme: .lexicalClass,
-            options: [.omitPunctuation, .omitWhitespace]
-        ) { tag, _ in
-            headTag = tag
-            return true
-        }
-        // Verbs and adverbs cannot head a name; everything the tagger refuses outright cannot either. Unknown stays kept, as everywhere else here.
-        if headTag == .verb { return false }
-        return !feltTagRefusesAThing(headTag)
-    }
-
-    // MARK: - The topic label a conversation turn can honestly carry
-
-    /// Producers persist a payload-free topic label before minting the node; no safe noun phrase means no label.
-    public static func feltTopicLabel(
-        from text: String,
-        maxCharacters: Int = 32
-    ) -> String? {
-        // Refuse long names; truncating mid-word would manufacture a subject.
-        return feltSafeObjectPhrase(in: text, maxCharacters: maxCharacters)
-    }
-
-    /// Payload-free subject labels use a usable label or content noun phrase, never a subject ID or channel type.
-    static func innerStateSubjectLabel(_ node: CognitiveNode) -> String? {
-        let label = (node.subjectReference.label ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        // Stored labels must name a thing; otherwise derive the subject from the node's own words.
-        if !label.isEmpty, feltLabelNamesAThing(label, vouchedBy: node.summary) {
-            return String(label.prefix(CognitiveInnerStateReading.subjectLabelCharacters))
-        }
-        return feltSafeObjectPhrase(
-            in: node.summary,
-            maxCharacters: CognitiveInnerStateReading.subjectLabelCharacters)
-    }
-
-    /// True when at least one word of a persisted subject label names a thing. The same two tests the producer applies, over a label rather than a candidate
-    /// token, so the two seams cannot disagree.
-    static func feltLabelNamesAThing(_ label: String, vouchedBy sentence: String? = nil) -> Bool {
-        // Preserve original casing for tagging; only the lowercase weak-word set uses folded words.
-        let words = label
-            .components(separatedBy: CharacterSet.letters.inverted)
-            .filter { !$0.isEmpty }
-        guard !words.isEmpty else { return false }
-        // Standalone labels require a nameable subject; rejected labels defer to the node's words.
-        if words.count == 1, let only = words.first {
-            return !feltWeakObjectWords.contains(only.lowercased())
-                && feltWordNamesAThingAlone(only, vouchedBy: sentence)
-        }
-        // Stored phrases obey the producer's noun-phrase head rule.
-        guard feltPhraseHeadNamesAThing(label) else { return false }
-        return words.enumerated().contains { index, word in
-            guard !feltWeakObjectWords.contains(word.lowercased()) else { return false }
-            // A capitalised word that is NOT the label's first carries no sentence-initial excuse for its capital: it is a proper name, whatever the lexicon
-            // makes of the lowercase homograph.
-            if index > 0, word.first?.isUppercase == true { return true }
-            return feltWordNamesAThing(word)
-        }
     }
 }

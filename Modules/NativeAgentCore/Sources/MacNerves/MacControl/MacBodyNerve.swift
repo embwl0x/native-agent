@@ -68,14 +68,14 @@ package final class MacBodyNerve: Sendable {
         var activityPID: pid_t?
         var worker: JointObserver?
         var failures: [pid_t: String] = [:]
-        var reading: [String: JSONValue] = [:]
+        var reading: (fields: [String: JSONValue], titleObservedAt: Date?) = ([:], nil)
         var waiters: [UUID: AsyncStream<Void>.Continuation] = [:]
         var stopped = false
 
         mutating func retire() {
             worker?.stop()
             worker = nil
-            reading = [:]
+            reading = ([:], nil)
             finishWaiters()
         }
 
@@ -113,6 +113,9 @@ package final class MacBodyNerve: Sendable {
                     if let pid { self?.send(.launched(pid, name: app?.localizedName, regular: app?.activationPolicy == .regular, agentDriven: agentDriven)) }
                 case NSWorkspace.willSleepNotification, NSWorkspace.screensDidSleepNotification: self?.send(.sleep)
                 case NSWorkspace.screensDidWakeNotification: self?.send(.wake)
+                case NSWorkspace.didWakeNotification:
+                    // A system wake clears the sleep edge only when the display is awake too; a dark wake waits for the display's own wake.
+                    if CGDisplayIsAsleep(CGMainDisplayID()) == 0 { self?.send(.wake) }
                 case NSWorkspace.sessionDidResignActiveNotification: self?.send(.sessionInactive)
                 case NSWorkspace.sessionDidBecomeActiveNotification: self?.send(.sessionActive)
                 default: self?.send(.workspace(agentDriven: agentDriven))
@@ -144,11 +147,11 @@ package final class MacBodyNerve: Sendable {
     }
 
     package func explicit(_ pid: pid_t) async {
-        let fields = observe(pid, retry: true)
-        guard fields["status"] == .string("reading") else { return }
+        let reading = observe(pid, retry: true)
+        guard reading.fields["status"] == .string("reading") else { return }
         let id = UUID(), pair = AsyncStream<Void>.makeStream()
         state.withLock { state in
-            if state.worker?.pid == pid, state.reading["status"] == .string("reading") { state.waiters[id] = pair.continuation }
+            if state.worker?.pid == pid, state.reading.fields["status"] == .string("reading") { state.waiters[id] = pair.continuation }
             else { pair.continuation.finish() }
         }
         for await _ in pair.stream {}
@@ -156,26 +159,26 @@ package final class MacBodyNerve: Sendable {
     }
 
     @discardableResult
-    package func observe(_ pid: pid_t?, retry: Bool = false, agentDriven: Bool = false) -> [String: JSONValue] {
+    package func observe(_ pid: pid_t?, retry: Bool = false, agentDriven: Bool = false) -> (fields: [String: JSONValue], titleObservedAt: Date?) {
         state.withLock { state in
-            if let pid, NSWorkspace.shared.frontmostApplication?.processIdentifier != pid { return [:] }
+            if let pid, NSWorkspace.shared.frontmostApplication?.processIdentifier != pid { return ([:], nil) }
             let previous = state.bodyPID
             state.bodyPID = pid
             if let pid, state.worker?.pid != pid { state.activityPID = nil; state.retire() }
             guard !state.stopped, let pid else {
                 if state.activityPID == nil { state.retire() }
-                else if previous != nil { state.reading = [:]; state.finishWaiters(); state.worker?.bodyChanged() }
-                return [:]
+                else if previous != nil { state.reading = ([:], nil); state.finishWaiters(); state.worker?.bodyChanged() }
+                return ([:], nil)
             }
             let failed = state.failures[pid]
             if let cause = failed {
-                guard retry else { return ["status": .string("unavailable"), "cause": .string(cause)] }
+                guard retry else { return (["status": .string("unavailable"), "cause": .string(cause)], nil) }
                 state.failures[pid] = nil
                 if state.worker?.focusUnavailable == true { state.retire() }
             }
             if state.worker == nil || previous != pid || failed != nil {
                 let source = ensureWorker(&state, pid: pid, agentDriven: agentDriven)
-                state.reading = ["status": .string("reading")]
+                state.reading = (["status": .string("reading")], nil)
                 source.bodyChanged()
             }
             return state.reading
@@ -226,12 +229,13 @@ package final class MacBodyNerve: Sendable {
         }
     }
 
-    fileprivate func published(_ value: [String: JSONValue], by source: JointObserver, agentDriven: Bool, creationFailed: Bool = false) {
+    fileprivate func published(_ value: [String: JSONValue], by source: JointObserver, agentDriven: Bool,
+                               creationFailed: Bool = false, titleObservedAt: Date? = nil) {
         state.withLock { state in
             guard source === state.worker else { return }
             if creationFailed { state.failures[source.pid] = value["cause"]?.stringValue }
-            guard state.bodyPID == source.pid, state.reading != value else { return }
-            state.reading = value
+            guard state.bodyPID == source.pid, state.reading.fields != value else { return }
+            state.reading = (value, titleObservedAt)
             state.finishWaiters()
             state.failures[source.pid] = value["cause"]?.stringValue
             send(.changed(agentDriven: agentDriven))
@@ -670,9 +674,11 @@ private final class JointObserver: @unchecked Sendable {
         windowNumber = nil
         try subscribe(window: window, focus: focus)
         let windowValues = try values(window, [kAXTitleAttribute, kAXDocumentAttribute, "AXSheets", kAXRoleAttribute, kAXPositionAttribute, kAXSizeAttribute])
+        let title = try windowValues[kAXTitleAttribute] as? String
+        let titleObservedAt = title.map { _ in Date() }
         let focusValues = try values(focus, [kAXRoleAttribute, kAXSelectedTextRangeAttribute])
         var fields: [String: JSONValue] = ["status": .string("available")]
-        fields["title"] = (try windowValues[kAXTitleAttribute] as? String).map(JSONValue.string)
+        fields["title"] = title.map(JSONValue.string)
         fields["document"] = (try windowValues[kAXDocumentAttribute] as? String).map(JSONValue.string)
         fields["focused_role"] = (try focusValues[kAXRoleAttribute] as? String).map(JSONValue.string)
         if let sheets = try windowValues["AXSheets"] as? [AXUIElement] { fields["has_sheet"] = .bool(!sheets.isEmpty) }
@@ -703,6 +709,6 @@ private final class JointObserver: @unchecked Sendable {
                 }
             }
         }
-        owner?.published(fields, by: self, agentDriven: agentDriven)
+        owner?.published(fields, by: self, agentDriven: agentDriven, titleObservedAt: titleObservedAt)
     }
 }

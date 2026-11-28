@@ -41,18 +41,29 @@ actor ChatGPTDotConversation {
         // Reserve this lifecycle before the recovery pass suspends.
         do {
             for peer in try AgentPeerStore(dataRoot: dataRoot).list() where ChatGPTDotIPCTransport.owns(peer) {
-                for (id, admission) in try admissions(peer: peer.id)
-                    where try admission.started && DataRootLife.isCurrent(admission.lifeID, in: dataRoot)
-                        && admissionTasks[peer.id + ":" + id] == nil {
-                    if admission.failed == nil {
-                        try updateAdmissions(peer: peer.id) { $0[id] = Admission(lifeID: admission.lifeID,
-                            message: admission.message, started: true, failed: "The app stopped before it finished.") }
+                do {
+                    for (id, admission) in try admissions(peer: peer.id)
+                        where try admission.started && DataRootLife.isCurrent(admission.lifeID, in: dataRoot)
+                            && admissionTasks[peer.id + ":" + id] == nil {
+                        if admission.failed == nil {
+                            try updateAdmissions(peer: peer.id) { $0[id] = Admission(lifeID: admission.lifeID,
+                                message: admission.message, started: true, failed: "The app stopped before it finished.") }
+                        }
                     }
-                }
-                if try admissions(peer: peer.id).values.contains(where: { !$0.started && $0.failed == nil }) {
-                    _ = try await append([], peer: peer, recovery: generation)
-                    guard self.generation == generation else { return }
-                    try Task.checkCancellation()
+                    if try admissions(peer: peer.id).values.contains(where: { !$0.started && $0.failed == nil }) {
+                        _ = try await append([], peer: peer, recovery: generation)
+                        guard self.generation == generation else { return }
+                        try Task.checkCancellation()
+                    }
+                    RepairOwed.settle(dataRoot, operation: "contact.dot.recover:" + peer.id,
+                        evidence: .init(source: "dot-admission", id: peer.id))
+                } catch is CancellationError { throw CancellationError() }
+                catch {
+                    let words = "Could not recover the saved Dot admission for \(peer.name): \(error.localizedDescription)"
+                    RepairOwed.owe(dataRoot, id: "dot-recovery:" + peer.id, kind: .message,
+                        operation: "contact.dot.recover:" + peer.id, owner: peer.id,
+                        words: NativeAppSecretRedactor.redactText(words),
+                        lever: "Repair or remove this contact's saved Dot admission.")
                 }
             }
         } catch {

@@ -194,7 +194,7 @@ extension NativeAgentEngine {
         }
         rows += state.issues.map { issue in
             .init(id: "activity.issue." + issue.id.uuidString, title: "Activity capture notice", detail: issue.message,
-                at: ISO8601DateFormatter().string(from: issue.occurredAt), tone: issue.severity == .notice ? .quiet : .failed)
+                at: NativeTimestampFormat.plainZulu(issue.occurredAt), tone: issue.severity == .notice ? .quiet : .failed)
         }
         if let purged = state.purged {
             rows.append(.init(id: "activity.deleted", title: "Last deletion", value: "\(purged) recorded spans deleted"))

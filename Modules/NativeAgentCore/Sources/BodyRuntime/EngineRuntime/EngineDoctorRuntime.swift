@@ -46,7 +46,9 @@ public struct EngineDoctorRuntime<Port: EngineDoctorPlatformPort>: Sendable {
         defer { if ownsRepair { doctorRepairInFlight.withLock { $0 = false } } }
         let impl = suppliedChecks ?? makeDoctorChecks(root: dataRoot)
         var checks = await impl.runAll()
+        try Task.checkCancellation()
         checks += await liveDoctorCoverageReadings(probeSearch: true, includeCognition: true, refreshContacts: true)
+        try Task.checkCancellation()
         if let checkID, checkID != "status.desk_attention", !checks.contains(where: { $0.id == checkID }) {
             throw ToolFailureError("No Doctor check has id \(checkID). Nothing was repaired.",
                 argumentPath: "check_id", accepted: "A check id from doctor.run.", effects: .none)
@@ -60,7 +62,9 @@ public struct EngineDoctorRuntime<Port: EngineDoctorPlatformPort>: Sendable {
             }
         }
         var repairReceipts: [CheckResult] = []
+        var settledRepairIDs: Set<String> = []
         if ownsRepair {
+            try Task.checkCancellation()
             let coreIDs = DoctorSafeRepairPolicy.executableCoreIDs(for: checks)
             await DoctorReadout.recordReadings(checks.filter { DoctorSafeRepairPolicy.isAdverse($0.status) }.map {
                 $0.settled(liveAvailable: liveRepairs[$0.id] != nil, coreAvailable: coreIDs.contains($0.id))
@@ -119,6 +123,10 @@ public struct EngineDoctorRuntime<Port: EngineDoctorPlatformPort>: Sendable {
                 repairReceipt.detail = text
                 repairReceipt.repair = nil
                 repairReceipts.append(repairReceipt)
+                if repairReceipt.repairApplied == true, ["ok", "off", "not needed"].contains(verified.status) {
+                    await settle { await DoctorReadout.recordReadings([verified], dataRoot: dataRoot) }
+                    settledRepairIDs.insert(id)
+                }
             }
         }
         let executable = DoctorSafeRepairPolicy.executableCoreIDs(for: checks)
@@ -134,17 +142,20 @@ public struct EngineDoctorRuntime<Port: EngineDoctorPlatformPort>: Sendable {
             }
             checks[index] = row.settled(liveAvailable: liveAvailable, coreAvailable: executable.contains(row.id))
         }
-        await DoctorReadout.recordReadings(checks, dataRoot: dataRoot)
-        let status = await DoctorFacade.statusChecks(dataRoot: dataRoot, approvals: port.doctorEngine.approvals,
+        try Task.checkCancellation()
+        await DoctorReadout.recordReadings(checks.filter { !settledRepairIDs.contains($0.id) }, dataRoot: dataRoot)
+        let status = try await DoctorFacade.statusChecks(dataRoot: dataRoot, approvals: port.doctorEngine.approvals,
             repairDesk: ownsRepair && repairScope == .button && (checkID == nil || checkID == "status.desk_attention"),
             stuckReason: DeskPageContent.stuckReason, safeDetail: Self.safeDetail)
         checks += status.checks
         let repaired = status.repaired || DoctorSafeRepairPolicy.appliedRepairCount(in: repairReceipts) > 0
         let rows = await DoctorReadout.repairProjection(checks, dataRoot: dataRoot)
+        try Task.checkCancellation()
         if !rows.contains(where: { $0.id == "doctor.repair_store" }) {
             _ = await MaintenanceBackgroundWork(port: EngineBackgroundWorkPort())
                 .fileDoctorAsk(dataRoot: dataRoot, rows: rows)
         }
+        try Task.checkCancellation()
         return DoctorReport(status: DoctorReadout.doctorRollup(rows.map(\.status)), repaired: repaired, checks: rows)
     }
 
@@ -192,18 +203,17 @@ public struct EngineDoctorRuntime<Port: EngineDoctorPlatformPort>: Sendable {
         async let search = searchDoctorCoverageCheck(probe: probeSearch)
         async let tools = toolsDoctorCoverageCheck()
         async let autonomy = autonomyDoctorCoverageCheck()
-        // Share loop verdicts with the live Doctor report.
-        async let loops = self.doctorBackgroundLoopsCheck()
-        async let loopDetails = self.doctorBackgroundLoopChecks()
+        async let loops = self.doctorBackgroundLoopReadings()
         async let memory = memoryDoctorCoverageCheck()
         async let bridges = bridgesDoctorCoverageCheck()
         async let agents = self.doctorAgentConnectionsCheck(refresh: refreshContacts)
         async let inspector = self.doctorInspectorCheck()
         async let embedding = self.doctorEmbeddingDownloadCheck()
         async let pulses = self.doctorOrganPulsesCheck()
-        let common = await [providers, telegram, search, tools, autonomy, loops, memory, bridges, agents, inspector, embedding, pulses]
+        let (loopSummary, loopDetails) = await loops
+        let common = await [providers, telegram, search, tools, autonomy, loopSummary, memory, bridges, agents, inspector, embedding, pulses]
         let ownerChecks = await operationRecoveryChecks()
-        let readings = common + (await loopDetails) + [self.doctorDataRootCheck()] + ownerChecks
+        let readings = common + loopDetails + [self.doctorDataRootCheck()] + ownerChecks
         return includeCognition ? readings + (await self.doctorCognitionChecks()) : readings
     }
 

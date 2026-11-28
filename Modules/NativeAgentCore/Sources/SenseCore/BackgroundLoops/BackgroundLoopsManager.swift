@@ -9,8 +9,7 @@ import Synchronization
 public actor BackgroundLoopLifetimes {
     public static let shared = BackgroundLoopLifetimes()
 
-    internal let scheduler: SwiftNativeLoopScheduler
-    internal let clock: @Sendable () -> Date
+    internal let scheduler = SwiftNativeLoopScheduler()
     internal var started = false
     private var starting = false
     private var stopped = false
@@ -46,13 +45,7 @@ public actor BackgroundLoopLifetimes {
     /// Cap dead-listener retries at 30 seconds to avoid spinning; retain consecutive ends so status exposes the fault.
     internal let eventListenerRestartBackoff: [TimeInterval] = [1, 5, 30]
 
-    public init(
-        scheduler: SwiftNativeLoopScheduler = SwiftNativeLoopScheduler(),
-        clock: @escaping @Sendable () -> Date = { Date() }
-    ) {
-        self.scheduler = scheduler
-        self.clock = clock
-    }
+    public init() {}
 
     isolated deinit {
         for observer in wallClockObservers { NotificationCenter.default.removeObserver(observer) }
@@ -140,7 +133,7 @@ public actor BackgroundLoopLifetimes {
             return false
         }
         started = true
-        startedAt = clock()
+        startedAt = Date()
         let previousObservation = residentObservationTask
         let observation = self.residentObservation
         let observationID = UUID()
@@ -279,7 +272,7 @@ public actor BackgroundLoopLifetimes {
             return .failed(error: "loop not registered: \(loopId)")
         }
         return await executeRegisteredTick(
-            loopId: loopId, runner: runner, lifecycle: nil, requiresDue: false
+            loopId: loopId, runner: runner, lifecycle: nil
         )
     }
 
@@ -305,9 +298,9 @@ public actor BackgroundLoopLifetimes {
         runner: ManagedLoopRunner,
         gate: LoopExecutionGate,
         execution: ManagedLoopExecution,
-        isDue: @escaping @Sendable () async -> Bool
+        stillRegistered: @escaping @Sendable () async -> Bool
     ) async -> LoopTickOutcome {
-        let outcome = await runner.tickOutcome(ifDue: isDue, execution: execution)
+        let outcome = await runner.tickOutcome(ifRegistered: stillRegistered, execution: execution)
         let execution = await gate.snapshot()
         // Admission checks cannot discard a produced outcome. Stop and replacement
         // drain this execution's accounting before releasing its registration.
@@ -319,20 +312,18 @@ public actor BackgroundLoopLifetimes {
     internal func executeRegisteredTick(
         loopId: String,
         runner: ManagedLoopRunner,
-        lifecycle: UInt64?,
-        requiresDue: Bool
+        lifecycle: UInt64?
     ) async -> LoopTickOutcome {
         guard registrationIsCurrent(loopId: loopId, gate: runner.gate, lifecycle: lifecycle) else {
             return .skipped(reason: LoopTickOutcome.notDueSkipReason, healthNeutral: true)
         }
-        let isDue: @Sendable () async -> Bool = { [weak self, scheduler, gate = runner.gate] in
+        let stillRegistered: @Sendable () async -> Bool = { [weak self, gate = runner.gate] in
             guard let self else { return false }
-            if requiresDue, await scheduler.isDue(loopId: loopId) != true { return false }
             return await self.registrationIsCurrent(loopId: loopId, gate: gate, lifecycle: lifecycle)
         }
         let execution = ManagedLoopExecution()
         let outcome = await executeAndRecordOutcome(loopId: loopId, runner: runner, gate: runner.gate,
-            execution: execution, isDue: isDue)
+            execution: execution, stillRegistered: stillRegistered)
         await execution.accounting.didRecord()
         return outcome
     }
@@ -420,7 +411,6 @@ public actor BackgroundLoopLifetimes {
         let runner = ManagedLoopRunner(
             underlying: loop,
             gate: gate,
-            clock: clock,
             onFinished: { [weak self] in
                 await self?.reschedulePhysiologyDeadline(loopId: loop.loopId)
             },
@@ -437,7 +427,7 @@ public actor BackgroundLoopLifetimes {
             guard let self else { return }
             let lifecycle = await self.lifecycleGeneration
             _ = await self.executeRegisteredTick(
-                loopId: loopId, runner: runner, lifecycle: lifecycle, requiresDue: false
+                loopId: loopId, runner: runner, lifecycle: lifecycle
             )
         }
         if started {

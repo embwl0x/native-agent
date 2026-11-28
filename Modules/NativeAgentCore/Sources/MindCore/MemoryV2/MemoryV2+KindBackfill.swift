@@ -54,8 +54,7 @@ public enum MemoryKindBackfill {
         try await OnDeviceClassification.classify(content: content, into: taxonomy)
     }
 
-    /// Classify the complete candidate set. A failed row keeps the whole proposed classification owed; no damaged inference disappears from a card. A row the
-    /// classifier cannot label stays exactly as it is and is named; the rest are proposed. Only a classifier that is unavailable fails the pass.
+    /// Classify the complete candidate set. A row the classifier cannot label stays exactly as it is and is named when the rest are proposed.
     public static func classify(
         rows: [StoredMemory],
         classifier: @Sendable (String, [String]) async throws -> String
@@ -63,10 +62,13 @@ public enum MemoryKindBackfill {
         var out: [RowProposal] = []
         var unclassified: [(id: String, reason: String)] = []
         for row in rows {
+            try Task.checkCancellation()
             let label: String
             do { label = try await classifier(row.content, MemoryKindStamp.taxonomy) }
+            catch is CancellationError { throw CancellationError() }
             catch FoundationModelsError.unavailable { throw FoundationModelsError.unavailable }
             catch {
+                try Task.checkCancellation()
                 unclassified.append((row.id, error.localizedDescription))
                 continue
             }
@@ -86,15 +88,13 @@ public enum MemoryKindBackfill {
 
     // MARK: - Staging
 
-    /// Reuse pending approvals before staging so interrupted stamp writes cannot duplicate cards. Write no stamp on failed staging; pending-scan failure stages
-    /// nothing and leaves later recovery possible.
+    /// Reuse pending approvals before staging so interrupted stamp writes cannot duplicate cards. Stamp the returned approval ID after creation.
     @discardableResult
     @concurrent public static func stageIfNeeded(
         dataRoot: URL,
         storage: MemoryStorage,
         classifier: @Sendable (String, [String]) async throws -> String = foundationModelsClassifier,
         createApproval: @Sendable (JSONValue) async throws -> String,
-        approvalIsPending: @Sendable (String) async throws -> Bool,
         listPendingBackfills: @Sendable () async throws -> [(id: String, payload: JSONValue)]
     ) async -> String? {
         do {
@@ -130,6 +130,8 @@ public enum MemoryKindBackfill {
             let candidates = try await classifiableRows(storage: storage)
             guard !candidates.isEmpty else { return nil }
             (rows, unclassified) = try await classify(rows: candidates, classifier: classifier)
+        } catch is CancellationError {
+            return nil
         } catch {
             nativeLog("[kindBackfill] detection failed: \(String(describing: error))")
             oweFailure(error, dataRoot: dataRoot)
@@ -151,13 +153,12 @@ public enum MemoryKindBackfill {
             "payload": payload(rows: rows),
         ])
         do {
+            try Task.checkCancellation()
             let approvalId = try await createApproval(body)
-            guard try await approvalIsPending(approvalId) else {
-                try writeStamp(approvalId: approvalId, dataRoot: dataRoot)
-                return approvalId
-            }
-            try writeStamp(approvalId: approvalId, dataRoot: dataRoot)
+            try await settle { Result { try writeStamp(approvalId: approvalId, dataRoot: dataRoot) } }.get()
             return approvalId
+        } catch is CancellationError {
+            return nil
         } catch {
             nativeLog("[kindBackfill] stage failed: \(String(describing: error))")
             oweFailure(error, dataRoot: dataRoot)

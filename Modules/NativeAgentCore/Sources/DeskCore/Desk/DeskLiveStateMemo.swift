@@ -1,7 +1,7 @@
+import PersistenceCore
 import NativeAgentShared
 import Darwin
 import Foundation
-import PersistenceCore
 import NativeAgentCore
 import Synchronization
 // Blueprint: | `DeskLiveStateMemo.swift` | Replay memo keyed by the canonical feed stamp |

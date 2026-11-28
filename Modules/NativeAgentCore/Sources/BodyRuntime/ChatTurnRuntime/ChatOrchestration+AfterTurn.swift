@@ -27,7 +27,6 @@ extension SwiftNativeTurnEngine {
         sessionId: String?,
         surface: String,
         took: String? = nil,
-        afterReply held: AfterReply? = nil,
         replied: Bool = true,
         turn: Turn,
     work: ChatTurnWork) -> AfterReply {
@@ -41,7 +40,7 @@ extension SwiftNativeTurnEngine {
             userMessage: userMessage, assistantMessage: assistantMessage,
             toolDispatches: toolDispatches, sessionId: sessionId, surface: surface,
             repliedAt: replied ? Date() : nil, turn: turn.with(\.afterTurnOrigin, origin), work: work, bus: TurnTraceContext.bus)
-        let held = held ?? afterReply {}
+        let held = afterReply {}
         held.beforeStart { await self.recordMemoryPromotion(pending) }
         return held
     }

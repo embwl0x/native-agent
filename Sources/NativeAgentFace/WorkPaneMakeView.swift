@@ -216,19 +216,19 @@ private struct GrantedMakePreview: View {
                     MakeSheetView(file: file, delimiter: delimiter, reference: preview.reference, version: preview.version, read: table)
                 } else if preview.kind == "web", let file = held?.resources.first?.url,
                         let folder = held?.resources.dropFirst().first?.url {
-                    MakeMockupView(file: file, folder: folder, revision: 0)
+                    MakeMockupView(file: file, folder: folder)
                 } else { FaceReadStatus(state: preview.state) }
             } else if let issue { Text(issue).foregroundStyle(.red).textSelection(.enabled) }
             else if let image {
                 Image(nsImage: image).resizable().scaledToFit().padding(12)
             } else if let file = resources.first?.url {
                 if preview.kind == "web", let folder = resources.dropFirst().first?.url {
-                    MakeMockupView(file: file, folder: folder, revision: 0)
+                    MakeMockupView(file: file, folder: folder)
                 } else if preview.kind == "web" {
                     Text("The body did not grant the mockup's resource folder.").foregroundStyle(.red)
                 } else if let delimiter = SheetTable.delimiter(type: file.pathExtension) {
                     MakeSheetView(file: file, delimiter: delimiter, reference: preview.reference, version: preview.version)
-                } else { MakeQuickLookView(file: file, revision: 0) }
+                } else { MakeQuickLookView(file: file) }
             } else if preview.resources.isEmpty {
                 Text("The ready Make preview supplied no resource grant.").foregroundStyle(.red)
             } else { Text("Waiting on preview resources…").foregroundStyle(.secondary) }
@@ -284,7 +284,6 @@ enum FaceResourceAccess {
 struct MakeMockupView: NSViewRepresentable {
     let file: URL
     let folder: URL
-    let revision: Int
     @Environment(\.quietCaptureSession) private var capture
 
     func makeCoordinator() -> SandboxedPreview { SandboxedPreview() }
@@ -300,12 +299,12 @@ struct MakeMockupView: NSViewRepresentable {
         if let capture {
             context.coordinator.capture = capture.register(view, cancel: { [weak coordinator = context.coordinator] in coordinator?.cancel() })
         }
-        context.coordinator.show(file, folder: folder, revision: revision, in: view)
+        context.coordinator.show(file, folder: folder, in: view)
         return view
     }
 
     func updateNSView(_ view: WKWebView, context: Context) {
-        context.coordinator.show(file, folder: folder, revision: revision, in: view)
+        context.coordinator.show(file, folder: folder, in: view)
     }
 
     static func dismantleNSView(_ view: WKWebView, coordinator: SandboxedPreview) {
@@ -317,7 +316,7 @@ struct MakeMockupView: NSViewRepresentable {
     @MainActor
     final class SandboxedPreview: NSObject, WKNavigationDelegate {
         var capture: QuietWebCapture?
-        private var shown: (URL, URL, Int)?
+        private var shown: (URL, URL)?
         private var folder: URL?
         private var guarded = false
         private var preparation: Task<Void, Never>?
@@ -338,10 +337,10 @@ struct MakeMockupView: NSViewRepresentable {
             capture?.close()
         }
 
-        func show(_ file: URL, folder: URL, revision: Int, in view: WKWebView) {
+        func show(_ file: URL, folder: URL, in view: WKWebView) {
             let folder = folder.standardizedFileURL
-            guard shown.map({ $0.0 != file || $0.1 != folder || $0.2 != revision }) ?? true else { return }
-            shown = (file, folder, revision)
+            guard shown.map({ $0.0 != file || $0.1 != folder }) ?? true else { return }
+            shown = (file, folder)
             preparation?.cancel()
             preparation = nil
             self.folder = nil
@@ -404,9 +403,8 @@ struct MakeMockupView: NSViewRepresentable {
 
 struct MakeQuickLookView: NSViewRepresentable {
     let file: URL
-    let revision: Int
 
-    final class QuickLookSelection { var shown: (URL, Int)? }
+    final class QuickLookSelection { var shown: URL? }
 
     func makeCoordinator() -> QuickLookSelection { QuickLookSelection() }
 
@@ -419,9 +417,8 @@ struct MakeQuickLookView: NSViewRepresentable {
 
     func updateNSView(_ view: NSView, context: Context) {
         guard let view = view as? QLPreviewView else { return }
-        guard context.coordinator.shown.map({ $0.0 != file || $0.1 != revision }) ?? true else { return }
-        let sameFile = context.coordinator.shown?.0 == file
-        context.coordinator.shown = (file, revision)
-        if sameFile { view.refreshPreviewItem() } else { view.previewItem = file as NSURL }
+        guard context.coordinator.shown != file else { return }
+        context.coordinator.shown = file
+        view.previewItem = file as NSURL
     }
 }

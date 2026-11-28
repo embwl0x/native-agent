@@ -62,11 +62,7 @@ public enum NativeTimestampFormat {
         microsecondUTCOffset(date, rounding: .down)
     }
 
-    /// The one microsecond `+00:00` builder. `rounding` turns the instant into whole microseconds (`.down` truncates like Python's isoformat of a datetime;
-    /// `.toNearestOrEven` is `fromtimestamp`'s rounding), carrying into the second; a zero fraction is omitted unless `alwaysFraction`.
-    public static func microsecondUTCOffset(
-        _ date: Date, rounding: FloatingPointRoundingRule, alwaysFraction: Bool = false
-    ) -> String {
+    public static func microsecondUTCOffset(_ date: Date, rounding: FloatingPointRoundingRule) -> String {
         // The whole-second component and the micros are derived from ONE rounded value so they can never disagree at a boundary.
         let totalMicros = Int64((date.timeIntervalSince1970 * 1_000_000).rounded(rounding))
         // Floor pre-epoch seconds so the microsecond remainder stays in 0..<1e6.
@@ -87,7 +83,7 @@ public enum NativeTimestampFormat {
             c.year ?? 0, c.month ?? 0, c.day ?? 0,
             c.hour ?? 0, c.minute ?? 0, c.second ?? 0
         )
-        let fraction = micros == 0 && !alwaysFraction ? "" : String(format: ".%06d", micros)
+        let fraction = micros == 0 ? "" : String(format: ".%06d", micros)
         return base + fraction + "+00:00"
     }
 

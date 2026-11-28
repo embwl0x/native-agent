@@ -266,6 +266,10 @@ struct ModelCatalogCache: Sendable {
         try checkedCache(dataRoot: dataRoot)
     }
 
+    func currentModels(dataRoot: URL) -> [ProviderModelInfo]? {
+        try? currentCache(dataRoot: dataRoot)?.models
+    }
+
     private func ownerKey(_ dataRoot: URL) -> String {
         cachePath(dataRoot).standardizedFileURL.path
     }

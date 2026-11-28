@@ -32,12 +32,6 @@ extension QuietComposerCommands {
             suppliedPresentation = presentation
         }
     }
-
-    @MainActor
-    fileprivate static func draft(_ sessionID: String, appModel: AppModel) -> String {
-        appModel.chatDraft(for: sessionID)
-    }
-
 }
 
 extension AppModel: QuietComposerCommandPort {
@@ -46,21 +40,9 @@ extension AppModel: QuietComposerCommandPort {
     }
     var quietComposerEfforts: [ReasoningEffortOption] { QuietComposerCommands.Routing(appModel: self).residentPresentation?.efforts ?? [] }
     var quietComposerSupportsFast: Bool { QuietComposerCommands.Routing(appModel: self).residentPresentation?.supportsFast == true }
-    func quietComposerDraft(_ sessionID: String) -> String { QuietComposerCommands.draft(sessionID, appModel: self) }
-    func quietComposerDraftRevision(_ sessionID: String) -> (Date, Int) {
-        let draft = composerDraft(for: sessionID)
-        return (draft.editedAt, Int(clamping: draft.manualEditRevision))
-    }
-    func setQuietComposerDraft(_ after: String, sessionID: String) {
-        composerDraft(for: sessionID).edit(after)
-    }
-    func clearQuietAcceptedDraft(_ message: String, sessionID: String, editedAt: Date) {
-        clearChatDraftAfterSend(message, sessionId: sessionID, editedAt: editedAt)
-    }
-    func quietComposerPresentation(verb: String, value: String, choice: String) async -> QuietComposerOutcome {
+    func quietComposerPresentation(verb: String) async -> QuietComposerOutcome {
         do {
-            let face = try BodyFacePresentation.current(model: self)
-            if let result = await face.composerPresentation(verb: verb, value: value, choice: choice, callerTurn: nil) { return result }
+            _ = try BodyFacePresentation.current(model: self)
             switch verb {
             case "show_browser":
                 BrowserWindowController.shared.showWindow()

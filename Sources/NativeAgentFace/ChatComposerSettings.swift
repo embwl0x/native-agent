@@ -138,7 +138,7 @@ struct ChatComposerSettings: View {
                 Button {
                     guard let presentation = routing.presentation else { return }
                     if presentation.contract != nil {
-                        NotificationCenter.default.post(OpenCommandRouteRequest(route: "bots"))
+                        SettingsLink.open(.bots)
                         return
                     }
                     enqueue(.fast(false))
@@ -228,7 +228,7 @@ struct ChatComposerSettings: View {
     private var widestEffortWordWidth: CGFloat? {
         let labels = routing.efforts.map(\.label)
         guard !labels.isEmpty else { return nil }
-        let font = NSFont.systemFont(ofSize: ShellType.labelSize, weight: .medium)
+        let font = NSFont.systemFont(ofSize: (ShellType.labelSize * BoardGeometry.macTextScale).rounded(), weight: .medium)
         return labels
             .map { ($0 as NSString).size(withAttributes: [.font: font]).width }
             .max()
@@ -346,7 +346,7 @@ struct ChatComposerSettings: View {
         accessibility: String, identifier: String
     ) -> some View {
         Button {
-            NotificationCenter.default.post(OpenCommandRouteRequest(route: "bots"))
+            SettingsLink.open(.bots)
         } label: {
             menuWordLabel(text, minWidth: card == .effort ? widestEffortWordWidth : nil)
         }
@@ -408,7 +408,7 @@ struct ChatComposerSettings: View {
                 })
             }
             menu.addItem(composerMenuItem("more_models", "More models…") {
-                NotificationCenter.default.post(OpenCommandRouteRequest(route: "providers"))
+                SettingsLink.open(.providers)
             })
             addScope("Saved default for Chat", to: menu)
         case .effort:

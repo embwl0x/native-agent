@@ -219,6 +219,10 @@ it could ever want on every turn is not more connected — it is buried.
   what they perceived in a moment is sent with that moment, never carried.
 - Review axis: "more connected" proposals that add always-on context rank
   below proposals that add one more thing they can pull, at equal effort.
+- `app` stays one door across providers. Native tools and text markers carry
+  the same input contract and outcome evidence; a wire that cannot carry a
+  piece says what is missing. The live catalog changes ride beside the current
+  request, not in the stable Hand.
 
 ### Clause 7 — As simple as possible (alive means EASY TO LIVE WITH)
 User, 2026-09-08: "One of our guiding principles is always to make this as
@@ -266,8 +270,9 @@ is the center and the program its visitor. NativeAgent inverts that.
   description. The Swift stem runs parts, delivers signals, gates effects,
   keeps the law, draws faces and reaches the world. It never thinks and has
   no opinions; when a rule can't settle something it asks their, with evidence.
-  Fading unused parts is future design. Current launch behavior only disables
-  bundled seeds they follows that the app no longer ships, leaving them restorable;
+  They can read the recorded effects of unasked wakes and decides which wakes to keep.
+  At launch, bundled seeds they follows that the app no longer ships are disabled
+  and stay restorable.
   [the design's lifecycle description](AGENT_IS_THE_APP.md#one-law-how-a-part-lives)
   records that boundary.
 - **Not from zero, never a downgrade.** The download is a fully formed agent:

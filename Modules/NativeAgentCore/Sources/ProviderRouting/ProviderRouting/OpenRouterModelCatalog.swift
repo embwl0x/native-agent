@@ -283,11 +283,6 @@ public enum OpenRouterModelCatalog {
         } catch { return error.localizedDescription }
     }
 
-    static func readCache(dataRoot: URL) -> [ProviderModelInfo]? {
-        do { return try cache.currentCache(dataRoot: dataRoot)?.models }
-        catch { return nil } // cacheFault carries the unavailable cause.
-    }
-
     private static let decodedCache = ModelCatalogDecodeCache()
 
     private static func readDecodedCache(dataRoot: URL) throws -> DecodedModelCatalog? {

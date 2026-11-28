@@ -35,7 +35,8 @@ public enum NativeAgentScheduledProactiveScan {
             return []
         }
 
-        let pendingApprovals = try await SwiftNativeApprovalInbox(root: dataRoot).list(filter: .pending).count
+        let pendingApprovals = try await SwiftNativeApprovalInbox(root: dataRoot).list(filter: .pending)
+            .filter { OwnerAttentionPolicy.approvalWaits(status: $0.status, agentOwned: $0.isAgentsOwnDecision) }.count
 
         let deskStaleDays = arguments.staleDays
         let deskItems = try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState().items
@@ -71,7 +72,7 @@ public enum NativeAgentScheduledProactiveScan {
                 id: id,
                 title: "Clear pending approvals",
                 summary: """
-                    \(pendingApprovals) approval request(s) are waiting. The assistant should avoid duplicate asks and surface the oldest \
+                    \(pendingApprovals) approval request(s) are waiting. The agent should avoid duplicate asks and surface the oldest \
                     meaningful blocker.
                     """,
                 detail: "Current scan found \(pendingApprovals) pending approval request(s).",

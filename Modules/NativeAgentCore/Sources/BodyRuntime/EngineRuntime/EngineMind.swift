@@ -28,7 +28,6 @@ public final class MindLifetime: Sendable {
         var last: Task<Void, Never>?
         var watchers: [UUID: AsyncStream<NativeCognitionRuntimeChange>.Continuation] = [:]
         var relay: Task<Void, Never>?
-        var revision: UInt64 = 0
     }
     private let state = Mutex(State())
 
@@ -221,11 +220,7 @@ public final class MindLifetime: Sendable {
     }
 
     private func tell(reason: String) {
-        let change: NativeCognitionRuntimeChange = state.withLock { state in
-            state.revision &+= 1
-            return NativeCognitionRuntimeChange(revision: state.revision, occurredAt: Date(), reason: reason)
-        }
-        tell(change)
+        tell(NativeCognitionRuntimeChange(reason: reason))
     }
 
     private func tell(_ change: NativeCognitionRuntimeChange) {
@@ -260,10 +255,10 @@ extension MindLifetime: CognitiveRuntimeProviding, LLMCallLifecycleObserving, In
         await runtime?.observeProviderCall(event)
     }
 
-    public func innerStateReading(windowHours: Double, detail: CognitiveInnerStateReading.Detail, surface: String) async
+    public func innerStateReading(windowHours: Double, detail: CognitiveInnerStateReading.Detail, request: CognitiveCapsuleRequest) async
         -> CognitiveInnerStateReading {
         guard let runtime else { return .unavailable(at: Date(), windowHours: windowHours, detail: detail) }
-        return await runtime.innerStateReading(windowHours: windowHours, detail: detail, surface: surface)
+        return await runtime.innerStateReading(windowHours: windowHours, detail: detail, request: request)
     }
 
     public func nextNight() async throws -> JSONValue {

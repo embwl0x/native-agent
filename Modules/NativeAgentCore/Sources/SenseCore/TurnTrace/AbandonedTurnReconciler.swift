@@ -53,6 +53,7 @@ public struct TurnCheckpoint: Codable, Sendable, Equatable {
     public var workingCommentaryCharacters = 0
     /// Persisted sentinel: 1 while a call awaits its receipt, nil otherwise; never a step index.
     public var runningStep: Int?
+    public var withdrawsUnstarted: Bool?
     public var deliveryPending = false
     /// Input events and started-effect identities. Relaunch reruns `step` to reconstruct state and effects; returned effect bodies are not stored.
     public var log: [JSONValue]?
@@ -140,36 +141,23 @@ public struct AbandonedTurnReconciler: Sendable {
     private static let cursorKind = "turn.reconciliation.cursor"
     private let dataRoot: URL
     private let lane: TurnTracePersistLane
-    private let now: @Sendable () -> Date
-    private let processEpoch: Date
 
-    public init(
-        dataRoot: URL? = nil,
-        lane: TurnTracePersistLane = TurnTracePersistLane(),
-        now: @escaping @Sendable () -> Date = { Date() },
-        processEpoch: Date = AbandonedTurnReconciler.processEpoch
-    ) {
-        let root = dataRoot ?? lane.resolvedDataRoot()
-        self.dataRoot = root
-        self.lane = TurnTracePersistLane(dataRootOverride: root)
-        self.now = now
-        self.processEpoch = processEpoch
+    public init(dataRoot: URL) {
+        self.dataRoot = dataRoot
+        self.lane = TurnTracePersistLane(dataRootOverride: dataRoot)
     }
 
     public struct Outcome: Sendable, Equatable {
         public let acceptedScanned: Int
         public let reconciled: [String]
-        /// Turns accepted in this process are left alone.
-        public let tooRecentToJudge: Int
         public let resumable: [TurnCheckpoint]
         /// A failed or unreadable record/checkpoint, or an unconfirmed write. Nil reports no failure in this sweep.
         public let failure: String?
 
-        public init(acceptedScanned: Int, reconciled: [String], tooRecentToJudge: Int,
+        public init(acceptedScanned: Int, reconciled: [String],
                     resumable: [TurnCheckpoint] = [], failure: String? = nil) {
             self.acceptedScanned = acceptedScanned
             self.reconciled = reconciled
-            self.tooRecentToJudge = tooRecentToJudge
             self.resumable = resumable
             self.failure = failure
         }
@@ -190,7 +178,7 @@ public struct AbandonedTurnReconciler: Sendable {
     /// Discover accepted turns by sequence and checkpoints independently of age. Each turn's terminal evidence is read by its own subject.
     @discardableResult
     @concurrent public func sweep(inFlightTurnIds: Set<String> = []) async -> Outcome {
-        let today = now()
+        let today = Date()
         var accepted: [String: Accepted] = [:]
         var terminalIndex: [String: TraceRead] = [:]
         var persistenceFailures: [String] = []
@@ -223,7 +211,6 @@ public struct AbandonedTurnReconciler: Sendable {
             return read
         }
 
-        var tooRecent = 0
         var written: [String] = []
         var writeAttempts = 0
         var deferred = false
@@ -269,7 +256,7 @@ public struct AbandonedTurnReconciler: Sendable {
         } catch {
             let detail = "Turn checkpoint is unreadable; repair chat/session_state before resuming: \(error)"
             Self.owe(dataRoot: dataRoot, sessionId: "", turnId: "", detail: detail)
-            return Outcome(acceptedScanned: accepted.count, reconciled: [], tooRecentToJudge: 0, failure: detail)
+            return Outcome(acceptedScanned: accepted.count, reconciled: [], failure: detail)
         }
         let candidates = accepted
             .filter { !inFlightTurnIds.contains($0.key)
@@ -282,8 +269,8 @@ public struct AbandonedTurnReconciler: Sendable {
         if accepted.keys.contains(where: { inFlightTurnIds.contains($0) }) { deferred = true }
         for (turnId, row) in candidates {
             guard !Task.isCancelled else { deferred = true; break }
-            guard row.ts < processEpoch || checkpoints[turnId]?.stoppedReason != nil else {
-                tooRecent += 1
+            guard row.ts < Self.processEpoch || checkpoints[turnId]?.stoppedReason != nil else {
+                deferred = true
                 continue
             }
             let read: TraceRead
@@ -363,11 +350,11 @@ public struct AbandonedTurnReconciler: Sendable {
             } catch { persistenceFailures.append("Turn recovery could not keep its repair obligation: \(error)") }
         }
         // A failed read/write, deferred work or a current-process turn leaves its accepted sequence pending.
-        if persistenceFailures.isEmpty, !deferred, tooRecent == 0, let scannedSeq {
+        if persistenceFailures.isEmpty, !deferred, let scannedSeq {
             do { try await writeCursor(seq: scannedSeq, at: today) }
             catch { persistenceFailures.append("Turn recovery cursor could not be recorded: \(error.localizedDescription)") }
         }
-        return Outcome(acceptedScanned: accepted.count, reconciled: written, tooRecentToJudge: tooRecent, resumable: resumable,
+        return Outcome(acceptedScanned: accepted.count, reconciled: written, resumable: resumable,
                        failure: persistenceFailures.isEmpty ? nil : persistenceFailures.joined(separator: "\n"))
     }
 

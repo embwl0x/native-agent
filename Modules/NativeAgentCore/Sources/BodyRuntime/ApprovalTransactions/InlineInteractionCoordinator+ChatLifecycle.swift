@@ -102,7 +102,7 @@ extension InlineInteractionCoordinator {
             await refresh()
         }
         func finishEffect() async {
-            let effect = await applyControlEffect(interaction, descriptor: descriptor, value: value,
+            let effect = await applyControlEffect(interaction, descriptor: descriptor,
                 values: values, controls: controls)
             if effect.watch { watch() }
             else { await finish(selection: descriptor.target, error: effect.error, note: effect.note) }
@@ -188,7 +188,7 @@ extension InlineInteractionCoordinator {
 
     /// Effects run only from the person's local control; phone answers use the canonical Inbox row or non-destructive verification.
     func applyControlEffect(
-        _ interaction: InlineInteraction, descriptor: InlineInteractionDescriptor, value: String?, values: [String: String],
+        _ interaction: InlineInteraction, descriptor: InlineInteractionDescriptor, values: [String: String],
         controls: any InlineInteractionControlPort) async -> (error: String?, note: String?, watch: Bool) {
         switch descriptor.control {
         case .connectorManualToken:

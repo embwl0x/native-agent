@@ -83,10 +83,15 @@ public enum AuthoredToolEffects {
         "network.connect": [.networkWrite], "network.listen": [.networkWrite],
         "network.accept": [.networkWrite], "network.close": [.networkWrite],
         "network.send": [.networkWrite, .externalSend],
+        "network.websocket.open": [.networkWrite, .externalSend], "network.websocket.send": [.networkWrite, .externalSend],
+        "network.websocket.receive": [.safeRead, .networkRead], "network.websocket.close": [.networkWrite, .externalSend],
+        "fetch.sse.open": [.networkWrite, .externalSend], "fetch.sse.next": [.safeRead, .networkRead], "fetch.sse.close": [.networkWrite],
         "apps.call": [.applescript, .systemControl],
+        PartOpenURLRequest.effect: [.shell, .appDataWrite],
         // The stem's file readers open a snapshot copy read-only; reach to the path is the part's declared readPaths.
         "files.query": [.safeRead], "files.mime": [.safeRead], "files.names": [.safeRead],
         "screen.watch": [.safeRead], "screen.next": [.safeRead], "frame.read": [.safeRead],
+        "ax.query": [.safeRead],
         // Program start owns shell admission; later talk stays within it.
         "program.start": [.processSpawn, .shell], "program.send": [.processSpawn],
         "program.receive": [.safeRead], "program.close": [.processSpawn],
@@ -106,19 +111,29 @@ public enum AuthoredToolEffects {
     }
 
     public static func primitiveEffect(_ operation: String, arguments: JSONValue?) -> (tool: String, capabilities: CapabilitySet) {
+        let operation = operation == PartOpenURLRequest.operation ? PartOpenURLRequest.effect : operation
         let args: [String: JSONValue] = if case .object(let fields)? = arguments { fields } else { [:] }
         if operation == "apps.call", case .object(let args)? = arguments, appReadOnly(args) {
             return (operation, [.safeRead, .applescript])
         }
+        if operation == PartOpenURLRequest.effect,
+           let arguments, let request = try? PartOpenURLRequest(arguments), request.classification == .standard {
+            return (operation, [.appDataWrite])
+        }
         if fetchOperations.contains(operation) {
             let read = args["method"] == nil || arguments?.stringFields["method"]?.uppercased() == "GET"
+            let newBody = args["body_base64"] != nil || args["multipart"] != nil
             // A secret-bearing request acts as the person at that service; only GET/HEAD without a body remains a read.
             if operation == "fetch.secret" || operation == "fetch" && !Keyring.names(in: arguments ?? .null).isEmpty {
-                return ("fetch.secret", (read || arguments?.stringFields["method"]?.uppercased() == "HEAD") && args["body"] == nil
+                return ("fetch.secret", (read || arguments?.stringFields["method"]?.uppercased() == "HEAD") && args["body"] == nil && !newBody
                     ? [.safeRead, .networkRead, .secrets] : [.networkWrite, .externalSend, .secrets])
             }
-            return ("fetch.keyless", read
+            return ("fetch.keyless", read && !newBody
                 ? [.networkPublic, .safeRead, .networkRead] : [.networkPublic, .networkWrite, .externalSend])
+        }
+        if ["network.websocket.open", "network.websocket.send", "fetch.sse.open"].contains(operation),
+           !Keyring.names(in: arguments ?? .null).isEmpty {
+            return (operation, (primitiveCapabilities[operation] ?? [.destructive]).union([.secrets]))
         }
         return (operation, primitiveCapabilities[operation] ?? [.destructive])
     }

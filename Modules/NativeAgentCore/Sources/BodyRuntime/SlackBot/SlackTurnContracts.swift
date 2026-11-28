@@ -1,4 +1,4 @@
-import Foundation
+import NativeAgentShared
 import NativeAgentCore
 // Blueprint: | `SlackTurnContracts.swift` | `SlackInboundFile` struct |
 
@@ -90,14 +90,11 @@ struct SlackInboundMessage: Sendable, Codable, Equatable {
 
     /// The ts to thread an in-turn notice under when the message is not itself in a thread: its own ts, which opens a thread on that message.
     var threadAnchorTs: String? {
-        let trimmed = ts.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
+        ts.trimmedNonEmpty
     }
 
     var normalizedThreadTs: String? {
-        guard let threadTs else { return nil }
-        let trimmed = threadTs.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
+        threadTs.trimmedNonEmpty
     }
 }
 

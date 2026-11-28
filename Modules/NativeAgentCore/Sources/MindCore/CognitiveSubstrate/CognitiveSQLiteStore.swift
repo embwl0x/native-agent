@@ -196,18 +196,13 @@ public actor CognitiveSQLiteStore {
         }
     }
 
-    /// Artifact writes and their capacity releases are one transaction.
     func commitArtifactTransition(
         artifacts: [CognitiveArtifactWrite],
-        deletedArtifactIDs: [UUID],
         at now: Date
     ) async throws {
         try await dbPool.write { db in
             for artifact in artifacts {
                 try Self.upsertArtifact(db, artifact: artifact, at: now)
-            }
-            for id in Set(deletedArtifactIDs) {
-                try db.execute(sql: "DELETE FROM cognitive_artifacts WHERE id = ?", arguments: [id.uuidString])
             }
         }
     }

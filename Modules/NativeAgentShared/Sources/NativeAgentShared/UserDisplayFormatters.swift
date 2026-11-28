@@ -1,6 +1,6 @@
 import Synchronization
 import Foundation
-// Blueprint: | `UserDisplayFormatters.swift` | Shared timestamp/path display and `CompactDurationFormatter`; parsing is cached |
+// Blueprint: | `UserDisplayFormatters.swift` | Shared timestamp, path and compact duration display; timestamp parsing is cached |
 
 public enum UserDisplayFormatters {
     /// Shorten the home component without symlink or existence checks.
@@ -26,7 +26,16 @@ public enum UserDisplayFormatters {
     }
 
     public static func humanizeDuration(_ seconds: Double) -> String {
-        CompactDurationFormatter.string(seconds)
+        guard seconds.isFinite, seconds >= 0 else { return "" }
+        if seconds < 10 { return String(format: "%.1fs", seconds) }
+        guard let total = Int(exactly: seconds.rounded()) else { return "" }
+        if total < 60 { return "\(total)s" }
+        if total < 3600 {
+            let s = total % 60
+            return s == 0 ? "\(total / 60)m" : "\(total / 60)m \(s)s"
+        }
+        let m = (total % 3600) / 60
+        return m == 0 ? "\(total / 3600)h" : "\(total / 3600)h \(m)m"
     }
 }
 

@@ -339,7 +339,7 @@ public struct DesktopChatRoute: Sendable {
     /// Drive and confirm submission under the desktop lane, then observe its answer.
     private func runDesktopSend(turn: Turn, mac: MacOperationContext, name: String, message: String, store: AgentPeerStore,
                                 send: DesktopSend) async -> JSONValue {
-        let (byPerson, thread, first, dataRoot) = (send.byPerson, send.thread, send.first, send.dataRoot)
+        let (byPerson, thread, first) = (send.byPerson, send.thread, send.first)
         var submissionConfirmed = false
         let result: Result<Driven, Error>
         do {
@@ -361,7 +361,7 @@ public struct DesktopChatRoute: Sendable {
             }
             let driven = await DesktopLane.shared.operate(ticket) { () -> Result<Driven, Error> in
                 do { return .success(try await self.drive(turn: turn, mac: mac, message, thread: thread, first: first,
-                    lane: ticket, dataRoot: dataRoot)) }
+                    lane: ticket)) }
                 catch { return .failure(error) }
             }
             if ticket.yieldedUntyped {
@@ -513,7 +513,7 @@ public struct DesktopChatRoute: Sendable {
 
     /// The send's desktop part, under the lane: open the chat, type, submit and see the outgoing row.
     @concurrent func drive(turn: NativeAgentCore.Turn, mac: MacOperationContext, _ message: String, thread: String?, first: String?,
-        lane: DesktopLane.Ticket, dataRoot: URL) async throws -> Driven {
+        lane: DesktopLane.Ticket) async throws -> Driven {
         guard SystemMacAXElementSource().isTrusted() else { throw Blocker.permission }
         let opened = try await inChatWindow(turn: turn, mac: mac) {
             try await showWindow(turn: turn, mac: mac)
@@ -950,11 +950,6 @@ public struct DesktopChatRoute: Sendable {
         return box
     }
 
-    func frame(mac: MacOperationContext, of node: AXUIElement) throws -> CGRect {
-        guard let frame = MacAXAttributeRead.frame(node, context: mac) else { throw Blocker.window }
-        return frame
-    }
-
     nonisolated func openTitle(mac: MacOperationContext, _ tree: [AXUIElement]) throws -> String? {
         if let title = try headerTitle(mac: mac, tree) { return title }
         guard let panel = try sideChatsPanel(mac: mac, tree) else { return nil }
@@ -1060,7 +1055,7 @@ public struct DesktopChatRoute: Sendable {
     /// the failure says what the step waited for (`step`, in the person's words) and what the app showed instead.
     // Every caller is @concurrent (drive, openThread, showSideChats, showWindow, typeAndSubmit), so the wait runs off the main actor in its caller.
     func until(_ step: String, mac: MacOperationContext, _ ready: () throws -> Bool) async throws {
-        let events = try await DesktopRouteObservation(bundleID: bundleID, context: mac, patience: DesktopRouteObservation.stepPatience)
+        let events = try await DesktopRouteObservation(bundleID: bundleID, context: mac)
         defer { events.stop() }
         var waitingPublished = false
         repeat {

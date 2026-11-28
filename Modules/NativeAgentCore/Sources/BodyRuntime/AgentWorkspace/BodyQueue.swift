@@ -51,8 +51,8 @@ public enum BodyQueue {
 
     /// Resolution closes the finding's item, also when an interrupted resolve already closed it.
     @discardableResult
-    public static func resolve(key: String, note: String, dataRoot: URL, observedAt: Date? = nil) async throws -> Bool {
-        return try await settle(dataRoot: dataRoot, observedAt: observedAt) { $0 == key ? note : nil }
+    public static func resolve(key: String, note: String, dataRoot: URL) async throws -> Bool {
+        return try await settle(dataRoot: dataRoot) { $0 == key ? note : nil }
     }
 
     /// Close matching finding-key prefixes in one pass, retaining each prefix's note.
@@ -61,7 +61,7 @@ public enum BodyQueue {
     }
 
     @discardableResult
-    private static func settle(dataRoot: URL, observedAt: Date? = nil,
+    private static func settle(dataRoot: URL,
                                _ noteFor: @escaping @Sendable (String) -> String?) async throws -> Bool {
         let answer: @Sendable (DeskItem) -> String? = { item in
             guard item.project == project, let key = item.findingKey else { return nil }
@@ -70,9 +70,6 @@ public enum BodyQueue {
         let store = SwiftNativeDeskStore(dataRoot: dataRoot)
         try await store.settleWaits { item in
             guard let note = answer(item) else { return nil }
-            if let observedAt {
-                guard let updated = DeskClock.parseISO(item.updatedAt), updated <= observedAt else { return nil }
-            }
             return (note, .done, nil)
         }
         let items = try await store.liveState().items

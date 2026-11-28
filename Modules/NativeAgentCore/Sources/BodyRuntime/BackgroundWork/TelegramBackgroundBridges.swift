@@ -6,7 +6,7 @@ import DeskCore
 import PersistenceCore
 // Blueprint: | `TelegramBackgroundBridges.swift` | Telegram memory-write bridge through the canonical memory owner |
 
-public struct TelegramMemoryWriterBridge: TelegramMemoryWriteRef, Sendable {
+public struct TelegramMemoryWriterBridge: Sendable {
     let memory: SwiftNativeMemoryV2
     let dataRoot: URL
 

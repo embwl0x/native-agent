@@ -86,6 +86,8 @@ public struct TurnContinuationRuntime: Sendable {
                 sourceKey: surface, correlationId: notificationId)
         } catch { preparationError = error }
         let lifecycle = mirrorLifecycle(dataRoot: dataRoot)
+        if preparationError == nil, let route,
+           try await lifecycle.attachRoute(route, deliveryId: deliveryId, requestDigest: digest, sessionId: sessionId) { return }
         switch try await lifecycle.claim(deliveryId: deliveryId, requestDigest: digest, sessionId: sessionId,
                                          responseRunId: runId, route: route, source: surface) {
         case .start, .inProgress:
@@ -285,7 +287,9 @@ public struct TurnContinuationRuntime: Sendable {
             journal = DeskContinuationTurn(store: store, record: record, handle: item.handle)
         } else { journal = nil }
         var turn = request.turn(dataRoot: dataRoot, id: checkpoint.turnId, parent: parent)
-        turn.peerSteering = PeerDataTaint(dataRoot: turn.dataRoot, restoring: sources)
+        let current = parent.map { PeerDataTaint.carried(turn: $0) }
+        turn.peerSteering = PeerDataTaint(dataRoot: turn.dataRoot, restoring: sources + (current?.sources ?? []),
+            elevated: current?.elevated ?? [])
         if let ceiling = checkpoint.fileAccessCeiling { turn.fileAccessCeiling = ceiling }
         let response = try await runOwnedContinuation(request, helperDefinition: checkpoint.helperDefinition,
             turn: turn, journal: journal) { turn in
@@ -399,8 +403,16 @@ public struct TurnContinuationRuntime: Sendable {
                     guard contacts.count == 1, let contact = contacts.first else {
                         throw ToolFailureError("No one saved contact owns this conversation.", effects: .none, code: "card_contact_unavailable")
                     }
-                    try await AgentContactHeldAnswer.hold(dataRoot: dataRoot, peer: contact, session: sessionID,
-                        deliveryID: "card:" + response.runId, response: response, client: engine.chatClient(profile: .bridge), turn: turn)
+                    let root = dataRoot
+                    let client = engine.chatClient(profile: .bridge)
+                    let held: Result<Void, Error> = await settle {
+                        do {
+                            try await AgentContactHeldAnswer.hold(dataRoot: root, peer: contact, session: sessionID,
+                                deliveryID: "card:" + response.runId, response: response, client: client, turn: turn)
+                            return .success(())
+                        } catch { return .failure(error) }
+                    }
+                    try held.get()
                 } else if let route = redeliveryRoute(envelope, sessionID: sessionID) {
                     // The saved answer is the delivery ledger's: an unconfirmed send is redelivered from it, never answered again.
                     let digest = CodexCompletionTranscriptEvidence.responseDigest(sessionId: sessionID, runId: response.runId,
@@ -474,7 +486,8 @@ public struct TurnContinuationRuntime: Sendable {
     private func runAdmittedContinuation(turn: Turn, prompt: String, surface: String,
         operation: @escaping @Sendable (Turn) async throws -> Void) async throws {
         _ = try await TurnAdmission.shared.run(dataRoot: dataRoot, sessionID: turn.session,
-            arrival: TurnArrival(words: prompt, surface: surface, row: .hidden), runID: turn.run, turn: turn, operation: operation)
+            arrival: TurnArrival(words: prompt, surface: surface, row: .hidden, cardAnswer: true),
+            runID: turn.run, turn: turn, operation: operation)
     }
 
     private func runApprovalAdmission(envelope: TurnEnvelope, prompt: String, turn: Turn,
@@ -529,17 +542,22 @@ public struct TurnContinuationRuntime: Sendable {
                 return try await sender.deliverReply(response, deliveryId: deliveryID, route: route,
                     priorVerdict: nil, notifyRequestedResult: notifyRequestedResult).status
             }
-            switch try await lifecycle.claim(deliveryId: deliveryID, requestDigest: digest, sessionId: response.sessionId, responseRunId: response.runId,
-                route: route) {
-            case .start:
-                try await lifecycle.cacheResponse(response, deliveryId: deliveryID, requestDigest: digest)
-            case .cached: break
-            case .inProgress:
-                try await lifecycle.cacheResponse(response, deliveryId: deliveryID, requestDigest: digest)
-            case .settled(let delivery):
-                return delivery?.status ?? "unknown"
-            case .outcomeUnknown, .conflict: throw CodexCompletionLifecycle.LifecycleError.requestConflict
+            let cached: Result<String?, Error> = await settle {
+                do {
+                    switch try await lifecycle.claim(deliveryId: deliveryID, requestDigest: digest,
+                        sessionId: response.sessionId, responseRunId: response.runId, route: route) {
+                    case .start, .inProgress:
+                        try await lifecycle.cacheResponse(response, deliveryId: deliveryID, requestDigest: digest)
+                    case .cached: break
+                    case .settled(let delivery):
+                        return .success(delivery?.status ?? "unknown")
+                    case .outcomeUnknown, .conflict:
+                        throw CodexCompletionLifecycle.LifecycleError.requestConflict
+                    }
+                    return .success(nil)
+                } catch { return .failure(error) }
             }
+            if let status = try cached.get() { return status }
             let delivery = await AgentBridgeCompletionRouter.deliver(
                 turn: turn, deliveryId: deliveryID, requestDigest: digest, text: response.output,
                 attachments: response.attachments ?? [], route: route, sender: sender, lifecycle: lifecycle,

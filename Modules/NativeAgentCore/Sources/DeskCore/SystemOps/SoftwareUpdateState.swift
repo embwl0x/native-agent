@@ -103,10 +103,10 @@ public enum SoftwareUpdateState {
     }
 
     @MainActor public static func restoreNotice(
-        info: [String: Any], preferencesSuiteName: String? = nil,
+        info: [String: Any],
         isNewer: @MainActor (String, String) -> Bool
     ) async -> NoticeState {
-        let reading = await readNotice(suiteName: preferencesSuiteName)
+        let reading = await readNotice()
         let notice: PersistedNotice
         switch reading {
         case .absent: return .absent
@@ -118,7 +118,7 @@ public enum SoftwareUpdateState {
               notice.feedURL == context.feedURL,
               notice.publicKey == context.publicKey,
               isNewer(notice.availableVersion, context.installedVersion) else {
-            if let failure = await eraseNotice(suiteName: preferencesSuiteName) { return failure }
+            await eraseNotice()
             return .stale
         }
         return .available(notice.availableVersion)
@@ -130,11 +130,8 @@ public enum SoftwareUpdateState {
         case unreadable(String)
     }
 
-    @concurrent private static func readNotice(suiteName: String?) async -> NoticeReading {
-        let preferences: UserDefaults
-        do { preferences = try noticePreferences(suiteName: suiteName) }
-        catch { return .unreadable(error.localizedDescription) }
-        guard let value = preferences.object(forKey: persistedNoticeKey) else { return .absent }
+    @concurrent private static func readNotice() async -> NoticeReading {
+        guard let value = UserDefaults.standard.object(forKey: persistedNoticeKey) else { return .absent }
         guard let data = value as? Data else {
             return .unreadable("Saved update notice has the wrong preference type; preserved unchanged. Run Check for Updates to obtain fresh evidence.")
         }
@@ -156,23 +153,23 @@ public enum SoftwareUpdateState {
     }
 
     @MainActor public static func storeNotice(
-        _ version: String?, info: [String: Any], preferencesSuiteName: String? = nil,
+        _ version: String?, info: [String: Any],
         isNewer: @MainActor (String, String) -> Bool
     ) async -> NoticeState {
         guard let version else {
-            if let failure = await eraseNotice(suiteName: preferencesSuiteName) { return failure }
+            await eraseNotice()
             return .absent
         }
         guard let notice = persistedNotice(availableVersion: version, info: info, isNewer: isNewer) else {
-            if let failure = await eraseNotice(suiteName: preferencesSuiteName) { return failure }
+            await eraseNotice()
             return .stale
         }
-        return await writeNotice(notice, suiteName: preferencesSuiteName)
+        return await writeNotice(notice)
     }
 
-    @concurrent private static func writeNotice(_ notice: PersistedNotice, suiteName: String?) async -> NoticeState {
+    @concurrent private static func writeNotice(_ notice: PersistedNotice) async -> NoticeState {
         do {
-            let preferences = try noticePreferences(suiteName: suiteName)
+            let preferences = UserDefaults.standard
             let data = try JSONEncoder().encode(notice)
             if preferences.data(forKey: persistedNoticeKey) != data { preferences.set(data, forKey: persistedNoticeKey) }
             return .available(notice.availableVersion)
@@ -181,20 +178,9 @@ public enum SoftwareUpdateState {
         }
     }
 
-    @concurrent private static func eraseNotice(suiteName: String?) async -> NoticeState? {
-        do {
-            let preferences = try noticePreferences(suiteName: suiteName)
-            if preferences.object(forKey: persistedNoticeKey) != nil { preferences.removeObject(forKey: persistedNoticeKey) }
-            return nil
-        } catch { return .unreadable(error.localizedDescription) }
-    }
-
-    private static func noticePreferences(suiteName: String?) throws -> UserDefaults {
-        guard let suiteName else { return .standard }
-        guard let preferences = UserDefaults(suiteName: suiteName) else {
-            throw PartCallError(code: "update_preferences_unavailable", message: "The update-notice preference suite could not be opened.")
-        }
-        return preferences
+    @concurrent private static func eraseNotice() async {
+        let preferences = UserDefaults.standard
+        if preferences.object(forKey: persistedNoticeKey) != nil { preferences.removeObject(forKey: persistedNoticeKey) }
     }
 
     /// Hosts that only ever appear in placeholder/dry-run configuration. A build carrying one of these has no real feed no matter what else it claims.

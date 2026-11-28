@@ -26,7 +26,7 @@ extension AppToolExecutor {
         execution: AppActionExecution) async throws -> JSONValue {
         // One preview after the whole door call, including form batches and navigation/readback.
         // Inventory, setup, history and dry runs do not publish. Close publishes its receipt, without capture.
-        let previews = turn.screenPreview != nil && !Self.inputBool(input["dry_run"], default: false)
+        let previews = turn.screenPreview != nil && !Self.inputBool(input["dry_run"])
             && (Self.chromePageActions.contains(actionId)
                 || ["browser.chrome_snapshot", "browser.chrome_look", "browser.chrome_media", "browser.chrome_close_tab"].contains(actionId))
         let preview = previews ? ChromeScreenPreviewCall() : nil
@@ -44,7 +44,7 @@ extension AppToolExecutor {
 
     private func runBrowserToolCall(actionId: String, input: [String: JSONValue], surface: String, turn: Turn,
         execution: AppActionExecution, preview: ChromeScreenPreviewCall?) async throws -> JSONValue {
-        let dryRun = Self.inputBool(input["dry_run"], default: false)
+        let dryRun = Self.inputBool(input["dry_run"])
         let fields: ChromeFields?
         if ["browser.chrome_fill", "browser.chrome_navigate"].contains(actionId) { fields = try Self.chromeFields(input) }
         else { fields = nil }
@@ -650,14 +650,6 @@ extension AppToolExecutor {
             // Visible row numbers are resolved from the served page before this boundary. A bare number is never an internal node identity.
             return input[key]?.scalarText
         }
-        func integer(_ key: String) -> Int? {
-            switch input[key] {
-            case .int(let value): return Int(value)
-            case .double(let value): return Int(exactly: value.rounded(.towardZero))
-            case .string(let value): return Int(value)
-            default: return nil
-            }
-        }
         switch actionId {
         case "browser.chrome_media":
             effect = .media
@@ -675,8 +667,8 @@ extension AppToolExecutor {
             if let document = string("__chrome_document_id") { payload["expectedDocumentId"] = .string(document) }
             if let url = string("__chrome_page_url") { payload["expectedURL"] = .string(url) }
             // The extension protocol owns bounds/defaults for every read.
-            if let value = integer("max_nodes") { payload["maxNodes"] = .int(Int64(value)) }
-            if let value = integer("max_text_chars") { payload["maxTextChars"] = .int(Int64(value)) }
+            if let value = ToolArguments.integerArgument(input["max_nodes"]) { payload["maxNodes"] = .int(Int64(value)) }
+            if let value = ToolArguments.integerArgument(input["max_text_chars"]) { payload["maxTextChars"] = .int(Int64(value)) }
             if let value = string("find") { payload["find"] = .string(value) }
             if let value = string("scope") { payload["scope"] = .string(value) }
             if let value = string("more") {
@@ -696,7 +688,7 @@ extension AppToolExecutor {
         case "browser.chrome_type":
             effect = .type
             payload["text"] = .string(string("text") ?? "")
-            if let value = integer("delay_ms") { payload["delayMs"] = .int(Int64(value)) }
+            if let value = ToolArguments.integerArgument(input["delay_ms"]) { payload["delayMs"] = .int(Int64(value)) }
         case "browser.chrome_select":
             effect = .select
             guard case .array(let values)? = input["values"],
@@ -709,7 +701,7 @@ extension AppToolExecutor {
             payload["key"] = .string(string("key") ?? "")
         case "browser.chrome_set_checked":
             effect = .setChecked
-            payload["checked"] = .bool(inputBool(input["checked"], default: false))
+            payload["checked"] = .bool(inputBool(input["checked"]))
         case "browser.chrome_double_click":
             effect = .doubleClick
         case "browser.chrome_drag":
@@ -722,13 +714,13 @@ extension AppToolExecutor {
             if let value = string("node_id") { payload["nodeId"] = .string(value) }
             if let value = string("state") { payload["state"] = .string(value) }
             // Requested waits are capped at the longest allowed duration.
-            if let value = integer("timeout_ms") { payload["timeoutMs"] = .int(Int64(min(max(value, 100), 10_000))) }
-            if let value = integer("settle_ms") { payload["settleMs"] = .int(Int64(min(max(value, 0), 2_000))) }
+            if let value = ToolArguments.integerArgument(input["timeout_ms"]) { payload["timeoutMs"] = .int(Int64(min(max(value, 100), 10_000))) }
+            if let value = ToolArguments.integerArgument(input["settle_ms"]) { payload["settleMs"] = .int(Int64(min(max(value, 0), 2_000))) }
         case "browser.chrome_scroll":
             effect = .scroll
             payload = [
-                "deltaX": .int(Int64(integer("delta_x") ?? 0)),
-                "deltaY": .int(Int64(integer("delta_y") ?? 0)),
+                "deltaX": .int(Int64(ToolArguments.integerArgument(input["delta_x"]) ?? 0)),
+                "deltaY": .int(Int64(ToolArguments.integerArgument(input["delta_y"]) ?? 0)),
             ]
             // Some provider calls serialize absent optional strings as an empty pair. Normalize only that pair; never discard a partial target.
             let snapshotID = string("snapshot_id")
@@ -806,11 +798,11 @@ extension AppToolExecutor {
         )
     }
 
-    private static func inputBool(_ raw: JSONValue?, default defaultValue: Bool) -> Bool {
+    private static func inputBool(_ raw: JSONValue?) -> Bool {
         switch raw?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "y": return true
         case "n": return false
-        default: return ConnectorInputValue.bool(raw, default: defaultValue)
+        default: return ConnectorInputValue.bool(raw, default: false)
         }
     }
 }

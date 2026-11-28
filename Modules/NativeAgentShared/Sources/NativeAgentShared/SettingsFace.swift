@@ -26,8 +26,6 @@ public struct SettingsFace: FaceValue {
     public var preferences: [String: PartFace.Value] = [:]
     public var preferenceIssues: [String: String] = [:]
     public var hasReadPreferences = false
-    public var searchURL: String?
-    public var searchIssue: String?
 
     public init() {}
 }
@@ -48,34 +46,13 @@ public struct SoftwareUpdateSettingsFace: FaceValue {
     }
     public struct Source: FaceValue {
         public let availableVersion: String?
-        public let canCheck: Bool
-        public let automaticChecks: Bool
-        public let failure: String?
-        public let unavailable: Unavailability?
-        public init(availableVersion: String?, canCheck: Bool, automaticChecks: Bool, failure: String?, unavailable: Unavailability?) {
+        public init(availableVersion: String?) {
             self.availableVersion = availableVersion
-            self.canCheck = canCheck
-            self.automaticChecks = automaticChecks
-            self.failure = failure
-            self.unavailable = unavailable
         }
     }
     public let source: Source
-    public let menuTitle: String
-    public let settingsDetail: String
-    public var isAvailable: Bool { source.unavailable == nil }
     public init(source: Source) {
         self.source = source
-        if let version = source.availableVersion { menuTitle = "Update Available — \(version)…" }
-        else { menuTitle = source.unavailable == nil ? "Check for Updates…" : "About Software Updates…" }
-        let detail: String
-        switch source.unavailable {
-        case .some(let unavailable): detail = unavailable.detail
-        case nil:
-            detail = source.automaticChecks ? "NativeAgent checks the signed release feed automatically. You can also check manually."
-                : "Automatic update checks are off. You can still check the signed release feed manually."
-        }
-        settingsDetail = source.failure.map { $0 + " " + detail } ?? detail
     }
 }
 
@@ -121,9 +98,6 @@ public struct PermissionSettingsFace: FaceValue {
         public let highlight: String?
         public init(line: String, highlight: String?) { self.line = line; self.highlight = highlight }
     }
-    public var systemStatuses: [String: String] = [:]
-    public var issue: String?
-    public var isReading = true
     public var docks: [String: Dock] = [:]
     public init() {}
 }

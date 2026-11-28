@@ -29,14 +29,13 @@ public final class DoctorFacade {
 
     public private(set) var activityEvents: [ActivityEvent] = []
     public private(set) var activityRefresh: PanelRefreshStatus?
-    public private(set) var productionHardening: ProductionHardeningSummary?
     public private(set) var productionExports: [ProductionExport] = []
     public private(set) var hardeningRefresh: PanelRefreshStatus?
     public internal(set) var productionExportWork: (support: Bool, startedAt: Date)?
     public internal(set) var productionExportFailure: (support: Bool, detail: String)?
     @ObservationIgnored var capabilitiesDidChange: (@MainActor @Sendable () async -> Void)?
     @ObservationIgnored private let activityRead = LatestRead()
-    @ObservationIgnored private let hardeningRead = LatestRead()
+    @ObservationIgnored private let productionExportsRead = LatestRead()
 
     public var report: DoctorReport? { didSet { diagnosticsDidChange?() } }
     @ObservationIgnored public let reportRead = LatestRead()
@@ -66,8 +65,6 @@ public final class DoctorFacade {
         })
     }
     public var watchdog: WatchdogStatus?
-    public var healthCard: HealthCard?
-    @ObservationIgnored public let healthCardRead = LatestRead()
     @ObservationIgnored private let watchdogRead = LatestRead()
 
     @discardableResult
@@ -95,28 +92,32 @@ public final class DoctorFacade {
     }
 
     public func recordProductionExports(_ verified: [ProductionExport]) async {
-        hardeningRead.write { productionExports = verified }
+        productionExportsRead.write {
+            productionExports = verified
+            let now = Date()
+            hardeningRefresh = PanelRefreshStatus(lastAttemptAt: now, lastSuccessAt: now, failedEndpoints: [])
+        }
         await capabilitiesDidChange?()
     }
 
     public func refreshHardening() async -> [(endpoint: String, label: String, error: Error)] {
-        let read = await hardeningRead.read({
-            var hardening: ProductionHardeningSummary?
-            var exports: [ProductionExport]?
-            var failures: [(endpoint: String, label: String, error: Error)] = []
-            do { hardening = try await DoctorReadout.getProductionHardening(dataRoot: dataRoot) }
-            catch { failures.append(("production hardening", "getProductionHardening", error)) }
-            do { exports = try await ProductionExport.list(dataRoot: dataRoot) }
-            catch { failures.append(("production exports", "getProductionExports", error)) }
-            return (hardening, exports, failures)
-        }, publish: { read in
-            if let value = read.0 { productionHardening = value }
-            if let value = read.1 { productionExports = value }
-            hardeningRefresh = PanelRefreshStatus(lastAttemptAt: Date(),
-                lastSuccessAt: read.2.isEmpty ? Date() : hardeningRefresh?.lastSuccessAt, failedEndpoints: read.2.map { $0.endpoint })
+        let endpoint = "production exports"
+        let result: Result<[ProductionExport], Error> = await productionExportsRead.read({
+            do { return .success(try await ProductionExport.list(dataRoot: dataRoot)) }
+            catch { return .failure(error) }
+        }, publish: { result in
+            switch result {
+            case .success(let exports):
+                productionExports = exports
+                hardeningRefresh = PanelRefreshStatus(lastAttemptAt: Date(), lastSuccessAt: Date(), failedEndpoints: [])
+            case .failure:
+                hardeningRefresh = PanelRefreshStatus(lastAttemptAt: Date(),
+                    lastSuccessAt: hardeningRefresh?.lastSuccessAt, failedEndpoints: [endpoint])
+            }
         })
         await capabilitiesDidChange?()
-        return read.2
+        if case .failure(let error) = result { return [(endpoint, "getProductionExports", error)] }
+        return []
     }
 
     public nonisolated init(dataRoot: URL, launchedAt: Date) {
@@ -184,7 +185,9 @@ public final class DoctorFacade {
             ])
         }
         let executableRepairs = DoctorSafeRepairPolicy.executableCoreIDs(for: report.checks)
-        let checks = report.checks.map { check in
+        // What needs attention leads, so a failing check is in the first answer when the report is long enough to be paged.
+        let checks = (report.checks.filter { DoctorSafeRepairPolicy.isAdverse($0.status) }
+            + report.checks.filter { !DoctorSafeRepairPolicy.isAdverse($0.status) }).map { check in
             let repairAvailable = executableRepairs.contains(check.id)
                 || (check.repair_available == true
                     && DoctorSafeRepairPolicy.isAdverse(check.status))

@@ -225,8 +225,8 @@ public struct AbilityStore: Sendable {
             + "\(info.st_mtimespec.tv_sec):\(info.st_mtimespec.tv_nsec):\(info.st_ctimespec.tv_sec):\(info.st_ctimespec.tv_nsec)"
     }
     /// Change notifications only announce completed source work; they never run parts.
-    public func signal(_ name: String, part: String? = nil, _ payload: [String: JSONValue] = [:]) {
-        let message = Signalled(root: dataRoot.path, signal: name, part: part, payload: payload)
+    public func signal(_ name: String, part: String? = nil, _ payload: [String: JSONValue] = [:], origin: WakeOrigin = .signal) {
+        let message = Signalled(root: dataRoot.path, signal: name, part: part, payload: payload, origin: origin)
         NotificationCenter.default.post(message, subject: message.root as NSString)
     }
     public static func withLock<T>(_ body: () throws -> T) rethrows -> T {
@@ -541,49 +541,225 @@ public struct AbilityStore: Sendable {
         public let part: String
     }
     /// Notebook mutations share the deletion lock; backup includes notebooks except news/ledger, while export/sharing/sync exclude them.
-    package static let notebookValueBytes = 16_384
+    package static let notebookValueBytes = 262_144
+    private static let notebookTotalBytes = 2_097_152
+    private static let notebookMaxKeys = 256
+
+    enum NotebookCall: Sendable {
+        case get(String)
+        case set(String, JSONValue, ttl: Int64?, legacy: Bool)
+        case delete(String)
+        case list(String)
+        case cas(String, expected: JSONValue, value: JSONValue, ttl: Int64?)
+        case page
+
+        var writes: Bool { writeKey != nil }
+
+        var keyedWrite: Bool {
+            if case .set(_, _, _, let legacy) = self { return !legacy }
+            return writes
+        }
+
+        var writeKey: String? {
+            switch self {
+            case .set(let key, _, _, _), .delete(let key), .cas(let key, _, _, _): key
+            case .get, .list, .page: nil
+            }
+        }
+
+        func checkedWriteValue() throws -> Data? {
+            let value: JSONValue
+            switch self {
+            case .set(_, let next, _, _), .cas(_, _, let next, _): value = next
+            default: return nil
+            }
+            let data = try value.serializedData(pretty: false)
+            let text = String(decoding: data, as: UTF8.self)
+            guard NativeAgentSecretRedactor.secretPath(value) == nil,
+                  Keyring.names(in: value).isEmpty, !text.contains("{{secret:"),
+                  !NativeAgentSecretRedactor.containsAuditSecret(text) else { throw AbilityStore.notebookSecretFailure }
+            return data
+        }
+
+        init(_ operation: String, _ args: [JSONValue], legacy: Bool = true) throws(SenseFailure) {
+            let bad = SenseFailure(code: "bad_state", message: """
+                Use get(key), set(key, value, options?), delete(key), list(prefix?), or cas(key, expected, value, options?). \
+                Keys are 1–256 UTF-8 bytes and ttl_seconds is an integer from 1 through 31536000.
+                """)
+            if operation == "list" {
+                if args.isEmpty { self = .list(""); return }
+                guard args.count == 1 else { throw bad }
+                if args[0] == .null { self = .list(""); return }
+                guard case .string(let prefix) = args[0], prefix.utf8.count <= SenseWire.stateKeyBytes else { throw bad }
+                self = .list(prefix)
+                return
+            }
+            if legacy, operation == "get", args.isEmpty { self = .get("part"); return }
+            if legacy, operation == "set", args.count == 1 { self = .set("part", args[0], ttl: nil, legacy: true); return }
+            guard case .string(let key)? = args.first, SenseWire.validStateKey(key) else { throw bad }
+            func ttl(at index: Int) throws(SenseFailure) -> Int64? {
+                guard args.count > index else { return nil }
+                guard args.count == index + 1 else { throw bad }
+                if args[index] == .null { return nil }
+                guard case .object(let options) = args[index] else { throw bad }
+                if options.isEmpty { return nil }
+                guard options.count == 1, case .int(let seconds)? = options["ttl_seconds"],
+                      (1...31_536_000).contains(seconds) else { throw bad }
+                return seconds
+            }
+            switch operation {
+            case "get" where args.count == 1: self = .get(key)
+            case "set" where args.count >= 2: self = .set(key, args[1], ttl: try ttl(at: 2), legacy: false)
+            case "delete" where args.count == 1: self = .delete(key)
+            case "cas" where args.count >= 3: self = .cas(key, expected: args[1], value: args[2], ttl: try ttl(at: 3))
+            default: throw bad
+            }
+        }
+
+        func writtenValue(reply: JSONValue?) -> JSONValue? {
+            switch self {
+            case .set(_, let value, _, _): value
+            case .delete: .null
+            case .cas(_, _, let value, _) where reply?.objectValue?["swapped"] == .bool(true): value
+            default: nil
+            }
+        }
+    }
+
+    private struct NotebookMetadata: Codable {
+        let updated_at: Date
+        let expires_at: Date?
+        let rev: Int64
+    }
+
+    package static var notebookSecretFailure: SenseFailure {
+        SenseFailure(code: "secret_in_state_forbidden", message: "The notebook cannot hold credential values or secret references.")
+    }
+
     package static func notebookPath(dataRoot: URL, id: String) -> URL {
         dataRoot.appendingPathComponent("senses/\(id)/state.json")
     }
-    package static func notebook(dataRoot: URL, id: String, setting: Bool, value: JSONValue,
-                               writing: () -> Void = {},
-                               writeUncertain: () -> Void = {},
-                               failure: (String, String) -> any Error) throws -> JSONValue {
+    static func notebook(dataRoot: URL, id: String, call: NotebookCall, expectedVersion: String? = nil,
+                         writing: () -> Void = {}, writeUncertain: () -> Void = {},
+                         listChange: ((JSONValue) -> Void)? = nil) throws -> JSONValue {
         guard !id.isEmpty, id != ".", id != "..", !id.contains("/"), !id.contains("\\") else {
-            throw failure("bad_state", "Part notebook id is invalid.")
+            throw SenseFailure(code: "bad_state", message: "Part notebook id is invalid.")
         }
         var changed = false
-        let result = try notebook(notebookPath(dataRoot: dataRoot, id: id), key: "part", setting: setting, value: value,
-            writing: { changed = true; writing() }, writeUncertain: writeUncertain, failure: failure)
+        let result = try withLock {
+            if let expectedVersion {
+                guard let part = try AbilityStore(dataRoot: dataRoot).selectedPart(id), part.file != nil,
+                      part.row["status"] == .string("active"), part.row["codeFingerprint"] == .string(expectedVersion) else {
+                    throw SenseFailure(code: "state_changed", message: "The notebook's ability was stopped or replaced.")
+                }
+            }
+            return try notebook(notebookPath(dataRoot: dataRoot, id: id), call: call,
+                writing: { changed = true; writing() }, writeUncertain: writeUncertain, listChange: listChange)
+        }
         if changed { NotificationCenter.default.post(NotebookDidChange(part: id), subject: id as NSString) }
         return result
     }
-    package static func notebook(_ notebook: URL, key: String, setting: Bool, value: JSONValue,
-                               writing: () -> Void = {},
-                               writeUncertain: () -> Void = {},
-                               failure: (String, String) -> any Error) throws -> JSONValue {
+    static func notebook(_ notebook: URL, call: NotebookCall,
+                         writing: () -> Void = {}, writeUncertain: () -> Void = {},
+                         listChange: ((JSONValue) -> Void)? = nil) throws -> JSONValue {
         try withLock {
+            try Task.checkCancellation()
             guard notebook.resolvingSymlinksInPath().path == notebook.standardizedFileURL.path else {
-                throw failure("bad_state", "Sense notebook cannot be a symbolic link.")
+                throw SenseFailure(code: "bad_state", message: "Sense notebook cannot be a symbolic link.")
             }
+            try checkItem(notebook.deletingLastPathComponent())
+            try checkItem(notebook)
             var state: [String: JSONValue] = [:]
             do {
                 let attrs = try FileManager.default.attributesOfItem(atPath: notebook.path)
                 guard attrs[.type] as? FileAttributeType == .typeRegular,
-                      ((attrs[.size] as? NSNumber)?.intValue ?? Int.max) <= 65_536,
+                      ((attrs[.size] as? NSNumber)?.intValue ?? Int.max) <= notebookTotalBytes,
                       let saved = try? JSONDecoder().decode([String: JSONValue].self, from: Data(contentsOf: notebook)) else {
-                    throw failure("bad_state", "Sense notebook is malformed or too large.")
+                    throw SenseFailure(code: "bad_state", message: "Sense notebook is malformed or too large.")
                 }
                 state = saved
             } catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile {}
-            guard setting else { return state[key] ?? .null }
-            guard try JSONEncoder().encode(value).count <= notebookValueBytes else {
-                throw failure("state_limit", "Sense notebook values must be at most 16 KiB.")
+
+            let savedMetadata = state.removeValue(forKey: "")
+            var metadata: [String: NotebookMetadata] = [:]
+            if let savedMetadata {
+                guard let decoded = try? JSONDecoder().decode([String: NotebookMetadata].self, from: savedMetadata.serializedData(pretty: false)),
+                      decoded.allSatisfy({ state[$0.key] != nil && $0.value.rev > 0 }) else {
+                    throw SenseFailure(code: "bad_state", message: "Sense notebook metadata is malformed.")
+                }
+                metadata = decoded
             }
-            guard state[key] != value else { return .null }
-            state[key] = value
-            let data = try JSONEncoder().encode(state)
-            guard data.count <= 65_536 else { throw failure("state_limit", "Sense notebook exceeds 64 KiB.") }
+            let now = Date()
+            let expired = metadata.compactMap { key, entry in
+                entry.expires_at.map { $0 <= now } == true ? key : nil
+            }
+            for key in expired { state.removeValue(forKey: key); metadata.removeValue(forKey: key) }
+            let keyLimit = max(notebookMaxKeys, state.count)
+            func encoded() throws -> Data {
+                var envelope = state
+                if !metadata.isEmpty { envelope[""] = try .fromEncodable(metadata) }
+                return try JSONEncoder().encode(envelope)
+            }
+            func listRow(_ key: String) throws -> JSONValue? {
+                guard let value = state[key] else { return nil }
+                let entry = metadata[key]
+                return .object(["key": .string(key), "bytes": .int(Int64(try JSONEncoder().encode(value).count)),
+                                "rev": .int(entry?.rev ?? 0), "updated_at": entry.map { .string($0.updated_at.formatted(.iso8601)) } ?? .null,
+                                "expires_at": entry?.expires_at.map { .string($0.formatted(.iso8601)) } ?? .null])
+            }
+            let before: (key: String, row: JSONValue, bytes: Int)? = if listChange != nil, let key = call.writeKey {
+                (key, try listRow(key) ?? .null, try encoded().count)
+            } else { nil }
+            var changed = !expired.isEmpty
+            func set(_ key: String, _ value: JSONValue, ttl: Int64?, legacy: Bool) throws -> Int64 {
+                let previous = metadata[key]
+                if legacy, state[key] == value, previous?.expires_at == nil { return previous?.rev ?? 0 }
+                guard try JSONEncoder().encode(value).count <= SenseWire.stateValueBytes else {
+                    throw SenseFailure(code: "state_limit", message: "Notebook values must be at most 256 KiB.")
+                }
+                let (rev, overflow) = (previous?.rev ?? 0).addingReportingOverflow(1)
+                guard !overflow else { throw SenseFailure(code: "state_limit", message: "Notebook key exhausted its revisions.") }
+                state[key] = value
+                metadata[key] = NotebookMetadata(updated_at: now, expires_at: ttl.map { now.addingTimeInterval(Double($0)) }, rev: rev)
+                changed = true
+                return rev
+            }
+            let result: JSONValue
+            switch call {
+            case .get(let key): return state[key] ?? .null
+            case .list(let prefix):
+                let keys = try state.keys.sorted().filter { $0.hasPrefix(prefix) }.compactMap { try listRow($0) }
+                return .object(["keys": .array(keys), "total_bytes": .int(Int64(try encoded().count)), "limit_bytes": .int(Int64(notebookTotalBytes))])
+            case .page:
+                let packet = state.removeValue(forKey: "part") ?? .null
+                guard packet == .null || packet.objectValue != nil else {
+                    throw SenseFailure(code: "bad_notebook", message: "The part's notebook page packet must be an object.")
+                }
+                var facts = packet.objectValue ?? [:]
+                if !state.isEmpty { facts["notebook"] = .object(state) }
+                return .object(facts)
+            case .set(let key, let value, let ttl, let legacy):
+                _ = try set(key, value, ttl: ttl, legacy: legacy)
+                result = .null
+            case .delete(let key):
+                if state.removeValue(forKey: key) != nil { changed = true }
+                metadata.removeValue(forKey: key)
+                result = .null
+            case .cas(let key, let expected, let value, let ttl):
+                guard (state[key] ?? .null) == expected else {
+                    return .object(["swapped": .bool(false), "current_rev": state[key].map { _ in .int(metadata[key]?.rev ?? 0) } ?? .null])
+                }
+                result = .object(["swapped": .bool(true), "rev": .int(try set(key, value, ttl: ttl, legacy: false))])
+            }
+            guard changed else { return result }
+            let data = try encoded()
+            guard data.count <= notebookTotalBytes, state.count <= keyLimit else {
+                throw SenseFailure(code: "state_limit", message: "Notebook is limited to 2 MiB and 256 keys.")
+            }
+            let delta: JSONValue? = if let before {
+                .object(["key": .string(before.key), "before": before.row, "after": try listRow(before.key) ?? .null,
+                         "bytes": .int(Int64(data.count - before.bytes))])
+            } else { nil }
             do { try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: notebook) }
             catch {
                 // The durable write can fail after rename.
@@ -591,7 +767,8 @@ public struct AbilityStore: Sendable {
                 throw error
             }
             writing()
-            return .null
+            if let delta { listChange?(delta) }
+            return result
         }
     }
 }

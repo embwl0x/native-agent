@@ -35,7 +35,7 @@ struct DreamsView: View {
 
     private func presentation(_ snapshot: PartFaceSnapshot) -> PartFace? {
         guard var face = snapshot.drawnFace else { return nil }
-        face.sections += snapshot.levers ?? []
+        face.sections += snapshot.drawnLevers
         return face
     }
 

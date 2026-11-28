@@ -70,7 +70,7 @@ extension ChatView {
                     .foregroundStyle(NativeAgentShell.text)
                     .lineLimit(1)
                 Spacer(minLength: 4)
-                ChatSidebarArchiveButton(shell: true)
+                ChatSidebarArchiveButton()
 
                 Button {
                     Task {
@@ -242,7 +242,7 @@ extension ChatView {
 // Keep these expressions outside the viewport body because its generic chain is at the type-checker's limit.
 extension ChatView {
     var latestPillAnimation: Animation? {
-        NativeAgentMotion.respecting(NativeAgentMotion.spring, reduceMotion: reduceMotion)
+        Animation.respecting(NativeAgentMotion.spring, reduceMotion: reduceMotion)
     }
 
     var latestPillTransition: AnyTransition {
@@ -305,7 +305,6 @@ struct ChatLatestPillGate<Pill: View>: View {
 /// Mount archive controls independently so hosting the durable route cannot start unrelated chat work.
 struct ChatSidebarArchiveButton: View {
     @Environment(AppModel.self) private var appModel
-    var shell = false
     @State private var failure: String?
     @State private var isArchiving = false
 
@@ -318,16 +317,12 @@ struct ChatSidebarArchiveButton: View {
                 isArchiving = false
             }
         } label: {
-            if shell {
-                Text("Archive")
-                    .font(ShellType.labelSemibold)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .contentShape(Rectangle())
-                    .foregroundStyle(NativeAgentShell.secondary)
-            } else {
-                Image(systemName: "archivebox")
-            }
+            Text("Archive")
+                .font(ShellType.labelSemibold)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .contentShape(Rectangle())
+                .foregroundStyle(NativeAgentShell.secondary)
         }
         .buttonStyle(.borderless)
         .disabled(appModel.activeChatSessionId.isEmpty || isArchiving)

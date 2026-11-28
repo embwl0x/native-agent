@@ -115,7 +115,7 @@ extension FacePageSession {
         var edits: [String: String] = [:]
         for field in block.fields ?? [] { edits[field.id] = formKey(block, field: field.id, section: section) }
         submit(.init(section: section, row: block.key), row: block.key, action: action.id, value: nil, call: action.call, door: door,
-               values: values, formRevision: block.revision, formEdits: edits)
+               values: values, formRevision: block.revision, formEdits: edits, expectedPageRevision: block.pageRevision)
     }
 }
 
@@ -127,7 +127,7 @@ struct FaceFormBlock: View {
     @Environment(\.faceStyle) private var style
     @Environment(\.faceSecretForm) private var secretForm
     @Environment(\.faceProtectedEntry) private var protectedEntry
-    @State private var confirming: PartFace.Action?
+    @State private var confirming: (action: PartFace.Action, block: PartFace.Block?)?
     private var item: FaceItemID { .init(section: section, row: block.key) }
     private var protected: Bool { block.protected == true || block.fields?.contains(where: { $0.kind == "secret" }) == true }
     private var unsupported: Bool {
@@ -135,8 +135,9 @@ struct FaceFormBlock: View {
     }
     private var admitted: Bool { FaceView.door == "mac" && secretForm?.admits(block) == true }
     private var plain: PartFace.Block { protected ? block.withoutSecrets : block }
+    private var confirmationBlock: PartFace.Block? { protected ? nil : block }
 
-    private func submit(_ action: PartFace.Action) {
+    private func submit(_ action: PartFace.Action, from block: PartFace.Block) {
         if protected, admitted { secretForm?.submit(block, section: section, action: action, session: session) }
         else { session.submitForm(block, section: section, action: action, door: door) }
     }
@@ -169,8 +170,8 @@ struct FaceFormBlock: View {
                 FaceFlow(spacing: 12) {
                     ForEach((block.submit ?? []).filter { $0.runs(from: FaceView.door) }) { action in
                         Button(action.label) {
-                            if action.role == .destructive { confirming = action }
-                            else { submit(action) }
+                            if action.role == .destructive { confirming = (action, confirmationBlock) }
+                            else { submit(action, from: block) }
                         }
                         .buttonStyle(FaceActionButtonStyle(fill: nil))
                         .disabled(session.held(item) || action.unavailable != nil)
@@ -185,11 +186,11 @@ struct FaceFormBlock: View {
             .padding(style.insets)
             .onChange(of: secretForm?.entry.generation) { session.discardCheckResult(block.key) }
             .onChange(of: session.formValues(plain, section: section)) { session.discardCheckResult(block.key) }
-            .confirmationDialog(confirming?.label ?? "", isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } }),
+            .confirmationDialog(confirming?.action.label ?? "", isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } }),
                                 titleVisibility: .visible) {
-                if let action = confirming {
-                    Button(action.label, role: .destructive) {
-                        submit(action); confirming = nil
+                if let pending = confirming {
+                    Button(pending.action.label, role: .destructive) {
+                        submit(pending.action, from: pending.block ?? block); confirming = nil
                     }
                 }
                 Button("Cancel", role: .cancel) { confirming = nil }
@@ -206,8 +207,8 @@ struct FaceFormBlock: View {
     private func commit() {
         let actions = (block.submit ?? []).filter { $0.runs(from: FaceView.door) && $0.unavailable == nil }
         guard let action = actions.first(where: { $0.role == .primary }) ?? (actions.count == 1 ? actions.first : nil) else { return }
-        if action.role == .destructive { confirming = action }
-        else { submit(action) }
+        if action.role == .destructive { confirming = (action, confirmationBlock) }
+        else { submit(action, from: block) }
     }
 
     @ViewBuilder private var outcome: some View {

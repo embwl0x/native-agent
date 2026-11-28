@@ -1,7 +1,7 @@
+import PersistenceCore
 import MacNerves
 import NativeAgentCore
 import NativeAgentShared
-import PersistenceCore
 import DeskCore
 import SenseCore
 import Foundation
@@ -18,8 +18,6 @@ extension AppActions {
             part, otherwise the same line is offered once per local day
             """,
                   [.required("line"), .optional("event_key")], tool: "home_arrive", versionExempt: true),
-        AppAction("house.file", "desk", "File something to tend, with who owns it", [.required("title"), .required("summary"), .required("owner"), .optional("refs", .array)],
-                 warn: "owner is me, builder or user; refs contains strings or Desk ref objects {kind,…}", tool: "house_file", versionExempt: true),
 
         // Folded reads are scriptable and raise no inbox notes.
         .fold("time_now", "*", "The date and time now: local, UTC, epoch, weekday and day of year", read: true),

@@ -18,7 +18,7 @@ extension FaceActReply {
     func checkedCommit() throws -> CommittedResult {
         let result: CommittedResult
         switch self {
-        case .committed(let value), .operation(.completed(let value)): result = value
+        case .committed(let value): result = value
         case .failed(let failure), .refused(let failure): throw failure
         default: throw FaceActionFeedback.unexpected("a committed result")
         }

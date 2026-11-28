@@ -9,10 +9,7 @@ extension ProductionExport {
     public typealias ArtifactProcessRunner = @Sendable (String, [String], URL) async throws -> (status: Int32, stdout: String, stderr: String)
 
     /// Export consistent SQLite memory and selected stores as one checksummed archive recorded in the registry.
-    @concurrent public static func createArchive<Hardening: Encodable & Sendable>(
-        dataRoot root: URL, runProcess: ArtifactProcessRunner,
-        hardening: @Sendable () async throws -> Hardening
-    ) async throws -> ProductionExport {
+    @concurrent public static func createArchive(dataRoot root: URL, runProcess: ArtifactProcessRunner) async throws -> ProductionExport {
         let now = NativeTimestampFormat.plainZulu(Date())
         let id = UUID().uuidString.lowercased()
         let exportRoot = root
@@ -27,7 +24,6 @@ extension ProductionExport {
         try fm.createDirectory(at: stageDir, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: stageDir) }
 
-        try TrustBackupPersistence.writeCodableJSON(try await hardening(), to: stageDir.appendingPathComponent("production_hardening.json"))
         try TrustBackupPersistence.writeCodableJSON(PrivacyMap(dataRoot: root, generatedAt: SwiftNativeManifestSigner.isoTimestamp(Date())),
             to: stageDir.appendingPathComponent("privacy_map.json"))
 

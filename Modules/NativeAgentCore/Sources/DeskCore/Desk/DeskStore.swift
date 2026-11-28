@@ -22,7 +22,6 @@ public struct SwiftNativeDeskStore: Sendable {
     /// Share revisions across store instances so admission needs no Desk I/O.
     static let truthRevision = Mutex<UInt64>(0)
     public static var currentRevision: UInt64 { truthRevision.withLock { $0 } }
-    public static let defaultArchiveGrace: TimeInterval = 48 * 60 * 60
     /// Enforce pursuit and work-session budgets in the store so prompts cannot bypass them.
     public static let maxOpenAgentPursuits = 2
     public static let maxWorkSessionsPerPursuitPerDay = 2

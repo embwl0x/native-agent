@@ -197,17 +197,13 @@ extension SwiftNativeChatOrchestrationClient {
         if normalizedRole == "assistant", kind == .assistantTurnCompleted {
             subject = CognitiveSubjectReference(
                 type: "chat.assistant_turn",
-                id: "\(sessionId):\(messageId)",
-                // The substrate derives a safe topic from the redacted summary, or leaves it absent.
-                label: CognitiveSubstrate.feltTopicLabel(from: redactedSummary)
+                id: "\(sessionId):\(messageId)"
             )
         } else if kind == .userMessageReceived || kind == .userCorrection {
             // User and assistant subjects identify individual turns; session continuity uses sessionId metadata.
             subject = CognitiveSubjectReference(
                 type: "chat.user_turn",
-                id: "\(sessionId):\(messageId)",
-                // The substrate derives a safe topic from the redacted summary, or leaves it absent.
-                label: CognitiveSubstrate.feltTopicLabel(from: redactedSummary)
+                id: "\(sessionId):\(messageId)"
             )
         } else {
             subject = CognitiveSubjectReference(type: "chat.session", id: sessionId)
@@ -301,8 +297,7 @@ extension SwiftNativeChatOrchestrationClient {
                   let invocationID = turn.invocationID else { return }
             // Persisted physiology uses by-tool redaction before cutting its preview.
             let inputPreview = Self.compactCognitiveJSON(
-                MacInjectionArgRedaction.redactedPayload(tool: safeName, payload: input, turn: turn),
-                maxCharacters: 240
+                MacInjectionArgRedaction.redactedPayload(tool: safeName, payload: input, turn: turn)
             )
             var metadata: [String: JSONValue] = [
                 "sessionId": .string(sessionId),
@@ -349,13 +344,13 @@ extension SwiftNativeChatOrchestrationClient {
                 metadata: metadata
             ))
 
-        case .toolResult, .delta, .final, .notice, .replyTextSettled, .writing:
+        case .toolResult, .unstartedStep, .delta, .final, .notice, .replyTextSettled, .writing:
             return
         }
     }
 
-    nonisolated private static func compactCognitiveJSON(_ value: JSONValue, maxCharacters: Int) -> String {
-        do { return String(try value.serialize(pretty: false).prefix(max(0, maxCharacters))) }
+    nonisolated private static func compactCognitiveJSON(_ value: JSONValue) -> String {
+        do { return String(try value.serialize(pretty: false).prefix(240)) }
         catch { return "[Observation unavailable: JSON encoding failed (\(error.localizedDescription)). Repair its producing owner.]" }
     }
 

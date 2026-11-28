@@ -49,8 +49,6 @@ public struct SwiftToolDispatcher: ToolDispatchClient {
     public init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         bodyField: BodyField? = nil,
-        memoryV2: SwiftNativeMemoryV2? = nil,
-        knowledgeGraphPath: URL? = nil,
         allowProcessGlobalTools: Bool = true,
         dotTransport: ChatGPTDotIPCTransport? = nil,
         jobStore: AgentJobStore? = nil,
@@ -67,8 +65,6 @@ public struct SwiftToolDispatcher: ToolDispatchClient {
         self.init(runtime: ActionRuntime(
             dataRoot: dataRoot,
             bodyField: bodyField,
-            memoryV2: memoryV2,
-            knowledgeGraphPath: knowledgeGraphPath,
             allowProcessGlobalTools: allowProcessGlobalTools,
             dotTransport: dotTransport,
             jobStore: jobStore,

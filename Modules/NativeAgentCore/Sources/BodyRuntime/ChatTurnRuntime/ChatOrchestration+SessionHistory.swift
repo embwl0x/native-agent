@@ -24,10 +24,6 @@ extension SwiftNativeTurnEngine {
         imageBlocks: [LLMContentBlock] = [],
         // Relevance uses raw user text without turn-scoped wire hints; nil uses `userMessage`.
         queryUserMessage: String? = nil,
-        // Reuse the turn-start instant for the clock line on every iteration.
-        clockNowOverride: Date? = nil,
-        // Supplied bytes and disk reads share the same replay path.
-        transcript: Data? = nil,
         // The caller's clock read opening `turn.history_context`, so the hop onto this actor is a timed step.
         startedNs: UInt64,
         turn: Turn, work: ChatTurnWork
@@ -41,7 +37,7 @@ extension SwiftNativeTurnEngine {
         let queryMessage = queryUserMessage ?? userMessage
         let replacementAnswerID = turn.rows.replacementAssistantMessageID
         // One instant and preference snapshot feed facts, base receipts and composition.
-        let currentTurnClock = clockNowOverride ?? clock()
+        let currentTurnClock = clock()
         let quietHoursStart = DispatchTime.now().uptimeNanoseconds
         let quietHoursWindow = try readTurnQuietHours()
         trace.record(.historyQuietHours, since: quietHoursStart, of: .historyBuild)
@@ -54,7 +50,7 @@ extension SwiftNativeTurnEngine {
         )
         let build = HistoryContextBuild(trace: trace)
         let (prior, priorStats, replacementQuestion) = try await readPromptHistory(build, sessionId: sessionId, surface: surface,
-            historyLimit: historyLimit, historyReader: historyReader, transcript: transcript,
+            historyLimit: historyLimit, historyReader: historyReader,
             excludeHistoryRunId: excludeHistoryRunId, replacementAnswerID: replacementAnswerID, turn: turn)
         let (base, preparedHistory) = try await buildHistoryBase(build, prior: prior, surface: surface,
             userMessage: userMessage, sessionId: sessionId, personaOverride: personaOverride, imageBlocks: imageBlocks,
@@ -85,7 +81,7 @@ extension SwiftNativeTurnEngine {
     /// The conversation's verbatim history from one transcript read, before any replaced question; a failed read is owed repair.
     private func readPromptHistory(
         _ build: HistoryContextBuild, sessionId: String, surface: String, historyLimit: Int,
-        historyReader: SessionHistoryReader, transcript: Data?, excludeHistoryRunId: String?,
+        historyReader: SessionHistoryReader, excludeHistoryRunId: String?,
         replacementAnswerID: String?, turn: Turn
     ) async throws -> (prior: [HistoryChatMessage], priorStats: SessionHistoryReadStats, replacementQuestion: String?) {
         var trace = build.trace
@@ -118,19 +114,12 @@ extension SwiftNativeTurnEngine {
             // Measured inline: the read's closure holds actor state and cannot be sent to the trace.
             let promptReadStart = DispatchTime.now().uptimeNanoseconds
             do {
-                let bytes: Data?
-                if let transcript { bytes = transcript } else {
-                    let readStart = DispatchTime.now().uptimeNanoseconds
-                    let read = try await historyReader.transcriptBytes(forSessionId: sessionId)
-                    let readNs = DispatchTime.now().uptimeNanoseconds &- readStart
-                    bytes = read.bytes
-                    trace.record(.promptReadFile, nanoseconds: read.fileNanoseconds, of: .promptRead)
-                    trace.record(.promptReadReaderHop, nanoseconds: readNs &- read.fileNanoseconds, of: .promptRead)
-                }
-                selected = historyReader.promptMessagesWithStats(
-                    transcript: bytes,
-                    excludingRunId: nil
-                )
+                let readStart = DispatchTime.now().uptimeNanoseconds
+                let read = try await historyReader.transcriptBytes(forSessionId: sessionId)
+                let readNs = DispatchTime.now().uptimeNanoseconds &- readStart
+                trace.record(.promptReadFile, nanoseconds: read.fileNanoseconds, of: .promptRead)
+                trace.record(.promptReadReaderHop, nanoseconds: readNs &- read.fileNanoseconds, of: .promptRead)
+                selected = historyReader.promptMessagesWithStats(transcript: read.bytes)
                 let replay = selected.stats
                 trace.record(.promptReadLines, nanoseconds: replay.splitNanoseconds, of: .promptRead)
                 trace.record(.promptReadRowMemo, nanoseconds: replay.rowMemoNanoseconds, of: .promptRead)

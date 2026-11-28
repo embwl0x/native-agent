@@ -11,7 +11,6 @@ public struct MacAppActRefusal: Error, LocalizedError, Sendable {
     public let message: String
     public let integration: String?
     public var remedy: JSONValue? = nil
-    public var targetDiscovery: JSONValue? = nil
 
     public var errorDescription: String? { message }
     public var fields: [String: JSONValue] {
@@ -30,15 +29,10 @@ public struct MacAppActRefusal: Error, LocalizedError, Sendable {
             }
         }
         if let remedy { fields["remedy"] = remedy }
-        if let targetDiscovery {
-            fields["target_discovery"] = targetDiscovery
-            fields["effects"] = .string("none")
-            fields["status"] = .string("failed")
-        }
         return fields
     }
     public func result(action: String) -> MacControlResult {
-        MacControlResult(ok: false, action: action, output: .object(fields), error: code, durationMs: 0, httpStatus: targetDiscovery == nil ? 403 : 503)
+        MacControlResult(ok: false, action: action, output: .object(fields), error: code, durationMs: 0, httpStatus: 403)
     }
 }
 
@@ -111,13 +105,6 @@ public enum MacAppActGate {
         let operation = tool.hasPrefix("mac.") ? String(tool.dropFirst(4)) : tool
         let input = operation == "act" ? unwrappingScreenAddress(input) : input
         if context.looking, ["act", "hand"].contains(operation), holdingAllowsLooking(input) { return nil }
-        if operation == "media" || operation == "mac_media" {
-            do {
-                guard let pid = try await MacMediaTarget.currentPID() else { return nil }
-                return refusal(pid: pid, dataRoot: dataRoot, context: context)
-            } catch let failure as MacMediaTarget.Failure { return failure.refusal }
-            catch { throw CancellationError() } // The discovery owner throws only Failure or cancellation.
-        }
         if ["apps.call", "applescript"].contains(operation) {
             guard let bundle = input["bundle_id"]?.stringValue, !bundle.isEmpty else {
                 return unavailable("this call names no bundle_id", next: "Give the bundle_id of the app it drives")

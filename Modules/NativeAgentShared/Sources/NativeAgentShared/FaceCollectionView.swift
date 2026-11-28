@@ -6,6 +6,7 @@ import Accessibility
 
 @MainActor @Observable public final class FaceCollectionReads {
     struct Collection {
+        let latest = LatestRead()
         var source: PartFace.Section
         var section: PartFace.Section
         var request: FaceReadRequest?
@@ -34,7 +35,10 @@ import Accessibility
         return held.section
     }
 
-    func scope(section: String, row: String) -> String? { collections[section]?.rowScopes[row] }
+    func scope(section: PartFace.Section, row: String) -> String? {
+        guard let collection = collections[section.id], collection.source == section else { return nil }
+        return collection.rowScopes[row]
+    }
 
     /// A page holds demands; recycled rows only draw their already-held results.
     func hold(_ sources: [PartFace.Section], items demands: [FaceReadRequest], by viewer: UUID, door: any FaceDoor,
@@ -50,12 +54,15 @@ import Accessibility
                 // A new publication of the same collection cannot erase pages already read or their scopes.
                 let firstIDs = Set(source.rows.map(\.id))
                 var section = source
-                section.rows += held.section.rows.filter { !firstIDs.contains($0.id) }
-                section.more = held.section.more
-                section.footer = held.section.footer
+                if !held.rowScopes.isEmpty {
+                    section.rows += held.section.rows.filter { held.rowScopes[$0.id] != nil && !firstIDs.contains($0.id) }
+                    section.more = held.section.more
+                    section.footer = held.section.footer
+                }
+                for row in source.allRows { held.rowScopes.removeValue(forKey: row.id) }
                 held.source = source
                 held.section = section
-                collections[source.id] = held
+                held.latest.write { collections[source.id] = held }
             } else if held.leases.isEmpty || source.more == nil {
                 release(held)
                 collections[source.id] = Collection(source: source, section: source)
@@ -63,7 +70,7 @@ import Accessibility
                 // Keep the old reading on screen until its replacement has restored the held span at the visible row.
                 held.task?.cancel()
                 held.source = source
-                collections[source.id] = held
+                held.latest.write { collections[source.id] = held }
                 load(source, cursor: source.more?.next, anchor: anchor, door: door,
                      minimumRows: held.section.rows.count, starting: source)
             }
@@ -123,14 +130,15 @@ import Accessibility
 
     func more(_ source: PartFace.Section, anchor: String?, door: any FaceDoor) {
         let current = section(source)
-        guard let more = current.more, collections[source.id]?.task == nil else { return }
+        guard let more = current.more else { return }
+        if let held = collections[source.id], held.source != source || held.task != nil { return }
         if collections[source.id] == nil { collections[source.id] = Collection(source: source, section: source) }
         load(source, cursor: more.next, anchor: anchor, door: door)
     }
 
     private func load(_ source: PartFace.Section, cursor: String?, anchor: String?, door: any FaceDoor,
                       minimumRows: Int? = nil, starting: PartFace.Section? = nil) {
-        let previous = collections[source.id]
+        guard let previous = collections[source.id] else { return }
         let current = starting ?? section(source)
         let request = FaceReadRequest(id: UUID(), key: source.id, expectedCall: source.more?.read ?? current.more?.read,
                                       revision: cursor == nil ? nil : current.revision ?? current.more?.revision,
@@ -142,71 +150,92 @@ import Accessibility
         collections[source.id]?.request = request
         collections[source.id]?.failure = nil
         collections[source.id]?.cancelled = false
-        collections[source.id]?.leases.append((request, door))
         let task = Task {
-            do {
-                var face: PartFace
-                var completed = request
-                var replacing = starting != nil
-                do { face = try await door.readFace(request) }
-                catch let error as PartCallError where error.code == "collection_changed" && request.cursor != nil {
-                    try Task.checkCancellation()
-                    replacing = true
-                    completed = .init(id: UUID(), key: source.id, expectedCall: request.expectedCall,
-                                      anchor: request.anchor, query: request.query)
-                    collections[source.id]?.leases.append((completed, door))
-                    face = try await door.readFace(completed)
-                }
-                var accumulated = starting
-                var scopes: [String: String] = [:]
-                let restoring = minimumRows ?? (completed.cursor == nil && request.cursor != nil ? current.rows.count : 0)
-                while true {
-                    try Task.checkCancellation()
-                    guard collections[source.id]?.request == request else { return }
-                    guard var next = face.sections.first(where: { $0.id == source.id }) else {
-                        throw PartCallError(code: "collection_unconfirmed", message: "The collection owner did not return section " + source.id + ".")
-                    }
-                    for row in next.rows {
-                        for descendant in row.descendants { scopes[descendant.id] = completed.scope }
-                    }
-                    if let previous = accumulated ?? (completed.cursor != nil ? current : nil) {
-                        guard next.revision != nil, next.revision == previous.revision else {
-                            throw PartCallError(code: "collection_changed", message: "The collection changed while restoring this reading.")
-                        }
-                        let ids = Set(previous.rows.map(\.id))
-                        next.rows = previous.rows + next.rows.filter { !ids.contains($0.id) }
-                        if accumulated != nil, next.more != nil, next.rows.count == previous.rows.count {
-                            throw PartCallError(code: "collection_unconfirmed", message: "The continuation supplied no new rows.")
-                        }
-                        if accumulated == nil { scopes = collections[source.id]?.rowScopes.merging(scopes) { _, new in new } ?? scopes }
-                    }
-                    accumulated = next
-                    // The held row count bounds the restored span; an anchor outside it is still owed until read or confirmed absent at the end.
-                    let needsAnchor = starting != nil && anchor.map { id in !next.rows.contains { $0.id == id } } == true
-                    guard next.rows.count < restoring || needsAnchor, let more = next.more else {
-                        collections[source.id]?.rowScopes = scopes
-                        collections[source.id]?.section = next
-                        if replacing, let previous {
-                            let retired = Set(previous.leases.map { $0.request.id })
-                            collections[source.id]?.leases.removeAll { retired.contains($0.request.id) }
-                            release(previous)
-                        }
-                        break
-                    }
-                    guard let revision = next.revision ?? more.revision, more.next != completed.cursor else {
-                        throw PartCallError(code: "collection_unconfirmed", message: "The collection owner did not advance its continuation.")
-                    }
-                    completed = .init(id: UUID(), key: source.id, expectedCall: more.read, revision: revision,
-                                      cursor: more.next, anchor: anchor)
-                    collections[source.id]?.leases.append((completed, door))
-                    face = try await door.readFace(completed)
-                }
-            } catch {
-                guard collections[source.id]?.request == request else { return }
-                if error is CancellationError || Task.isCancelled { collections[source.id]?.cancelled = true }
-                else { collections[source.id]?.failure = error.localizedDescription }
+            guard collections[source.id]?.request == request else { return }
+            defer {
+                if collections[source.id]?.request == request { collections[source.id]?.task = nil }
             }
-            if collections[source.id]?.request == request { collections[source.id]?.task = nil }
+            guard collections[source.id]?.source == source else { return }
+            collections[source.id]?.leases.append((request, door))
+            let retired = Set(previous.leases.map { $0.request.id })
+            var published = false
+            do {
+                _ = try await previous.latest.read({ () async throws -> (PartFace.Section, [String: String], Bool) in
+                    var face: PartFace
+                    var completed = request
+                    var replacing = starting != nil
+                    do { face = try await door.readFace(request) }
+                    catch let error as PartCallError where error.code == "collection_changed" && request.cursor != nil {
+                        try Task.checkCancellation()
+                        guard collections[source.id]?.request == request, collections[source.id]?.source == source else {
+                            throw CancellationError()
+                        }
+                        replacing = true
+                        completed = .init(id: UUID(), key: source.id, expectedCall: request.expectedCall,
+                                          anchor: request.anchor, query: request.query)
+                        collections[source.id]?.leases.append((completed, door))
+                        face = try await door.readFace(completed)
+                    }
+                    var accumulated = starting
+                    var scopes: [String: String] = [:]
+                    let restoring = minimumRows ?? (completed.cursor == nil && request.cursor != nil ? current.rows.count : 0)
+                    while true {
+                        try Task.checkCancellation()
+                        guard collections[source.id]?.request == request else { throw CancellationError() }
+                        guard var next = face.sections.first(where: { $0.id == source.id }) else {
+                            throw PartCallError(code: "collection_unconfirmed", message: "The collection owner did not return section " + source.id + ".")
+                        }
+                        var added = next.rows
+                        if let previous = accumulated ?? (completed.cursor != nil ? current : nil) {
+                            guard next.revision != nil, next.revision == previous.revision else {
+                                throw PartCallError(code: "collection_changed", message: "The collection changed while restoring this reading.")
+                            }
+                            let ids = Set(previous.rows.map(\.id))
+                            added = next.rows.filter { !ids.contains($0.id) }
+                            next.rows = previous.rows + added
+                            if accumulated != nil, next.more != nil, next.rows.count == previous.rows.count {
+                                throw PartCallError(code: "collection_unconfirmed", message: "The continuation supplied no new rows.")
+                            }
+                            if accumulated == nil { scopes = collections[source.id]?.rowScopes ?? [:] }
+                        }
+                        for row in added {
+                            for descendant in row.descendants { scopes[descendant.id] = completed.scope }
+                        }
+                        accumulated = next
+                        // The held row count bounds the restored span; an anchor outside it is still owed until read or confirmed absent at the end.
+                        let needsAnchor = starting != nil && anchor.map { id in !next.rows.contains { $0.id == id } } == true
+                        guard next.rows.count < restoring || needsAnchor, let more = next.more else {
+                            return (next, scopes, replacing)
+                        }
+                        guard let revision = next.revision ?? more.revision, more.next != completed.cursor else {
+                            throw PartCallError(code: "collection_unconfirmed", message: "The collection owner did not advance its continuation.")
+                        }
+                        completed = .init(id: UUID(), key: source.id, expectedCall: more.read, revision: revision,
+                                          cursor: more.next, anchor: anchor)
+                        collections[source.id]?.leases.append((completed, door))
+                        face = try await door.readFace(completed)
+                    }
+                }, publish: { next, scopes, replacing in
+                    guard collections[source.id]?.request == request else { return }
+                    collections[source.id]?.rowScopes = scopes
+                    collections[source.id]?.section = next
+                    if replacing {
+                        collections[source.id]?.leases.removeAll { retired.contains($0.request.id) }
+                        release(previous)
+                    }
+                    published = true
+                })
+            } catch {
+                if collections[source.id]?.request == request, collections[source.id]?.source == source {
+                    if error is CancellationError || Task.isCancelled { collections[source.id]?.cancelled = true }
+                    else { collections[source.id]?.failure = error.localizedDescription }
+                }
+            }
+            if !published, !Task.isCancelled, collections[source.id]?.request == request {
+                let discarded = collections[source.id]?.leases.filter { !retired.contains($0.request.id) } ?? []
+                collections[source.id]?.leases.removeAll { !retired.contains($0.request.id) }
+                for lease in discarded { await lease.door.releaseFace(lease.request) }
+            }
         }
         collections[source.id]?.task = task
     }
@@ -266,7 +295,9 @@ public struct FaceSelectionView: View {
     @State private var retainedSelection: PartFace.Row?
     @State private var viewer = UUID()
     @Environment(\.faceHoldsDocuments) private var holdsDemands
-    @State private var width: CGFloat = 0
+    #if os(macOS)
+    @State private var splits = false
+    #endif
     public init(face: PartFace, session: FacePageSession, selection: Binding<String?>, door: any FaceDoor, page: String? = nil,
                 leaf: ((PartFace.Block) -> AnyView)? = nil, selectionRows: [PartFace.Row]? = nil,
                 rowFilter: ((PartFace.Row) -> Bool)? = nil,
@@ -297,7 +328,7 @@ public struct FaceSelectionView: View {
     public var body: some View {
         Group {
             #if os(macOS)
-            if width >= 900 {
+            if splits {
                 HSplitView {
                     list.frame(minWidth: 240, idealWidth: 320)
                     reading.frame(minWidth: 320, maxWidth: .infinity, maxHeight: .infinity)
@@ -307,7 +338,9 @@ public struct FaceSelectionView: View {
             pushed
             #endif
         }
-        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
+        #if os(macOS)
+        .onGeometryChange(for: Bool.self) { $0.size.width >= 900 } action: { splits = $0 }
+        #endif
         .onAppear { session.attach(viewer); retainedSelection = selectedRow; hold() }
         .onDisappear { session.collections.release(viewer); session.detach(viewer) }
         .onChange(of: face.sections) { _, _ in hold() }

@@ -129,14 +129,14 @@ extension SwiftToolDispatcher {
         catch { return ChatToolOutcome.errorMessage(error) }
     }
 
-    static func hostApprovalReason(tool: String, input: AgentConnectArgs, dataRoot: URL, usesCanonicalBody: Bool) -> String? {
+    static func hostApprovalReason(input: AgentConnectArgs, dataRoot: URL, usesCanonicalBody: Bool) -> String? {
         let input = input.wire
         // ACP's live connect card binds the exact resolved executable; its version is read only after approval. It is also required when ordinary tool trust
         // allows.
-        if tool == "agent_connect", case .string(let name)? = input["name"],
+        if case .string(let name)? = input["name"],
            AgentHostDirectory.row(named: name)?.acp != nil { return nil }
         // Reconnect can add or reconcile messaging allowances too; an existing contact still needs the same setup disclosure on its approval card.
-        guard let proposed = agentHostProposal(tool: tool, input: input, dataRoot: dataRoot, usesCanonicalBody: usesCanonicalBody) else { return nil }
+        guard let proposed = agentHostProposal(tool: "agent_connect", input: input, dataRoot: dataRoot, usesCanonicalBody: usesCanonicalBody) else { return nil }
         let proposalValue: AgentHostConnection.Proposal
         switch proposed {
         case .success(let value): proposalValue = value

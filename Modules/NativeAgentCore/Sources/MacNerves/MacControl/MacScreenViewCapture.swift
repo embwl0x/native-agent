@@ -282,9 +282,8 @@ func macScreenCaptureWait<Value>(
 public struct SystemMacScreenCaptureSource: MacScreenCaptureSource {
     public init() {}
 
-    /// Preflight never prompts; only the user may initiate Screen Recording acquisition.
     public func isScreenRecordingTrusted() -> Bool {
-        CGPreflightScreenCaptureAccess()
+        SystemPermissionPreflight.heldByThisProcess(.screenRecording)
     }
 
     private static func windowImage(_ window: SCWindow, maxPixelWidth: Int? = nil, context: MacOperationContext) async throws -> MacScreenShot {

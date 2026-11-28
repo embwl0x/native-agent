@@ -13,7 +13,7 @@ public protocol InnerStateProviding: Sendable {
     func innerStateReading(
         windowHours: Double,
         detail: CognitiveInnerStateReading.Detail,
-        surface: String
+        request: CognitiveCapsuleRequest
     ) async -> CognitiveInnerStateReading
     /// The rhythm's own reading of the next night: its time, or why none is due.
     func nextNight() async throws -> JSONValue
@@ -21,7 +21,7 @@ public protocol InnerStateProviding: Sendable {
 
 extension SwiftToolDispatcher {
 
-    func impl_inner_state(input: InnerStateArgs, surface: String) async -> JSONValue {
+    func impl_inner_state(input: InnerStateArgs, surface: String, turn: Turn) async -> JSONValue {
         let requested = Self.innerStateWindowHours(input.windowHours)
         let detail: CognitiveInnerStateReading.Detail =
             (input.detail?.lowercased() == "full") ? .full : .compact
@@ -38,12 +38,29 @@ extension SwiftToolDispatcher {
             ])
         }
 
-        let reading = await mind.innerStateReading(windowHours: requested, detail: detail, surface: surface)
+        let session = turn.verifiedSessionID
+        let fromUser = session.map { session in
+            SwiftNativeChatOrchestrationClient.isUsersTurn(surface: surface, sessionId: session, dataRoot: dataRoot, turn: turn)
+        } ?? false
+        let speaker = fromUser ? CognitiveCare.ownerKey : session.flatMap {
+            SwiftNativeChatOrchestrationClient.cognitivePeerSpeaker(sessionId: $0, dataRoot: dataRoot, turn: turn)
+        }
+        let request = CognitiveCapsuleRequest(
+            surface: surface, userMessage: turn.userText ?? "", sessionId: session, turnKind: .live,
+            fromUser: fromUser, speaker: speaker)
+        let reading = await mind.innerStateReading(windowHours: requested, detail: detail, request: request)
         let state = Self.innerStateJSON(reading, requestedWindowHours: input.windowHours)
         guard case .object(var fields) = state else { return state }
-        // The next night as the rhythm reads it, never recomputed here.
-        do { fields["next_night"] = try await mind.nextNight() }
-        catch { fields["next_night"] = .object(["state": .string("unavailable"), "reason": .string(error.localizedDescription)]) }
+        if !fromUser, speaker != nil {
+            // What she knows of her person's day is theirs to hear, not a peer's.
+            fields["person_day"] = nil
+            if !reading.available { fields["people"] = .array([]) }
+        } else {
+            // The next night as the rhythm reads it, never recomputed here.
+            // It is read from her person's presence and hours, so it is theirs to hear.
+            do { fields["next_night"] = try await mind.nextNight() }
+            catch { fields["next_night"] = .object(["state": .string("unavailable"), "reason": .string(error.localizedDescription)]) }
+        }
         return .object(fields)
     }
 
@@ -112,7 +129,22 @@ extension SwiftToolDispatcher {
 
         var now: [String: JSONValue] = [:]
         now["felt"] = reading.fingerprint.map(JSONValue.string) ?? .null
-        now["about"] = reading.fingerprintSubject.map { .string(innerStateSafeText($0, limit: CognitiveInnerStateReading.subjectLabelCharacters)) } ?? .null
+        if !reading.feltHistory.isEmpty {
+            now["felt_history"] = .array(reading.feltHistory.sorted { $0.key > $1.key }.map { at, words in
+                .object(["at": .string(iso.string(from: Date(timeIntervalSince1970: at))),
+                    // Entries kept before the frame's own words were recorded are "axis:word|…".
+                    "words": .string(words.contains("|")
+                        ? words.split(separator: "|").compactMap { $0.split(separator: ":", maxSplits: 1).last.map(String.init) }.joined(separator: ", ")
+                        : words)])
+            })
+        }
+        if let named = reading.namedFeeling {
+            now["named"] = .object(["name": .string(named.name.rawValue), "strength": .double((named.strength * 100).rounded() / 100),
+                "since": .string(iso.string(from: named.at))])
+        }
+        now["about"] = reading.fingerprintSubject.map {
+            .string(innerStateSafeText($0, limit: CognitiveInnerStateReading.careSubjectCharacters))
+        } ?? .null
         func registerJSON(_ chosen: CognitiveChosenRegister) -> JSONValue {
             .object([
                 "name": .string(innerStateSafeText(chosen.choice.name, limit: 80)),
@@ -154,7 +186,9 @@ extension SwiftToolDispatcher {
                         (reading.generatedAt.timeIntervalSince(node.when) / 3600 * 10).rounded() / 10),
                     // Which list it came from: `felt` = among the window's strongest, `recent` = among the newest. Different claims.
                     "selection": .string(node.selection.rawValue),
-                    "subject": .string(innerStateSafeText(node.subject, limit: CognitiveInnerStateReading.subjectLabelCharacters)),
+                    "subject": node.subject.map {
+                        .string(innerStateSafeText($0, limit: CognitiveInnerStateReading.careSubjectCharacters))
+                    } ?? .null,
                     "valence": .double(node.valence),
                     "arousal": .double(node.arousal),
                     "warmth": .double(node.warmth),
@@ -173,13 +207,15 @@ extension SwiftToolDispatcher {
             ]),
             // An absent forward-facing stance renders as null, never an invented "nothing planned" verdict.
             "toward": reading.toward.map { toward in
-                .object([
+                var fields: [String: JSONValue] = [
                     "label": .string(innerStateSafeText(toward.label, limit: CognitiveInnerStateReading.subjectLabelCharacters)),
                     "source": .string(toward.sourceKind),
                     "valence_sign": .int(Int64(toward.valenceSign)),
-                    "due": .string(iso.string(from: toward.due)),
+                    "due": toward.due.map { .string(iso.string(from: $0)) } ?? .null,
                     "overdue": .bool(toward.isOverdue),
-                ])
+                ]
+                if let startedAt = toward.peerStartedAt { fields["started_at"] = .string(iso.string(from: startedAt)) }
+                return .object(fields)
             } ?? .null,
         ]
         out["cares"] = .array(reading.cares.map { care in

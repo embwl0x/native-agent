@@ -19,20 +19,7 @@ extension SwiftNativeMacControl {
     /// READ. The whole document, in words, and never through `look`'s budgets. An explicit path reads that file. Otherwise read the selected window's live
     /// text, including unsaved edits that its on-disk document omits.
     func handleRead(_ body: [String: JSONValue], turn: Turn, context: MacOperationContext) async -> MacControlResult {
-        let started = now()
-        func result(
-            ok: Bool,
-            _ output: [String: JSONValue],
-            error: String? = nil
-        ) -> MacControlResult {
-            MacControlResult(
-                ok: ok,
-                action: "read",
-                output: .object(output),
-                error: error,
-                durationMs: Int(now().timeIntervalSince(started) * 1000)
-            )
-        }
+        let reply = MacScreenReadReply(started: now(), now: now)
         func refuse(_ code: String, _ words: String, _ extra: [String: JSONValue] = [:]) -> MacControlResult {
             var output: [String: JSONValue] = [
                 "read": .bool(false),
@@ -41,18 +28,12 @@ extension SwiftNativeMacControl {
                 "message": .string(words),
             ]
             for (key, value) in extra { output[key] = value }
-            return result(ok: false, output, error: code)
+            return reply.result(ok: false, output, error: code)
         }
         // Read the frontmost window or the named running app's window without activating it.
-        let requestedApp: String? = {
-            guard let raw = body["app"]?.stringValue?
-                .trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
-            return raw
-        }()
+        let requestedApp = body["app"]?.trimmedString
         // Only a caller-named path asks for disk contents. AXDocument names the saved file, which may be older than the live window.
-        let rawPath = body["path"]?.stringValue?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let requestedPath = (rawPath?.isEmpty ?? true) ? nil : rawPath
+        let requestedPath = body["path"]?.trimmedString
         if let path = requestedPath.map(NativeAgentWorkspaceRoot.fileSpelling) {
             do {
             switch try extractDocument(at: path) {
@@ -75,7 +56,7 @@ extension SwiftNativeMacControl {
                         + " have no extractable text and were skipped. Look at those pages to read their pixels.")
                 }
                 Self.attachRedaction(redaction, to: &output)
-                return result(ok: true, output)
+                return reply.result(ok: true, output)
             case .failure(let failure):
                 var evidence: [String: JSONValue] = ["path": .string(path)]
                 if failure == .fileNotFound {
@@ -112,7 +93,7 @@ extension SwiftNativeMacControl {
         }
         let selectedWindow = target.flatMap { accessibilitySource(context: context).windowRoot(pid: $0.processIdentifier, context: context) }
         return await readFromScreen(
-            started: started,
+            reply: reply,
             body: body,
             app: target,
             window: selectedWindow
@@ -150,7 +131,7 @@ extension SwiftNativeMacControl {
     /// Emit only pointer positioning and vertical wheel events, then restore the captured scrollbar value with readback. Without a writable position, return
     /// visible text without scrolling.
     private func readFromScreen(
-        started: Date,
+        reply: MacScreenReadReply,
         body: [String: JSONValue],
         app requestedTarget: MacAXAppInfo?,
         window selectedWindow: MacAXElementRef?,
@@ -158,7 +139,6 @@ extension SwiftNativeMacControl {
     ) async -> MacControlResult {
         let passive = context.observationMode == .passive
         if let refusal = documentReadCoverRefusal(passive: passive) { return refusal }
-        let reply = MacScreenReadReply(started: started, now: now)
         guard accessibilitySource(context: context).isTrusted() else { return axUntrustedResult(action: "read") }
         guard let app = requestedTarget else {
             return reply.refuse("no_window", MacDocumentRead.noWindowWords)
@@ -372,6 +352,7 @@ extension SwiftNativeMacControl {
             }
             if reading.truncationReason == nil && !reading.reachedEnd {
                 do { try await eventSink.send(mouse: MacMouseEvent(phase: .move, button: .left, x: centreX, y: centreY), turn: turn, context: context) }
+                catch is CancellationError { reading.truncationReason = "cancelled" }
                 catch { return reply.refuse("window_motor_unconfirmed", error.localizedDescription) }
             }
             while reading.framesRead < MacDocumentRead.maxFrames {
@@ -384,6 +365,7 @@ extension SwiftNativeMacControl {
                 }
                 // Scrolling down moves content up; retain the same direction convention as act.
                 do { try await eventSink.send(scroll: MacScrollEvent(deltaX: 0, deltaY: -delta, unit: .pixel), turn: turn, context: context) }
+                catch is CancellationError { reading.truncationReason = "cancelled"; break }
                 catch { reading.truncationReason = "window_motor_unconfirmed: " + error.localizedDescription; break }
                 reading.steps += 1
                 await Self.settleForDocumentRead()

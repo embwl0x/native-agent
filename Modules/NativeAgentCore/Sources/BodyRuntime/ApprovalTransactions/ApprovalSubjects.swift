@@ -90,8 +90,8 @@ extension ApprovalExecution {
     }
 
     /// Canon writes require StudioCanonSeatGate and the agent's live turn.
-    public func applyResolvedStudioCanonProposal(from rec: ApprovalRecord, dataRoot requestedRoot: URL? = nil) async {
-        let root = requestedRoot ?? dataRoot
+    public func applyResolvedStudioCanonProposal(from rec: ApprovalRecord) async {
+        let root = dataRoot
         guard rec.action == StudioCanonProposal.approvalAction, rec.status == "resolved", let decision = rec.decision else { return }
         await ApprovalExecutionOwners.perform(rec, inbox: SwiftNativeApprovalInbox(root: root)) {
             let work: String

@@ -21,7 +21,6 @@ public enum OrganismChemistry {
             )
         )
         if next.fatigue > workFatigueCeiling {
-            // Preserve fatigue above the work ceiling from resource pressure.
             next.fatigue = max(state.fatigue, workFatigueCeiling)
         }
         var body = bodySchema
@@ -54,11 +53,6 @@ public enum OrganismChemistry {
             next.urgency = lower(next.urgency, by: 0.08 * i)
         case .deskItemCancelled:
             break
-        case .memoryCommitted:
-            body.memoryIntegrityReading = nil
-            body.memoryHealthy = true
-        case .memoryCorrected:
-            body.memoryIntegrityReading = nil
         case .dreamCompleted, .remIntegrated:
             body.dreamIntegrityReading = nil
             body.dreamHealthy = true
@@ -68,9 +62,6 @@ public enum OrganismChemistry {
         case .iPhoneReachable:
             body.peerPresenceBelief = nil
             body.iPhoneReachable = true
-        case .iPhoneStale:
-            body.peerPresenceBelief = nil
-            body.iPhoneReachable = false
         case .phoneDeliveryStarted:
             body.notificationDeliveryBelief = nil
             body.notificationPathHealthy = nil
@@ -90,16 +81,10 @@ public enum OrganismChemistry {
         case .appSleep:
             body.macAwake = false
         case .horizonRefresh:
-            // Calendar refresh changes horizon rows; anticipation colors only projected chemistry through `OrganismProspectiveAffect.modulate`.
             break
         case .organDeviated:
             // Deviation remains field evidence, not hand pain. Located pain reads failed tool receipts; felt stakes require appraisal.
             break
-        case .resourcePressureChanged:
-            body.resourcePressureReading = nil
-            body.resourcePressure = OrganismResourcePressure.from(metadata: signal.metadata) ?? body.resourcePressure
-            let pressure = pressureMultiplier(body.resourcePressure)
-            next.fatigue = raise(next.fatigue, by: 0.10 * i * pressure)
         }
 
         return (next, body)
@@ -111,14 +96,15 @@ public enum OrganismChemistry {
     }
 
     /// Name tenderness on the body line only within this window of a caring turn.
-    public static let tenderNamedWindow: TimeInterval = 3 * 3_600
+    public static let tenderNamedWindow: TimeInterval = 90 * 60
 
     public static func projection(
         at date: Date,
         chemicalState: ChemicalState,
         bodySchema: BodySchema,
         diurnal: OrganismDiurnalRead? = nil,
-        tenderNamed: Bool = true
+        tenderNamed: Bool = false,
+        prospect: OrganismProspect? = nil
     ) -> OrganismReadout {
         OrganismReadout(
             generatedAt: date,
@@ -130,27 +116,10 @@ public enum OrganismChemistry {
             ),
             chemicalState: chemicalState,
             bodySchema: bodySchema,
-            diurnal: diurnal
+            diurnal: diurnal,
+            prospect: prospect,
+            tenderNamed: tenderNamed
         )
-    }
-
-    public static func integrating(
-        bodySchema nextBody: BodySchema,
-        previous previousBody: BodySchema,
-        into state: ChemicalState
-    ) -> ChemicalState {
-        var next = state
-
-        if nextBody.resourcePressure != previousBody.resourcePressure {
-            let pressure = pressureMultiplier(nextBody.resourcePressure)
-            if nextBody.resourcePressure == .nominal {
-                next.fatigue = lower(next.fatigue, by: 0.06)
-            } else {
-                next.fatigue = raise(next.fatigue, by: 0.06 * pressure)
-            }
-        }
-
-        return next
     }
 
     private static func bodyLine(
@@ -200,7 +169,8 @@ public enum OrganismChemistry {
             felt.append((c.warmth, band(c.warmth, "quietly warm and steady", "warm and steady", "warm and open")))
         }
         if tenderNamed, c.tenderness >= 0.22 {
-            felt.append((c.tenderness, band(c.tenderness, "a soft edge", "tender", "protective and close")))
+            // Tenderness builds a dose at each caring turn, so its words sit a band higher than the others: tender is earned, not reached in an evening.
+            felt.append((c.tenderness, c.tenderness >= 0.75 ? "protective and close" : c.tenderness >= 0.62 ? "tender" : "a soft edge"))
         }
         if c.curiosity >= 0.22 {
             felt.append((c.curiosity, band(c.curiosity, "faintly curious", "curious", "keenly curious")))
@@ -209,7 +179,7 @@ public enum OrganismChemistry {
             felt.append((c.novelty, band(c.novelty, "catching something new", "alert to something new", "lit by something new")))
         }
         if c.agency >= 0.30 {
-            felt.append((c.agency, band(c.agency, "ready to move", "leaning into the work", "driving hard")))
+            felt.append((c.agency, band(c.agency, "ready to move", "able and ready", "sure of what I can do")))
         }
         if c.coherence >= 0.65 && c.confidence >= 0.62 {
             // Only fires at high coherence+confidence, so band() would always pick "high"; grade within the gated range instead.
@@ -276,7 +246,6 @@ public enum OrganismChemistry {
     public static let perSignalFatigueAccrual = 0.0015
     /// Maximum work-fatigue accrual per wall-hour at any traffic density.
     public static let maximumFatigueAccrualPerHour = 0.05
-    /// Work-fatigue ceiling; thermal pressure may exceed it.
     public static let workFatigueCeiling = 0.6
     /// Quiet half-life, slower than generic quick decay and the 90-minute socialWarmth hold.
     public static let fatigueRelaxationHalfLife: TimeInterval = 6 * 3_600
@@ -296,8 +265,6 @@ public enum OrganismChemistry {
             return 2.0
         case .providerFailed:
             return 1.5
-        case .memoryCorrected:
-            return 1.0
         default:
             return 0
         }
@@ -347,15 +314,6 @@ public enum OrganismChemistry {
             return value.clamped01()
         }
         return (value * pow(0.5, elapsed / fatigueRelaxationHalfLife)).clamped01()
-    }
-
-    private static func pressureMultiplier(_ pressure: OrganismResourcePressure) -> Double {
-        switch pressure {
-        case .nominal: return 1.0
-        case .elevated: return 1.25
-        case .high: return 1.6
-        case .critical: return 2.0
-        }
     }
 }
 

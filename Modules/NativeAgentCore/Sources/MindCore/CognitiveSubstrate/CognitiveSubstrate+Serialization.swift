@@ -75,23 +75,17 @@ enum CognitiveArtifactCodec {
             }
             try field("soundRutSignature") { $0.stringValue.map { $0.contains(":") } == true }
             try field("soundRutEarlyRepeatSpent") { if case .bool = $0 { return true }; return false }
-            for key in ["remindedOfSurfaced", "dreamThemeSurfaced", "careReleased"] {
+            try field("feltHistory") {
+                guard case .object(let lines) = $0, lines.count <= CognitiveCapsulePresentationState.feltHistoryCapacity else { return false }
+                return lines.allSatisfy { Int($0.key).map { $0 > 0 } == true && ($0.value.stringValue?.count ?? 241) <= 240 }
+            }
+            for key in ["remindedOfSurfaced", "dreamThemeSurfaced"] {
                 try field(key) {
                     guard case .object(let dates) = $0 else { return false }
                     return dates.allSatisfy { id, date in
-                        let validID = key == "careReleased" ? UUID(uuidString: id) != nil
-                            : key == "dreamThemeSurfaced" ? id.count <= 48 : id.utf8.count <= 120
+                        let validID = key == "dreamThemeSurfaced" ? id.count <= 48 : id.utf8.count <= 120
                         return validID && date.numberValue(coercingStrings: false, finiteOnly: true) != nil
                     }
-                }
-            }
-            try field("careLineRest") {
-                guard case .object(let rests) = $0 else { return false }
-                return rests.allSatisfy { id, value in
-                    guard UUID(uuidString: id) != nil, case .array(let pair) = value, pair.count == 2,
-                          pair[0].numberValue(coercingStrings: false, finiteOnly: true) != nil,
-                          case .int(let turns) = pair[1] else { return false }
-                    return turns > 0 && turns <= Int64(CognitiveSubstrate.careLineRestTurns)
                 }
             }
         case "emotional_consolidation":
@@ -101,9 +95,11 @@ enum CognitiveArtifactCodec {
             }
         case "affect":
             try field("chosenRegister", nullable: true) { CognitiveChosenRegister(payload: $0) != nil }
-            for key in ["arousal", "uncertainty", "taskPressure", "socialWarmth"] {
+            try field("namedFeeling", nullable: true) { CognitiveAffectState.NamedFeeling(payload: $0) != nil }
+            for key in ["arousal", "uncertainty", "taskPressure"] {
                 guard number(object, key, range: 0...1) else { throw FieldFailure(path: family + "." + key) }
             }
+            guard number(object, "socialWarmth", range: -1...1) else { throw FieldFailure(path: family + ".socialWarmth") }
             for key in ["lastUserPresenceAt", "lastWarmPresenceAt"] {
                 try field(key) { $0.numberValue(coercingStrings: false, finiteOnly: true) != nil }
             }
@@ -218,6 +214,7 @@ extension CognitiveAffectState {
             object["lived"] = Int64(exactly: lived).map(JSONValue.int) ?? .string(String(lived))
         }
         if let chosenRegister { object["chosenRegister"] = chosenRegister.payload }
+        if let namedFeeling { object["namedFeeling"] = namedFeeling.payload }
         // These are temporal anchors for the existing analytic quiet-time projection, not a second affect owner. Optional anchors remain absent when no
         // corresponding presence has been observed.
         if let lastUserPresenceAt {
@@ -228,6 +225,21 @@ extension CognitiveAffectState {
         }
         return .object(object)
     }
+}
+
+extension CognitiveAffectState.NamedFeeling {
+    init?(payload: JSONValue) {
+        guard let fields = payload.objectValue,
+              let rawName = fields["name"]?.stringValue, let name = Name(rawValue: rawName),
+              let strength = fields["strength"]?.numberValue(coercingStrings: false, finiteOnly: true),
+              (Self.retentionFloor...0.65).contains(strength),
+              let at = fields["at"]?.numberValue(coercingStrings: false, finiteOnly: true) else { return nil }
+        self.init(name: name, strength: strength, at: Date(timeIntervalSince1970: at))
+    }
+
+    var payload: JSONValue { .object([
+        "name": .string(name.rawValue), "strength": .double(strength), "at": .double(at.timeIntervalSince1970),
+    ]) }
 }
 
 extension CognitiveEpisodeReference {

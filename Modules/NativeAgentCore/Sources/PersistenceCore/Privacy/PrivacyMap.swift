@@ -67,8 +67,9 @@ public struct PrivacyMap: Codable, Hashable, Sendable {
                 """),
             Spec(id: "trust", title: "Trust", relativePath: "trust",
                 detail: "saved trust policy and preserved damaged-policy evidence; backed up and exported; phone receives the policy projection"),
-            Spec(id: "task_ledger", title: "Task Ledger", relativePath: "orchestration",
-                detail: "task ledger events and compaction base; excluded from local backups and phone sync"),
+            Spec(id: "task_ledger", title: "Retired Task Ledger", relativePath: "orchestration", detail: """
+                retained events and compaction base. The task reader and writer are retired. Off-disk backups can copy the bytes. Local backup, export and phone sync exclude them.
+                """),
             Spec(id: "native_actions", title: "Native Actions", relativePath: "native_power/actions",
                 detail: "native action receipts; excluded from local backups and phone sync"),
             Spec(id: "ability_fetches", title: "Ability Request Receipts", relativePath: "ability_fetches", detail: """
@@ -250,7 +251,7 @@ public struct PrivacyMap: Codable, Hashable, Sendable {
                 detail: "optional Doctor scheduling configuration read by DoctorReadout; excluded from local backup, archive inputs and phone sync"),
             Spec(id: "runtime", title: "Runtime Reports", relativePath: "runtime",
                 detail: """
-                    operator-produced hardening report and local runtime state; support copies this tree; \
+                    local runtime state and any leftover retired hardening report; the app no longer decodes the report; support copies this tree; \
                     excluded from local backup and direct phone copy
                     """),
             Spec(id: "release", title: "Release Reports", relativePath: "release",

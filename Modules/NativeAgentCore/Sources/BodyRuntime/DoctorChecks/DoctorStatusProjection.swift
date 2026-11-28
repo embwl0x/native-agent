@@ -3,10 +3,9 @@ import NativeAgentCore
 import PersistenceCore
 import SenseCore
 import NativeAgentShared
-// Blueprint: | `DoctorStatusProjection.swift` | `DoctorReadout`: `healthReadings`, `persistDoctorSnapshot`, `recordReadings`, `repairProjection` |
+// Blueprint: | `DoctorStatusProjection.swift` | `DoctorReadout`: `persistDoctorSnapshot`, `recordReadings`, `repairProjection` |
 
 public enum DoctorReadout {
-    /// A snapshot from another process launch cannot describe this launch's window.
     private static let launchID = UUID().uuidString
 
     public static func repairProjection(_ rows: [CheckResult], dataRoot: URL) async -> [CheckResult] {
@@ -85,96 +84,18 @@ public enum DoctorReadout {
         }
     }
 
-    public static func healthReadings(
-        now: String,
-        cachePath: URL,
-        liveChecks: [CheckResult],
-        runCoreChecks: () async -> [CheckResult]
-    ) async -> (checks: [CheckResult], measuredAt: String) {
-        do {
-            if let cached = try readCachedReadings(at: cachePath) {
-                let liveIDs = Set(liveChecks.map(\.id))
-                return (cached.checks.filter { !liveIDs.contains($0.checkID) } + liveChecks, cached.measuredAt)
-            }
-        } catch {
-            return ([cacheFailure(error, path: cachePath)] + liveChecks, now)
-        }
-        let measuredAt = ISO8601DateFormatter().string(from: Date())
-        let raw = await runCoreChecks()
-        let executable = DoctorSafeRepairPolicy.executableCoreIDs(for: raw)
-        let core = raw.map { $0.settled(liveAvailable: false, coreAvailable: executable.contains($0.id)) }
-        await recordReadings(core, dataRoot: cachePath.deletingLastPathComponent().deletingLastPathComponent())
-        do {
-            try await persistDoctorSnapshot(core, to: cachePath, runAt: now, measuredAt: measuredAt, inPlace: true)
-        } catch {
-            return (core + [cacheFailure(error, path: cachePath)] + liveChecks, measuredAt)
-        }
-        return (core + liveChecks, measuredAt)
-    }
-
-    /// Serialize all latest.json writers under one lock; full runs replace rows and core-only reads update in place. Preserve unmeasured live rows and their
-    /// oldest measuredAt; only a missing file can start fresh.
     public static func persistDoctorSnapshot(
-        _ results: [CheckResult], to path: URL, runAt: String, measuredAt: String, inPlace: Bool = false
+        _ results: [CheckResult], to path: URL, runAt: String, measuredAt: String
     ) async throws {
         try await SwiftNativePersistenceCore.withFileLock(path) {
-            var rows = results
-            var measured = measuredAt
-            if inPlace, FileManager.default.fileExists(atPath: path.path) {
-                let previous = try JSONDecoder().decode(CachedDoctorPayload.self, from: Data(contentsOf: path))
-                if previous.launchID == launchID {
-                    let previousChecks = previous.checks
-                    let fresh = Dictionary(results.map { ($0.checkID, $0) }, uniquingKeysWith: { first, _ in first })
-                    let previousIDs = Set(previousChecks.map(\.checkID))
-                    rows = previousChecks.map { fresh[$0.checkID] ?? $0 } + results.filter { !previousIDs.contains($0.checkID) }
-                    if previousChecks.contains(where: { fresh[$0.checkID] == nil }) {
-                        measured = min(previous.measuredAt, measuredAt)
-                    }
-                }
-            }
-            rows = await repairProjection(rows, dataRoot: path.deletingLastPathComponent().deletingLastPathComponent())
+            let rows = await repairProjection(results, dataRoot: path.deletingLastPathComponent().deletingLastPathComponent())
             let enc = JSONEncoder()
             enc.outputFormatting = [.sortedKeys]
             try await SwiftNativePersistenceCore.writeJSON(.object([
-                "checks": try JSONValue.parse(try enc.encode(rows)), "runAt": .string(runAt), "measuredAt": .string(measured),
+                "checks": try JSONValue.parse(try enc.encode(rows)), "runAt": .string(runAt), "measuredAt": .string(measuredAt),
                 "launchID": .string(launchID),
             ]), to: path)
         }
-    }
-
-    private static func cacheFailure(_ error: Error, path: URL) -> CheckResult {
-        CheckResult(source: path.path, id: "doctor.cache", title: "Saved health readings", status: "fail",
-            detail: "Doctor readings could not be read or published: \(error.localizedDescription)",
-            human_action: ToolFailureError.fileRepairInstruction(
-                path, shape: "Preserve the measured checks and their runAt, measuredAt and launchID; repair the unreadable Doctor snapshot."))
-    }
-
-    private static func readCachedReadings(at path: URL) throws -> (checks: [CheckResult], measuredAt: String)? {
-        let data: Data
-        do { data = try Data(contentsOf: path) }
-        catch CocoaError.fileReadNoSuchFile { return nil }
-        let payload = try JSONDecoder().decode(CachedDoctorPayload.self, from: data)
-        guard !payload.launchID.isEmpty,
-              let runAt = NativeTimestampFormat.parseISO8601FractionalFirst(payload.runAt),
-              NativeTimestampFormat.parseISO8601FractionalFirst(payload.measuredAt) != nil else {
-            throw PersistenceCoreError.ioFailure(
-                "Invalid Doctor snapshot metadata at \(path.path): launchID, runAt and measuredAt must identify the retained measurements.")
-        }
-        guard payload.launchID == launchID else { return nil }
-        let age = Date().timeIntervalSince(runAt)
-        guard age >= 0 else {
-            throw PersistenceCoreError.ioFailure(
-                "Doctor snapshot runAt is in the future at \(path.path); verify the clock and repair its measurement metadata.")
-        }
-        guard age < 60 else { return nil }
-        return (payload.checks, payload.measuredAt)
-    }
-
-    private struct CachedDoctorPayload: Decodable {
-        let checks: [CheckResult]
-        let runAt: String
-        let measuredAt: String
-        let launchID: String
     }
 
     public static func supportSnapshotOfflineRollup(_ checks: [CheckResult]) -> String {

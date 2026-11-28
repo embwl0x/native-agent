@@ -71,16 +71,6 @@ public final class PersonaFacade {
         return try result.get()
     }
 
-    @discardableResult
-    public func saveProfile(_ value: PersonalityProfile) async throws -> (profile: PersonalityProfile, documentsIssue: String?) {
-        let saved = try await owner.savePersonality(value).sharedProfile
-        profileRead.write { profile = saved; profileError = nil; publishSettings() }
-        do {
-            _ = try await loadDocuments()
-            return (saved, nil)
-        } catch { return (saved, error.localizedDescription) }
-    }
-
     public func saveName(_ name: String) async throws -> PersonalityProfile {
         let saved = try await owner.saveName(name)
         profileRead.write { profile = saved; profileError = nil; publishSettings() }

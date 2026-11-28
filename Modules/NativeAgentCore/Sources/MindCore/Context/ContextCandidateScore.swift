@@ -15,6 +15,7 @@ public enum ContextEligibilityReason: String, Codable, Sendable {
     case neverInject = "never_inject"
     case outsideContextScope = "outside_context_scope"
     case expired
+    case notYetValid = "not_yet_valid"
     case staleRuntime = "stale_runtime"
     case secretBearing = "secret_bearing"
 }

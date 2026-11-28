@@ -9,6 +9,7 @@ import MacNerves
 public enum MacChatTurnActivitySource: Sendable, Equatable {
     case toolUse
     case toolResult
+    case unstartedStep(id: String)
     case notice(kind: String)
 }
 
@@ -23,6 +24,7 @@ public struct MacChatTurnActivity: Sendable, Equatable {
     public let occurredAt: Date
     /// The call a use starts or a result ends; results meet their use by this name in arrival order.
     public let callName: String?
+    public let disposition: TurnFace.Step.Disposition?
 }
 
 /// Discard raw input and output before constructing activity; retain only bounded plain labels and exact outcome class.
@@ -40,16 +42,41 @@ public enum MacChatTurnActivityBoundary {
             return toolUse(name: call.name, args: call.input.stringFields, identity: identity, at: instant)
         case .toolResult(let name, let output):
             let reply = ToolResult(output)
+            let disposition: TurnFace.Step.Disposition? = switch (reply.outcome, reply.effects) {
+            case (_, .unknown?): .effectsUnconfirmed
+            case (.cancelled, .occurred?), (.cancelled, .partial?): .effectRecorded
+            case (.cancelled, .none?): .stopped
+            case (.failed, .none?), (.timeout, .none?): .failedWithoutEffect
+            case (.succeeded, .occurred?): .landed
+            case (.unknown, .none?): .noEffect
+            case (.unknown, .occurred?), (.unknown, .partial?): .effectRecorded
+            default: nil
+            }
             return toolResult(
                 name: shown.result(name).name,
                 result: reply.outcome,
                 identity: identity,
-                at: instant
+                at: instant,
+                disposition: unstartedDisposition(reply) ?? disposition
             )
+        case .unstartedStep(let id, let name, let disposition):
+            return MacChatTurnActivity(identity: identity, source: .unstartedStep(id: id), phase: .working,
+                actionSummary: sanitized(ToolActivityPresentation.title(name)), delegateDisplayName: nil,
+                outcome: nil, occurredAt: instant, callName: nil, disposition: disposition)
         case .notice(let kind, let text):
             return notice(kind: kind, text: text, identity: identity, at: instant)
         case .delta, .final, .error, .replyTextSettled, .writing:
             return nil
+        }
+    }
+
+    static func unstartedDisposition(_ reply: ToolResult) -> TurnFace.Step.Disposition? {
+        guard reply.payload.objectValue?["execution"] == .string("not_run"),
+              reply.effects == ToolFailureError.Effects.none else { return nil }
+        return switch reply.payload.objectValue?["reason"] {
+        case .string("person_arrival"), .string("owner_withdrawal"): .withdrawnBeforeStart
+        case .string("cancelled_before_start"): .stoppedBeforeStart
+        default: nil
         }
     }
 
@@ -69,7 +96,8 @@ public enum MacChatTurnActivityBoundary {
             delegateDisplayName: nil,
             outcome: nil,
             occurredAt: instant,
-            callName: nil
+            callName: nil,
+            disposition: nil
         )
     }
 
@@ -88,7 +116,8 @@ public enum MacChatTurnActivityBoundary {
             delegateDisplayName: delegate,
             outcome: nil,
             occurredAt: instant,
-            callName: name
+            callName: name,
+            disposition: nil
         )
     }
 
@@ -98,7 +127,8 @@ public enum MacChatTurnActivityBoundary {
         name: String,
         result: ChatToolOutcome.ExactResultClass,
         identity: MacChatTurnIdentity,
-        at instant: Date
+        at instant: Date,
+        disposition: TurnFace.Step.Disposition? = nil
     ) -> MacChatTurnActivity {
         let outcome: TurnPresentationActivity.Outcome? = switch result {
         case .succeeded: .ok
@@ -114,7 +144,8 @@ public enum MacChatTurnActivityBoundary {
             delegateDisplayName: nil,
             outcome: outcome,
             occurredAt: instant,
-            callName: name
+            callName: name,
+            disposition: disposition
         )
     }
 

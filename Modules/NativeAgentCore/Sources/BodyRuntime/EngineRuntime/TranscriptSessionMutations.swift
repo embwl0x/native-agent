@@ -1,6 +1,5 @@
 import SenseCore
 import Foundation
-import Observation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
@@ -8,6 +7,7 @@ import ProviderRouting
 import MindCore
 import MacNerves
 import Darwin
+import Observation
 // Blueprint: | `TranscriptSessionMutations.swift` | Canonical session creation, archive and generation-checked clearing |
 extension TranscriptsFacade {
     @concurrent public nonisolated func create(title: String, sourceKey: String? = nil) async throws -> NativeAgentShared.ChatSession {
@@ -27,7 +27,7 @@ extension TranscriptsFacade {
         ]
         if let sourceKey, !sourceKey.isEmpty { sessionRow["sourceKey"] = .string(sourceKey) }
         let rowToInsert = sessionRow
-        let sessionsPath = self.sessionsPath
+        let sessionsPath = DataRootPaths.chatSessionIndex(in: self.dataRoot)
         try await SwiftNativePersistenceCore.withFileLock(sessionsPath) {
             var sessions = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
             sessions.insert(rowToInsert, at: 0)
@@ -41,16 +41,12 @@ extension TranscriptsFacade {
         }
         return try NativeAgentShared.ChatSession(row: sessionRow)
     }
-    @concurrent public nonisolated func update(id: String, title: String?, archived: Bool?) async throws -> NativeAgentShared.ChatSession {
-        let sessionsPath = self.sessionsPath
-        let nowIso = ISO8601DateFormatter().string(from: Date())
+    @concurrent public nonisolated func update(id: String, title: String?) async throws -> NativeAgentShared.ChatSession {
+        let sessionsPath = DataRootPaths.chatSessionIndex(in: dataRoot)
         let updated: [String: JSONValue]? = try await ChatSessionIndexFile.mutate(at: sessionsPath) { sessions in
             guard let idx = sessions.firstIndex(where: { $0["id"] == .string(id) }) else { return nil }
             var row = sessions[idx]
             if let title { row["title"] = .string(title) }
-            if let archived { row["archived"] = .bool(archived) }
-            // Renames do not change speech time; only archive flips bump the index stamp.
-            if archived != nil { row["updatedAt"] = .string(nowIso) }
             sessions[idx] = row
             return row
         }
@@ -74,11 +70,11 @@ extension TranscriptsFacade {
                 userInfo: [NSLocalizedDescriptionKey: "Cannot clear chat messages: invalid chat session id"]
             )
         }
-        let messagesPath = chatRoot
+        let messagesPath = DataRootPaths.chatDirectory(in: dataRoot)
             .appendingPathComponent("messages", isDirectory: true)
             .appendingPathComponent("\(safeSessionId).jsonl")
-        let sessionsPath = self.sessionsPath
-        let usagePath = chatRoot
+        let sessionsPath = DataRootPaths.chatSessionIndex(in: dataRoot)
+        let usagePath = DataRootPaths.chatDirectory(in: dataRoot)
             .appendingPathComponent("session_state", isDirectory: true)
             .appendingPathComponent(safeSessionId, isDirectory: true)
             .appendingPathComponent("provider_usage.json")
@@ -104,42 +100,46 @@ extension TranscriptsFacade {
             return usage
         }
         await publishClearedTranscript(safeSessionId)
-        do {
-            if let usageBeforeClear {
-                let invalidated = try await SwiftNativePersistenceCore.withFileLock(usagePath) {
-                    let current: Data
-                    do {
-                        current = try Data(contentsOf: usagePath)
-                    } catch CocoaError.fileReadNoSuchFile {
-                        return false
+        let saved: Result<Void, Error> = await settle {
+            do {
+                if let usageBeforeClear {
+                    let invalidated = try await SwiftNativePersistenceCore.withFileLock(usagePath) {
+                        let current: Data
+                        do {
+                            current = try Data(contentsOf: usagePath)
+                        } catch CocoaError.fileReadNoSuchFile {
+                            return false
+                        }
+                        // Concurrent provider calls own their replacement receipts.
+                        guard current == usageBeforeClear else { return false }
+                        try FileManager.default.removeItem(at: usagePath)
+                        return true
                     }
-                    // Concurrent provider calls own their replacement receipts.
-                    guard current == usageBeforeClear else { return false }
-                    try FileManager.default.removeItem(at: usagePath)
-                    return true
-                }
-                if invalidated {
-                    await MainActor.run {
-                        NotificationCenter.default.post(LLMCallTraceRecorder.SessionUsageDidChange(sessionID: safeSessionId),
-                                                        subject: safeSessionId as NSString)
+                    if invalidated {
+                        await MainActor.run {
+                            NotificationCenter.default.post(LLMCallTraceRecorder.SessionUsageDidChange(sessionID: safeSessionId),
+                                                            subject: safeSessionId as NSString)
+                        }
                     }
                 }
+                try await ChatSessionIndexFile.mutate(at: sessionsPath) { rows in
+                    // A concurrent append owns its new index projection; never zero its preview.
+                    guard try messagesPath.resourceValues(forKeys: [.fileSizeKey]).fileSize == 0,
+                          let index = rows.firstIndex(where: { $0["id"] == .string(safeSessionId) })
+                    else { return }
+                    rows[index]["messageCount"] = .int(0)
+                    rows[index]["firstMessageAt"] = .null
+                    rows[index]["lastMessageAt"] = .null
+                    rows[index]["lastMessagePreview"] = .null
+                    rows[index]["updatedAt"] = .string(ISO8601DateFormatter().string(from: Date()))
+                    // Only a newer generation authorizes remote clearing; wall time cannot prove it.
+                    ChatSessionIndexFile.bumpTranscriptGeneration(in: &rows[index])
+                }
+                return .success(())
+            } catch {
+                return .failure(ChatMessageClearError.transcriptClearedMetadataNotSaved(error.localizedDescription))
             }
-            try await ChatSessionIndexFile.mutate(at: sessionsPath) { rows in
-                // A concurrent append owns its new index projection; never zero its preview.
-                guard try messagesPath.resourceValues(forKeys: [.fileSizeKey]).fileSize == 0,
-                      let index = rows.firstIndex(where: { $0["id"] == .string(safeSessionId) })
-                else { return }
-                rows[index]["messageCount"] = .int(0)
-                rows[index]["firstMessageAt"] = .null
-                rows[index]["lastMessageAt"] = .null
-                rows[index]["lastMessagePreview"] = .null
-                rows[index]["updatedAt"] = .string(ISO8601DateFormatter().string(from: Date()))
-                // Only a newer generation authorizes remote clearing; wall time cannot prove it.
-                ChatSessionIndexFile.bumpTranscriptGeneration(in: &rows[index])
-            }
-        } catch {
-            throw ChatMessageClearError.transcriptClearedMetadataNotSaved(error.localizedDescription)
         }
+        try saved.get()
     }
 }

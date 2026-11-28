@@ -14,7 +14,6 @@ public actor ApprovalsFacade {
     private var records: [ApprovalRecord] = []
     private var refreshErrorText: String?
     private var hasLoadedSnapshot = false
-    private var readsInFlight: Set<UUID> = []
     private let latest = LatestRead()
     private var observers: [UUID: AsyncStream<Void>.Continuation] = [:]
     private var resolutionTasks: [String: Task<ApprovalRecord, Error>] = [:]
@@ -35,9 +34,6 @@ public actor ApprovalsFacade {
 
     /// Return this read; only forward publication replaces shared rows.
     public func list() async throws -> [ApprovalRecord] {
-        let readID = UUID()
-        readsInFlight.insert(readID)
-        await publishFace()
         var changed = false
         let result: Result<[ApprovalRecord], Error> = await latest.read({
             do { return .success(try await inbox.list(filter: .all)) }
@@ -56,7 +52,6 @@ public actor ApprovalsFacade {
                 refreshErrorText = detail
             }
         })
-        readsInFlight.remove(readID)
         await publishFace()
         if changed { signalChange() }
         return try result.get()
@@ -94,12 +89,8 @@ public actor ApprovalsFacade {
 
     private func publishFace() async {
         let value = ApprovalsFace(
-            rows: Dictionary(records.map {
-                ($0.id, ApprovalsFace.Row(id: $0.id, title: NativeAppSecretRedactor.redactText($0.title), status: $0.status))
-            }, uniquingKeysWith: { first, _ in first }),
             waitingCount: hasLoadedSnapshot ? WorkOverviewRead.waitingApprovals(records).count : nil,
-            hasLoadedSnapshot: hasLoadedSnapshot, error: refreshErrorText.map(NativeAppSecretRedactor.redactText),
-            isRefreshing: !readsInFlight.isEmpty
+            error: refreshErrorText.map(NativeAppSecretRedactor.redactText)
         )
         await counts.updateApprovals(value)
     }

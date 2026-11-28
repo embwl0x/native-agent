@@ -486,15 +486,13 @@ function face(input) {
         packed(live.map(itemRow).concat(byDay("marks:", marks.filter(terminal))), 256).forEach((rows, index) => sections.push({
             id: index ? "my-marks-" + index : "my-marks", title: index ? "My own upkeep, older" : title, style: "list", rows, folded: true}));
     }
+    const sectionLimit = 64;
+    sections.length = Math.min(sections.length, input.table ? sectionLimit - 1 : sectionLimit);
     if (input.table) {
         const t = input.table, key = "piece:" + t.ref;
-        if (sections.length >= 64) sections.pop();
         const layTable = (section, at = tablePosition) => sections.splice(selected === null ? at : sections.length, 0, section);
         if (t.reason) layTable({id: key, title: "The table", style: "note", rows: [{id: key, title: t.reason, tone: "attention"}]});
         else {
-            const boundary = t.source_boundary ? t.source_boundary + "\n" : "";
-            const reading = utf8Fit(boundary + "The table, version " + t.version + ". Elements and live facts:\n"
-                + t.elements.map(e => JSON.stringify(e)).join("\n"), 16 * 1024 - 160);
             const tools = sections.find(section => section.id === "desk-tools");
             if (tools) tools.rows.push({id: key, title: "Pop out the table", actions: keyActions(key, () => "Pop out the table")});
             const live = input.items.filter(item => !terminal(item)), seen = new Set();
@@ -509,10 +507,11 @@ function face(input) {
             layTable({id: key, title: "The table", ...(empty ? {folded: true} : {}),
                 block: {kind: "leaf", key, leaf: "board", ref: t.ref, revision: t.version,
                 cards: Object.fromEntries(t.card_pairs), choices,
-                alt: reading.text + "\nRaw points: make.read {ref:\"table\"} gives the file path." + (reading.cut
-                    ? "\nReading cut; make.read {ref:" + JSON.stringify(t.ref) + "} gives the complete board file." : "")}},
+                alt: t.reading}},
                 empty ? afterLivePosition : tablePosition);
         }
+        if (t.slice && sections.length < sectionLimit) sections.splice(1, 0, {id: "selected-table-slice", title: "This item on the table",
+            block: {kind: "leaf", key: "selected-table-slice", leaf: "table_slice", ref: t.ref, ids: t.slice.ids, alt: t.slice.reading}});
     }
     // What the Desk has open, for the ask bar and the agent's page read. A title is one line there, so its line breaks become spaces.
     const opened = selected !== null && selected.kind === "item" && selected.found

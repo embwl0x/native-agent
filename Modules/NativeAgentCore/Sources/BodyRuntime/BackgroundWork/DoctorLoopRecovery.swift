@@ -8,30 +8,51 @@ import PersistenceCore
 public enum DoctorLoopRecovery {
     public static let checkPrefix = "live.background_loop."
 
+    struct RegistrationReading: Sendable {
+        let statuses: [LoopStatus]
+        let managerRunning: Bool
+        let configured: [String: LoopRegistration]
+        let checkedAt: Date
+    }
+
+    static func readRegistrations(manager: SenseCore.BackgroundLoopLifetimes) async -> RegistrationReading {
+        let statuses = await manager.status()
+        let managerRunning = await manager.isRunning()
+        let configured = await manager.configuredLoops()
+        return RegistrationReading(statuses: statuses, managerRunning: managerRunning, configured: configured, checkedAt: Date())
+    }
+
     public static func checks(
         manager: SenseCore.BackgroundLoopLifetimes,
         dataRoot: URL,
         friendlyLoopName: (String) -> String
     ) async -> [CheckResult] {
-        let statuses = await manager.status()
-        let managerRunning = await manager.isRunning()
-        let configured = await manager.configuredLoops()
-        let byID = Dictionary(uniqueKeysWithValues: statuses.map { ($0.name, $0) })
-        let now = Date()
+        let reading = await readRegistrations(manager: manager)
         let receipts: [String: [DoctorLoopHealth.FailureIncident]]
         do {
             receipts = try await DoctorLoopHealth.recentFailureDates(dataRoot: dataRoot)
         } catch {
-            return [CheckResult(source: "Loop failure details", id: DoctorLoopHealth.doctorCheckID,
-                title: "Background Loops", status: "unmeasured",
-                detail: "Loop failure history is unavailable: \(error.localizedDescription)",
-                human_action: "Preserve and repair the background loop failure ledger, then run Doctor again.")]
+            return [failureHistoryUnavailable(error)]
         }
-        let verdicts = DoctorLoopHealth.evaluate(
-            observations: statuses,
-            recentFailureDates: receipts,
-            now: now
-        )
+        return await checks(reading: reading, receipts: receipts, dataRoot: dataRoot, friendlyLoopName: friendlyLoopName)
+    }
+
+    static func failureHistoryUnavailable(_ error: any Error) -> CheckResult {
+        CheckResult(source: "Loop failure details", id: DoctorLoopHealth.doctorCheckID,
+            title: "Background Loops", status: "unmeasured",
+            detail: "Loop failure history is unavailable: \(error.localizedDescription)",
+            human_action: "Preserve and repair the background loop failure ledger, then run Doctor again.")
+    }
+
+    static func checks(
+        reading: RegistrationReading,
+        receipts: [String: [DoctorLoopHealth.FailureIncident]],
+        dataRoot: URL,
+        friendlyLoopName: (String) -> String
+    ) async -> [CheckResult] {
+        let configured = reading.configured
+        let byID = Dictionary(uniqueKeysWithValues: reading.statuses.map { ($0.name, $0) })
+        let verdicts = DoctorLoopHealth.evaluate(observations: reading.statuses, recentFailureDates: receipts, now: reading.checkedAt)
         let verdictByID = Dictionary(uniqueKeysWithValues: verdicts.map { ($0.loopId, $0) })
         let loopIDs = Set(configured.keys).union(byID.keys)
         var pending: Set<String> = []
@@ -85,7 +106,7 @@ public enum DoctorLoopRecovery {
                 + NativeAppSecretRedactor.redactText(String(state.prefix(700))) + lastFailure + "."
             let failure = [status?.lastError, status?.lastResult].compactMap { $0 }.joined(separator: " ")
             let action = MaintenanceBackgroundWork.loopSettingFix(loopId: id, error: failure)
-            let missingRegistration = !off && managerRunning && configured[id] != nil && status?.running != true
+            let missingRegistration = !off && reading.managerRunning && configured[id] != nil && status?.running != true
             // Offline state has no faulty owner; unexplained persistent failure belongs to the loop’s code.
             let offline = ["network", "offline", "timed out", "not connected to the internet"].contains { failure.lowercased().contains($0) }
             let durable = missingRegistration || (level.isFault && action?.ask != nil) || (level == .fail && !offline)
@@ -107,7 +128,6 @@ public enum DoctorLoopRecovery {
     public static func repair(
         checkID: String,
         manager: SenseCore.BackgroundLoopLifetimes,
-        dataRoot: URL,
         restart: @escaping @Sendable (String) async -> LoopRestartOutcome
     ) async -> DoctorExecutableRepair? {
         guard checkID.hasPrefix(checkPrefix) else { return nil }

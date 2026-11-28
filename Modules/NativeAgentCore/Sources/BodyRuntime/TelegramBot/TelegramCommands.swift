@@ -211,7 +211,7 @@ extension SwiftNativeTelegramBot {
             let store = TelegramSessionStore(dataRoot: dataRoot)
             let persona = args.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
             if persona.isEmpty {
-                let current = try await store.persona(destination: destination) ?? "NativeAgent"
+                let current = store.persona() ?? "NativeAgent"
                 return "Persona: \(current)"
             }
             let saved = try await store.setPersona(destination: destination, persona: persona)

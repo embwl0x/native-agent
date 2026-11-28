@@ -132,7 +132,9 @@ extension SwiftToolDispatcher {
         for (rank, ent) in results.filter(passesFilters).prefix(limit * 3).enumerated() {
             guard let id = ent.objectValue?["id"]?.stringValue else { continue }
             if entities[id] == nil { order.append(id); entities[id] = ent }
-            fused[id, default: 0] += 1.0 / (60.0 + Double(rank))
+            // Only a memory fact can also be a meaning hit; a named entity has this one lane, so its rank counts for both.
+            let lanes = id.hasPrefix("memfact_") ? 1.0 : 2.0
+            fused[id, default: 0] += lanes / (60.0 + Double(rank))
             via[id, default: []].append("text")
         }
         var meaningSearch = "ok"

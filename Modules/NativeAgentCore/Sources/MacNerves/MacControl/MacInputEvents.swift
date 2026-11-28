@@ -179,54 +179,6 @@ public struct CGEventSink: MacEventSink {
         return cg
     }
 
-    package func postNative(_ event: CGEvent, context: MacOperationContext) async throws {
-        switch event.type {
-        case .keyDown:
-            try await requirePersonKeyboardFree()
-            guard emitTrackedNative(event, context: context) else {
-                throw PersonOnlyWindows.MotorFailure(detail: "Key emission was refused; no key was posted.")
-            }
-        case .mouseMoved, .leftMouseDown, .rightMouseDown, .otherMouseDown,
-             .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .leftMouseUp, .rightMouseUp, .otherMouseUp, .scrollWheel:
-            try await PersonOnlyWindows.withAgentPointer(at: event.location) { connections in
-                try await MacInputRouting.post(connections: connections) {
-                    emitTrackedNative(event, context: context)
-                }
-            }
-        default: emitTrackedNative(event, context: context)
-        }
-    }
-
-    @discardableResult private func emitTrackedNative(_ event: CGEvent, context: MacOperationContext) -> Bool {
-        guard emitNative(event, context: context) else { return false }
-        guard let binding = context.driver else { return true }
-        let button: MacMouseButton
-        switch event.type {
-        case .keyDown, .keyUp:
-            let code = UInt16(clamping: event.getIntegerValueField(.keyboardEventKeycode))
-            let key = "key:\(code)"
-            if event.type == .keyDown {
-                binding.held(key, context: context, release: { [context = context.with(\.driver, nil)] in
-                    guard let release = self.keyEvent(.init(keyCode: code, down: false)) else { return false }
-                    return self.emitNative(release, context: context)
-                })
-            } else { binding.held(key, context: context, release: nil) }
-            return true
-        case .leftMouseDown, .leftMouseUp: button = .left
-        case .rightMouseDown, .rightMouseUp: button = .right
-        default: return true
-        }
-        let key = "mouse:\(button)"
-        if event.type == .leftMouseDown || event.type == .rightMouseDown {
-            let point = event.location
-            binding.held(key, context: context, release: { [context = context.with(\.driver, nil)] in
-                guard let release = self.mouseEvent(.init(phase: .up, button: button, x: point.x, y: point.y)) else { return false }
-                return self.emitNative(release, context: context)
-            })
-        } else { binding.held(key, context: context, release: nil) }
-        return true
-    }
-
     @discardableResult private func emitNative(_ event: CGEvent, context: MacOperationContext) -> Bool {
         switch event.type {
         case .keyUp, .leftMouseUp, .rightMouseUp, .otherMouseUp: break

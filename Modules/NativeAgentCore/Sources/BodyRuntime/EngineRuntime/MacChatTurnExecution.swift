@@ -5,11 +5,10 @@ import NativeAgentCore
 @_exported import NativeAgentShared
 import ProviderRouting
 import PersistenceCore
-import CloudKit
-import Observation
 import MacNerves
 import DeskCore
-@unsafe @preconcurrency import EventKit
+import CloudKit
+import Observation
 import Synchronization
 import os
 import OSLog
@@ -397,10 +396,14 @@ public extension NativeAgentEngine {
         let envelope: TurnEnvelope?
         if let parent { envelope = parent.envelope }
         else { envelope = .personOnMac("mac_ui:chat.regenerate") }
+        let currentAsk = parent.map { turn in
+            let steering = PeerDataTaint.carried(turn: turn, surface: "chat")
+            return turn.with(\.peerSteering, PeerDataTaint(dataRoot: turn.dataRoot, restoring: steering.sources, elevated: steering.elevated))
+        }
         var retryTurn = TurnRequest(message: priorText, sessionID: sessionId, surface: "chat",
             envelope: .some(envelope), origin: .some(retrySnapshot.priorUserOrigin),
             replacementAssistantMessageID: .some(isSyntheticNotice ? nil : target.id))
-            .turn(dataRoot: dataRoot, id: lifecycleIdentity.turnId, parent: parent)
+            .turn(dataRoot: dataRoot, id: lifecycleIdentity.turnId, parent: currentAsk)
         if let renderer { retryTurn[FacePresentationPart.self] = renderer }
         retryTurn.rows.replacementUserMessageID = retrySnapshot.userRowPersisted ? retrySnapshot.priorUserMessageId : nil
         // A retry's question is already in the transcript under its original run: the checkpoint carries it as input, so an

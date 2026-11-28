@@ -232,6 +232,7 @@ extension ToolsFacade {
         // The person at the Telegram door is its owner (`TelegramBotConfig.ownerUserId`); another allowed sender's tap is an ask, as the
         // agent's own call is, and a card, which only the person answers, refuses it. With no single owner Telegram carries no person's act.
         var decided = tap.decided
+        var isPersonTap = true
         if tap.door == "telegram" {
             let owner = try TelegramConfig.loadSavedConfiguration(dataRoot: dataRoot, resolveCredential: false)?.ownerUserId
             if owner == nil || tap.device != owner.map(String.init) {
@@ -242,11 +243,13 @@ extension ToolsFacade {
                         : "Only the person answers this card. Nothing changed.")
                 }
                 decided = false
+                isPersonTap = false
             }
         }
         let act = decided ? PersonAct(by: .tap(door: tap.door, device: tap.device, chat: tap.chat, page: tap.page, row: tap.row),
             tool: "app", input: input) : nil
         var turn = Turn(dataRoot: dataRoot, session: Happening.stream).with(\.verifiedSessionID, Happening.stream).with(\.personAct, act)
+        if isPersonTap { turn.abilityRunSource = .personTap }
         turn[FacePresentationPart.self] = tap.renderer
         turn.personEditOf = personEditOf
         let readOnly = try AppActionBinding.action(input: input, turn: turn)?.read == true
@@ -308,9 +311,9 @@ extension ToolsFacade {
         }
     }
 
-    public nonisolated func loadManifest(detail: String? = nil, turn: Turn? = nil) async throws -> JSONValue {
-        // A standalone native catalog read is its ingress; invoked reads keep their caller's turn.
-        let turn = turn ?? Turn(dataRoot: dataRoot).with(\.envelope, .personOnMac("mac_ui:tools.catalog"))
+    public nonisolated func loadManifest(detail: String? = nil) async throws -> JSONValue {
+        // A standalone native catalog read is its ingress.
+        let turn = Turn(dataRoot: dataRoot).with(\.envelope, .personOnMac("mac_ui:tools.catalog"))
         return try await rootEngine().toolDispatchClient().toolManifest(detail: detail, turn: turn)
     }
 

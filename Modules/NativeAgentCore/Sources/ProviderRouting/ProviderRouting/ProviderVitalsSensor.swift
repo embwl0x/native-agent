@@ -7,7 +7,7 @@ import NativeAgentShared
 
 // MARK: - INTEROCEPTION: provider vitals sensor
 // Observe lifecycle evidence passively: no provider calls or turn-path I/O. Update bounded in-memory latency/error EMAs and emit only band changes;
-// persistence is explicitly off-turn. Missing output timings stay unknown.
+// persistence is explicitly off-turn.
 
 public enum ProviderVitalsBand: Int, Sendable, Codable, Equatable, Comparable, CaseIterable {
     case nominal = 0
@@ -33,32 +33,23 @@ public enum ProviderVitalsDirection: String, Sendable, Codable, Equatable {
     case recovering
 }
 
-/// Cancellation is not provider ill-health; lifecycle samples omit throughput when it was not measured.
+/// Only successful and failed calls contribute samples.
 public struct ProviderVitalsSample: Sendable, Equatable {
     public var providerId: String
     public var occurredAt: Date
     public var durationMs: Double?
-    public var ttftMs: Double?
-    public var tokensPerSec: Double?
     public var isError: Bool
-    public var isCancelled: Bool
 
     public init(
         providerId: String,
         occurredAt: Date,
         durationMs: Double? = nil,
-        ttftMs: Double? = nil,
-        tokensPerSec: Double? = nil,
-        isError: Bool,
-        isCancelled: Bool = false
+        isError: Bool
     ) {
         self.providerId = providerId
         self.occurredAt = occurredAt
         self.durationMs = durationMs
-        self.ttftMs = ttftMs
-        self.tokensPerSec = tokensPerSec
         self.isError = isError
-        self.isCancelled = isCancelled
     }
 }
 
@@ -111,8 +102,6 @@ public actor ProviderVitalsSensor {
         var band: ProviderVitalsBand = .nominal
         var emaLatencyMs: Double?
         var baselineLatencyMs: Double?
-        var emaTTFTMs: Double?
-        var emaTokensPerSec: Double?
         var emaErrorRate: Double = 0
         var consecutiveFailures: Int = 0
         var sampleCount: Int = 0
@@ -151,13 +140,10 @@ public actor ProviderVitalsSensor {
         case .succeeded, .failed:
             let started = takeStart(id: event.id)
             let duration = started.map { max(0, event.occurredAt.timeIntervalSince($0) * 1000) }
-            let ttft = event.firstOutputMs.map(Double.init)
             let sample = ProviderVitalsSample(
                 providerId: event.providerId,
                 occurredAt: event.occurredAt,
                 durationMs: duration,
-                ttftMs: ttft,
-                tokensPerSec: nil,
                 isError: event.phase == .failed
             )
             return observe(sample: sample)
@@ -167,7 +153,6 @@ public actor ProviderVitalsSensor {
     /// One sample performs one bounded in-memory EMA/band update.
     @discardableResult
     public func observe(sample: ProviderVitalsSample) -> ProviderVitalsTransition? {
-        guard !sample.isCancelled else { return nil }
         let key = normalizedProviderId(sample.providerId)
         guard !key.isEmpty else { return nil }
         var state = states[key] ?? State()
@@ -176,12 +161,6 @@ public actor ProviderVitalsSensor {
         // Resolve this sample's band before deciding whether it may teach the slow baseline.
         if let duration = sample.durationMs {
             state.emaLatencyMs = ema(state.emaLatencyMs, duration, alpha: Self.fastAlpha)
-        }
-        if let ttft = sample.ttftMs {
-            state.emaTTFTMs = ema(state.emaTTFTMs, ttft, alpha: Self.fastAlpha)
-        }
-        if let tps = sample.tokensPerSec {
-            state.emaTokensPerSec = ema(state.emaTokensPerSec, tps, alpha: Self.fastAlpha)
         }
         let errorPoint = sample.isError ? 1.0 : 0.0
         state.emaErrorRate = ema(state.emaErrorRate, errorPoint, alpha: Self.fastAlpha) ?? errorPoint
@@ -246,8 +225,6 @@ public actor ProviderVitalsSensor {
             ]
             if let l = state.emaLatencyMs { obj["emaLatencyMs"] = .double(l) }
             if let b = state.baselineLatencyMs { obj["baselineLatencyMs"] = .double(b) }
-            if let t = state.emaTTFTMs { obj["emaTTFTMs"] = .double(t) }
-            if let tps = state.emaTokensPerSec { obj["emaTokensPerSec"] = .double(tps) }
             if let date = state.lastSampleAt { obj["lastSampleAt"] = .string(NativeTimestampFormat.plainZulu(date)) }
             providers[key] = .object(obj)
         }
@@ -302,17 +279,13 @@ public actor ProviderVitalsSensor {
                 continue
             }
             guard let latency = Self.optionalNonnegativeNumber(row["emaLatencyMs"]),
-                  let baseline = Self.optionalNonnegativeNumber(row["baselineLatencyMs"]),
-                  let ttft = Self.optionalNonnegativeNumber(row["emaTTFTMs"]),
-                  let tokensPerSec = Self.optionalNonnegativeNumber(row["emaTokensPerSec"]) else {
+                  let baseline = Self.optionalNonnegativeNumber(row["baselineLatencyMs"]) else {
                 continue
             }
             var state = State()
             state.band = band
             state.emaLatencyMs = latency
             state.baselineLatencyMs = baseline
-            state.emaTTFTMs = ttft
-            state.emaTokensPerSec = tokensPerSec
             state.emaErrorRate = errorRate
             state.consecutiveFailures = failures
             state.sampleCount = samples

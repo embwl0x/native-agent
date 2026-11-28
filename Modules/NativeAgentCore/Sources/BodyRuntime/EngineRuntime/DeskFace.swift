@@ -33,32 +33,40 @@ extension NativeAgentEngine {
         catch { contactsIssue = "Contacts could not be read: " + error.localizedDescription }
         do { answers = try await inboxAnswers() }
         catch { inboxIssue = "Answers could not be read: " + error.localizedDescription }
+        var readingSources: [String: [String]] = [:]
         var facts = deskFacts(snapshot, pieces: pieces, liveError: state.liveError, scheduleError: state.scheduleError,
                               scheduleRead: state.scheduleRead, scheduleCurrent: state.scheduleCurrent,
-                              contactsIssue: contactsIssue, inboxIssue: inboxIssue)
+                              contactsIssue: contactsIssue, inboxIssue: inboxIssue, readingSources: &readingSources)
         facts["night"] = .object(await nextNightReading())
-        facts["table"] = pieces.standingTable(snapshot.board?.deskState?.items, dataRoot: dataRoot)
-        facts["selected"] = deskSelectedFacts(snapshot, selected: state.selected, pieces: pieces)
+        facts["selected"] = deskSelectedFacts(snapshot, selected: state.selected, pieces: pieces, readingSources: &readingSources)
         facts["keys"] = deskKeys(snapshot, selected: state.selected)
         // A contact is shown by name. A row's words (its title and summary) may hold `peer:<id>`, written when the work was filed; the page
         // reads the name the contact has now. Ids, handles and calls keep the identifier.
         if !names.isEmpty { facts = facts.mapValues { Self.named($0, names) } }
+        let selection = facts["selected"]?.objectValue
+        let selectedItem = selection?["found"] == .bool(true) ? selection?["handle"]?.stringValue : nil
+        facts["table"] = pieces.standingTable(snapshot.board?.deskState?.items, dataRoot: dataRoot, displayNames: names, selectedItem: selectedItem)
         // The board revision orders reads; a selection or a clock edge changes the facts at one revision, and the face is drawn again.
         // A row that needs the person carries its Inbox row's own answers; unread answers carry their cause in the packet.
         let levers = deskLevers(snapshot, selected: state.selected, answers: answers)
-        return PartFaces.Packet(facts: .object(facts), epoch: board.revision, levers: levers.page, keyLevers: levers.keyed)
+        return PartFaces.Packet(facts: .object(facts), epoch: board.revision, levers: levers.page, keyLevers: levers.keyed,
+                                readingSources: readingSources)
     }
 
     /// The Desk item a page read names, found by the resolver every Desk call uses (desk.N, its handle or its exact title); nil when it names
     /// none. Several items sharing the title is the resolver's own refusal.
     @concurrent func deskItemHandle(_ named: String) async throws -> String? {
+        if named.hasPrefix("execution:") {
+            let id = String(named.dropFirst("execution:".count))
+            return try AgentJobStore(dataRoot: dataRoot).jobs().contains { $0.id == id } ? named : nil
+        }
         let state = try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState()
         return try state.matching(named).first?.handle
     }
 
     /// `app {page:"desk", item}`: the Desk face as it draws with that item opened (its rows and actions, its steps' board, its pieces,
     /// the person's Veto riding its row), drawn by the Desk's own part from a packet opened on the item.
-    @concurrent func deskItemFace(_ named: String) async throws -> PartFace {
+    @concurrent func deskItemFace(_ named: String) async throws -> (face: PartFace, sources: [String: [String]]) {
         guard let handle = try await deskItemHandle(named) else {
             throw PartCallError(code: "item_unavailable",
                 message: "No Desk item is named \(named). Name it as the Desk does: desk.<number>, its handle or its exact title.")
@@ -75,7 +83,7 @@ extension NativeAgentEngine {
             let drawn = PartFaceSnapshot(part: Self.deskPart, version: version, sourceEpoch: packet.epoch, status: .ready, face: bound,
                                          error: nil, owed: packet.owed, levers: packet.levers, keyLevers: packet.keyLevers).drawnFace
             guard let drawn else { throw PartCallError(code: "bad_face", message: "The Desk's opened item drew no face.") }
-            return drawn
+            return (drawn, packet.readingSources)
         }
     }
 
@@ -287,7 +295,8 @@ extension NativeAgentEngine {
 
     /// The Desk's measured facts: the board's items with what groups them, live activity, the overview, work lines, timers and named gaps.
     private func deskFacts(_ snapshot: DeskPageSnapshot, pieces: DeskPieceShelf, liveError: String?, scheduleError: String?,
-                           scheduleRead: Bool, scheduleCurrent: Bool, contactsIssue: String?, inboxIssue: String?) -> [String: JSONValue] {
+                           scheduleRead: Bool, scheduleCurrent: Bool, contactsIssue: String?, inboxIssue: String?,
+                           readingSources: inout [String: [String]]) -> [String: JSONValue] {
         let now = snapshot.now
         let evidence = DeskMovementPresentation.evidence(snapshot.agentJobs.items)
         let studio = MakeStudio(dataRoot: dataRoot)
@@ -334,6 +343,10 @@ extension NativeAgentEngine {
         } ?? .null
         let jobs: [JSONValue] = snapshot.agentJobs.items.map { job -> JSONValue in
             let row = WorkOverviewRead.row(for: job)
+            if job.state.isTerminal, !row.summary.isEmpty {
+                let sources = job.reportSources
+                if !sources.isEmpty { readingSources[row.id] = sources }
+            }
             return .object(["id": .string(row.id), "title": .string(row.title), "summary": .string(row.summary),
                             "state": .string(row.stateLabel(at: now)), "at": .string(row.updatedAt),
                             "terminal": .bool(job.state.isTerminal), "needsYou": .bool(job.state == .needsYou)])

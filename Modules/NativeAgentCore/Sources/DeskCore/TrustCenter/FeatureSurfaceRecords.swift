@@ -183,7 +183,7 @@ public func featureSurfaceRecords(nowISO: String) -> [FeatureSurfaceRecord] {
         FeatureSurfaceRecord(
             sourceId: "trust_doctor",
             name: "Trust and Doctor",
-            description: "Policy simulation, backups, provider repair, SearXNG autodetect, OAuth browser login, support diagnostics, and release checks.",
+            description: "Policy simulation, backups, provider repair, SearXNG autodetect, OAuth browser login, and support diagnostics.",
             triggers: ["doctor", "repair", "safe", "permission", "trust", "backup", "oauth"],
             permissions: [],
             riskClass: "safety_surface",
@@ -203,7 +203,7 @@ public func featureSurfaceRecords(nowISO: String) -> [FeatureSurfaceRecord] {
         FeatureSurfaceRecord(
             sourceId: "eval_release_ops",
             name: "Evals, Release, and Agent Ops",
-            description: "Evaluation records, release checklist, watchdog, runtime traces, production support exports, and ops health snapshots.",
+            description: "Evaluation records, watchdog, runtime traces, production support exports, and ops health snapshots.",
             triggers: ["eval", "test", "release", "watchdog", "ops", "trace", "support export"],
             permissions: [],
             riskClass: "read_only",

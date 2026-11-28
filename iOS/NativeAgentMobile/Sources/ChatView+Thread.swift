@@ -274,7 +274,7 @@ extension ChatView {
                         .transition(.opacity)
                     }
                 }
-                .animation(AppMotion.respecting(.easeOut(duration: 0.18), reduceMotion: reduceMotion), value: showLatestButton)
+                .animation(Animation.respecting(.easeOut(duration: 0.18), reduceMotion: reduceMotion), value: showLatestButton)
                 .safeAreaBar(edge: .bottom, spacing: NativeAgentMobileTheme.Spacing.md) {
                     MobileTranscriptBottomBar(transcript: transcript) {
                         VStack(spacing: 0) {
@@ -291,10 +291,10 @@ extension ChatView {
             .navigationTitle(agentDisplayName)
             .toolbar(.hidden, for: .navigationBar)
             .tint(AlivePalette.text)
-            .animation(AppMotion.respecting(AppMotion.snappy, reduceMotion: reduceMotion), value: voiceInput.isListening)
+            .animation(Animation.respecting(AppMotion.snappy, reduceMotion: reduceMotion), value: voiceInput.isListening)
             // Sync-error dismissal must end when its condition changes.
             .onChange(of: sync.syncError) { _, newValue in
-                if MacSyncErrorBannerPresentation.normalizedMessage(newValue) == nil {
+                if newValue.trimmedNonEmpty == nil {
                     dismissedSyncError = nil
                 }
             }

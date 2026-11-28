@@ -48,11 +48,10 @@ extension SwiftNativeTurnEngine {
         completionState: TurnEngineResult.CompletionState = .completed,
         afterTurn: Bool = true,
         took: String? = nil,
-        afterReply: AfterReply? = nil,
         turn: Turn, work: ChatTurnWork
     ) async -> TurnEngineResult {
         let recalledIds = ctx.resolvedRecalledIds
-        var held = afterReply
+        var held: AfterReply? = nil
         if afterTurn {
             held = deferMemoryPromotion(
                 userMessage: userMessage,
@@ -61,7 +60,6 @@ extension SwiftNativeTurnEngine {
                 sessionId: sessionId,
                 surface: surface,
                 took: took,
-                afterReply: held,
              turn: turn,work: work)
         }
         let endNs = DispatchTime.now().uptimeNanoseconds
@@ -176,10 +174,14 @@ extension SwiftNativeTurnEngine {
             tools: tools,
             progress: progress,
             cancelFlagPath: cancelFlagPath,
-            neutralizingTextResults: markerCodec != nil,
-         turn: turn, work: work)
+            turn: turn, work: work)
         dispatches.append(contentsOf: iterationRecords)
         conversation.append(contentsOf: LocalToolImage.continuation(toolResultBlocks))
+        for block in toolResultBlocks {
+            if case .toolResult(_, let content, _) = block, let result = try? JSONValue.parse(Data(content.utf8)) {
+                AgentConversationHistoryView.take(result, turn: turn)
+            }
+        }
         // A held send's answer in these results is now in the turn's input: that is its delivery.
         if let root = remPinsDataRoot {
             let held = iterationRecords.flatMap { HeldSends.answers(in: $0.result) }

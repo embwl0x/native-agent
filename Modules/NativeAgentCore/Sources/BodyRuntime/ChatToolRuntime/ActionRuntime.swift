@@ -57,8 +57,6 @@ final class ActionRuntime: Sendable {
     init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         bodyField: BodyField? = nil,
-        memoryV2: SwiftNativeMemoryV2? = nil,
-        knowledgeGraphPath: URL? = nil,
         allowProcessGlobalTools: Bool = true,
         dotTransport: ChatGPTDotIPCTransport? = nil,
         jobStore: AgentJobStore? = nil,
@@ -78,10 +76,8 @@ final class ActionRuntime: Sendable {
         self.pageReader = SwiftNativeResearchClient(dataRoot: dataRoot)
         self.standingBotRunEnqueue = standingBotRunEnqueue
         self.standingBotRunner = standingBotRunner
-        self.memoryOwner = Mutex(memoryV2 ?? (SwiftNativeMemoryV2.usesDefaultDataRoot(dataRoot) ? .shared : nil))
-        self.knowledgeGraphPath = knowledgeGraphPath ?? dataRoot
-            .appendingPathComponent("memory", isDirectory: true)
-            .appendingPathComponent("memory.sqlite")
+        self.memoryOwner = Mutex(SwiftNativeMemoryV2.usesDefaultDataRoot(dataRoot) ? .shared : nil)
+        self.knowledgeGraphPath = DataRootPaths.memoryDatabase(in: dataRoot)
         self.allowsCanonicalBodyTools = allowProcessGlobalTools
         self.providerLifecycleObserver = providerLifecycleObserver
         self.studioJournalBus = studioJournalBus

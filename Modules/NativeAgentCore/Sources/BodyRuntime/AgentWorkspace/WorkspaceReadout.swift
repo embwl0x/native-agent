@@ -63,12 +63,9 @@ enum WorkspaceReadout {
         let rows = result.objectValue!["bots"]!.arrayValue!
         var items: [String: AgentWorkspaceItem] = [:], actions: [String: AgentWorkspaceButton] = [:]
         var facts: [JSONValue] = []
-        func read(_ label: String, _ tool: String, _ input: [String: JSONValue] = [:], _ title: String? = nil) -> AgentWorkspaceButton {
-            .init(label: label, action: .open(.record(tool: tool, input: input, title: title ?? label)))
-        }
         actions["create"] = .init(label: "create", action: .open(.record(tool: "app", input: ["find": .string("bot_create"), "args": .object([:])], title: "create")))
-        actions["replies"] = read("replies","shelf_read",["limit": .int(16),"include_read": .bool(true),"sort": .string("newest_first")])
-        actions["all"] = read("all","bot_list")
+        actions["replies"] = AgentWorkspaceActivity.read("replies", tool: "shelf_read", input: ["limit": .int(16),"include_read": .bool(true),"sort": .string("newest_first")])
+        actions["all"] = AgentWorkspaceActivity.read("all", tool: "bot_list")
         for (index,value) in rows.enumerated() {
             let row = value.objectValue ?? [:], key = "bot:" + String(index)
             let name = row["name"]?.stringValue ?? "Helper"
@@ -76,9 +73,9 @@ enum WorkspaceReadout {
             if let raw = row["id"]?.stringValue, let id = UUID(uuidString: raw)?.uuidString {
                 let agent = "bot:" + id
                 let candidates: [(String,AgentWorkspaceButton)] = [
-                    ("open",read("open","bot_list",["id": .string(id)],name)),
+                    ("open",AgentWorkspaceActivity.read("open", tool: "bot_list", input: ["id": .string(id)], title: name)),
                     ("talk",.init(label:"talk",action:.message(agent:agent,conversation:nil,name:name),needsText:true)),
-                    ("conversation",read("conversation","agent_read",["agent": .string(agent)],name)),
+                    ("conversation",AgentWorkspaceActivity.read("conversation", tool: "agent_read", input: ["agent": .string(agent)], title: name)),
                     ("run",.init(label:"run",action:.perform(tool:"bot_run_once",input:["id": .string(id)],title:"run",textField:nil,isEffect:true))),
                     ("settings",.init(label:"settings",action:.open(.record(tool: "app", input: ["find": .string("bot_update"), "args": .object(["id": .string(id)])], title: "settings"))))
                 ]

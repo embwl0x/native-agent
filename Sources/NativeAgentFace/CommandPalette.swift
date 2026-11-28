@@ -113,7 +113,7 @@ struct CommandPaletteView: View {
                 }.frame(maxHeight: 360)
                 .onChange(of: selection) { _, id in
                     if let id {
-                        withAnimation(NativeAgentMotion.respecting(NativeAgentMotion.quickCurve, reduceMotion: reduceMotion)) {
+                        withAnimation(Animation.respecting(NativeAgentMotion.quickCurve, reduceMotion: reduceMotion)) {
                             proxy.scrollTo(id, anchor: .center)
                         }
                     }
@@ -202,8 +202,11 @@ struct CommandPaletteView: View {
     private func open(_ target: FacePaletteTarget) async throws {
         switch target {
         case .page(let raw):
-            guard let page = SidebarItem(rawValue: raw) else { throw missingPage(raw) }
-            ApplicationLifetime.shared.request(.sidebar(page))
+            if let page = SidebarItem(rawValue: raw), page != .ownPage {
+                ApplicationLifetime.shared.request(.sidebar(page))
+            } else if let page = SurfaceLayout.ownPage("rail", raw) {
+                ApplicationLifetime.shared.request(.ownPage(page))
+            } else { throw missingPage(raw) }
         case .tab(let raw, let tab):
             guard let page = SidebarItem(rawValue: raw) else { throw missingPage(raw) }
             try await SettingsLink.openChecked(page, tab: tab, appModel: appModel)

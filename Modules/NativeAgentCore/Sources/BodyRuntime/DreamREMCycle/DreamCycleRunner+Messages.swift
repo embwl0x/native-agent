@@ -34,7 +34,6 @@ extension DreamCycleRunner {
             let runID: String?;
             let role: String;
             let content: String;
-            let peers: [String]?;
             var lived = true
         }
         var all: [Row] = []
@@ -81,8 +80,7 @@ extension DreamCycleRunner {
                         "Transcript occurrence time unavailable at \(url.path); preserve and repair its createdAt before dreaming it")
                 }
                 // Keep admitted origins until exchange grouping because a new reply may belong to an origin just before the mark.
-                all.append(Row(at: at, sid: sid, mid: messageId, runID: runID, role: role, content: content,
-                    peers: DreamEntryProvenance.transcriptCause(obj, session: sid, dataRoot: dataRoot)?.sourcePeerIds, lived: lived))
+                all.append(Row(at: at, sid: sid, mid: messageId, runID: runID, role: role, content: content, lived: lived))
             }
         }
         let paired = ConversationHistory.pairExchanges(all.map { ($0.sid, $0.runID, $0.role, $0.lived) })
@@ -107,6 +105,7 @@ extension DreamCycleRunner {
         exchanges.removeAll { $0.at <= mark }
         exchanges.sort { ($0.at, $0.start) < ($1.at, $1.start) }
         var pickedEntries: [(index: Int, row: Row)] = []
+        var clippedIndex: Int?
         var used = 0, count = 0
         var moreMessagesRemain = false
         var newest: Date?, firstAt: Date?, stoppedAt: Date?
@@ -122,14 +121,12 @@ extension DreamCycleRunner {
             // An exchange larger than a whole dream is read first in its own night, as much of its end as fits; anything else waits.
             if pickedEntries.isEmpty {
                 for entry in exchange.rows.sorted(by: { $0.index > $1.index }) {
-                    var entry = entry
+                    var length = rowLength(entry.row)
                     // A single message larger than a whole dream is read from its end.
-                    if pickedEntries.isEmpty, rowLength(entry.row) > Self.convCharBudget {
-                        let row = entry.row
-                        entry.row = Row(at: row.at, sid: row.sid, mid: row.mid, runID: row.runID, role: row.role,
-                            content: String(row.content.suffix(Self.convCharBudget - row.role.count - 4)), peers: row.peers, lived: row.lived)
+                    if pickedEntries.isEmpty, length > Self.convCharBudget {
+                        clippedIndex = entry.index
+                        length = Self.convCharBudget
                     }
-                    let length = rowLength(entry.row)
                     guard count < Self.convCountLimit, used + length <= Self.convCharBudget else { break }
                     pickedEntries.append(entry)
                     used += length
@@ -151,25 +148,23 @@ extension DreamCycleRunner {
         // Restore chronology so the dream reads a day rather than a ranking.
         pickedEntries.sort { $0.index < $1.index }
         // Rows remain citable without a run; only known runs establish exchange grouping.
-        var sourcesByIndex: [Int: DreamSourceRef] = [:]
+        var sources: [DreamSourceRef] = []
         var material: [String: CognitiveReflectionCause] = [:]
-        for (index, row) in pickedEntries {
-            guard let mid = row.mid, !mid.isEmpty else { continue }
+        let messages = pickedEntries.map { index, row -> (sessionId: String, role: String, content: String, source: String?) in
+            let redacted = DreamPart.redact(row.content)
+            let content = index == clippedIndex
+                ? String(redacted.suffix(Self.convCharBudget - row.role.count - 4)) : redacted
+            guard let mid = row.mid, !mid.isEmpty else { return (row.sid, row.role, content, nil) }
             let source = DreamSourceRef(
                 kind: row.runID == nil ? "message" : "exchange",
                 id: row.runID ?? mid, sessionID: row.sid,
                 livedDate: DreamEntryProvenance.dateStem(for: row.at), messageID: row.runID == nil ? nil : mid)
-            sourcesByIndex[index] = source
-            material[source.reference] = CognitiveReflectionCause(text: "\(row.role):\n\(row.content)", sourcePeerIds: row.peers)
+            guard DreamPart.redact(source.reference) == source.reference else { return (row.sid, row.role, content, nil) }
+            sources.append(source)
+            material[source.reference] = CognitiveReflectionCause(text: "\(row.role):\n\(content)", sourcePeerIds: [])
+            return (row.sid, row.role, content, source.reference)
         }
-        let sources = pickedEntries.compactMap { sourcesByIndex[$0.index] }
-        return (
-            pickedEntries.map { ($0.row.sid, $0.row.role, $0.row.content, sourcesByIndex[$0.index]?.reference) },
-            newest,
-            sources,
-            material,
-            moreMessagesRemain
-        )
+        return (messages, newest, sources, material, moreMessagesRemain)
     }
 
     // Exclude tool-call rows before prompt assembly so tool-heavy days cannot dilute identity input.

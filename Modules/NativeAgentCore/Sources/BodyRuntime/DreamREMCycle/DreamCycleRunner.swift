@@ -10,11 +10,13 @@ import SenseCore
 
 
 public actor DreamCycleRunner {
+    static let stopPendingWords = "dream delivery remains pending after Stop"
+
     let dataRoot: URL
     private let personaRoot: URL
     private let llm: any LLMClient
     private let now: @Sendable () -> Date
-    private let recencyWindow: TimeInterval
+    private static let recencyWindow: TimeInterval = 24 * 60 * 60
     private let memoryDeltaProvider: DreamMemoryDeltaProvider
     private let surpriseProvider: DreamSurpriseProvider
     private let feltSummaryProvider: DreamFeltSummaryProvider
@@ -39,7 +41,6 @@ public actor DreamCycleRunner {
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         personaRoot: URL? = nil,
         llm: any LLMClient,
-        recencyWindow: TimeInterval = 24 * 60 * 60,
         memoryDeltaProvider: @escaping DreamMemoryDeltaProvider = { _ in [] },
         surpriseProvider: @escaping DreamSurpriseProvider = { _, _ in "" },
         feltSummaryProvider: @escaping DreamFeltSummaryProvider = { nil },
@@ -54,7 +55,6 @@ public actor DreamCycleRunner {
         self.personaRoot = personaRoot
             ?? PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
         self.llm = llm
-        self.recencyWindow = recencyWindow
         self.memoryDeltaProvider = memoryDeltaProvider
         self.surpriseProvider = surpriseProvider
         self.feltSummaryProvider = feltSummaryProvider
@@ -66,9 +66,7 @@ public actor DreamCycleRunner {
         self.now = now
     }
 
-    /// Force changes the recency window and replaces the target entry without bypassing Trust.
     public func runNightlyDreamCycle(
-        force: Bool = false,
         trigger: DreamTrigger = .schedule,
         preview: Bool = false,
         delivery: DreamEffectSink? = nil,
@@ -100,46 +98,52 @@ public actor DreamCycleRunner {
         }
         defer { reservation?.release() }
 
-        // Use the mark to exclude consumed messages; checked absence or force selects the recency window.
         // An unreadable mark stops with its named cause rather than rereading or skipping evidence.
         var report = DreamReport(trigger: trigger)
+        var owedBefore: [(journal: URL?, words: String)] = []
         if !preview {
             let pending = await retryPendingWork(delivery: delivery)
             report.effectsSettled = pending.settled
             report.lessonsSaved = pending.lessonsSaved
-            report.errors += pending.errors
+            report.errors += pending.errors.map { $0.words }
+            owedBefore = pending.errors
             report.busy = pending.busy
-            // Historical gaps belong to their items; new material still dreams. Force requires settling its replaceable target first.
-            guard !pending.discoveryUnavailable, !Task.isCancelled,
-                  !force || !pending.pendingPaths.contains(outPath.path) else { return report }
+            guard !pending.discoveryUnavailable, !Task.isCancelled else { return report }
         }
-        let (prepared, draft) = try await prepareNightlyDream(report, force: force, preview: preview, parent: parent, dateKey: dateKey)
-        guard let draft else { return prepared }
-        return try await publishNightlyDream(prepared, draft: draft, force: force, trigger: trigger, delivery: delivery,
-            dateKey: dateKey, outPath: outPath)
+        do {
+            let (prepared, draft) = try await prepareNightlyDream(report, preview: preview, parent: parent, dateKey: dateKey, outPath: outPath)
+            guard let draft else { return prepared }
+            return await publishNightlyDream(prepared, draft: draft, trigger: trigger, delivery: delivery,
+                dateKey: dateKey, owedBefore: owedBefore)
+        } catch is CancellationError where !preview {
+            report.errors.append(Self.stopPendingWords)
+            return report
+        }
     }
 
-    private typealias NightlyDreamDraft = (payload: DreamPayload, lessons: [DreamLesson],
+    private typealias NightlyDreamDraft = (payload: DreamPayload, prose: String, previousDiary: Data?, lessons: [DreamLesson],
         careNight: CognitiveCareNight?, newestIncluded: Date, citedStudioEntryIDs: [String],
-        messageSources: [DreamSourceRef], sourceMaterial: [String: CognitiveReflectionCause],
-        sourcePeerIds: [String]?, feltSummary: String?)
+        sourceMaterial: [String: CognitiveReflectionCause], feltSummary: String?, began: Date)
 
-    private func prepareNightlyDream(_ initial: DreamReport, force: Bool, preview: Bool, parent: Turn?, dateKey: String) async throws
+    private func prepareNightlyDream(_ initial: DreamReport, preview: Bool, parent: Turn?, dateKey: String, outPath: URL) async throws
         -> (DreamReport, NightlyDreamDraft?) {
         var report = initial
         let mark: Date
         do {
             let committedMark = try ConversationHistory.dreamConsolidationMark(dataRoot: dataRoot)
-            mark = force
-                ? now().addingTimeInterval(-recencyWindow)
-                : (committedMark ?? now().addingTimeInterval(-recencyWindow))
+            mark = committedMark ?? now().addingTimeInterval(-Self.recencyWindow)
         } catch {
             report.errors.append("Dream cutoff could not be read at \(dreamMarkPath().path) (\(error)). Repair the saved cutoff before retrying.")
             return (report, nil)
         }
+        let began = now()
+        let materialMark = (try? Data(contentsOf: dreamMarkPath())).flatMap { try? JSONValue.parse($0) }
+            .flatMap { NativeTimestampFormat.parseTrimmedISO8601FractionalFirst($0.objectValue?["materialThrough"]?.stringValue) }
         let feltOrigins: [CognitiveFeltOrigin]
         do {
             feltOrigins = try await feltOriginProvider()
+        } catch let stopped as CancellationError where !preview {
+            throw stopped
         } catch {
             report.errors.append("felt origin read failed: \(error)")
             return (report, nil)
@@ -157,102 +161,142 @@ public actor DreamCycleRunner {
             FileHandle.standardError.write(Data("DreamCycleRunner: \(message)\n".utf8))
             return (report, nil)
         }
-        let (messages, newestIncluded, messageSources, sourceMaterial, moreMessagesRemain) = gathered
+        let (messages, newest, messageSources, sourceMaterial, moreMessagesRemain) = gathered
         report.moreMessagesRemain = moreMessagesRemain
         report.sessionsProcessed = Set(messages.map { $0.sessionId }).count
 
-        // No new material means no empty entry and no mark change.
-        if messages.isEmpty {
-            report.skipReason = "no_new_material"
-            return (report, nil)
-        }
-        guard let newestIncluded else {
-            report.errors.append("message context had no high-water timestamp")
-            return (report, nil)
-        }
-
-        // Resolve persona and memory deltas once so the run uses consistent inputs.
-        let personaDocs = try await readDreamPersonaDocs(
-            dataRoot: dataRoot, personaRoot: personaRoot, surface: "dream", preview: preview
-        )
+        // A night with messages reads what is not conversation since the message mark, as it always has. A night without any reads it
+        // since the last dream of either kind began, so a day without a conversation still has a night and no quiet night repeats one.
+        // The message mark moves only with messages.
+        let materialSince = messages.isEmpty ? max(mark, materialMark ?? mark) : mark
         let memoryDeltas: [String]
         do {
-            memoryDeltas = try await memoryDeltaProvider(mark)
+            memoryDeltas = try await memoryDeltaProvider(materialSince)
+        } catch let stopped as CancellationError where !preview {
+            throw stopped
         } catch {
             report.errors.append("memory context read failed: \(error)")
             return (report, nil)
         }
+        let surprises: String
+        do {
+            let material = try await surpriseProvider(materialSince, began).trimmingCharacters(in: .whitespacesAndNewlines)
+            surprises = String(DreamPart.redact(material).prefix(2_400))
+        } catch let stopped as CancellationError where !preview {
+            throw stopped
+        } catch {
+            report.errors.append("surprise context read failed: \(error)")
+            return (report, nil)
+        }
+        // No new material means no empty entry and no mark change. Felt tone and cares are always there and are not a day's material.
+        if messages.isEmpty, memoryDeltas.isEmpty, surprises.isEmpty {
+            report.skipReason = "no_new_material"
+            return (report, nil)
+        }
+        guard let newestIncluded = newest ?? (messages.isEmpty ? mark : nil) else {
+            report.errors.append("message context had no high-water timestamp")
+            return (report, nil)
+        }
+
+        // Resolve persona once so the run uses consistent inputs.
+        let personaDocs = try await readDreamPersonaDocs(
+            dataRoot: dataRoot, personaRoot: personaRoot, surface: "dream", preview: preview
+        )
         // Absent felt tone is silence; failed tone reads fail the run so the same window remains available for retry.
         let feltSummary: String?
         do {
             feltSummary = try await feltSummaryProvider()
+        } catch let stopped as CancellationError where !preview {
+            throw stopped
         } catch {
             report.errors.append("felt context read failed: \(error)")
             return (report, nil)
         }
         let careNight: CognitiveCareNight?
         do { careNight = try await careNightProvider() }
+        catch let stopped as CancellationError where !preview { throw stopped }
         catch {
             report.errors.append("care night evidence unavailable; cutoff unchanged: \(error)")
-            return (report, nil)
-        }
-        let surpriseBlock: String
-        do {
-            let surprises = try await surpriseProvider(mark, now())
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            surpriseBlock = surprises.isEmpty ? "" : try completionPolicy(
-                "nightly-dream", section: "surprises", arguments: [String(surprises.prefix(2_400))])
-        } catch {
-            report.errors.append("surprise context read failed: \(error)")
             return (report, nil)
         }
         let citedStudioEntryIDs = Self.studioEntryCitations(
             from: feltOrigins, feltSummary: feltSummary)
         let dreamSystem = try Self.dreamSystemPrompt(personaDocs: personaDocs)
-        let prompt = try buildCombinedPrompt(
-            dateKey: dateKey,
-            messages: messages, memoryDeltas: memoryDeltas, feltSummary: feltSummary,
-            surpriseBlock: surpriseBlock,
-            careBlock: careNight?.block ?? "",
-            sourcePeerIds: CognitiveReflectionCause.unionPeerIds(messages.map { row in
-                row.source.flatMap { sourceMaterial[$0]?.sourcePeerIds }
-            }))
-        let raw: String
+        let evidence = Self.dreamEvidence(dateKey: dateKey, messages: messages, memoryDeltas: memoryDeltas,
+            feltSummary: feltSummary, surprises: surprises, careBlock: careNight?.block ?? "")
+        let identity = parent.map { Turn(dataRoot: $0.dataRoot, id: $0.id, run: $0.run, session: $0.session) }
+        var call = LLMCall(turn: identity, surface: "dream", purpose: "dream")
+        call.session = nil
+        call.preview = preview
+        let providerCall = call
+        let llm = self.llm
+        let sessionCount = report.sessionsProcessed
+        let previousDiary: Data?
+        if !preview, fm.fileExists(atPath: outPath.path) {
+            do { previousDiary = try Data(contentsOf: outPath) }
+            catch {
+                report.errors.append("diary snapshot error: \(error)")
+                return (report, nil)
+            }
+        } else { previousDiary = nil }
+        let addsSection = previousDiary != nil
+        let clock = now
+        let required = ["world", "cares", "surprises"] + (citedStudioEntryIDs.isEmpty ? [] : ["felt"]) + (messages.isEmpty ? ["memories"] : [])
+        let part = DreamPart(mode: .dream, evidence: evidence, required: required, preview: preview) { prompt in
+            let raw = try await llm.complete(prompt: prompt, system: dreamSystem, model: nil, tools: nil, call: providerCall)
+            let completion: DreamPayload
+            // Plain JSON is read as it always was; the extractor is for a reply wrapped in a fence or prose.
+            do {
+                completion = try (try? JSONDecoder().decode(DreamPayload.self, from: Data(raw.utf8)))
+                    ?? JSONValue.decodeCompletion(raw, as: DreamPayload.self)
+            }
+            catch {
+                try Task.checkCancellation()
+                let fault = String(DreamPart.redact(String(describing: error)).prefix(300))
+                let request = prompt + "\n\nYour last reply could not be read (\(fault)). Return one JSON object with the required fields."
+                let revised = try await llm.complete(prompt: request, system: dreamSystem, model: nil, tools: nil, call: providerCall)
+                do { completion = try JSONValue.decodeCompletion(revised, as: DreamPayload.self) }
+                catch {
+                    throw PartCallError(code: "bad_dream_policy",
+                        message: "Dream could not decode the second reply: " + DreamPart.redact(String(describing: error)))
+                }
+            }
+            return (.object(completion.retainedFields), .dreamDrops(completion.drops))
+        } validate: { value, reading in
+            var payload = try JSONDecoder().decode(DreamPayload.self, from: value.serializedData(pretty: false))
+            if case .dreamDrops(let original)? = reading {
+                payload.drops.total += original.total
+                payload.drops.mergesMalformed += original.mergesMalformed
+            }
+            if let careNight { payload.bindSelfReading(to: careNight) }
+            let heading = addsSection ? "## Dreamt again — \(Self.sectionStamp(clock()))" : "# Dream — \(dateKey)"
+            let diaryBody = Self.renderDreamBody(sessionCount: sessionCount, payload: payload,
+                lessons: surprises.isEmpty ? [] : payload.lessons, studioEntryIDs: citedStudioEntryIDs)
+            let prose = try Self.renderCombinedEntry(heading: heading, body: diaryBody, claims: payload.claims,
+                sources: messageSources)
+            return .dream(payload, prose: prose)
+        }
+        let payload: DreamPayload
+        let prose: String
         do {
-            try Task.checkCancellation()
-            // Standalone dream work keeps its parent's identity without borrowing the parent's model route.
-            let identity = parent.map { Turn(dataRoot: $0.dataRoot, id: $0.id, run: $0.run, session: $0.session) }
-            var call = LLMCall(turn: identity, surface: "dream", purpose: "dream")
-            call.session = nil
-            call.preview = preview
-            raw = try await llm.complete(
-                prompt: prompt.text, system: dreamSystem, model: nil,
-                tools: nil, call: call)
+            guard case .dream(let reading, let body) = try await part.read(root: dataRoot, parent: parent) else {
+                throw DreamREMCycleError.underlying("The dream cycle returned a reading for the wrong mode.")
+            }
+            payload = reading
+            prose = body
+        } catch let stopped as CancellationError where !preview {
+            throw stopped
         } catch {
-            report.errors.append("llm error: \(error)")
+            report.errors.append("Dream policy failed: \(DreamPart.redact(error.localizedDescription))")
             report.repair = (error as? ProviderFailure.Diagnostic)?.repair?.remedy()
             return (report, nil)
         }
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8) else {
-            report.errors.append("Dream payload is empty or not UTF-8; nothing was learned or written. Repair the nightly-dream output before retrying.")
-            return (report, nil)
-        }
-        let payload: DreamPayload
-        do {
-            payload = try JSONDecoder().decode(DreamPayload.self, from: data)
-        } catch {
-            report.errors.append(
-                """
-                    Dream payload could not be decoded: \(String(describing: error)). Nothing was learned or written; repair the nightly-dream output before \
-                    retrying.
-                    """)
-            return (report, nil)
-        }
-        let lessons = surpriseBlock.isEmpty ? [] : payload.lessons
+        let lessons = surprises.isEmpty ? [] : payload.lessons
+        report.droppedOptionalItems = payload.drops.total
         report.careNight = careNight.map {
             CognitiveCareNight(block: $0.block, readAt: $0.readAt, keys: $0.keys, answers: payload.cares, source: "dream_diary/\(dateKey).md",
-                clusters: $0.clusters, merges: payload.careMerges, stanceChanges: payload.careStanceChanges,
+                clusters: $0.clusters, merges: payload.careMerges, mergesMalformed: payload.drops.mergesMalformed,
+                stanceChanges: payload.careStanceChanges,
                 mindEpoch: $0.mindEpoch, selfStoryRefs: $0.selfStoryRefs, selfChangeRefs: $0.selfChangeRefs,
                 selfPeople: $0.selfPeople, traits: payload.traits, story: payload.story, people: payload.people)
         }
@@ -260,57 +304,44 @@ public actor DreamCycleRunner {
             report.preview = .object(["title": .string(payload.title), "summary": .string(payload.summary),
                 "mood": .string(payload.mood), "affect": payload.affect.map(JSONValue.double) ?? .null,
                 "careAnswers": .array(payload.cares.map(JSONValue.string)),
+                "droppedOptionalItems": .int(Int64(payload.drops.total)),
                 "lessonsNotRecorded": .int(Int64(lessons.count)), "date": .string(dateKey),
                 "consumedThroughUnchanged": .string(NativeTimestampFormat.fractionalZulu(newestIncluded))])
             return (report, nil)
         }
-        return (report, (payload, lessons, careNight, newestIncluded, citedStudioEntryIDs, messageSources, sourceMaterial, prompt.peerIds, feltSummary))
+        return (report, (payload, prose, previousDiary, lessons, careNight, newestIncluded, citedStudioEntryIDs, sourceMaterial,
+            feltSummary, began))
     }
 
-    private func publishNightlyDream(_ initial: DreamReport, draft: NightlyDreamDraft, force: Bool, trigger: DreamTrigger,
-                                     delivery: DreamEffectSink?, dateKey: String, outPath: URL) async throws -> DreamReport {
+    private func publishNightlyDream(_ initial: DreamReport, draft: NightlyDreamDraft, trigger: DreamTrigger,
+                                     delivery: DreamEffectSink?, dateKey: String,
+                                     owedBefore: [(journal: URL?, words: String)]) async -> DreamReport {
         var report = initial
-        let (payload, lessons, careNight, newestIncluded, citedStudioEntryIDs, messageSources, sourceMaterial, sourcePeerIds, feltSummary) = draft
-        // Ordinary runs append sections without changing prior writing; force replaces the day.
-        let previousDiary: Data?
-        if fm.fileExists(atPath: outPath.path) {
-            do {
-                previousDiary = try Data(contentsOf: outPath)
-            } catch {
-                report.errors.append("diary snapshot error: \(error)")
-                return report
-            }
-        } else {
-            previousDiary = nil
-        }
-        let addsSection = !force && previousDiary != nil
-        let prose = try renderCombinedEntry(
-            heading: addsSection ? "## Dreamt again — \(Self.sectionStamp(now()))" : "# Dream — \(dateKey)",
-            sessionCount: report.sessionsProcessed,
-            payload: payload,
-            lessons: lessons,
-            studioEntryIDs: citedStudioEntryIDs,
-            sources: messageSources,
-            sourcePeerIds: sourcePeerIds
-        )
+        let (payload, prose, previousDiary, lessons, careNight, newestIncluded, citedStudioEntryIDs, sourceMaterial, feltSummary, began) = draft
         let citedSources = Set(DreamEntryProvenance.readClaims(in: prose, as: DreamEntryProvenance.self)
             .flatMap { $0.claims.flatMap(\.sourceRefs) })
+        // Her dreams are hers (User, 2026-11-26): what she dreams from is her own mind and conversations she herself was in, so a dream
+        // and the rows it cites name no outside source. Who said what stays on each transcript row and memory, where it is recorded.
         var reflectionMaterial = sourceMaterial.filter { citedSources.contains($0.key) }
         reflectionMaterial["dream_diary/\(dateKey).md"] = CognitiveReflectionCause(
-            text: prose, sourcePeerIds: sourcePeerIds, sourceRefs: citedSources.sorted())
-        var work = DreamPendingWork(id: UUID(), date: dateKey, trigger: trigger, force: force,
-            sessionsProcessed: report.sessionsProcessed, sourcePeerIds: sourcePeerIds,
+            text: prose, sourcePeerIds: [], sourceRefs: citedSources.sorted())
+        var work = DreamPendingWork(id: UUID(), date: dateKey, trigger: trigger, force: false,
+            sessionsProcessed: report.sessionsProcessed, sourcePeerIds: [],
             lessons: lessons, reflection: reflectionMaterial, care: report.careNight.map(DreamPendingWork.Care.init),
             affect: payload.affect, studioEntries: citedStudioEntryIDs,
-            completion: .init(occurredAt: now(), feltSummary: feltSummary),
+            completion: .init(occurredAt: now(), feltSummary: feltSummary, droppedOptionalItems: payload.drops.total),
             completedSteps: [:])
-        if careNight == nil { work.finish("care", result: "skipped: inner life off") }
+        if careNight == nil {
+            work.finish("care", result: "skipped: inner life off")
+            // An organ that is off says so, so an old "worked" stamp cannot stand in for a night that never ran.
+            OrganJudge.beatOff("care_night", because: "inner life is off")
+        }
         if payload.affect == nil { work.finish("mood", result: "skipped: no affect judgment") }
         let markdown = prose + "\n" + work.identityMarker + "\n"
         let entry: Data
-        if addsSection, let previousDiary { entry = previousDiary + Data(("\n" + markdown).utf8) }
+        if let previousDiary { entry = previousDiary + Data(("\n" + markdown).utf8) }
         else { entry = Data(markdown.utf8) }
-        work.publication = .init(entry: entry, previousDiary: previousDiary, consumedThrough: newestIncluded)
+        work.publication = .init(entry: entry, previousDiary: previousDiary, consumedThrough: newestIncluded, materialThrough: began)
         let capturedWork = work
         // Returned writing must settle even when Stop races the response.
         let saved = await settle {
@@ -322,7 +353,9 @@ public actor DreamCycleRunner {
         let pending = await retryPendingWork(delivery: delivery)
         report.effectsSettled += pending.settled
         report.lessonsSaved += pending.lessonsSaved
-        report.errors += pending.errors
+        report.errors.replaceSubrange(0..<owedBefore.count,
+            with: owedBefore.filter { !pending.revisited.contains($0.journal) }.map { $0.words })
+        report.errors += pending.errors.map { $0.words }
         // The same owed item retried twice in one run is named once.
         let named = report.busy
         report.busy += pending.busy.filter { !named.contains($0) }
@@ -359,13 +392,14 @@ public actor DreamCycleRunner {
     @discardableResult
     func integrateMood(
         affect: Double?,
-        dateKey: String
+        dateKey: String,
+        dreamId: UUID
     ) async throws -> String? {
         guard let affect else { return nil }
         guard let datedMoodSink else {
             throw PersistenceCoreError.ioFailure("mood delivery for \(dateKey) is unavailable; the saved judgment remains pending")
         }
-        switch try await datedMoodSink(affect, dateKey) {
+        switch try await datedMoodSink(affect, dateKey, dreamId) {
         case .done: break
         case .skipped(let reason): return reason
         case .reflection:
@@ -389,40 +423,38 @@ public actor DreamCycleRunner {
             .appendingPathComponent(".dream_state.json")
     }
 
-    /// Never regress the mark; force cannot return consumed material to future windows.
-    func advanceDreamMark(to date: Date) throws {
+    func advanceDreamMark(to date: Date, materialThrough: Date?) throws {
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let existing = try ConversationHistory.dreamConsolidationMark(dataRoot: dataRoot)
         let mark = (existing.map { max($0, date) }) ?? date
-        let body = JSONValue.object([
-            "lastDreamedAt": .string(iso.string(from: mark)),
-        ])
+        // The mark for what is not conversation moves forward only, beside the message mark; a file without it reads as the message mark.
+        let saved = (try? Data(contentsOf: dreamMarkPath())).flatMap { try? JSONValue.parse($0) }
+            .flatMap { NativeTimestampFormat.parseTrimmedISO8601FractionalFirst($0.objectValue?["materialThrough"]?.stringValue) }
+        var fields: [String: JSONValue] = ["lastDreamedAt": .string(iso.string(from: mark))]
+        if let material = [saved, materialThrough].compactMap({ $0 }).max() { fields["materialThrough"] = .string(iso.string(from: material)) }
+        let body = JSONValue.object(fields)
         try SwiftNativePersistenceCore.writeDataAtomicDurable(body.serializedData(pretty: false), to: dreamMarkPath())
     }
 
-    /// Give conversation and self-memory equal structural weight; mark session boundaries so parallel conversations cannot blur together.
-    private func buildCombinedPrompt(
+    private static func dreamEvidence(
         dateKey: String,
         messages: [(sessionId: String, role: String, content: String, source: String?)],
         memoryDeltas: [String],
-        feltSummary: String? = nil,
-        surpriseBlock: String = "",
-        careBlock: String = "",
-        sourcePeerIds: [String]?
-    ) throws -> (text: String, peerIds: [String]?) {
+        feltSummary: String?,
+        surprises: String,
+        careBlock: String
+    ) -> [String: String] {
         var convLines: [String] = []
         var lastSession: String? = nil
         for m in messages {
             if m.sessionId != lastSession {
-                convLines.append("\n[conversation \(String(m.sessionId.prefix(8)))]\n")
+                convLines.append("\n[conversation \(DreamPart.redact(m.sessionId).prefix(8))]\n")
                 lastSession = m.sessionId
             }
             convLines.append("[\(m.role) | \(m.source ?? "source unavailable")] \(m.content)\n")
         }
-        let worldHalf = convLines.joined()
 
-        // Bound newest-first deltas, then render chronologically; empty input still keeps the Self header.
         var deltaLines: [String] = []
         var deltaUsed = 0
         var deltaCount = 0
@@ -432,35 +464,13 @@ public actor DreamCycleRunner {
             if trimmed.isEmpty { continue }
             let line = "- \(trimmed)\n"
             if deltaUsed + line.count > Self.deltaCharBudget { break }
-            deltaLines.append(line)
+            deltaLines.append("- \(DreamPart.redact(trimmed))\n")
             deltaUsed += line.count
             deltaCount += 1
         }
-        // Render retained deltas chronologically so the model reads their natural sequence.
-        let selfHalf = deltaLines.reversed().joined()
-        let selfBody = selfHalf.isEmpty ? "(no new memory deltas since the last dream)\n" : selfHalf
-
-        // Omit empty felt tone so silence stays silence; feeling colors tone without scripting content.
-        let feltBlock: String
-        if let felt = feltSummary?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !felt.isEmpty {
-            let bounded = String(felt.prefix(Self.feltCharBudget))
-            feltBlock = try completionPolicy("nightly-dream", section: "felt", arguments: [bounded])
-        } else {
-            feltBlock = ""
-        }
-
-        // Prose-only providers carry no provenance attestation.
-        let peers = CognitiveReflectionCause.unionPeerIds([sourcePeerIds]
-            + (selfHalf.isEmpty && surpriseBlock.isEmpty && feltBlock.isEmpty && careBlock.isEmpty ? [] : [nil]))
-        return (try completionPolicy("nightly-dream", section: "prompt", arguments: [
-            dateKey,
-            worldHalf,
-            selfBody,
-            surpriseBlock,
-            feltBlock,
-            careBlock
-        ]), peers)
+        let felt = feltSummary.map(DreamPart.redact)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return ["night": dateKey, "world": convLines.joined(), "memories": deltaLines.reversed().joined(),
+            "felt": String(felt.prefix(Self.feltCharBudget)), "surprises": surprises, "cares": DreamPart.redact(careBlock)]
     }
 
     // Private reflection keeps identity while changing only activity and audience.
@@ -480,7 +490,7 @@ public actor DreamCycleRunner {
         var seen = Set<String>()
         var cited: [String] = []
         for origin in origins {
-            guard let id = origin.studioEntryID else { continue }
+            guard let id = origin.studioEntryID, DreamPart.redact(id) == id else { continue }
             let bounded = String(id.prefix(studioEntryIDMaxCharacters))
             guard seen.insert(bounded).inserted else { continue }
             cited.append(bounded)
@@ -506,18 +516,13 @@ public actor DreamCycleRunner {
         return formatter.string(from: date)
     }
 
-    /// Give each section its own peers and claim lines so provenance binds to that dream rather than the entire day.
-    private func renderCombinedEntry(
-        heading: String,
+    private static func renderDreamBody(
         sessionCount: Int,
         payload: DreamPayload,
         lessons: [DreamLesson],
-        studioEntryIDs: [String] = [],
-        sources: [DreamSourceRef] = [],
-        sourcePeerIds: [String]?
-    ) throws -> String {
-        var out = "\(heading)\n\n"
-        out += "**\(payload.title)**\n\n"
+        studioEntryIDs: [String]
+    ) -> String {
+        var out = "**\(payload.title)**\n\n"
         out += "\(payload.summary)\n\n"
         out += "_Mood: \(payload.mood)_\n\n"
         if let affect = payload.affect { out += "_Affect: \(affect)_\n\n" }
@@ -535,18 +540,27 @@ public actor DreamCycleRunner {
         }
         if !lessons.isEmpty {
             out += "**What I learned:**\n"
-            for lesson in lessons { out += "- \(lesson.lesson) (from: \(lesson.from))\n" }
+            for lesson in lessons { out += lesson.diaryLine }
             out += "\n"
         }
         let convNote = sessionCount == 1 ? "1 conversation" : "\(sessionCount) conversations"
         out += "_(woven from \(convNote))_\n"
+        return out
+    }
+
+    /// Give each section its own peers and claim lines so provenance binds to that dream rather than the entire day.
+    private static func renderCombinedEntry(heading: String, body: String, claims: [DreamClaim],
+                                            sources: [DreamSourceRef]) throws -> String {
+        var out = "\(heading)\n\n" + body
         var dropped: [String] = []
-        let claims = try DreamEntryProvenance.renderBlock(payload.claims, content: out, sources: sources, dropped: &dropped)
+        let bound = try DreamEntryProvenance.renderBlock(claims, content: out, sources: sources, dropped: &dropped)
         if !dropped.isEmpty {
-            out += "_(\(dropped.count == 1 ? "1 claim" : "\(dropped.count) claims") left without sources: \(dropped.joined(separator: "; ")))_\n"
+            let diagnostic = "_(\(dropped.count == 1 ? "1 claim" : "\(dropped.count) claims") left without sources: \(dropped.joined(separator: "; ")))_"
+            out += DreamPart.redact(diagnostic) + "\n"
         }
-        out += try DreamEntryProvenance.peerBlock(sourcePeerIds)
-        out += claims
+        try DreamEntryProvenance.checkProse(out)
+        out += try DreamEntryProvenance.peerBlock([])
+        out += bound
         return out
     }
 

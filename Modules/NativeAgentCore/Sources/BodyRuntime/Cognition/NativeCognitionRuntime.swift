@@ -83,7 +83,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
     var admissionClosed = false
     var isAdmissionClosed: Bool { admissionClosed || isFlushedForTermination }
     /// Publish payload-free invalidations to mounted views instead of polling; canonical runtime state survives coalesced bursts.
-    var changeRevision: UInt64 = 0
     var changeContinuations: [UUID: AsyncStream<NativeCognitionRuntimeChange>.Continuation] = [:]
 
     /// Rebuild pursuit off-actor from exact-path invalidations so turns score bounded resident candidates without replaying Desk I/O.
@@ -175,7 +174,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
             defaults: preferenceDefaults,
             environment: configurationEnvironment
         )
-        let organismConfiguration = Self.loadOrganismConfiguration(
+        let organismConfiguration = Self.organismConfigurationForLaunch(
             dataRoot: dataRoot,
             defaults: preferenceDefaults
         )
@@ -199,6 +198,9 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
                 now: now,
                 predictedToolGroupsSink: { groups in
                     attentionProjection.replacePredictedToolGroups(groups)
+                },
+                repair: { reading, parent in
+                    try await FieldRepairPart(reading).read(root: root, parent: parent)
                 }
             )
         )

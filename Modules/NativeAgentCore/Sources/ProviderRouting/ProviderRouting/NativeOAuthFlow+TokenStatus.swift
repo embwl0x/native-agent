@@ -120,11 +120,9 @@ extension NativeOAuthFlow {
     }
 
     private static func openAIAdoptedCLISessionDetail(
-        activeAuthPath path: URL, accountEmail: String?,
-        sharedCLIHome: URL = ChatGPTTransport.defaultUserCodexHome()
+        activeAuthPath path: URL, accountEmail: String?
     ) -> String? {
-        let sharedCLIAuth = ChatGPTTransport.preferredAuthPath(
-            userCodexHome: sharedCLIHome, source: .sharedCLI)
+        let sharedCLIAuth = ChatGPTTransport.preferredAuthPath(source: .sharedCLI)
             .resolvingSymlinksInPath().standardizedFileURL.path
         let activePath = path.resolvingSymlinksInPath().standardizedFileURL.path
         guard activePath == sharedCLIAuth else { return nil }
@@ -201,17 +199,14 @@ extension NativeOAuthFlow {
 
     /// A usable CLI session without this root's consent remains an explicit offer, including after decline.
     public static func codexCLISessionOffer(
-        dataRoot: URL? = nil,
-        sharedCLIHome: URL = ChatGPTTransport.defaultUserCodexHome(),
-        consentState: ChatGPTTransport.CLISessionAdoptionConsentState? = nil
+        dataRoot: URL? = nil
     ) -> CodexCLISessionOffer? {
-        let consentState = consentState
-            ?? ChatGPTTransport.cliAdoptionConsentState(dataRoot: dataRoot)
+        let consentState = ChatGPTTransport.cliAdoptionConsentState(dataRoot: dataRoot)
         if case .corrupt(let reason) = consentState {
             return .unavailable(reason: reason)
         }
         guard consentState != .allowed else { return nil }
-        let auth = ChatGPTTransport.preferredAuthPath(userCodexHome: sharedCLIHome, source: .sharedCLI)
+        let auth = ChatGPTTransport.preferredAuthPath(source: .sharedCLI)
         do {
             guard try ChatGPTTransport.hasAccessToken(at: auth) else { return nil }
         } catch {
@@ -225,13 +220,12 @@ extension NativeOAuthFlow {
 
     /// Shared CLI-session presence is independent of app sign-in or adoption consent.
     public static func sharedCodexCLISessionRemains(
-        providerId: String,
-        sharedCLIHome: URL = ChatGPTTransport.defaultUserCodexHome()
+        providerId: String
     ) throws -> Bool {
         let id = providerId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard id == "openai_oauth_direct" || id == "codex" else { return false }
         return try ChatGPTTransport.hasAccessToken(
-            at: ChatGPTTransport.preferredAuthPath(userCodexHome: sharedCLIHome, source: .sharedCLI)
+            at: ChatGPTTransport.preferredAuthPath(source: .sharedCLI)
         )
     }
 

@@ -4,7 +4,7 @@ import NativeAgentCore
 import MindCore
 import BodyRuntime
 import SenseCore
-// Blueprint: | `AppModel+ChatSessions.swift` | `AppModel`, `composerDraft(for:)`: Shared drafts and checked session transactions |
+// Blueprint: | `AppModel+ChatSessions.swift` | `AppModel`: Checked chat session transactions |
 
 @MainActor
 extension AppModel: MacChatSessionSelectionPort {
@@ -12,78 +12,6 @@ extension AppModel: MacChatSessionSelectionPort {
         // Install the defaults observer at the earliest model entry point so external writes reach the running app.
         installDefaultsBackedSettingsObserver()
         await reloadChatState()
-    }
-
-    // Only empty derived state may leave memory when a row leaves the hot index.
-    @MainActor
-    private func pruneChatDrafts() {
-        let activeIds = Set(engine.transcripts.sessions.map(\.id))
-        chatComposerDrafts = chatComposerDrafts.filter { activeIds.contains($0.key) || !$0.value.text.isEmpty }
-        chatPendingAttachments = chatPendingAttachments.filter { activeIds.contains($0.key) || !$0.value.isEmpty }
-    }
-
-    @MainActor
-    private func migrateEmptySessionChatState(to sessionId: String) {
-        guard !sessionId.isEmpty else { return }
-        if let draft = chatComposerDrafts[""], !draft.text.isEmpty {
-            let target = composerDraft(for: sessionId)
-            if target.text.isEmpty {
-                target.edit(draft.text)
-                draft.edit("")
-            } else {
-                systemToasts.push(error: """
-                    An earlier unsent draft is kept separately because this conversation already has a draft. Start a new chat to move it into an empty \
-                    composer.
-                    """)
-            }
-        }
-        if let pending = chatPendingAttachments.removeValue(forKey: ""), !pending.isEmpty {
-            var existing = chatPendingAttachments[sessionId] ?? []
-            existing.append(contentsOf: pending)
-            chatPendingAttachments[sessionId] = existing
-        }
-    }
-
-    func composerDraft(for sessionId: String) -> ChatComposerDraft {
-        if let draft = chatComposerDrafts[sessionId] { return draft }
-        let draft = ChatComposerDraft(sessionId: sessionId)
-        chatComposerDrafts[sessionId] = draft
-        return draft
-    }
-
-    /// Acceptance clears only the exact live edit that was sent.
-    @MainActor
-    func clearChatDraftAfterSend(_ sent: String, sessionId: String, editedAt: Date) {
-        let draft = composerDraft(for: sessionId)
-        if draft.text == sent, draft.editedAt == editedAt {
-            draft.edit("")
-        }
-    }
-
-    @MainActor
-    func injectChatDraft(_ text: String, sessionId: String) {
-        guard !sessionId.isEmpty else { return }
-        let draft = composerDraft(for: sessionId)
-        if draft.text.isEmpty { draft.edit(text) }
-    }
-
-    @MainActor
-    func chatDraft(for sessionId: String) -> String {
-        composerDraft(for: sessionId).text
-    }
-
-    @MainActor
-    @discardableResult
-    func requestSkillBuild(starter: String = "Create a skill from this conversation: ") -> SkillBuildRequestPresentation.DraftOutcome {
-        let sessionID = activeChatSessionId.trimmingCharacters(in: .whitespacesAndNewlines)
-        let outcome = SkillBuildRequestPresentation.build(
-            activeSessionID: sessionID,
-            existingDraft: sessionID.isEmpty ? "" : chatDraft(for: sessionID)
-        )
-        if case .draftPrepared = outcome {
-            injectChatDraft(starter, sessionId: sessionID)
-        }
-        return outcome
     }
 
     @MainActor
@@ -126,7 +54,6 @@ extension AppModel: MacChatSessionSelectionPort {
             let changed = refreshed != engine.transcripts.sessions
             engine.transcripts.publishSessionIndexRead(refreshed)
             guard changed else { return }
-            pruneChatDrafts()
             admittedIndex = refreshed
             if !activeChatSessionId.isEmpty, !refreshed.contains(where: { $0.id == activeChatSessionId && $0.archived != true }) {
                 chatSelectionGeneration += 1
@@ -195,7 +122,6 @@ extension AppModel: MacChatSessionSelectionPort {
                 guard chatSelectionGeneration == selectionGenerationAtStart else { return }
                 activeChatSessionId = reconciled.session.id
             }
-            migrateEmptySessionChatState(to: activeChatSessionId)
             let indexSnapshot = engine.transcripts.sessions
             let knownSessionIds = Set(engine.transcripts.sessions.map(\.id))
             await repairChatTurnLifecyclesIfNeeded(
@@ -206,8 +132,6 @@ extension AppModel: MacChatSessionSelectionPort {
             guard chatSelectionGeneration == selectionGenerationAtStart else { return }
             // Prune only against the index read that is still current; load the conversation either way.
             if engine.transcripts.sessions == indexSnapshot {
-                pruneChatDrafts()
-                // Pruning must preserve unsent composer work.
                 await pruneStaleSessionChatState(knownSessionIds: knownSessionIds)
             }
             let targetSessionId = activeChatSessionId
@@ -256,7 +180,6 @@ extension AppModel: MacChatSessionSelectionPort {
             engine.transcripts.setMessages([], for: session.id)
             activeChatSessionId = session.id
             await refreshChatSessionIndex()
-            migrateEmptySessionChatState(to: activeChatSessionId)
             statusText = "New chat session ready"
             publishChatSnapshot()
         } catch {

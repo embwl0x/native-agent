@@ -85,15 +85,14 @@ extension SwiftNativeMemoryV2 {
     }
 
     /// Reconcile the graph from this actor's canonical database without creating a second fact owner.
-    @discardableResult
-    public func reconcileKnowledgeGraphProjection() async throws -> KnowledgeGraphMemoryRebuildReport {
+    public func reconcileKnowledgeGraphProjection() async throws {
         try await ensureCanonicalAttachment()
         guard let underlying = storage else {
             throw MemoryV2Error.storageUnavailable
         }
         let sqlitePath = underlying.path
         let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
-        return try await indexer.rebuildMemoryDerivedGraphFromCanonicalStore(
+        try await indexer.rebuildMemoryDerivedGraphFromCanonicalStore(
             producing: try MemoryPolicyGate.knowledgeGraphEnabled(
                 dataRoot: sqlitePath.deletingLastPathComponent().deletingLastPathComponent()
             )
@@ -163,7 +162,7 @@ extension SwiftNativeMemoryV2 {
         guard try await underlying.quickCheck() == ["ok"] else {
             throw MemoryV2Error.underlying("Canonical memory integrity check failed; the store was retained without rebuilding its graph.")
         }
-        _ = try await reconcileKnowledgeGraphProjection()
+        try await reconcileKnowledgeGraphProjection()
         Self.graphProjectionFailureSlot.withLock { $0 = nil }
     }
 
@@ -246,12 +245,72 @@ extension SwiftNativeMemoryV2 {
         catch { emitDiagnostic("[MemoryV2] Canonical attachment failed: \(error)") }
         return storage
     }
+
+    package func uniqueContextRecords(ids: [String]) async throws -> [String: MemoryRecord] {
+        guard !ids.isEmpty else { return [:] }
+        try await ensureCanonicalAttachment()
+        guard let storage else { throw MemoryV2Error.storageUnavailable }
+        let keys = String(decoding: try JSONEncoder().encode(ids.map(MemoryStorage.contextRecordID)), as: UTF8.self)
+        return try await storage.dbPool.read { db in
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT \(MemoryStorage.memoryProjectionColumns) FROM memories
+                WHERE status = 'active' AND memory_context_id(id) IN (SELECT value FROM json_each(?))
+                """, arguments: [keys])
+            let groups = try Dictionary(grouping: rows) { row in MemoryStorage.contextRecordID(try row.decode(forColumn: "id")) }
+            return try groups.compactMapValues { group in
+                guard group.count == 1, let row = group.first else { return nil }
+                return try MemoryRecord(stored: MemoryStorage.decodeMemoryProjection(row))
+            }
+        }
+    }
 }
 
 extension MemoryStorage {
-    /// Probe quick_check on the exact pool the running app reads and writes.
+    package struct QuickCheckInterrupted: LocalizedError {
+        package let rows: [String]
+        package let detail: String
+        package var errorDescription: String? { detail }
+    }
+
     public func quickCheck() async throws -> [String] {
-        try await dbPool.read { db in try String.fetchAll(db, sql: "PRAGMA quick_check") }
+        let rows = try await quickCheckOnFreshSnapshot()
+        // A search index kept from another table is rebuilt from that table: its damage costs no memory.
+        let damaged = Set(rows.compactMap { row -> String? in
+            if row.hasPrefix("fts5: corruption"), let from = row.range(of: "from table \"") {
+                return row[from.upperBound...].split(separator: "\"").first.map(String.init)
+            }
+            if let named = row.range(of: "malformed inverted index for FTS5 table ") {
+                return row[named.upperBound...].split(separator: ".").last.map(String.init)
+            }
+            return nil
+        })
+        guard !damaged.isEmpty else { return rows }
+        do {
+            try await dbPool.write { db in
+                for table in damaged where !table.contains("\"") {
+                    guard let sql = try String.fetchOne(db, sql: "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", arguments: [table]),
+                          sql.localizedCaseInsensitiveContains("fts5"), sql.contains("content=") else { continue }
+                    try db.execute(sql: "INSERT INTO \"\(table)\"(\"\(table)\") VALUES('rebuild')")
+                }
+            }
+        } catch let error where !(error is CancellationError) {
+            throw QuickCheckInterrupted(rows: rows, detail: "Derived index rebuild failed: \(error)")
+        }
+        do {
+            return try await quickCheckOnFreshSnapshot()
+        } catch let error where !(error is CancellationError) {
+            throw QuickCheckInterrupted(rows: rows, detail: "Post-rebuild quick_check could not be completed: \(error)")
+        }
+    }
+
+    private func quickCheckOnFreshSnapshot() async throws -> [String] {
+        dbPool.invalidateReadOnlyConnections()
+        do {
+            let snapshot = try dbPool.makeSnapshot()
+            return try await snapshot.read { db in try String.fetchAll(db, sql: "PRAGMA quick_check") }
+        } catch let error as DatabaseError where error.resultCode == .SQLITE_CORRUPT || error.resultCode == .SQLITE_NOTADB {
+            return [String(describing: error)]
+        }
     }
 }
 

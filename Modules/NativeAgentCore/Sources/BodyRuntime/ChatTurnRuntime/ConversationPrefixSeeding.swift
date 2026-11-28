@@ -32,14 +32,14 @@ enum ConversationPrefixSeeding {
 
     /// The text lane's session catalog belongs with the changing block, while
     /// its always-on floor remains in the stable system material.
-    static func seed(_ ctx: TurnContext, textToolCatalogAppendix: String? = nil) -> Seed {
+    static func seed(_ ctx: TurnContext, textToolCatalogAppendix: String? = nil, providerSchemaNotice: String? = nil) -> Seed {
         // Fitting changes the held bodies. Select their complement anew before measuring or sending this exact request.
         let held = Set(ctx.historyRowCharacters.keys)
         let receipts = ctx.historyReplaySpec?.historyReceipts?(held)
         let historyLeads = ctx.historyReplaySpec?.historyLeads?(held.union(receipts?.historyIdentities ?? []))
         let catalog = textToolCatalogAppendix
             ?? ctx.toolSchemas.map(\.volatileCatalogAppendix).filter { !$0.isEmpty }.joined(separator: "\n\n")
-        let trailing = [receipts?.text, historyLeads, catalog].compactMap { $0 }.joined(separator: "\n\n")
+        let trailing = [receipts?.text, historyLeads, catalog, providerSchemaNotice].compactMap { $0 }.joined(separator: "\n\n")
         let split = ctx.splittingVolatileBlock(appending: trailing)
         let block = split.turnVolatileBlock ?? ""
         let liveBlocks: [LLMContentBlock]?
@@ -117,8 +117,19 @@ enum ConversationPrefixSeeding {
 
     /// The request and its count leave the same builder, after codec layout.
     static func request(_ context: TurnContext, codec: ToolCallCodec) throws -> Request {
+        let providerSchemaNotice: String?
+        if context.providerId == "openrouter", let app = context.toolSchemas.first(where: { $0.name == "app" }) {
+            let parameters = try app.checkedParameters().serialize(pretty: false)
+            providerSchemaNotice = """
+                OpenRouter does not report which tool schema keywords survive endpoint translation.
+                Use the canonical app input schema below for native app calls.
+                \(parameters)
+                """
+        } else {
+            providerSchemaNotice = nil
+        }
         let seed = seed(context, textToolCatalogAppendix: codec == .textMarkers
-            ? try TextMarkerCodec.volatileCatalogAppendix(for: context) : nil)
+            ? try TextMarkerCodec.volatileCatalogAppendix(for: context) : nil, providerSchemaNotice: providerSchemaNotice)
         let layout = codec == .textMarkers
             ? try TextMarkerCodec.systemLayout(baseSystem: seed.context.systemPrompt,
                 segments: seed.context.systemSegments, context: seed.context)

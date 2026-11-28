@@ -82,7 +82,7 @@ package enum ToolResultSections {
                 if fields.isEmpty { try append(value, path: path) }
                 // Small fields lead, so a source's own state and continuation precede its bulk instead of trailing it as if they were content;
                 // then search ranking, verdict fields, and the shortest remaining fields keep other bulk off the first page.
-                let priority = ["results", "hits", "matches", "text", "content",
+                let priority = ["results", "hits", "matches", "text", "content", "items", "checks", "traces", "receipts", "rows", "events",
                                 "status", "reason", "error", "detail", "message", "result"]
                 let rank = Dictionary(uniqueKeysWithValues: try fields.map { key, value in
                     let bytes = try value.serialize(pretty: false).utf8.count
@@ -194,20 +194,21 @@ package enum ToolResultSections {
         }
     }
 
+    private static func field(_ index: Int, _ key: String, in projection: [Search.Section]) -> JSONValue? { projection[index].value.objectValue?[key] }
+
     /// Whether a section is the next piece of the string before it: both strings, at one path, with one line (or none).
     private static func continues(_ index: Int, _ projection: [Search.Section]) -> Bool {
-        func field(_ index: Int, _ key: String) -> JSONValue? { projection[index].value.objectValue?[key] }
-        guard index > 0, let path = field(index, "path"), path == field(index - 1, "path"),
-              field(index, "value")?.stringValue != nil, field(index - 1, "value")?.stringValue != nil else { return false }
-        return field(index, "line") == field(index - 1, "line")
+        guard index > 0, let path = field(index, "path", in: projection), path == field(index - 1, "path", in: projection),
+              field(index, "value", in: projection)?.stringValue != nil, field(index - 1, "value", in: projection)?.stringValue != nil else { return false }
+        return field(index, "line", in: projection) == field(index - 1, "line", in: projection)
     }
 
     /// The row for a unit's first matching piece, reading the pieces before it and at most the one after; none when no piece matches.
     private static func firstMatch(in unit: Range<Int>, _ projection: [Search.Section], terms: [String], sectionPages: [Int],
                                    budget: Int) -> (value: JSONValue, bytes: Int)? {
-        func field(_ index: Int, _ key: String) -> JSONValue? { projection[index].value.objectValue?[key] }
         func seam(_ left: Int, _ term: String) -> Bool {
-            guard left >= 0, left + 1 < projection.count, term.count > 1, let shared = field(left, "path"), shared == field(left + 1, "path")
+            guard left >= 0, left + 1 < projection.count, term.count > 1,
+                  let shared = field(left, "path", in: projection), shared == field(left + 1, "path", in: projection)
             else { return false }
             let joined = String(projection[left].text.suffix(term.count - 1)) + String(projection[left + 1].text.prefix(term.count - 1))
             return joined.localizedCaseInsensitiveContains(term)
@@ -218,11 +219,11 @@ package enum ToolResultSections {
             let text = projection[index].text, count = text.unicodeScalars.count
             defer { previous = count; lineOffset += count }
             guard terms.allSatisfy({ text.localizedCaseInsensitiveContains($0) || seam(index - 1, $0) || seam(index, $0) }) else { continue }
-            guard let path = field(index, "path") else {
+            guard let path = field(index, "path", in: projection) else {
                 // A section too large to show with its location is already a pointer to the raw pages; it stays one.
                 return (value: projection[index].value, bytes: size(projection[index].value.objectValue ?? [:], budget) + pointerFields)
             }
-            let line = field(index, "line")
+            let line = field(index, "line", in: projection)
             // The piece with its neighbours in the unit: enough for a window on each side and for a term cut by either seam.
             let lower = index > unit.lowerBound ? index - 1 : index, upper = min(unit.upperBound - 1, index + 1)
             var scalars: [Unicode.Scalar] = []
@@ -244,13 +245,13 @@ package enum ToolResultSections {
             if line == nil || window != 0..<scalars.count || unit.count > 1 { row["offset"] = .int(Int64(base + window.lowerBound)) }
             if case .int(let number)? = line {
                 let before = unit.lowerBound - 1
-                if before >= 0, field(before, "path") == path, field(before, "line") == .int(number - 1) {
+                if before >= 0, field(before, "path", in: projection) == path, field(before, "line", in: projection) == .int(number - 1) {
                     // The previous line's last two pieces hold more than its tail shows, however short its last piece is.
                     let head = before > 0 && continues(before, projection) ? before - 1 : before
                     row["before"] = .string(edge(lines(head...before, projection), tail: true))
                 }
                 let after = unit.upperBound
-                if after < projection.count, field(after, "path") == path, field(after, "line") == .int(number + 1) {
+                if after < projection.count, field(after, "path", in: projection) == path, field(after, "line", in: projection) == .int(number + 1) {
                     row["after"] = .string(edge(lines(after...after, projection), tail: false))
                 }
             }

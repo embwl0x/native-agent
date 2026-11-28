@@ -66,8 +66,8 @@ extension AppModel {
     }
 
     @discardableResult
-    func archiveActiveChat(sessionId: String? = nil) async -> AppMutationResult {
-        let session = sessionId ?? activeChatSessionId
+    func archiveActiveChat() async -> AppMutationResult {
+        let session = activeChatSessionId
         let selection = chatSelectionGeneration
         do {
             guard case .result(.bool(let changed)) = try await chatAct(.archiveConversation(session: session)) else {
@@ -88,25 +88,23 @@ extension AppModel {
     }
 
     func startActiveChatTurn(
-        _ text: String, attachments: [FaceAttachment] = [], expectedSessionId: String? = nil, composerRevision: UInt64? = nil
+        _ text: String, attachments: [FaceAttachment] = [], expectedSessionId: String? = nil
     ) async -> ChatTurnAcceptance {
         await submitChat(text, attachments: attachments, session: activeChatSessionId,
-                         expectedSelection: expectedSessionId ?? activeChatSessionId, hideUserBubble: false, composerRevision: composerRevision)
+                         expectedSelection: expectedSessionId ?? activeChatSessionId, hideUserBubble: false)
     }
 
     func startChatTurnForSession(
-        _ text: String, attachments: [FaceAttachment] = [], sessionId: String, composerRevision: UInt64? = nil
+        _ text: String, attachments: [FaceAttachment] = [], sessionId: String
     ) async -> ChatTurnAcceptance {
-        await submitChat(text, attachments: attachments, session: sessionId, expectedSelection: nil, hideUserBubble: false, composerRevision: composerRevision)
+        await submitChat(text, attachments: attachments, session: sessionId, expectedSelection: nil, hideUserBubble: false)
     }
 
     /// The body owns the turn after acceptance, including completion and cross-surface publication.
     private func submitChat(_ text: String, attachments: [FaceAttachment], session: String, expectedSelection: String?,
-                            hideUserBubble: Bool, composerRevision: UInt64?) async -> ChatTurnAcceptance {
-        let revision = composerRevision ?? composerDraft(for: session).manualEditRevision
+                            hideUserBubble: Bool) async -> ChatTurnAcceptance {
         do {
-            let request = SendRequest(session: session, text: text, attachments: attachments, composerRevision: revision,
-                                      expectedSelection: expectedSelection,
+            let request = SendRequest(session: session, text: text, attachments: attachments, expectedSelection: expectedSelection,
                                       options: FaceSendOptions(hideUserBubble: hideUserBubble, choice: nil, continuationReference: nil))
             let acceptedSession = try acceptedConversation(try await chatAct(.send(request)))
             guard acceptedSession == session, !acceptedSession.isEmpty else {

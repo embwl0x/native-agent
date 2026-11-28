@@ -10,14 +10,9 @@ public struct LivingStatusSnapshot: Sendable, Equatable {
     public var postureStatus: String
     public var bodyState: String
     public var behaviorLine: String
-    public var homeLine: String
-    public var whyLine: String
-    public var carryLine: String
-    public var innerLine: String
     public var deskSummary: String
     public var approvalsSummary: String
     public var lastDreamSummary: String
-    public var needsText: String
 
     public static func make(
         organism: OrganismSnapshot,
@@ -25,8 +20,7 @@ public struct LivingStatusSnapshot: Sendable, Equatable {
         blockedDeskCount: Int,
         ownerWaiting: Int,
         pendingApprovals: Int,
-        latestDream: DreamEntry?,
-        agentDisplayName: String = "NativeAgent"
+        latestDream: DreamEntry?
     ) -> LivingStatusSnapshot {
         let needsUser = ownerWaiting > 0
         let needsAttention = !needsUser && (
@@ -39,26 +33,10 @@ public struct LivingStatusSnapshot: Sendable, Equatable {
             postureStatus: (needsUser || needsAttention) ? "warn" : (organism.enabled ? "ok" : "disabled"),
             bodyState: Self.bodyState(for: organism),
             behaviorLine: behaviorLine,
-            homeLine: Self.homeLine(
-                posture: posture,
-                needsUser: needsUser,
-                organism: organism,
-                agentDisplayName: agentDisplayName
-            ),
-            whyLine: Self.whyLine(
-                for: organism,
-                pendingApprovals: pendingApprovals,
-                ownerWaiting: ownerWaiting,
-                blockedDeskCount: blockedDeskCount,
-                agentDisplayName: agentDisplayName
-            ),
-            carryLine: Self.carryLine(for: organism),
-            innerLine: Self.innerLine(from: organism.projectedBodyLine, enabled: organism.enabled),
             deskSummary: Self.deskSummary(active: activeDeskCount, blocked: blockedDeskCount),
             approvalsSummary: pendingApprovals > 0
                 ? "\(pendingApprovals) approval\(pendingApprovals == 1 ? "" : "s") pending" : "no approvals pending",
-            lastDreamSummary: latestDream.map { "last dream \($0.date)" } ?? "no dream entry yet",
-            needsText: needsUser ? "needs you" : (needsAttention ? "no action needed" : "needs nothing")
+            lastDreamSummary: latestDream.map { "last dream \($0.date)" } ?? "no dream entry yet"
         )
     }
 
@@ -99,59 +77,10 @@ public struct LivingStatusSnapshot: Sendable, Equatable {
         return sanitized(posture.summaryLine)
     }
 
-    private static func homeLine(
-        posture: String,
-        needsUser: Bool,
-        organism: OrganismSnapshot,
-        agentDisplayName: String
-    ) -> String {
-        guard organism.enabled else { return "\(agentDisplayName) is quiet until organism mode is enabled." }
-        let ask = needsUser ? "needs you" : "does not need you"
-        return sanitized("\(agentDisplayName) is \(posture.lowercased()) and \(ask).")
-    }
-
-    private static func whyLine(
-        for organism: OrganismSnapshot,
-        pendingApprovals: Int,
-        ownerWaiting: Int,
-        blockedDeskCount: Int,
-        agentDisplayName: String
-    ) -> String {
-        if pendingApprovals > 0 { return "Waiting on approval before irreversible movement." }
-        if ownerWaiting > 0 { return "The Desk's Needs you holds \(ownerWaiting) thing\(ownerWaiting == 1 ? "" : "s") for your decision." }
-        guard organism.enabled else { return "No body line appears while the organism kernel is off." }
-        let body = organism.bodySchema
-        if !body.providersHealthy || !body.toolHandsAvailable { return "Provider or tool path is brittle, so completion claims tighten." }
-        if !body.iPhoneReachable { return "Phone reachability is unconfirmed; notification delivery needs its own receipts." }
-        if body.notificationPathHealthy == false { return "Phone delivery failed, so delivery needs receipts." }
-        if body.resourcePressure != .nominal { return "Resource pressure is present in the agent's body state." }
-        if !body.memoryHealthy || !body.dreamHealthy || !body.approvalChannelsOpen {
-            return "A local body path needs \(agentDisplayName)'s attention, but no user action is requested."
-        }
-        if body.notificationPathHealthy == nil { return "Phone delivery is unconfirmed; reachability alone does not prove delivery." }
-        if blockedDeskCount > 0 { return "Desk has blocked work, but it is not waiting on your decision." }
-        if organism.projectedBodyLine == nil { return "No Body line appears because the body state is steady enough to stay quiet." }
-        return "Body line is active because the current state is shaping the turn."
-    }
-
-    private static func carryLine(for organism: OrganismSnapshot) -> String {
-        guard organism.enabled else { return "carrying no organism state" }
-        return sanitized("carrying \(organism.signalCount) signals, \(organism.fieldSummary.nodeCount) field nodes")
-    }
-
     private static func deskSummary(active: Int, blocked: Int) -> String {
         let activeText = "\(max(0, active)) desk item\(active == 1 ? "" : "s")"
         guard blocked > 0 else { return activeText }
         return "\(activeText), \(blocked) blocked"
-    }
-
-    private static func innerLine(from projectedBodyLine: String?, enabled: Bool) -> String {
-        guard enabled else { return "quiet until organism mode is enabled" }
-        let raw = projectedBodyLine?
-            .replacingOccurrences(of: "- Body:", with: "")
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let line = raw.isEmpty ? "steady enough to stay out of the way" : raw
-        return sanitized(line)
     }
 
     private static func sanitized(_ value: String) -> String {
@@ -183,27 +112,17 @@ public struct LivingStatusSnapshot: Sendable, Equatable {
         postureStatus: String,
         bodyState: String,
         behaviorLine: String,
-        homeLine: String,
-        whyLine: String,
-        carryLine: String,
-        innerLine: String,
         deskSummary: String,
         approvalsSummary: String,
-        lastDreamSummary: String,
-        needsText: String
+        lastDreamSummary: String
     ) {
         self.posture = posture
         self.postureStatus = postureStatus
         self.bodyState = bodyState
         self.behaviorLine = behaviorLine
-        self.homeLine = homeLine
-        self.whyLine = whyLine
-        self.carryLine = carryLine
-        self.innerLine = innerLine
         self.deskSummary = deskSummary
         self.approvalsSummary = approvalsSummary
         self.lastDreamSummary = lastDreamSummary
-        self.needsText = needsText
     }
 
 }

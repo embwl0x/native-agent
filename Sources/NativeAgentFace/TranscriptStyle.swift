@@ -13,11 +13,7 @@ enum TranscriptMetrics {
     static let userCorners = NativeAgentShellLayout.userBubbleCorners
     static let codePadH: CGFloat = NativeAgentSpacing.sm
     static let codePadV: CGFloat = NativeAgentSpacing.sm
-    /// The strip above the code that holds its language label and copy button.
-    static let codeHeader: CGFloat = 22
     static let codeRadius = NativeAgentRadius.card
-    /// The space the provenance line takes above a user bubble.
-    static let tagSpace: CGFloat = 16
     static let documentInset: CGFloat = NativeAgentSpacing.sm
     static let topFade: CGFloat = 24
     /// Text fades out across the clearance between the reading bottom and the composer's top edge, so none shows under the glass.

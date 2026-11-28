@@ -108,6 +108,9 @@ public struct KnowledgeGraphStore: Sendable {
             }()
 
             var score = 0.0
+            // The thing itself, asked for by its own name or alias, comes before anything that only mentions it.
+            let named = ([name] + aliases).contains { $0.lowercased().trimmingCharacters(in: .whitespacesAndNewlines) == qLower }
+            if named { score += 4.0 }
             if exactName {
                 score += 6.0
             } else if exactSummary {

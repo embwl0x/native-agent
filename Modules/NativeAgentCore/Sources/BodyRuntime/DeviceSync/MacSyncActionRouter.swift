@@ -7,7 +7,7 @@ import NativeAgentShared
 import PersistenceCore
 import DeskCore
 import ProviderRouting
-// Blueprint: | `MacSyncActionRouter.swift` | `MacSyncActionRouter`, `surfaceSelection`; Canonical mutation receipts and bounded readbacks. |
+// Blueprint: | `MacSyncActionRouter.swift` | Paired-phone routing, element-scoped Table taps, canonical mutation receipts and bounded readbacks |
 
 @MainActor
 struct MacSyncActionRouter {
@@ -167,7 +167,9 @@ struct MacSyncActionRouter {
         }
 
         func observed(_ response: [String: String]) -> [String: String] {
-            cognitiveResponse = response
+            if actionName != "faceAction" || (payload["checking"] != "true" && InboxAction.responseResultClass(response) == "succeeded") {
+                cognitiveResponse = response
+            }
             return response
         }
 
@@ -216,6 +218,9 @@ struct MacSyncActionRouter {
             // The paired phone's tap answers the row's own action through the person's door.
             case "faceAction":
                 return observed(try await faceActionResponse(action))
+
+            case TableElementEdit.Verb.put.rawValue, TableElementEdit.Verb.cross.rawValue, TableElementEdit.Verb.remove.rawValue:
+                return await tableEditResponse(action)
 
             case "workActivityState":
                 return try await workActivityStateResponse(action)
@@ -283,6 +288,52 @@ struct MacSyncActionRouter {
 }
 
 extension MacSyncActionRouter {
+    private func tableEditResponse(_ action: InboxAction) async -> [String: String] {
+        let payload = action.payload
+        let invalid = ["status": "error", "ok": "false", "code": "invalid_table_edit",
+                       "message": "A table edit needs one element ID and only the fields for its action."]
+        guard let verb = TableElementEdit.Verb(rawValue: action.action),
+              let id = payload["id"], PartFace.Block.isTableSliceID(id) else { return invalid }
+        var fields: [String: PartFace.Value]
+        if verb == .put {
+            let editable: Set<String> = ["type", "x", "y", "w", "h", "text", "color", "kind", "size",
+                                        "from", "to", "fromSide", "toSide", "points", "width", "item", "piece"]
+            guard let encoded = payload["fields"],
+                  let decoded = try? JSONDecoder().decode([String: PartFace.Value].self, from: Data(encoded.utf8)),
+                  !decoded.isEmpty, editable.isSuperset(of: decoded.keys) else { return invalid }
+            let replacingText = decoded["text"] != nil && decoded["type"] == nil
+            let opening = payload["openingText"]
+            guard replacingText == (opening != nil), payload.count == (replacingText ? 3 : 2) else { return invalid }
+            fields = decoded
+            fields["if_text"] = opening.map(PartFace.Value.string)
+        } else {
+            guard payload.count == 1 else { return invalid }
+            fields = [:]
+        }
+        let edit = TableElementEdit(verb, id, fields)
+        let call = PartFace.Call(verb.rawValue, edit.arguments)
+        let act = FaceAct.deskCommand(.init(command: verb.rawValue, handle: BoardDocument.tableRef, arguments: fields))
+        let outcome: FaceActOutcome
+        do {
+            outcome = try await sync.owner.tools.personTap(call, PartFaces.Tap(page: "desk", row: id,
+                action: call.action, door: "phone", device: action.clientId, chat: nil, decided: true))
+        } catch { outcome = .interrupted(error) }
+        if let failure = outcome.failure {
+            let safe = EngineFaceActs.redacted(failure, act: act)
+            return ["status": outcome.unresolved ? "outcome_unknown" : "error", "code": safe.code,
+                    "message": safe.message, "effects": safe.effects.rawValue]
+        }
+        guard outcome.accepted, !outcome.unresolved else {
+            return ["status": "outcome_unknown", "message": "The Mac has not confirmed this table edit.",
+                    "effects": outcome.effects.rawValue]
+        }
+        var settled = ["status": "ok", "ok": "true", "effects": outcome.effects.rawValue]
+        if case .int(let version)? = outcome.committed?.first(where: { $0.id == id })?.value {
+            settled["version"] = String(version)
+        }
+        return settled
+    }
+
     /// Signed phone card actions retain the canonical approval and Inbox owners' authority and receipts.
     func phoneApprovalResponse(id: String, decision: String, device: String, inboxItem: String? = nil) async throws -> [String: String] {
         let owner = try sync.owner
@@ -464,7 +515,7 @@ extension MacSyncActionRouter {
                 let outcome = try await api.faceOutcome(page: page, row: row, action: faceAction,
                     value: payload["value"], values: values, formRevision: payload["formRevision"],
                     device: action.clientId, expecting: call, operation: operation,
-                    undoOf: undoOf, checking: payload["checking"] == "true")
+                    undoOf: undoOf, checking: payload["checking"] == "true", expectedPageRevision: payload["expectedPageRevision"])
                 var response = ["status": outcome.unresolved ? "outcome_unknown" : (outcome.accepted ? "ok" : "error"),
                     "effects": outcome.effects.rawValue,
                     "outcome": String(decoding: try JSONEncoder().encode(outcome), as: UTF8.self)]
@@ -475,7 +526,8 @@ extension MacSyncActionRouter {
             guard payload["values"] == nil, payload["formRevision"] == nil else {
                 throw PartCallError(code: "drawn_call_missing", message: "Submit forms through their drawn call and retained operation.")
             }
-            let words = try await api.faceAction(page: page, row: row, action: faceAction, value: payload["value"], device: action.clientId)
+            let words = try await api.faceAction(page: page, row: row, action: faceAction, value: payload["value"],
+                device: action.clientId, expectedPageRevision: payload["expectedPageRevision"])
             var response = ["status": "ok", "ok": "true"]
             if let words { response["message"] = words }
             return response

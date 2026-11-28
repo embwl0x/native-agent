@@ -86,6 +86,13 @@ enum FaceFocus: Hashable {
 
     private var viewers: Set<UUID> = []
     var released: (() -> Void)?
+    var inlineFocused = false
+    var focusedTextView: UUID?
+    var textSelections: Set<UUID> = []
+    var copyMenus: Set<UUID> = []
+    public var interactsWithText: Bool { !textSelections.isEmpty || !copyMenus.isEmpty }
+    public var isHovering = false
+    public var isPinned = false
 
     public init() {}
 
@@ -134,11 +141,15 @@ enum FaceFocus: Hashable {
 
     public func attach(_ viewer: UUID) { viewers.insert(viewer) }
     public func detach(_ viewer: UUID) { viewers.remove(viewer); releaseIfIdle() }
-    var retained: Bool {
-        !viewers.isEmpty || drafts.hasEdits || !openFolds.isEmpty || operations.values.contains {
+    public var hasUnfinishedWork: Bool {
+        drafts.hasEdits || operations.values.contains {
             $0.checking || $0.outcome == nil || $0.outcome?.unresolved == true
         }
     }
+    public var holdsDissolution: Bool {
+        inlineFocused || focusedTextView != nil || isHovering || isPinned || interactsWithText || hasUnfinishedWork
+    }
+    var retained: Bool { !viewers.isEmpty || !openFolds.isEmpty || holdsDissolution }
     private func releaseIfIdle() { if !retained { released?() } }
 
     func held(_ item: FaceItemID) -> Bool {
@@ -148,7 +159,7 @@ enum FaceFocus: Hashable {
 
     public func submit(_ item: FaceItemID, row: String, action: String, value: String?, call: PartFace.Call?, door: any FaceDoor,
                 undoOf: UUID? = nil, values: [String: PartFace.Value]? = nil, formRevision: String? = nil,
-                formEdits: [String: String] = [:]) {
+                formEdits: [String: String] = [:], expectedPageRevision: String? = nil) {
         guard !held(item) else { return }
         let state = editRow(item.row)
         guard let call else {
@@ -159,7 +170,7 @@ enum FaceFocus: Hashable {
         }
         state.refusal = nil
         let submission = FaceActSubmission(id: UUID(), row: row, action: action, value: value, expectedCall: call, undoOf: undoOf,
-                                           values: values, formRevision: formRevision)
+                                           values: values, formRevision: formRevision, expectedPageRevision: expectedPageRevision)
         let key = draftKey(item)
         let revision = drafts.revision(key)
         let audience = viewers
@@ -175,7 +186,7 @@ enum FaceFocus: Hashable {
         state.operation?.task = task
     }
 
-    func check(_ item: FaceItemID, door: any FaceDoor) {
+    public func check(_ item: FaceItemID, door: any FaceDoor) {
         guard let state = rows[item.row], let operation = state.operation, operation.outcome?.unresolved == true, !operation.checking else { return }
         let original = operation.submission
         let read = FaceActSubmission(id: original.id, row: original.row, action: original.action, value: original.value,
@@ -293,10 +304,17 @@ enum FaceFocus: Hashable {
             access(keyPath: \.[subject])
             return cells[subject]
         }
-        set { withMutation(keyPath: \.[subject]) { cells[subject] = newValue } }
+        set {
+            withMutation(keyPath: \.hasEdits) {
+                withMutation(keyPath: \.[subject]) { cells[subject] = newValue }
+            }
+        }
     }
 
-    var hasEdits: Bool { !cells.isEmpty }
+    var hasEdits: Bool {
+        access(keyPath: \.hasEdits)
+        return !cells.isEmpty
+    }
     func revision(_ subject: String) -> UUID? { self[subject]?.edit.revision }
     public init() {}
 

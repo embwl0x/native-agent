@@ -61,14 +61,14 @@ public struct AgentContactRow: Identifiable, Sendable {
         }
     }
 
-    public static func rows(peers: [AgentPeerContact], candidates: [AgentDiscoveryCandidate], everyDoor: Bool = false) -> [Self] {
+    public static func rows(peers: [AgentPeerContact], candidates: [AgentDiscoveryCandidate]) -> [Self] {
         let hosts = candidates.filter(\.connectable).compactMap { candidate in
             candidate.hostID.flatMap { id in AgentHostDirectory.rows.first { $0.id == id } }
         }
         let discovered = candidates.filter { candidate in
             (candidate.cardURL != nil || candidate.draft != nil) && !peers.contains { $0.endpoint == candidate.cardURL || $0.endpoint == candidate.endpoint }
         }.map { Self(id: $0.id, name: $0.name, contact: nil, candidate: $0) }
-        let contacts = (rows(peers: peers, installed: hosts, everyDoor: everyDoor) + discovered).map { row in
+        let contacts = (rows(peers: peers, installed: hosts) + discovered).map { row in
             var row = row
             let hostID = row.contact.flatMap { AgentPeerStore.hostRowID($0.endpoint) } ?? row.id
             row.candidate = row.candidate ?? candidates.first { $0.hostID == hostID }
@@ -78,10 +78,10 @@ public struct AgentContactRow: Identifiable, Sendable {
     }
 
     /// Reuse canonical identities without merging door grants.
-    public static func rows(peers: [AgentPeerContact], candidates: [AgentDiscoveryCandidate], dataRoot: URL, everyDoor: Bool = false) throws -> [Self] {
+    public static func rows(peers: [AgentPeerContact], candidates: [AgentDiscoveryCandidate], dataRoot: URL) throws -> [Self] {
         let identity = try AgentContactIdentity(dataRoot: dataRoot, peers: peers)
         let health = try AgentContactHealth.read(dataRoot: dataRoot)
-        let all = rows(peers: peers, candidates: candidates, everyDoor: true).map { row in
+        let all = rows(peers: peers, candidates: candidates).map { row in
             var row = row
             row.health = health[row.key]
             return (identity.canonical(row.key), row)
@@ -92,11 +92,10 @@ public struct AgentContactRow: Identifiable, Sendable {
                 .sorted { $0.isBroken != $1.isBroken ? $0.isBroken : $0.checkedAt > $1.checkedAt }.first)
         }
         var seen: Set<String> = []
-        return all.compactMap { canonical, row in
+        return all.map { canonical, row in
             var row = row
             row.primary = !(row.contact?.who.map { who in peers.contains { $0.id == who } } ?? false)
                 && seen.insert(canonical).inserted
-            guard everyDoor || row.primary else { return nil }
             row.candidate = folded[canonical]?.candidate ?? row.candidate
             row.health = folded[canonical]?.health ?? health[canonical] ?? row.health
             return row
@@ -107,10 +106,10 @@ public struct AgentContactRow: Identifiable, Sendable {
     public var key: String { id }
 
     /// Group doors by contact without merging their Trust grants.
-    public static func rows(peers: [AgentPeerContact], installed: [AgentHostRow], everyDoor: Bool = false) -> [Self] {
+    public static func rows(peers: [AgentPeerContact], installed: [AgentHostRow]) -> [Self] {
         let configured = Set(peers.compactMap { AgentPeerStore.hostRowID($0.endpoint) })
         let credentials = AgentPeerCredentials.credentialReads(peers)
-        return peers.filter { peer in everyDoor || !peers.contains { $0.id == peer.who } }.map { peer in
+        return peers.map { peer in
             let availability = AgentPeerCredentials.availability(peer, reads: credentials)
             let available: Bool
             let failure: ToolFailureError?

@@ -405,17 +405,6 @@ public enum FirstPartyModelCatalog {
         guard !models(forProviderID: providerID).isEmpty else { return nil }
         return descriptor(for: modelID, providerID: providerID, dataRoot: dataRoot)?.supportedReasoningEfforts
     }
-
-    /// The effective Anthropic contract on either Anthropic route.
-    public static func anthropicDescriptor(
-        for modelID: String, providerID: String = "anthropic", dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) -> FirstPartyModelDescriptor? {
-        descriptor(for: modelID, providerID: providerID, dataRoot: dataRoot)
-    }
-
-    public static func xAIDescriptor(for modelID: String, dataRoot: URL = PersistenceCore.defaultDataRoot()) -> FirstPartyModelDescriptor? {
-        descriptor(for: modelID, providerID: "xai_oauth_direct", dataRoot: dataRoot)
-    }
 }
 
 /// Provider-specific request controls. A picker capability is not considered implemented until the corresponding adapter emits it here.
@@ -501,7 +490,7 @@ public enum FirstPartyExecutionControls {
         model: String, requested: String?, providerID: String = "anthropic", dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) throws -> String? {
         guard let requested else { return nil }
-        guard let descriptor = FirstPartyModelCatalog.anthropicDescriptor(for: model, providerID: providerID, dataRoot: dataRoot) else {
+        guard let descriptor = FirstPartyModelCatalog.descriptor(for: model, providerID: providerID, dataRoot: dataRoot) else {
             throw LLMError.providerError(message: "Think controls for \(model) are unknown. Choose a catalog model in Providers.")
         }
         let normalized = requested.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -516,7 +505,7 @@ public enum FirstPartyExecutionControls {
         to body: inout [String: Any], model: String, call: LLMCall,
         providerID: String = "anthropic", dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) throws {
-        if FirstPartyModelCatalog.anthropicDescriptor(for: model, providerID: providerID, dataRoot: dataRoot)?.adaptiveThinking == true {
+        if FirstPartyModelCatalog.descriptor(for: model, providerID: providerID, dataRoot: dataRoot)?.adaptiveThinking == true {
             body["thinking"] = ["type": "adaptive", "display": "summarized"]
         }
         guard let effort = try anthropicEffort(model: model, requested: call.admission?.reasoningEffort,
@@ -530,7 +519,7 @@ public enum FirstPartyExecutionControls {
 
     public static func xAIReasoningEffort(model: String, requested: String?, dataRoot: URL = PersistenceCore.defaultDataRoot()) throws -> String? {
         guard let requested else { return nil }
-        guard let descriptor = FirstPartyModelCatalog.xAIDescriptor(for: model, dataRoot: dataRoot) else {
+        guard let descriptor = FirstPartyModelCatalog.descriptor(for: model, providerID: "xai_oauth_direct", dataRoot: dataRoot) else {
             throw LLMError.providerError(message: "xAI Think controls for \(model) are unknown. Choose a catalog model in Providers.")
         }
         let normalized = requested.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -553,7 +542,8 @@ public enum FirstPartyExecutionControls {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         if let tier, tier != "default" {
-            guard tier == "priority", FirstPartyModelCatalog.xAIDescriptor(for: model, dataRoot: dataRoot)?.supportsFast == true else {
+            guard tier == "priority",
+                  FirstPartyModelCatalog.descriptor(for: model, providerID: "xai_oauth_direct", dataRoot: dataRoot)?.supportsFast == true else {
                 throw LLMError.providerError(message: "Service tier '\(tier)' is unsupported for \(model) on xAI. Choose a supported tier in Providers.")
             }
             body["service_tier"] = "priority"

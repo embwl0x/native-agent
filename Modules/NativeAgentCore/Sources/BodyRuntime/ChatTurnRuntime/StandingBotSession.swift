@@ -98,8 +98,7 @@ extension SwiftNativeChatOrchestrationClient {
         // A regenerate replaces the tail turn: its question is already on disk
         // and its old answer is not history for the new one.
         let historyRead = history.promptMessagesWithStats(
-            transcript: try await history.transcriptBytes(forSessionId: bot.sessionID).bytes,
-            excludingRunId: nil
+            transcript: try await history.transcriptBytes(forSessionId: bot.sessionID).bytes
         )
         var rows = try historyRead.checkedMessages()
         var replacingUserID = turn.rows.replacementUserMessageID

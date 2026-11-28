@@ -1,7 +1,7 @@
 import Foundation
+import PersistenceCore
 import NativeAgentShared
 import NativeAgentCore
-import PersistenceCore
 import DeskCore
 import CoreGraphics
 // Blueprint: | `MacNotification.swift` | Notification posting through the app's injected banner exit with truthful unverified acceptance |

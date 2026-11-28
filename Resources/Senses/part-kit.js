@@ -26,9 +26,14 @@
         if (id.indexOf("files.") === 0 && !files.includes(id)) return door(id, args);
         return invoke("primitive", id, args === undefined ? [] : [args]);
     }
-    const state = Object.freeze({get: () => invoke("state", "get", []), set: v => invoke("state", "set", [v])});
+    const state = Object.freeze(Object.fromEntries(["get", "set", "delete", "list", "cas"]
+        .map(operation => [operation, (...args) => invoke("state", operation, args)])));
+    const methods = (prefix, verbs) => Object.freeze(Object.fromEntries(verbs.map(verb => [verb, args => primitive(prefix + "." + verb, args)])));
+    const fetch = Object.freeze(Object.assign(args => primitive("fetch", args), {sse: methods("fetch.sse", ["open", "next", "close"])}));
     const host = settings.part ? {call: primitive, state, measurementSystem,
-        paths: Object.freeze({home, workspace}), fetch: args => primitive("fetch", args)} : {state};
+        paths: Object.freeze({home, workspace}), fetch,
+        app: Object.freeze({openURL: args => primitive("app.openURL", args)}),
+        ax: Object.freeze({query: args => primitive("ax.query", args)})} : {state};
     const request = request => {
         if (!request || typeof request !== "object" || Array.isArray(request))
           throw new TypeError("Use app({action:'desk.read',args:{handle:'desk.1'}}) or app.desk.read({handle:'desk.1'}).");
@@ -96,7 +101,10 @@
     function member(kind, id, children) {
         if (kind === "primitive") return args => primitive(id, args);
         if (kind === "door") return args => door(id, args);
-        if (kind === "primitives") return Object.freeze(new Proxy({}, {get: (_, k) => typeof k === "string" ? children["+" + k] : undefined}));
+        if (kind === "primitives") {
+            const members = id === "network" ? {websocket: methods("network.websocket", ["open", "send", "receive", "close"])} : {};
+            return Object.freeze(new Proxy(members, {get: (_, k) => typeof k === "string" ? members[k] ?? children["+" + k] : undefined}));
+        }
         if (kind === "host" || kind === "doors") {
             const value = kind === "host" ? host : Object.create(null);
             for (const key of children["*"]) Object.defineProperty(value, key, {enumerable: true, get: () => children["=" + key]});

@@ -26,8 +26,6 @@ public struct MemoryRecord: Sendable, Codable, Equatable, Identifiable {
     public var confidence: Double?
     public var importance: Double?
     public var tags: [String]?
-    public var lastUsedAt: String?
-    public var decay: JSONValue?
     public var correction: JSONValue?
     public var provenance: JSONValue?
     /// Temporal evidence is descriptive canonical data; it grants no authority or ranking change without explicit policy.
@@ -52,8 +50,6 @@ public struct MemoryRecord: Sendable, Codable, Equatable, Identifiable {
         confidence: Double? = nil,
         importance: Double? = nil,
         tags: [String]? = nil,
-        lastUsedAt: String? = nil,
-        decay: JSONValue? = nil,
         correction: JSONValue? = nil,
         provenance: JSONValue? = nil,
         validFrom: String? = nil,
@@ -76,8 +72,6 @@ public struct MemoryRecord: Sendable, Codable, Equatable, Identifiable {
         self.confidence = confidence
         self.importance = importance
         self.tags = tags
-        self.lastUsedAt = lastUsedAt
-        self.decay = decay
         self.correction = correction
         self.provenance = provenance
         self.validFrom = validFrom
@@ -90,7 +84,7 @@ public struct MemoryRecord: Sendable, Codable, Equatable, Identifiable {
     private static let knownKeys: Set<String> = [
         "id", "text", "layer", "memoryKind", "personaId", "lifecycle", "createdAt", "updatedAt",
         "sourceRunId", "status", "pinned", "confidence", "importance", "tags",
-        "lastUsedAt", "decay", "correction",
+        "correction",
         "provenance", "validFrom", "validTo", "observedAt", "evidence", "extras",
     ]
 
@@ -126,8 +120,6 @@ public struct MemoryRecord: Sendable, Codable, Equatable, Identifiable {
         self.confidence = try dbl("confidence")
         self.importance = try dbl("importance")
         self.tags = try arr("tags")
-        self.lastUsedAt = try str("lastUsedAt")
-        self.decay = try jv("decay")
         self.correction = try jv("correction")
         self.provenance = try jv("provenance")
         self.validFrom = try str("validFrom")
@@ -163,8 +155,6 @@ public struct MemoryRecord: Sendable, Codable, Equatable, Identifiable {
         try c.encodeIfPresent(confidence, forKey: JSONKey("confidence"))
         try c.encodeIfPresent(importance, forKey: JSONKey("importance"))
         try c.encodeIfPresent(tags, forKey: JSONKey("tags"))
-        try c.encodeIfPresent(lastUsedAt, forKey: JSONKey("lastUsedAt"))
-        try c.encodeIfPresent(decay, forKey: JSONKey("decay"))
         try c.encodeIfPresent(correction, forKey: JSONKey("correction"))
         try c.encodeIfPresent(provenance, forKey: JSONKey("provenance"))
         try c.encodeIfPresent(validFrom, forKey: JSONKey("validFrom"))
@@ -366,13 +356,6 @@ public actor SwiftNativeMemoryV2 {
         return try await storage.listMemoryRecords(kind: kind)
     }
 
-    /// Recheck chosen record IDs so compiled context cannot speak a memory the owner retired or narrowed.
-    public func memoryRecords(ids: [String]) async throws -> [MemoryRecord] {
-        try await ensureCanonicalAttachment()
-        guard let storage else { throw MemoryV2Error.storageUnavailable }
-        return try await storage.memories(ids: ids).map(MemoryRecord.init(stored:))
-    }
-
 
     /// `changed` is false when the memory already read this way and nothing was written.
     public func updateMemory(id: String, update: JSONValue, restating: [MemoryRoot.Telling]? = nil,
@@ -467,9 +450,9 @@ public actor SwiftNativeMemoryV2 {
     }
 
     /// Vectors from the already-resident model, or nil; never loads.
-    public func embedIfWarmWithEpoch(_ texts: [String], requireFullText: Bool = false) async throws -> MemoryEmbeddingBatch? {
+    public func embedIfWarmWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingBatch? {
         guard let managed = embedder as? ManagedEmbeddingProvider else { return nil }
-        return try await managed.embedIfResidentWithEpoch(texts, requireFullText: requireFullText)
+        return try await managed.embedIfResidentWithEpoch(texts)
     }
 
     public func managedEmbeddingRuntime() async throws -> ManagedEmbeddingProvider {
@@ -501,10 +484,7 @@ public actor SwiftNativeMemoryV2 {
             coreMLResourcesAvailable: coreMLUp,
             coreMLLoaded: coreMLUp,
             modelLoadable: coreMLUp,
-            lastUsedAt: nil,
             lastLoadedAt: nil,
-            lastUnloadedAt: nil,
-            unloadReason: nil,
             lastLoadError: epochError,
             loadCount: coreMLUp ? 1 : 0,
             unloadCount: 0
@@ -550,12 +530,9 @@ public actor SwiftNativeMemoryV2 {
         return try await embedder.embedQueriesWithEpoch(texts)
     }
 
-    @discardableResult
-    public func releaseEmbeddingMemory(reason: String = "manual release") -> EmbeddingRuntimeSnapshot? {
-        guard let managed = embedder as? ManagedEmbeddingProvider else {
-            return embeddingRuntimeSnapshot()
-        }
-        return managed.release(reason: reason)
+    public func releaseEmbeddingMemory() {
+        guard let managed = embedder as? ManagedEmbeddingProvider else { return }
+        managed.release()
     }
 
     public func memoryEmbeddingEpochState() async throws -> MemoryEmbeddingEpochState {
@@ -567,16 +544,14 @@ public actor SwiftNativeMemoryV2 {
     }
 
     /// Build bounded corpus vectors off the chat path and activate atomically; content or provider drift refuses the switch.
-    public func reindexAllMemoryEmbeddingsForCurrentProvider(
-        batchSize: Int = 64
-    ) async throws -> MemoryEmbeddingEpochActivationReport {
+    public func reindexAllMemoryEmbeddingsForCurrentProvider() async throws -> MemoryEmbeddingEpochActivationReport {
         guard let embedder else { throw MemoryV2Error.storageUnavailable }
-        return try await reindexMemoryEmbeddings(using: embedder, batchSize: batchSize)
+        return try await reindexMemoryEmbeddings(using: embedder)
     }
 
     /// A prepared provider can build its space without publishing a selection.
     func reindexMemoryEmbeddings(
-        using embedder: any EmbeddingProvider, batchSize: Int = 64
+        using embedder: any EmbeddingProvider
     ) async throws -> MemoryEmbeddingEpochActivationReport {
         try await ensureCanonicalAttachment()
         try Task.checkCancellation()
@@ -593,7 +568,7 @@ public actor SwiftNativeMemoryV2 {
         guard corpus.count <= 50_000 else {
             throw MemoryV2Error.underlying("embedding corpus exceeds bounded activation limit")
         }
-        let boundedBatch = min(256, max(1, batchSize))
+        let boundedBatch = 64
         var staged: [MemoryEmbeddingStagedRow] = []
         staged.reserveCapacity(corpus.count)
         var candidateEpoch: MemoryEmbeddingEpoch?

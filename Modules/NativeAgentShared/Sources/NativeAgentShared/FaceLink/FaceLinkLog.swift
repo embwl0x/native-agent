@@ -237,8 +237,6 @@ extension FaceLinkLog {
         case .failed(let error), .refused(let error): return name(reply) + " " + failure(error)
         case .committed(let result):
             return "committed" + (result.publicationFailure.map { " publicationFailure " + failure($0) } ?? "")
-        case .operation(.completed(let result)):
-            return "operation completed" + (result.publicationFailure.map { " publicationFailure " + failure($0) } ?? "")
         case .card(let result):
             return "card" + (result.failure.map { " failure " + failure($0) } ?? "")
         default: return name(reply)

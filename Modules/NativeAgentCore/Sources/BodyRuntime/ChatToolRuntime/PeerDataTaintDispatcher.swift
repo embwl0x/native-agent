@@ -3,7 +3,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import DeskCore
-// Blueprint: | `PeerDataTaintDispatcher.swift` | `PeerDataTaintDispatcher`, `peerApproval`: Read trust live; reads attribute, never steer. |
+// Blueprint: | `PeerDataTaintDispatcher.swift` | `PeerDataTaintDispatcher`: live peer approval and per-teller memory provenance |
 
 public enum PeerDataTaintDispatcher {
     static func trustSources(turn: Turn) -> [String] {
@@ -46,48 +46,30 @@ public enum PeerDataTaintDispatcher {
         return (requester, requester != nil && protectedAction)
     }
 
-    /// The refusal for a memory call whose telling is not by the door that started the turn. That door is read from the turn's peer sources and the
-    /// person's contact record, never a word the peer put in its message; a trusted door, or a turn no peer started, has none.
-    static func provenanceRefusal(tool: String, input: [String: JSONValue], surface: String, turn: Turn, peerStore: AgentPeerStore?) -> String? {
+    static func commitTellers(_ input: [String: JSONValue], turn: Turn) throws -> [String]? {
+        try memoryTellers("commit_memory", input: input, surface: turn.envelope?.surface ?? "", turn: turn)
+    }
+
+    static func memoryTellers(_ tool: String, input: [String: JSONValue], surface: String, turn: Turn,
+                              rewriteChangesText: Bool? = nil) throws -> [String]? {
         guard PeerTurnEffectPolicy.judgesProvenance(tool: tool, input: input) else { return nil }
-        let peerIdentity: PeerTurnEffectPolicy.PeerIdentity
-        let taint = turn.peerSteering
-        let root = peerStore?.dataRoot ?? turn.dataRoot
-        var held: PeerDataTaint.TrustRead?
-        let trust: () -> PeerDataTaint.TrustRead = {
-            if let held { return held }
-            let read = PeerTrust.read(trustSources(turn: turn), dataRoot: root)
-            held = read
-            return read
+        let through = MemoryDataProvenance.through(turn: turn)
+        let bridge = PeerTurnEffectPolicy.isPeerBridge(surface: surface)
+        if through.isEmpty, !bridge {
+            return try PeerTurnEffectPolicy.memoryTellers(tool: tool, input: input, peers: [], readPeerData: false)
         }
-        let readPeerData = taint?.isTainted(trust: trust) == true
-        if let taint, readPeerData {
-            let steering = taint.untrustedSources(trust: trust)
-            if steering.count == 1, steering[0].hasPrefix("peer:") {
-                let doorID = String(steering[0].dropFirst(5))
-                peerIdentity = PeerTurnEffectPolicy.PeerIdentity(
-                    id: doorID,
-                    name: peerStore == nil ? nil : trust().doorName(doorID)
-                )
-            } else {
-                peerIdentity = PeerTurnEffectPolicy.PeerIdentity(
-                    name: steering.map { source in
-                        guard source.hasPrefix("peer:") else { return source }
-                        let doorID = String(source.dropFirst(5))
-                        return (peerStore == nil ? nil : trust().doorName(doorID)) ?? source
-                    }.joined(separator: ", ")
-                )
-            }
-        } else if PeerTurnEffectPolicy.isPeerBridge(surface: surface), !PeerDataTaint.trustedTurn(turn, trust: trust) {
-            let peerID = PeerDataTaint.attestedPeerID(turn: turn)
-            peerIdentity = PeerTurnEffectPolicy.PeerIdentity(
-                id: peerID,
-                name: peerID.flatMap { peerStore == nil ? nil : trust().doorName($0) }
-            )
-        } else {
-            return nil
+        let trust = PeerTrust.read(through + PeerDataTaint.trustedTurnCandidates(turn), dataRoot: turn.dataRoot)
+        let steering = MemoryDataProvenance.steering(through, trust: trust)
+        var peers = steering.map { source -> PeerTurnEffectPolicy.PeerIdentity in
+            guard source.hasPrefix("peer:"), source.count > 5 else { return .init(name: source) }
+            let id = String(source.dropFirst(5))
+            return .init(id: id, name: trust.doorName(id))
         }
-        return PeerTurnEffectPolicy.provenanceRefusal(tool: tool, input: input, peer: peerIdentity, readPeerData: readPeerData)
+        if peers.isEmpty, bridge, !PeerDataTaint.trustedTurn(turn, trust: { trust }) {
+            peers = [.init()]
+        }
+        return try PeerTurnEffectPolicy.memoryTellers(tool: tool, input: input, peers: peers,
+            readPeerData: turn.peerSteering?.isTainted(trust: { trust }) == true, rewriteChangesText: rewriteChangesText)
     }
 
     /// The contact the app's own agent tools routed this call to: the `agent` an agent message or read was sent to, or a home `<name>.say`.
@@ -204,14 +186,10 @@ public enum PeerDataTaintDispatcher {
 
 extension DoorPipeline {
     func checkProvenance(tool: String, input: [String: JSONValue], surface: String, turn: Turn, invocation: ChatToolInvocation) async throws -> JSONValue {
-        // Peer provenance comes from the turn's origin, never a read. Check provenance_by against the transport-attested peer and its contact record, never a
-        // word the peer put in its message.
-        if let refusal = PeerDataTaintDispatcher.provenanceRefusal(tool: tool, input: input, surface: surface, turn: turn, peerStore: AgentPeerStore(dataRoot: dataRoot)) {
-            throw AutonomyGateError.toolDenied(reason: refusal)
-        }
+        let ran = ToolNameAliases.ranCall(tool, input: input)
+        _ = try PeerDataTaintDispatcher.memoryTellers(tool, input: input, surface: surface, turn: turn, rewriteChangesText: false)
         var result = try await admitEffect(tool: tool, input: input, surface: surface, turn: turn, invocation: invocation)
-        let ranTool = ToolNameAliases.ranTool(tool, input: input)
-        if ["read_page", "web_search", "browser.read_text", "browser.read_links", "browser.chrome_snapshot"].contains(ranTool),
+        if ["read_page", "web_search", "browser.read_text", "browser.read_links", "browser.chrome_snapshot"].contains(ran.tool),
            case .object(var fields) = result,
            ["text", "content", "results", "links", "nodes", "raw"].contains(where: { fields[$0].map(PeerDataTaintDispatcher.containsStructuredText) == true }) {
             fields["agent"] = .string("web content")

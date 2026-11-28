@@ -62,6 +62,7 @@ extension SwiftNativeTurnEngine {
             due = []
         }
         let entries = MyQueue.entries(state).filter { entry in
+            guard entry.step.causalWait == nil else { return false }
             if peerTurn {
                 guard let contacts, let origin = entry.step.origin, origin.hasPrefix("agent:") else { return false }
                 return peers.contains(PeerTrust.principal(String(origin.dropFirst(6)), dataRoot: turn.dataRoot, peers: contacts))

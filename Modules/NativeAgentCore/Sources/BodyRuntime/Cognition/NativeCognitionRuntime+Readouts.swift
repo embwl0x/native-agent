@@ -26,12 +26,7 @@ extension NativeCognitionRuntime {
     }
 
     public func publishRuntimeChange(reason: String) {
-        changeRevision &+= 1
-        let change = NativeCognitionRuntimeChange(
-            revision: changeRevision,
-            occurredAt: now(),
-            reason: String(reason.prefix(96))
-        )
+        let change = NativeCognitionRuntimeChange(reason: String(reason.prefix(96)))
         for continuation in changeContinuations.values {
             continuation.yield(change)
         }
@@ -45,13 +40,12 @@ extension NativeCognitionRuntime {
     /// A read joins the opening the mind's owner started; it never opens the mind itself.
     public func observatoryDetail() async -> CognitiveObservatoryDetail {
         await bootstrapTask?.value
-        let inspectFixedAt = now()
+        let (bodySample, inspectFixedAt) = await organismBodySample()
         let organism = await organismKernel.refreshBodySchemaAndFrozenRead(
-            await organismBodySample(at: inspectFixedAt), integratesChemistry: false,
+            bodySample,
             canonicalAffect: await substrate.canonicalAffectProjection(at: inspectFixedAt), fixedAt: inspectFixedAt)
         let read = await substrate.frozenRead(at: inspectFixedAt)
         let configuration = read.configuration
-        // One nonconsuming inspection supplies mode and cold preview; live previews mirror the last delivered capsule.
         let inspectRequest = await requestWithOrganismProjection(
             CognitiveCapsuleRequest(
                 surface: "chat",
@@ -63,8 +57,6 @@ extension NativeCognitionRuntime {
             toward: organism.toward,
             at: inspectFixedAt
         )
-        // Read all workspace-derived fields from the same substrate epoch.
-        let feltMode = await substrate.feltModeReading(for: inspectRequest, from: read)
 
         let capsulePreview: CognitiveCapsule?
         let capsulePreviewInfo: CapsulePreviewInfo?
@@ -72,14 +64,13 @@ extension NativeCognitionRuntime {
             capsulePreview = last.capsule
             capsulePreviewInfo = CapsulePreviewInfo(
                 source: .liveInjected,
-                userMessage: last.userMessage,
-                at: last.capsule.generatedAt
+                userMessage: last.userMessage
             )
         } else {
             let synthetic = await substrate.compileFrozenCapsulePresentation(inspectRequest, from: read, turn: nil).capsule
             let nonEmpty = synthetic.combined.isEmpty ? nil : synthetic
             capsulePreview = nonEmpty
-            capsulePreviewInfo = nonEmpty == nil ? nil : CapsulePreviewInfo(source: .synthetic, userMessage: nil, at: nil)
+            capsulePreviewInfo = nonEmpty == nil ? nil : CapsulePreviewInfo(source: .synthetic, userMessage: nil)
         }
         let receiptRead = await substrate.receiptReadSnapshot()
         let schemas = await substrate.schemaProposalSnapshot()
@@ -97,8 +88,7 @@ extension NativeCognitionRuntime {
             receiptRead: receiptRead,
             organism: organism.snapshot,
             capsulePreview: capsulePreview,
-            capsulePreviewInfo: capsulePreviewInfo,
-            feltMode: feltMode
+            capsulePreviewInfo: capsulePreviewInfo
         )
     }
 
@@ -116,10 +106,7 @@ extension NativeCognitionRuntime {
             associations: cognition.associations,
             associationMissingEndpointCount: cognition.associationMissingEndpointCount,
             receiptRead: await substrate.receiptReadSnapshot(),
-            organism: organism.snapshot,
-            capsulePreviewInfo: lastInjectedCapsule.map {
-                CapsulePreviewInfo(source: .liveInjected, userMessage: $0.userMessage, at: $0.capsule.generatedAt)
-            }
+            organism: organism.snapshot
         )
     }
 

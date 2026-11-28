@@ -39,13 +39,12 @@ public actor TurnFirstRenderRegistry {
     public func observeFirstRender(
         role: String,
         content: String,
-        isLastAssistant: Bool,
         messageSessionID: String?,
         messageTurnID: String?,
         activeSessionID: String,
         observedBy: String
     ) {
-        guard role == "assistant", isLastAssistant,
+        guard role == "assistant",
               content.contains(where: { !$0.isWhitespace }) else { return }
         // A present-but-blank message session must not claim the active tab.
         let sessionID = (messageSessionID ?? activeSessionID)

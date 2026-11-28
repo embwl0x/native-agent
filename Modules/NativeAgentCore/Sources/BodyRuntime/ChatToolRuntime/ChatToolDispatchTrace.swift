@@ -28,6 +28,12 @@ package enum ChatToolDispatchTracer {
         }
     }
 
+    /// The recorded call a dispatch runs inside, and the ability it named.
+    private struct TracedAct: NativeAgentCore.TurnPart, Sendable {
+        let receipt: String, ability: String
+        static let unset: TracedAct? = nil
+    }
+
     /// One dispatch predicate for both recording and the turn's learning readers.
     package static func isPreview(tool: String, input: [String: JSONValue]) -> Bool {
         tool == "app" && input["preview"] == .bool(true)
@@ -38,6 +44,9 @@ package enum ChatToolDispatchTracer {
         let dataRoot = pipeline.dataRoot
         let turn = turn.with(\.cardCause, turn.cardCause ?? CardCause())
         let ability = Self.abilityName(tool: tool, input: input)
+        if turn[DreamPart.Key.self] != nil {
+            return try await pipeline.checkProvenance(tool: tool, input: input, surface: surface, turn: turn, invocation: invocation)
+        }
         if turn.doorPreview != nil {
             let result = try await pipeline.checkProvenance(tool: tool, input: input, surface: surface, turn: turn, invocation: invocation)
             if tool == "app", let fields = result.objectValue, let execution = fields["execution"]?.stringValue {
@@ -52,6 +61,10 @@ package enum ChatToolDispatchTracer {
             return result
         }
         if pipeline.policy.traceOnlyAbilities, ability == nil {
+            return try await pipeline.checkProvenance(tool: tool, input: input, surface: surface, turn: turn, invocation: invocation)
+        }
+        // A part's own fold and admission re-enter this door inside its recorded call: one call is one row, and its children keep that row as parent.
+        if tool != "app", let ability, let held = turn[TracedAct.self], held.ability == ability, held.receipt == turn.act {
             return try await pipeline.checkProvenance(tool: tool, input: input, surface: surface, turn: turn, invocation: invocation)
         }
         let startNs = DispatchTime.now().uptimeNanoseconds
@@ -69,10 +82,13 @@ package enum ChatToolDispatchTracer {
             evidence: Self.dispatchEvidence(turn: turn, tool: tool, input: input, status: "running", result: nil, receiptID: receiptID),
             parent: parent
         )
+        var inner = turn.with(\.act, receiptID)
+        if let ability { inner[TracedAct.self] = TracedAct(receipt: receiptID, ability: ability) }
+        let held = inner
         let dispatched: JSONValue
         do {
             dispatched = ChatToolOutcome.normalizedFailure(try await pipeline.checkProvenance(
-                tool: tool, input: input, surface: surface, turn: turn.with(\.act, receiptID),
+                tool: tool, input: input, surface: surface, turn: held,
                 invocation: invocation.with(\.surfacedNos, inside)), tool: tool,
                 throughAppDoor: invocation.appDoor != nil)
         } catch {
@@ -191,7 +207,7 @@ package enum ChatToolDispatchTracer {
         if fields["accounting_error"] != nil { return result }
         fields["checker"] = fields["checker"] ?? .string("dispatch")
         do {
-            guard let target = try target.get() else { return .object(fields) }
+            guard let target = try target.get(), target.id != DreamPart.id else { return .object(fields) }
             fields["dispatch_receipt_id"] = .string(receiptID)
             return await AbilityStore(dataRoot: dataRoot).settleRun(id: target.id, version: target.version,
                 receipt: .object(fields), input: nil, turn: turn, at: at)
@@ -205,7 +221,7 @@ package enum ChatToolDispatchTracer {
     @discardableResult
     package static func traceUndispatched(turn: Turn, tool: String, input: [String: JSONValue], surface: String, result: JSONValue,
         dataRoot: URL) async -> JSONValue {
-        if turn.doorPreview != nil || isPreview(tool: tool, input: input) { return result }
+        if turn.doorPreview != nil || isPreview(tool: tool, input: input) || turn[DreamPart.Key.self] != nil { return result }
         let at = Date(), startNs = DispatchTime.now().uptimeNanoseconds
         let receiptID = UUID().uuidString.lowercased()
         let ability = abilityName(tool: tool, input: input)
@@ -234,15 +250,23 @@ package enum ChatToolDispatchTracer {
         return .object(fields)
     }
 
-    @concurrent private static func resultView(turn: Turn, tool: String, input: [String: JSONValue], result: JSONValue,
-        receiptID: String, dataRoot: URL) async -> ProviderToolResultPage.View {
+    @concurrent static func resultView(turn: Turn, tool: String, input: [String: JSONValue], result: JSONValue,
+        receiptID: String?, dataRoot: URL) async -> ProviderToolResultPage.View {
         do {
             let ran = ToolNameAliases.ranTool(tool, input: input)
-            var redacted = TurnTraceRedactor.redactValue(MacInjectionResultRedaction.redacted(tool: ran,
-                result: MacScreenViewResultRedaction.redacted(tool: ran, result: result), turn: turn))
+            func redact(_ result: JSONValue) -> JSONValue {
+                TurnTraceRedactor.redactValue(MacInjectionResultRedaction.redacted(tool: ran,
+                    result: MacScreenViewResultRedaction.redacted(tool: ran, result: result), turn: turn))
+            }
+            var redacted = redact(result)
             if case .object(var fields) = redacted {
-                fields["dispatch_receipt_id"] = .string(receiptID)
-                fields["dispatch_receipt_source"] = .string("detail")
+                if let receiptID {
+                    fields["dispatch_receipt_id"] = .string(receiptID)
+                    fields["dispatch_receipt_source"] = .string("detail")
+                } else if fields["reason"] == .string("continuation_settlement_failed"),
+                          let receipt = result.objectValue?["receipt"] {
+                    fields["receipt"] = redact(receipt)
+                }
                 redacted = .object(fields)
             }
             let content = ChatSecretRedactor.redactText(try redacted.serialize(pretty: false))
@@ -283,6 +307,7 @@ package enum ChatToolDispatchTracer {
         ]
         if let durationMs { payload["durationMs"] = .int(Int64(durationMs)) }
         if let parent { payload["parentId"] = .string(parent) }
+        if let invocationID = turn.invocationID { payload["invocationID"] = .string(invocationID) }
         if let origin = TurnTraceContext.automaticOrigin { payload["automaticOrigin"] = .string(origin) }
         let shown = ToolNameAliases.shown(tool, input: .object(input)).name
         if shown != tool { payload["shown"] = .string(shown) }
@@ -301,7 +326,7 @@ package enum ChatToolDispatchTracer {
             payload["result_recovery"] = resultView?.recovery
         }
         let event = TurnTraceEvent(
-            turnId: TurnTraceContext.turnId ?? turn.id, ts: recordedAt, kind: "tool.dispatch",
+            turnId: turn.id, ts: recordedAt, kind: "tool.dispatch",
             sessionId: traceSessionID(turn: turn, input), surface: surface, payload: .object(payload), turn: turn
         )
         if TurnTraceContext.turnId != nil { TurnTraceBus.fire(event, on: TurnTraceContext.bus ?? .shared) }

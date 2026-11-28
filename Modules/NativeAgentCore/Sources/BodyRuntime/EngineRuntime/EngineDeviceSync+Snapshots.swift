@@ -290,25 +290,29 @@ extension NativeAgentEngine {
         snapshots["memories"] = await self.phoneMemoryPages.snapshots["memories"]
         return snapshots
     }
-    @MainActor func faceAction(page: String, row: String, action: String, value: String?, device: String) async throws -> String? {
-        let pages = page == "memories" ? self.phoneMemoryPages : self.pages
-        let result = try await pages.act(page: page, row: row, action: action, value: value, door: "phone", device: device)
+    @MainActor func faceAction(page: String, row: String, action: String, value: String?, device: String,
+                               expectedPageRevision: String? = nil) async throws -> String? {
+        let pages = page == "memories" || page.hasPrefix("memories/") ? self.phoneMemoryPages : self.pages
+        let result = try await pages.act(page: page, row: row, action: action, value: value, door: "phone", device: device,
+            expectedPageRevision: expectedPageRevision)
         // The phone's following Inbox readback must include this completed action, even before its source event is delivered.
         if page == "inbox" { _ = await settle { await self.desk.refreshPage() } }
         return result
     }
     @MainActor func faceOutcome(page: String, row: String, action: String, value: String?, values: [String: PartFace.Value]?,
                                        formRevision: String?, device: String,
-                                       expecting: PartFace.Call, operation: UUID, undoOf: UUID?, checking: Bool) async throws -> FaceActOutcome {
-        let pages = page == "memories" ? self.phoneMemoryPages : self.pages
+                                       expecting: PartFace.Call, operation: UUID, undoOf: UUID?, checking: Bool,
+                                       expectedPageRevision: String?) async throws -> FaceActOutcome {
+        let pages = page == "memories" || page.hasPrefix("memories/") ? self.phoneMemoryPages : self.pages
         if checking { return await pages.reconcile(page: page, row: row, value: value, values: values, expecting: expecting) }
         do {
             var outcome = try await pages.actOutcome(page: page, row: row, action: action, value: value, values: values,
                                               formRevision: formRevision,
-                                              door: "phone", device: device, expecting: expecting, operation: operation, undoOf: undoOf)
+                                              door: "phone", device: device, expecting: expecting, operation: operation, undoOf: undoOf,
+                                              expectedPageRevision: expectedPageRevision)
             let request = PageActRequest(page: page, row: row, action: action,
                                          value: values.map(PartFace.Value.object) ?? value.map(PartFace.Value.string),
-                                         expectedRevision: formRevision, expectedCall: expecting)
+                                         expectedRevision: formRevision, expectedCall: expecting, expectedPageRevision: expectedPageRevision)
             outcome.failure = outcome.failure.map { EngineFaceActs.redacted($0, act: .pageAct(request)) }
             return outcome
         } catch let error as PartCallError {
@@ -385,7 +389,7 @@ extension NativeAgentEngine {
     }
     func mobileOtherRoomExchanges() async throws -> [OtherRoomExchange] {
         try await AgentContactThreads.read(root: self.dataRoot, contacts: self.contacts,
-            includeHelpers: false, refreshDoors: false).otherRooms.map { event in
+            refreshDoors: false).otherRooms.map { event in
             OtherRoomExchange(id: event.id, sessionID: event.sessionID, contactID: event.contactID,
                 contact: TurnSecretRedactor.redactText(event.contact), agent: TurnSecretRedactor.redactText(event.agent), at: event.at,
                 message: TurnSecretRedactor.redactText(event.message), reply: TurnSecretRedactor.redactText(event.reply))

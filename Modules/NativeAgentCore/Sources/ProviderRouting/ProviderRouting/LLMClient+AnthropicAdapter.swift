@@ -8,9 +8,8 @@ public final class AnthropicTransport: HTTPProviderProfile {
     public static let toolWire = ProviderToolWire.native
     public let providerId: String
     // Transport seams stay module-internal so the separate native-tools file can share them without exposing them publicly.
-    let session: URLSession
+    let session = ProviderHTTP.session
     let endpoint: URL?
-    private let apiKeyOverride: String?
     /// Messages providers reuse this wire adapter with their own endpoint and credentials.
     private let credentialConfigFile: String
     /// Injected roots confine credentials; secondary runtimes must supply their own root.
@@ -32,11 +31,10 @@ public final class AnthropicTransport: HTTPProviderProfile {
 
     /// Every Messages path uses the same credential, headers and sorted body encoding.
     func request(body: [String: Any]) throws -> URLRequest {
-        guard let key = try apiKeyOverride
-                ?? LLMCredentialResolver.checkedAPIKey(
-                    providerConfigFile: credentialConfigFile,
-                    dataRoot: credentialRoot),
-              !key.isEmpty else {
+        guard let key = try LLMCredentialResolver.checkedAPIKey(
+            providerConfigFile: credentialConfigFile,
+            dataRoot: credentialRoot
+        ), !key.isEmpty else {
             throw LLMError.notConfigured(provider: providerId)
         }
         guard let endpoint else {
@@ -60,9 +58,7 @@ public final class AnthropicTransport: HTTPProviderProfile {
     }
 
     public init(
-        session: URLSession = ProviderHTTP.session,
         endpoint: URL? = URL(string: "https://api.anthropic.com/v1/messages"),
-        apiKeyOverride: String? = nil,
         maxTokens: Int? = nil,
         dataRootOverride: URL? = nil,
         telemetryDataRootOverride: URL? = nil,
@@ -70,9 +66,7 @@ public final class AnthropicTransport: HTTPProviderProfile {
         credentialConfigFile: String = "anthropic.json",
         firstPartyAnthropicToolContract: Bool = true
     ) {
-        self.session = session
         self.endpoint = endpoint
-        self.apiKeyOverride = apiKeyOverride
         self.maxTokensOverride = maxTokens
         self.dataRootOverride = dataRootOverride
         self.providerId = providerId
@@ -99,17 +93,13 @@ public final class AnthropicTransport: HTTPProviderProfile {
 
     /// One subscription endpoint keeps Kimi Code on the shared Messages wire with its own credential and telemetry identity.
     public static func kimiCode(
-        session: URLSession = ProviderHTTP.session,
-        apiKeyOverride: String? = nil,
         // Kimi's separate token cap includes its always-on thinking.
         maxTokens: Int = 32_768,
         dataRootOverride: URL? = nil,
         telemetryDataRootOverride: URL? = nil
     ) -> AnthropicTransport {
         AnthropicTransport(
-            session: session,
             endpoint: URL(string: "https://api.kimi.com/coding/v1/messages"),
-            apiKeyOverride: apiKeyOverride,
             maxTokens: maxTokens,
             dataRootOverride: dataRootOverride,
             telemetryDataRootOverride: telemetryDataRootOverride,

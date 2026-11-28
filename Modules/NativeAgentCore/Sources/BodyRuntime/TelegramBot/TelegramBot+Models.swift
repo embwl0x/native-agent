@@ -367,8 +367,7 @@ public struct TelegramReplyContext: Sendable, Codable, Equatable {
 public enum TelegramReplyPromptRenderer {
     public static func messageWithReplyContext(
         text: String,
-        replyTo: TelegramReplyContext?,
-        quoteLimit: Int = 900
+        replyTo: TelegramReplyContext?
     ) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let replyTo,
@@ -376,9 +375,10 @@ public enum TelegramReplyPromptRenderer {
               !rawQuote.isEmpty
         else { return text }
 
+        let quoteLimit = 900
         let clippedQuote: String
         if rawQuote.count > quoteLimit {
-            clippedQuote = String(rawQuote.prefix(max(0, quoteLimit))) + "..."
+            clippedQuote = String(rawQuote.prefix(quoteLimit)) + "..."
         } else {
             clippedQuote = rawQuote
         }

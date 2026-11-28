@@ -190,7 +190,6 @@ extension EngineDoctorRuntime {
             return await DoctorLoopRecovery.repair(
                 checkID: check.id,
                 manager: port.doctorManager,
-                dataRoot: requestedRoot,
                 restart: { await port.doctorRestartLoop(id: $0) }
             )
         default: return await doctorCognitionRepair(for: check)

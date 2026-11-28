@@ -77,18 +77,13 @@ extension SwiftNativeSecurityCenter {
     }
 
     public nonisolated static func fullMacYoloAuthority(
-        surface: String,
-        originTrusted: Bool,
         snapshot: TrustPolicyAuthorizationSnapshot
     ) -> FullMacYoloAuthorityAssessment {
-        let remote = ConversationSurfaceProfile(surface).isRemote
         return fullMacYoloAuthority(
             originAssessment: OriginAssessment(
-                trusted: remote ? originTrusted : true,
-                reason: remote
-                    ? (originTrusted ? "origin authenticated by conversation surface" : "remote origin is not authenticated")
-                    : "local app surface",
-                isRemote: remote
+                trusted: true,
+                reason: "local app surface",
+                isRemote: false
             ),
             snapshot: snapshot
         )

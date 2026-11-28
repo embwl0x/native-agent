@@ -1,12 +1,12 @@
 import NativeAgentShared
 import Foundation
-import os
 import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import MacNerves
 import MindCore
 import SenseCore
+import os
 // Blueprint: | `AgentConversationStore.swift` | Retained conversation identity, send evidence and stamped send/queue admission |
 
 
@@ -30,10 +30,60 @@ public struct AgentConversationStore: Sendable {
     }
 
     public func records() throws -> [AgentConversationRecord] {
+        try records(reconcilingApprovals: true)
+    }
+
+    func records(reconcilingApprovals: Bool) throws -> [AgentConversationRecord] {
         try locked {
             var rows = try load()
-            if try reconcileDeniedApprovals(&rows) { try save(rows) }
+            if reconcilingApprovals, try reconcileDeniedApprovals(&rows) { try save(rows) }
             return rows
+        }
+    }
+
+    struct StaleSend: Error {
+        let agent: String
+        let name: String
+        let exchange: AgentConversationExchange
+        let later: [AgentConversationExchange]
+    }
+
+    func continuingSend(_ id: String, scope: String, turn: Turn, peer: AgentPeerContact?) throws -> AgentConversationRecord? {
+        try locked {
+            var rows = try load()
+            guard let index = rows.firstIndex(where: { $0.id == id }) else { return nil }
+            let row = rows[index]
+            try Self.requireCurrentSend(agent: row.agent, name: row.name, record: id, conversation: Self.destination(row.conversationID, peer: peer),
+                in: rows, scope: scope, turn: turn)
+            if try reconcileDeniedApprovals(&rows) { try save(rows) }
+            return rows[index]
+        }
+    }
+
+    private static func destination(_ requested: String?, peer: AgentPeerContact?) -> String? {
+        guard let peer else { return requested }
+        if peer.transport == .grokBot { return requested ?? GrokBotRoute.conversation(peer: peer.id) }
+        return SwiftToolDispatcher.hostPullConversation(peer: peer, requested: requested) ?? requested
+    }
+
+    private static func requireCurrentSend(agent: String, name: String, record: String?, conversation: String?,
+                                           in rows: [AgentConversationRecord], scope: String, turn: Turn?) throws {
+        guard let turn else { return }
+        let seen = turn.seenAgentExchanges
+        var unseen: [AgentConversationExchange] = []
+        for row in rows {
+            let sameConversation: Bool = conversation != nil && row.agent == agent && row.conversationID == conversation
+            guard row.id == record || sameConversation else { continue }
+            let exchanges: [AgentConversationExchange] = (row.exchanges ?? []) + (row.releasing ?? [])
+            for exchange in exchanges {
+                guard exchange.byPerson != true, let from = exchange.scopeSessionID, from != scope,
+                      exchange.sentAt > turn.startedAt, !seen.contains(exchange.id) else { continue }
+                unseen.append(exchange)
+            }
+        }
+        unseen.sort { $0.sentAt < $1.sentAt }
+        if let exchange = unseen.first {
+            throw StaleSend(agent: agent, name: name, exchange: exchange, later: Array(unseen.dropFirst()))
         }
     }
 
@@ -151,7 +201,8 @@ public struct AgentConversationStore: Sendable {
                       replyRoute: [String: String]?, message: String? = nil,
                       personInitiated: Bool = false,
                       supersedeWaiting: Bool = false, expectsReply: Bool? = nil,
-                      reservation: String? = nil, messageID: String? = nil, steeredBy: [String]) throws -> AgentConversationRecord {
+                      reservation: String? = nil, messageID: String? = nil, steeredBy: [String],
+                      continuingTurn: Turn? = nil, peer: AgentPeerContact? = nil, exactConversation: String? = nil) throws -> AgentConversationRecord {
         if let messageID, messageID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             throw ToolFailureError("message_id must be a non-empty protocol message string.",
                 argumentPath: "message_id", effects: .none)
@@ -166,12 +217,21 @@ public struct AgentConversationStore: Sendable {
         }
         return try locked {
             var rows = try load()
-            if try reconcileDeniedApprovals(&rows) { try save(rows) }
             // Continue the exact record resolved by the caller.
             let ownHeld = label == nil ? Self.ownThread(scope: scopeSessionID, agent: agent) : nil
-            let old = try record.flatMap { id in rows.first { $0.id == id && $0.agent == agent } }
+            var old = try record.flatMap { id in rows.first { $0.id == id && $0.agent == agent } }
                 ?? select(rows, scope: scopeSessionID, agent: agent, label: label)
                 ?? (fresh || ownHeld != nil ? nil : Self.continuing(rows, agent: agent, label: label))
+            let requested = fresh ? exactConversation : (old?.conversationID ?? ownHeld)
+            let destination = continuingTurn == nil ? (fresh ? nil : requested) : Self.destination(requested, peer: peer)
+            if !personInitiated, reservation == nil {
+                try Self.requireCurrentSend(agent: agent, name: name, record: fresh ? nil : old?.id, conversation: destination,
+                    in: rows, scope: scopeSessionID, turn: continuingTurn)
+            }
+            if try reconcileDeniedApprovals(&rows) {
+                try save(rows)
+                if let id = old?.id { old = rows.first { $0.id == id } }
+            }
             // An accepted ask its peer never answered (Grok Bot) may be superseded; an unsettled send never is.
             if !fresh, let old, old.phase == "sending" || (old.phase == "waiting" && !supersedeWaiting) {
                 throw Failure(
@@ -204,10 +264,9 @@ public struct AgentConversationStore: Sendable {
                     label: label ?? (fresh ? "Conversation " + String(id.prefix(8))
                         : ownHeld.map { Self.heldName($0, agent: agent, contact: name, in: rows) } ?? "Main"),
                     phase: "ready", operationID: id, updatedAt: Date(), sourceSurface: sourceSurface)
-                // Opened in the contact's own thread, it lives on the door that thread came through.
-                if !fresh, let ownHeld { row.conversationID = ownHeld }
             }
             try Self.absorbExchange(into: &row, file: fileURL)
+            row.conversationID = destination
             // Queued promotion retains the original experience.
             row.operationID = reservation ?? UUID().uuidString.lowercased()
             row.lifeID = try DataRootLife.current(in: fileURL.deletingLastPathComponent().deletingLastPathComponent())
@@ -216,10 +275,12 @@ public struct AgentConversationStore: Sendable {
             row.operationStartedAt = row.updatedAt
             let resumed = reservation.flatMap { id in row.exchanges?.first { $0.id == id && $0.status == "held" } }
             var exchange = resumed ?? .started(operationID: row.operationID, at: row.updatedAt, message: message, byPerson: personInitiated)
+            if resumed == nil { exchange.scopeSessionID = scopeSessionID }
             exchange.messageID = messageID
             exchange.phase = "sending"; exchange.status = "sending"; exchange.settledAt = nil
+            // Stamped before the history is fitted, so the fitted size is the saved size.
+            exchange.lifeID = row.lifeID
             row.exchanges = try AgentConversationExchange.bounded((row.exchanges ?? []).filter { $0.id != row.operationID } + [exchange], file: fileURL)
-            if let latest = row.exchanges?.indices.last { row.exchanges?[latest].lifeID = row.lifeID }
             row.personInitiated = personInitiated ? true : nil
             row.expectsReply = expectsReply
             row.sourceSurface = sourceSurface
@@ -246,13 +307,20 @@ public struct AgentConversationStore: Sendable {
 
     /// If the reply settled meanwhile, leave the send to the caller instead of queuing it.
     public func enqueue(id: String, scopeSessionID: String, text: String, byPerson: Bool, steeredBy: [String], arguments: [String: JSONValue]? = nil,
+                        continuingTurn: Turn? = nil, peer: AgentPeerContact? = nil,
                         stillInFlight: (AgentConversationRecord) throws -> Bool) throws -> (AgentConversationRecord, AgentConversationQueued)? {
         guard !scopeSessionID.isEmpty, scopeSessionID.utf8.count <= 256 else {
             throw Failure(message: "The queued message needs its caller's conversation; nothing was queued.")
         }
         return try locked {
             var rows = try load()
-            guard let i = rows.firstIndex(where: { $0.id == id }), try stillInFlight(rows[i]) else { return nil }
+            guard let i = rows.firstIndex(where: { $0.id == id }) else { return nil }
+            let row = rows[i]
+            if !byPerson, let continuingTurn {
+                try Self.requireCurrentSend(agent: row.agent, name: row.name, record: id, conversation: Self.destination(row.conversationID, peer: peer),
+                    in: rows, scope: scopeSessionID, turn: continuingTurn)
+            }
+            guard try stillInFlight(rows[i]) else { return nil }
             guard (rows[i].queued ?? []).count < 20 else {
                 throw Failure(message: "Twenty messages are already queued on this conversation; nothing more was added.")
             }
@@ -357,8 +425,7 @@ public struct AgentConversationStore: Sendable {
     }
 
     /// Late replies settle their own exchange, never the current send. Only committed reply storage can settle its repair debt.
-    public func settleExchange(id: String, exchange: String, reply: String?, receipt: JSONValue? = nil,
-                               firstActivity: Date? = nil) throws {
+    public func settleExchange(id: String, exchange: String, reply: String?, receipt: JSONValue? = nil) throws {
         try locked {
             var rows = try load()
             guard let i = rows.firstIndex(where: { $0.id == id }), var history = rows[i].exchanges,
@@ -366,7 +433,6 @@ public struct AgentConversationStore: Sendable {
                 throw Failure(message: "This conversation exchange is no longer retained; its reply was not saved.")
             }
             let before = rows[i]
-            if history[j].firstActivityAt == nil { history[j].firstActivityAt = firstActivity }
             if rows[i].operationID == exchange, let receipt {
                 rows[i].receipt = Self.cacheReceipt(receipt)
                 rows[i].phase = reply == nil ? "attention" : "ready"
@@ -524,7 +590,7 @@ public struct AgentConversationStore: Sendable {
 
     // Routes include chat and workspace; reconnects verify program paths without making them route identity.
     public static func routeFingerprint(_ peer: AgentPeerContact) -> String {
-        fingerprint(peer, program: "", full: true)
+        fingerprint(peer)
     }
 
     /// A saved route must identify the complete current route.
@@ -533,9 +599,9 @@ public struct AgentConversationStore: Sendable {
         return saved == routeFingerprint(peer)
     }
 
-    private static func fingerprint(_ peer: AgentPeerContact, program: String, full: Bool = false) -> String {
-        let fields = [peer.transport.rawValue, peer.endpoint.absoluteString, peer.acpWorkingDirectory ?? "", program]
-            + (full ? [peer.conversationLabel ?? "", peer.hostWorkspace ?? ""] : [])
+    private static func fingerprint(_ peer: AgentPeerContact) -> String {
+        let fields = [peer.transport.rawValue, peer.endpoint.absoluteString, peer.acpWorkingDirectory ?? "", "",
+                      peer.conversationLabel ?? "", peer.hostWorkspace ?? ""]
         let data = (try? JSONEncoder().encode(fields)) ?? Data()
         return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }

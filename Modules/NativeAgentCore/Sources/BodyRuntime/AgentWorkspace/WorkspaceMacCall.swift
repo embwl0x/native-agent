@@ -1,4 +1,3 @@
-import AppKit
 import Foundation
 import NativeAgentShared
 import MacNerves
@@ -7,6 +6,7 @@ import PersistenceCore
 import DeskCore
 import SenseCore
 import Darwin
+import AppKit
 // Blueprint: | `WorkspaceMacCall.swift` | Workspace-owned Mac calls refuse reading the agent's own app |
 
 /// Workspace calls refuse the agent's own app pages at execution time.

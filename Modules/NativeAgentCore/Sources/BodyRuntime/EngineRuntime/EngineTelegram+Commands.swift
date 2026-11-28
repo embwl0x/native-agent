@@ -6,10 +6,8 @@ import SenseCore
 // Blueprint: | `EngineTelegram+Commands.swift` | Checked token/configuration mutations and diagnostic receipts |
 
 public struct TelegramDiagnosticsClearReceipt: Equatable, Sendable {
-    public let clearedAt: String
     public let removedFileCount: Int
     public let removedRowCount: Int
-    public let status: TelegramPresentationSnapshot
 }
 
 extension TelegramFacade {
@@ -38,7 +36,6 @@ extension TelegramFacade {
         model: String,
         reasoningEffort: String,
         enabled: Bool,
-        clearToken: Bool = false,
         restartPollLoop: (@Sendable () async -> Void)? = nil
     ) async throws {
         // Empty UI token fields preserve saved credentials while ids are edited; only explicit clear removes them.
@@ -49,7 +46,6 @@ extension TelegramFacade {
             return (configuration: configuration, revision: try TelegramConfig.savedRevision(dataRoot: root))
         }
         let existing = snapshot.configuration
-        let effectiveToken = clearToken ? "" : trimmedToken
         let chatIds = try Self.telegramIDs(
             allowedChatIds,
             invalid: TelegramConfigurationError.invalidAllowedChatID
@@ -58,8 +54,8 @@ extension TelegramFacade {
             allowedUserIds,
             invalid: TelegramConfigurationError.invalidAllowedUserID
         )
-        // Preserve saved-disabled credentials without resolving them; clear or missing tokens force disabled, otherwise respect explicit enabled state.
-        let effectiveEnabled = !clearToken && (!effectiveToken.isEmpty || existing?.tokenConfigured == true) && enabled
+        // Preserve saved-disabled credentials without resolving them.
+        let effectiveEnabled = (!trimmedToken.isEmpty || existing?.tokenConfigured == true) && enabled
         guard !effectiveEnabled || !chatIds.isEmpty || !userIds.isEmpty else {
             throw TelegramConfigurationError.destinationRequired
         }
@@ -74,10 +70,10 @@ extension TelegramFacade {
             if !trimmedEffort.isEmpty {
                 body["reasoningEffort"] = .string(trimmedEffort)
             }
-            _ = try await SwiftNativeProviderRouting(dataRoot: root).saveModelConfig(.object(body))
+            try await SwiftNativeProviderRouting(dataRoot: root).saveModelConfig(.object(body))
         }
         let cfg = TelegramConfig(
-            botToken: effectiveToken,
+            botToken: trimmedToken,
             allowedChatIds: chatIds,
             allowedUserIds: userIds,
             requireMention: requireMention,
@@ -87,8 +83,8 @@ extension TelegramFacade {
         )
         do {
             try TelegramConfig.saveToDisk(cfg, dataRoot: root,
-                expectedRevision: clearToken ? nil : snapshot.revision,
-                keepExistingToken: !clearToken && trimmedToken.isEmpty)
+                expectedRevision: snapshot.revision,
+                keepExistingToken: trimmedToken.isEmpty)
         } catch {
             throw TelegramConfigurationError.persistenceFailed(error.localizedDescription)
         }
@@ -174,7 +170,7 @@ extension TelegramFacade {
         return response
     }
 
-    public nonisolated func clearTelegramDiagnostics(manager: BackgroundLoopLifetimes) async throws -> TelegramDiagnosticsClearReceipt {
+    public nonisolated func clearTelegramDiagnostics() async throws -> TelegramDiagnosticsClearReceipt {
         // Count receipts before deletion so a completed no-op remains distinguishable from removed diagnostic evidence.
         let root = dataRoot
         let before = try Self.telegramDiagnosticsEvidence(in: root)
@@ -182,13 +178,10 @@ extension TelegramFacade {
             dataRoot: root
         )
         try await impl.clearLogs()
-        let clearedAt = try await recordTelegramDiagnosticsCleared(root: root)
-        let status = try await refresh(manager: manager)
+        try await recordTelegramDiagnosticsCleared(root: root)
         return TelegramDiagnosticsClearReceipt(
-            clearedAt: clearedAt,
             removedFileCount: before.fileCount,
-            removedRowCount: before.rowCount,
-            status: status
+            removedRowCount: before.rowCount
         )
     }
 
@@ -213,11 +206,10 @@ extension TelegramFacade {
         }
     }
 
-    private nonisolated func recordTelegramDiagnosticsCleared(root: URL) async throws -> String {
+    private nonisolated func recordTelegramDiagnosticsCleared(root: URL) async throws {
         try await TelegramPollLoop.mutateState(dataRoot: root) { object in
             let marker = ISO8601DateFormatter().string(from: Date())
             object["lastDiagnosticsClearedAt"] = .string(marker)
-            return marker
         }
     }
 
@@ -230,9 +222,7 @@ extension TelegramFacade {
 }
 
 extension TelegramFacade {
-    private enum TelegramReloadError: Error { case pollerUnavailable }
-
-    public nonisolated func disconnectTelegram(restartPollLoop: (@Sendable () async -> Bool)? = nil) async throws {
+    public nonisolated func disconnectTelegram() async throws {
         let root = dataRoot
         try await SwiftNativePersistenceCore.withFileLock(root.appendingPathComponent("telegram/config.json")) {
             let existing = try TelegramConfig.loadSavedConfiguration(dataRoot: root, resolveCredential: false)
@@ -247,14 +237,6 @@ extension TelegramFacade {
                 voiceTranscriptionEnabled: existing?.voiceTranscriptionEnabled ?? TelegramConfig.defaultVoiceTranscriptionEnabled,
                 voiceMaxBytes: existing?.voiceMaxBytes ?? TelegramConfig.defaultVoiceMaxBytes
             ), dataRoot: root)
-        }
-        // A draining turn must not hold the settings lock; reload from latest disk state.
-        if let restartPollLoop {
-            try await SwiftNativePersistenceCore.withFileLock(root.appendingPathComponent("telegram/poll_reload")) {
-                guard await restartPollLoop() else {
-                    throw TelegramReloadError.pollerUnavailable
-                }
-            }
         }
     }
 

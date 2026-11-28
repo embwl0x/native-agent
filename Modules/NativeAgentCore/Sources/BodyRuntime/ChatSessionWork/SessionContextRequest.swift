@@ -17,7 +17,7 @@ public struct SessionContextRequest: Sendable {
     }
     package init(messages: [LLMMessage], systemAndToolsCharacters: Int,
                  historyCharacters: Int) throws {
-        let (count, overflow) = LLMMessage.inputCharacters(messages, system: nil, tools: [])
+        let (count, overflow) = LLMMessage.inputCharacters(messages, system: nil, tools: [], toolResultContent: providerToolResultContent)
             .addingReportingOverflow(systemAndToolsCharacters)
         guard !overflow, systemAndToolsCharacters >= 0 else {
             throw ProviderRoutingError.configurationFailed("The built request size is not representable.")
@@ -53,9 +53,9 @@ package struct SessionReplaySpec: Codable, Sendable {
         self.replacementUserMessageID = replacementUserMessageID
     }
 
-    package func messages(_ rows: [JSONValue], sessionId: String, dataRoot: URL) throws -> [HistoryChatMessage] {
+    package func messages(_ rows: [JSONValue], dataRoot: URL) throws -> [HistoryChatMessage] {
         let selected = SessionHistoryReader(dataRoot: dataRoot).promptMessagesWithStats(
-            transcript: try SessionContextRequest.transcript(rows), excludingRunId: nil)
+            transcript: try SessionContextRequest.transcript(rows))
         return SessionHistoryTail.select(
             try selected.checkedMessages(), beforeQuestionID: replacementUserMessageID, excludingRunID: excludedRunID)
     }
@@ -104,7 +104,7 @@ package struct SessionContextPlan: Codable, Sendable {
         self.systemAndToolsCharacters = systemAndToolsCharacters; self.additionalCharacters = additionalCharacters; self.model = model; self.provider = provider
     }
     package var encoded: Data { get throws { try JSONEncoder().encode(self) } }
-    package func build(_ rows: [JSONValue], sessionId: String, dataRoot: URL,
+    package func build(_ rows: [JSONValue], dataRoot: URL,
                        windowTokens: Int, outputTokens: Int, charactersPerToken: Double) throws -> SessionContextRequest {
         guard systemAndToolsCharacters >= 0, additionalCharacters >= 0, !currentRunID.isEmpty,
               let row = rows.last(where: {
@@ -119,7 +119,7 @@ package struct SessionContextPlan: Codable, Sendable {
         // Size the next replay including the producing turn's answer and tool receipts; user words replay from their row.
         let nextReplay = SessionReplaySpec(historyLimit: replay.historyLimit,
             excludedRunID: nil, replacementUserMessageID: nil)
-        let messages = try nextReplay.messages(rows, sessionId: sessionId, dataRoot: dataRoot)
+        let messages = try nextReplay.messages(rows, dataRoot: dataRoot)
         let admission = try SessionHistoryMessages.admission(messages: messages, historyLimit: replay.historyLimit,
             budget: ContextBudgetPolicy.resolve(windowTokens: windowTokens))
         let (fixedCharacters, overflow) = systemAndToolsCharacters.addingReportingOverflow(additionalCharacters)

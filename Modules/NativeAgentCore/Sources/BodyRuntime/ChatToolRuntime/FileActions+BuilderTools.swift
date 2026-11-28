@@ -131,15 +131,13 @@ struct SwiftTestArgs: SwiftPackageArgs {
         Optional Swift package directory. Defaults to a verified NativeAgent source checkout when present, otherwise the \
         canonical workspace. Active Full Mac may select an ordinary external package directory.
         """)
-    static let configurationField = DoorFieldDescriptor.choice("configuration", ["debug", "release"], "Optional. debug or release. Defaults to debug.")
     static let filterField = DoorFieldDescriptor.string("filter", "Optional SwiftPM --filter regex/specifier.")
-    static let jobsField = DoorFieldDescriptor.int("jobs", "Optional SwiftPM --jobs value, clamped 1...64.")
     static let timeoutSecondsField = DoorFieldDescriptor.int("timeout_seconds", "Optional. Default 900, max 3600.")
     static let disableSwiftpmSandboxField = DoorFieldDescriptor.bool("disable_swiftpm_sandbox", """
         Optional. Defaults true so SwiftPM does not invoke its own sandbox-exec inside our outer wrapper (profiles cannot \
         nest). Leave it true; setting it false makes the build fail at manifest compile.
         """).nullable()
-    static let doorFields = [packagePathField, configurationField, filterField, jobsField, timeoutSecondsField, disableSwiftpmSandboxField]
+    static let doorFields = [packagePathField, SwiftBuildArgs.configurationField, filterField, SwiftBuildArgs.jobsField, timeoutSecondsField, disableSwiftpmSandboxField]
     let packagePath: String?
     let configuration: String?
     let filter: String?
@@ -149,9 +147,9 @@ struct SwiftTestArgs: SwiftPackageArgs {
 
     init(door: inout DoorObjectDecoder) throws(DoorDecodeError) {
         packagePath = try door.string(Self.packagePathField)
-        configuration = try door.string(Self.configurationField)
+        configuration = try door.string(SwiftBuildArgs.configurationField)
         filter = try door.string(Self.filterField)
-        jobs = try door.numberLiteral(Self.jobsField)?.wire.exactIntegerValue
+        jobs = try door.numberLiteral(SwiftBuildArgs.jobsField)?.wire.exactIntegerValue
         timeoutSeconds = try door.numberLiteral(Self.timeoutSecondsField)?.wire.exactIntegerValue
         disableSwiftpmSandbox = try door.bool(Self.disableSwiftpmSandboxField)
     }

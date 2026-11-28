@@ -10,19 +10,22 @@ import Synchronization
 struct ACPJobDoor: JobRunner {
     let dataRoot: URL
     let live = JobDoorLive()
-    /// The app assembly checks the saved commission's authority and wraps the approved program as it wraps an ACP message.
-    let launch: @Sendable (_ job: String, _ executable: String, _ arguments: [String]) async throws -> [String]
+    let launch: @Sendable (_ job: String, _ elevated: [String], _ executable: String, _ arguments: [String]) async throws -> [String]
     static let door = "acp"
 
     func serves(_ contact: AgentPeerContact) -> Bool { contact.transport == .acp && contact.ability == nil }
 
-    func start(_ job: JobStart) async throws -> AsyncThrowingStream<JobEvent, Error> { try await open(job, resuming: nil) }
+    func start(_ job: JobStart) async throws -> AsyncThrowingStream<JobEvent, Error> {
+        try await open(job, resuming: nil, elevated: job.elevated)
+    }
 
-    func resume(_ job: JobStart, session: String) async throws -> AsyncThrowingStream<JobEvent, Error> { try await open(job, resuming: session) }
+    func resume(_ job: JobStart, session: String) async throws -> AsyncThrowingStream<JobEvent, Error> {
+        try await open(job, resuming: session, elevated: [])
+    }
 
     func cancel(session: String) async throws { await live.stop(Self.door + ":" + session) }
 
-    private func open(_ job: JobStart, resuming: String?) async throws -> AsyncThrowingStream<JobEvent, Error> {
+    private func open(_ job: JobStart, resuming: String?, elevated: [String]) async throws -> AsyncThrowingStream<JobEvent, Error> {
         let name = job.contact.name
         let record = try JobDoors.Record.read(job, dataRoot: dataRoot)
         let (_, row) = try JobDoors.recipe(job.contact)
@@ -34,13 +37,15 @@ struct ACPJobDoor: JobRunner {
         let environment: [String: String]
         do { environment = try row.installation.launchEnvironment() }
         catch { throw JobRefusal("\(name)'s installation could not be read: \(error.localizedDescription). Nothing ran.") }
-        guard let folder = job.folder ?? job.contact.acpWorkingDirectory.map({ URL(fileURLWithPath: $0, isDirectory: true) }) else {
+        guard let candidate = job.folder ?? job.contact.acpWorkingDirectory.map({ URL(fileURLWithPath: $0, isDirectory: true) }) else {
             throw JobRefusal("\(name) has no approved starting folder and the job has none. Reconnect it, or pass where. Nothing ran.")
         }
-        do { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]) }
-        catch { throw JobRefusal("\(folder.path) could not be made: \(error.localizedDescription). Nothing ran.") }
-        _ = try AgentJobs.place(.string(folder.path), dataRoot: dataRoot).get()
-        let command = try await launch(job.job, approved.path, line.arguments)
+        do { try FileManager.default.createDirectory(at: candidate, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]) }
+        catch { throw JobRefusal("\(candidate.path) could not be made: \(error.localizedDescription). Nothing ran.") }
+        let checked = await AgentJobs.place(.string(candidate.path), dataRoot: dataRoot)
+        guard let place = try checked.get() else { throw JobRefusal("No job folder was checked. Nothing ran.") }
+        let folder = URL(fileURLWithPath: place.path, isDirectory: true)
+        let command = try await launch(job.job, elevated, approved.path, line.arguments)
         let (stream, continuation) = AsyncThrowingStream<JobEvent, Error>.makeStream()
         let out = JobDoorOut(continuation, contact: job.contact)
         let run = JobDoorRun()

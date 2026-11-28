@@ -250,6 +250,7 @@ public actor CognitiveSubstrate {
     }
 
     func oweCareEmbedding(_ error: Error) {
+        guard !(error is CancellationError) else { return }
         RepairOwed.owe(conversationDataRoot, id: "care-embedding:" + UUID().uuidString, kind: .run,
             operation: "cognition.cares.embedding", owner: "memory/embedding",
             words: "Care interpretation is unavailable because the resident embedder failed: \(error.localizedDescription)",

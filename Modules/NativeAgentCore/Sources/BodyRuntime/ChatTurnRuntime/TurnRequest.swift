@@ -226,12 +226,14 @@ public struct TurnArrival: Sendable {
     /// The door's chat surface: the row's source, as its own turn would write it.
     public let surface: String
     public let row: Row
+    let cardAnswer: Bool
 
-    public init(words: String, attachments: [MultimodalAttachment] = [], surface: String, row: Row) {
+    public init(words: String, attachments: [MultimodalAttachment] = [], surface: String, row: Row, cardAnswer: Bool = false) {
         self.words = words
         self.attachments = attachments
         self.surface = surface
         self.row = row
+        self.cardAnswer = cardAnswer
     }
 }
 
@@ -284,10 +286,6 @@ public actor TurnAdmission {
     private var pendingResidentRefreshes: [String: (URL, @MainActor @Sendable () async -> Void)] = [:]
     private var inFlightObserver: NotificationCenter.ObservationToken?
 
-    private nonisolated func rootKey(_ dataRoot: URL) -> String {
-        dataRoot.standardizedFileURL.resolvingSymlinksInPath().path
-    }
-
     /// Publication and reload are one transition, excluded from every door's
     /// executing turn. Stop registrations also cover turns still entering admission.
     /// A busy root retains the latest request until the real owners release it.
@@ -300,7 +298,7 @@ public actor TurnAdmission {
                 await self?.drainResidentRefreshes()
             }
         }
-        pendingResidentRefreshes[rootKey(dataRoot)] = (dataRoot, operation)
+        pendingResidentRefreshes[ChatTurnSteering.rootKey(dataRoot)] = (dataRoot, operation)
         await drainResidentRefreshes()
     }
 
@@ -370,10 +368,10 @@ public actor TurnAdmission {
     }
 
     /// Work that never joins another turn (a regenerate, a restored run, the agent's wake, a helper's loop) waits only for its own place.
-    public func runAlone<T>(dataRoot: URL, sessionID: String?, runID: String? = nil, waitForCapacity: Bool = false,
+    public func runAlone<T>(dataRoot: URL, sessionID: String?, runID: String? = nil,
                             isolation: isolated (any Actor)? = #isolation,
                             turn: Turn, operation: (Turn) async throws -> T) async throws -> T {
-        switch try await admit(dataRoot: dataRoot, sessionID: sessionID, runID: runID, waitForCapacity: waitForCapacity, arrival: nil, turn: turn) {
+        switch try await admit(dataRoot: dataRoot, sessionID: sessionID, runID: runID, waitForCapacity: false, arrival: nil, turn: turn) {
         case .held(let place): return try await execute(consume place, operation: operation)
         case .steered: preconditionFailure("A turn without an arrival cannot offer one to steering")
         }
@@ -412,7 +410,7 @@ public actor TurnAdmission {
     private func execute<T>(_ place: consuming HeldPlace, isolation: isolated (any Actor)? = #isolation,
                             operation: (Turn) async throws -> T) async throws -> T {
         let (id, sessionID, dataRoot, turn) = (place.id, place.sessionID, place.dataRoot, place.turn)
-        let root = rootKey(dataRoot)
+        let root = ChatTurnSteering.rootKey(dataRoot)
         let stop = sessionID.flatMap { ChatCancelFlag.registeredStop(dataRoot: dataRoot, sessionId: $0, runId: turn.run) }
         return try await withSettledScope(consume place, isolation: isolation, work: { held in
             if ChatCancelFlag.isRaised(stop) { throw CancellationError() }

@@ -17,7 +17,7 @@ public enum TelegramTurnPresentationReducer {
         guard !state.isTerminal else { return state }
 
         switch event {
-        case .replyTextSettled, .final, .error:
+        case .replyTextSettled, .final, .error, .unstartedStep:
             return state
         case .toolUse(let name, _):
             let action = TelegramPollLoop.progressMessage(for: event) ?? ToolActivityPresentation.progress(name)

@@ -17,43 +17,30 @@ public final class AnthropicOAuthTransport: HTTPProviderProfile {
 
     public static let productionSession: URLSession = ProviderHTTP.makeSession()
 
-    let session: URLSession
-    private let endpoint: URL?
-    private let refreshEndpoint: URL?
+    let session = AnthropicOAuthTransport.productionSession
+    private let endpoint = URL(string: "https://api.anthropic.com/v1/messages")
+    private let refreshEndpoint = URL(string: ProviderOAuthConfig.anthropic.tokenEndpoint)
     /// An injected credential path confines alternate runtimes; production resolves the canonical layout.
     private let authPathOverride: URL?
-    private let maxTokensOverride: Int?
-    private let clientID: String
     public let telemetry: LLMCallTraceRecorder
 
     public init(
-        session: URLSession = AnthropicOAuthTransport.productionSession,
-        endpoint: URL? = URL(string: "https://api.anthropic.com/v1/messages"),
-        refreshEndpoint: URL? = URL(string: ProviderOAuthConfig.anthropic.tokenEndpoint),
         authPathOverride: URL? = nil,
-        maxTokens: Int? = nil,
-        clientID: String = ProviderOAuthConfig.anthropic.clientId,
         telemetryDataRootOverride: URL? = nil
     ) {
-        self.session = session
-        self.endpoint = endpoint
-        self.refreshEndpoint = refreshEndpoint
         self.authPathOverride = authPathOverride
-        self.maxTokensOverride = maxTokens
-        self.clientID = clientID
         self.telemetry = LLMCallTraceRecorder(dataRootOverride: telemetryDataRootOverride)
     }
 
     public func requestOutputTokens(model: String, call: LLMCall) throws -> Int {
-        // What is left of a run's budget never exceeds the model's effective ceiling, nor this transport's own cap.
         if let allowance = FirstPartyExecutionControls.budgetedOutputTokens(
-            model: model, providerID: providerId, call: call, transportCap: maxTokensOverride, dataRoot: catalogRoot) {
+            model: model, providerID: providerId, call: call, dataRoot: catalogRoot) {
             return allowance
         }
         return try FirstPartyExecutionControls.anthropicMaxOutputTokens(
             model: model,
             requestedEffort: call.admission?.reasoningEffort,
-            explicitOverride: maxTokensOverride, providerID: providerId, dataRoot: catalogRoot
+            explicitOverride: nil, providerID: providerId, dataRoot: catalogRoot
         )
     }
 
@@ -196,13 +183,14 @@ public final class AnthropicOAuthTransport: HTTPProviderProfile {
         }
         req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
 
-        let body = try Self.makeMessagesRequestBody(
+        var body = try Self.makeMessagesRequestBody(
             messages: messages,
             system: system,
             coercedModel: model,
             maxTokens: try requestOutputTokens(model: model, call: call),
-            stream: true, call: call, dataRoot: catalogRoot
+            call: call, dataRoot: catalogRoot
         )
+        Self.markStandingMemories(&body, call: call)
         req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
         Self.dumpBodyIfEnabled(body, call: "streamMessages")
 
@@ -288,7 +276,8 @@ public final class AnthropicOAuthTransport: HTTPProviderProfile {
             throw LLMError.notConfigured(provider: "anthropic_oauth_direct")
         }
 
-        let answer = try await OAuthTokenManager.exchange(provider: providerId, endpoint: refreshEndpoint, client: clientID,
+        let answer = try await OAuthTokenManager.exchange(
+            provider: providerId, endpoint: refreshEndpoint, client: ProviderOAuthConfig.anthropic.clientId,
             refresh: refreshToken, session: session, original: obj)
         let expiry = answer.expiresIn.map { NativeTimestampFormat.basicZulu(Date().addingTimeInterval($0)) }
         return try OAuthTokenManager.commit(path: path, baseline: baseline, provider: providerId,

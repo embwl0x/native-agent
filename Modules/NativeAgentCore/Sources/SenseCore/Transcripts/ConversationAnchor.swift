@@ -13,12 +13,6 @@ import NativeAgentShared
 /// A stateless owner keeps one durable conversation anchor. Off-disk backup, phone navigation and PrivacyMap/chat include it; local backup and export exclude
 /// it.
 public enum ConversationAnchor {
-    /// Notify only when anchor identity changes.
-    public struct DidPublish: NotificationCenter.AsyncMessage {
-        public typealias Subject = NSObject
-        public init() {}
-    }
-
     public static func path(dataRoot: URL) -> URL {
         dataRoot
             .appendingPathComponent("chat", isDirectory: true)
@@ -40,13 +34,11 @@ public enum ConversationAnchor {
 
     public enum PublishOutcome: Sendable, Equatable {
         case published(ConversationAnchorPin)
-        /// Already the anchor. New activity still advances its ordering stamp; no identity-change notification is posted.
-        case unchanged(ConversationAnchorPin)
         case refused(PublishRefusal)
     }
 
     /// Publish only for user activity, declaring the conversation's actual kind; peer, bot and wake turns must never move the user. Same-session activity
-    /// advances ordering without an identity-change notification. Share the sessions-index lock with retention to avoid inconsistent protection reads and
+    /// advances ordering. Share the sessions-index lock with retention to avoid inconsistent protection reads and
     /// opposing lock orders. Publication failure must not fail the user's message; callers log refusals or thrown IO errors and continue. Capture accepted
     /// activity time before awaiting or detaching: acquiring a lock is not user activity.
     @discardableResult
@@ -69,7 +61,7 @@ public enum ConversationAnchor {
             .appendingPathComponent("sessions.json")
         let anchorPath = path(dataRoot: dataRoot)
 
-        let outcome = try await SwiftNativePersistenceCore.withFileLock(sessionsPath) { () async throws -> PublishOutcome in
+        return try await SwiftNativePersistenceCore.withFileLock(sessionsPath) { () async throws -> PublishOutcome in
             // The row's recorded kind outranks the publisher's claim.
             let sessions = try SessionConversation(dataRoot: dataRoot)
             guard (sessions.kind(cleanSession) ?? conversationKind).isPersonConversation else { return .refused(.notADirectConversation) }
@@ -99,10 +91,8 @@ public enum ConversationAnchor {
                 ]),
                 to: anchorPath
             )
-            return existing?.pin.sessionId == cleanSession ? .unchanged(pin) : .published(pin)
+            return .published(pin)
         }
-        if case .published = outcome { NotificationCenter.default.post(ConversationAnchor.DidPublish()) }
-        return outcome
     }
 
     /// Reject pins outside the user's direct conversation. Atomic writes permit unlocked reads; brief staleness corrects on refresh.

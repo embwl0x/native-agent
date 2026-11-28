@@ -142,24 +142,4 @@ struct ActionDescriptor: Sendable {
         if let desc { props.append(("description", .string(desc))) }
         return ToolSchema.obj(props)
     }
-    static func looseObjectArraySchema(_ desc: String? = nil) -> JSONValue {
-        var props: [(String, JSONValue)] = [
-            ("type", .string("array")),
-            ("items", ToolSchema.obj([
-                ("type", .string("object")),
-                ("additionalProperties", .bool(true)),
-            ])),
-        ]
-        if let desc { props.append(("description", .string(desc))) }
-        return ToolSchema.obj(props)
-    }
-
-    static func nonEmptyStringSchema(_ description: String) -> JSONValue {
-        ToolSchema.obj([
-            ("type", .string("string")),
-            ("minLength", .int(1)),
-            ("description", .string(description)),
-        ])
-    }
-
 }

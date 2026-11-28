@@ -2,9 +2,8 @@ import SwiftUI
 import Foundation
 import NativeAgentShared
 
-// Blueprint: | `AgentScreenView.swift` | Home and room slots with typed page acts |
+// Blueprint: | `AgentScreenView.swift` | Read-only Home and room slots with live navigation |
 
-/// Arrival never marks seen or dispatches a tool. A person's explicit row action reaches its owner through the page port.
 struct AgentScreenView: View {
 
     @Environment(AppModel.self) private var appModel
@@ -48,7 +47,7 @@ struct AgentScreenView: View {
                         FaceReadStatus(state: pane?.state)
                         if let text = pane?.text {
                             Text(text)
-                                .font(.system(size: ShellType.captionSize, design: .monospaced))
+                                .font(ShellType.scaled(ShellType.captionSize, design: .monospaced))
                                 .foregroundStyle(NativeAgentShell.text)
                                 .textSelection(.enabled)
                                 .frame(maxWidth: .infinity, alignment: .topLeading)
@@ -76,7 +75,7 @@ struct AgentScreenView: View {
     @ViewBuilder private var home: some View {
         VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
             if let snapshot = appModel.face.slot(.page("home")).value(as: PartFaceSnapshot.self) {
-                FaceView(snapshot: snapshot, title: "Home", door: appModel.pageDoor(page: "home", open: open),
+                FaceView(snapshot: snapshot, title: "Home", door: homeDoor,
                          session: appModel.pageSessions.page("home"), leaf: { FacePageView.leaf($0) })
             } else { Text("Waiting on Home's face.") }
             if let feedback { Text(feedback).foregroundStyle(.secondary).textSelection(.enabled) }
@@ -86,6 +85,11 @@ struct AgentScreenView: View {
         .padding(.bottom, AliveMetrics.rowInsetH)
         .frame(maxWidth: Self.homeWidth, alignment: .topLeading)
         .frame(maxWidth: .infinity, alignment: .top)
+    }
+
+    private var homeDoor: any FaceDoor {
+        if quietOffscreenRead { return ReadOnlyFaceDoor() }
+        return ReadOnlyFaceDoor(open: open)
     }
 
     private func open(_ link: String) {

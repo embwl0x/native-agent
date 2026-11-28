@@ -1,16 +1,55 @@
 import Foundation
 import MindCore
-import NativeAgentShared
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 // Blueprint: | `AgentConversationHistoryView.swift` | `AgentConversationHistoryView` enum; `adding` |
 
 /// Scrollback reads the contact’s canonical session across doors; it must not replay messages or feed a peer’s model context.
 enum AgentConversationHistoryView {
+    static func take(_ result: JSONValue, turn: Turn) {
+        var ids: [String] = [], timing: [String] = []
+        func collect(_ value: JSONValue) {
+            switch value {
+            case .object(let fields):
+                if let send = fields["send"]?.stringValue, fields["text"]?.stringValue != nil,
+                   fields["from"] == .string("you") || fields["role"] == .string("assistant") { ids.append(send) }
+                if fields["reason"] == .string("conversation_advanced"), fields["session_history"] == nil {
+                    if let time = fields["prior_sent_at"]?.stringValue { timing.append(time) }
+                    timing += fields["later_sent_at"]?.arrayValue?.compactMap(\.stringValue) ?? []
+                }
+                if let sections = fields["sections"]?.arrayValue {
+                    var shown: [[JSONValue]: String] = [:]
+                    for section in sections {
+                        if let path = section.objectValue?["path"]?.arrayValue, let text = section.objectValue?["value"]?.stringValue {
+                            shown[path] = text
+                        }
+                    }
+                    for (path, text) in shown {
+                        if path.last == .string("send") {
+                            let row = Array(path.dropLast())
+                            if shown[row + [.string("text")]] != nil,
+                               shown[row + [.string("from")]] == "you" || shown[row + [.string("role")]] == "assistant" { ids.append(text) }
+                        }
+                        if path.last == .string("prior_sent_at") || path.dropLast().last == .string("later_sent_at") { timing.append(text) }
+                    }
+                }
+                if fields["result_handle"] != nil, let content = fields["content"]?.stringValue,
+                   let decoded = try? JSONValue.parse(Data(content.utf8)) { collect(decoded) }
+                for child in fields.values { collect(child) }
+            case .array(let values):
+                for child in values { collect(child) }
+            default: break
+            }
+        }
+        collect(result)
+        if !ids.isEmpty || !timing.isEmpty { turn.seeAgentExchanges(ids, timing: timing) }
+    }
+
     /// A contact can have inbound history before the agent ever opens a send record.
     static func adding(to presentation: JSONValue, agent: String, name: String,
                        before: String? = nil, exchange: String? = nil, limit: Int = 8, dataRoot: URL,
-                       peers: [AgentPeerContact]? = nil, lines snapshot: Result<[ContactThread.Line], Error>? = nil) -> JSONValue {
+                       peers: [AgentPeerContact]? = nil, startingWith unseen: [AgentConversationExchange] = []) -> JSONValue {
         guard case .object(var result) = presentation else { return presentation }
         if before != nil || exchange != nil {
             // Preserve live reply readiness while giving the selected historical moment reading space.
@@ -46,14 +85,42 @@ enum AgentConversationHistoryView {
                 + ". Repair agents/peers.json; the conversation is preserved.")
         }
         let peers = contacts
-        let lines: [ContactThread.Line]
-        do { lines = try snapshot?.get() ?? ContactThread.mergedLines(dataRoot: dataRoot, owner: owner, identity: AgentContactIdentity(contacts: peers)) }
+        let transcript: ContactThread.Transcript
+        do { transcript = try ContactThread.mergedTranscript(dataRoot: dataRoot, owner: owner, identity: AgentContactIdentity(contacts: peers)) }
         catch {
             return unavailable(
                 "This conversation's session could not be read (\(error.localizedDescription)). The conversation is preserved; no message was repeated.")
         }
+        let lines = transcript.lines
         let selected: ArraySlice<ContactThread.Line>
-        if let exchange {
+        if let send = unseen.first {
+            let start = lines.firstIndex { $0.sendID == send.id }
+                ?? lines.firstIndex { $0.at >= send.sentAt } ?? lines.endIndex
+            selected = lines[start...].prefix(128)
+            let committed = Set(lines.compactMap(\.sendID))
+            let retainedSends: [JSONValue] = unseen.filter { !committed.contains($0.id) }.map { send in
+                var retained: [String: JSONValue] = ["send": .string(send.id),
+                    "at": .string(NativeTimestampFormat.fractionalZulu(send.sentAt)), "from": .string("you"), "state": .string(send.status)]
+                if send.phase == "sending", !transcript.withheldSends.contains(nil), !transcript.withheldSends.contains(send.id),
+                   let text = send.prompt {
+                    retained["text"] = .string(String(text.prefix(800)))
+                    if send.promptTruncated || text.count > 800 { retained["text_truncated"] = .bool(true) }
+                }
+                return .object(retained)
+            }
+            if !retainedSends.isEmpty { metadata["retained_sends"] = .array(retainedSends) }
+            let answered = Set(lines.compactMap(\.answers))
+            let heldAnswers: [JSONValue] = unseen.compactMap { send in
+                guard !answered.contains(send.id), !transcript.withheldAnswers.contains(nil), !transcript.withheldAnswers.contains(send.id),
+                      var answer = AgentConversationView.heldAnswer(send.id, agent: agent, dataRoot: dataRoot) else { return nil }
+                answer["untrusted_remote_data"] = .bool(true)
+                return .object(answer)
+            }
+            if !heldAnswers.isEmpty { metadata["held_answers"] = .array(heldAnswers) }
+            if selected.endIndex < lines.endIndex {
+                metadata["detail"] = .string("This view shows the first 128 messages from the send. Open the conversation for later messages.")
+            }
+        } else if let exchange {
             guard let index = lines.firstIndex(where: { $0.id == exchange }) else {
                 return unavailable(
                     "That message was not found in this conversation's session. The conversation is preserved; no message was repeated.")
@@ -74,19 +141,20 @@ enum AgentConversationHistoryView {
             if start > 0 { metadata["earlier_before"] = .string(lines[start].id) }
         }
         // Only a history read failure carries its own status beside the send.
-        if lines.isEmpty {
+        if lines.isEmpty, unseen.isEmpty {
             metadata["detail"] = .string("The saved session read returned no messages; this does not prove that no earlier conversation exists.")
         }
         // Read send state from its owning ledger, or its retained row after ledger pruning.
         let sends: Result<[String: AgentConversationExchange], Error> = Result {
-            Dictionary(try AgentConversationStore(dataRoot: dataRoot).records().flatMap { ($0.exchanges ?? []) + ($0.releasing ?? []) }.map { ($0.id, $0) },
+            Dictionary(try AgentConversationStore(dataRoot: dataRoot).records(reconcilingApprovals: unseen.isEmpty)
+                .flatMap { ($0.exchanges ?? []) + ($0.releasing ?? []) }.map { ($0.id, $0) },
                        uniquingKeysWith: { first, _ in first })
         }
         var names = Dictionary(uniqueKeysWithValues: peers.map { ("peer:" + $0.id, $0.name) })
         for line in selected {
             if let source = line.source { names[source] = names[PeerTrust.principal(source, dataRoot: dataRoot, peers: peers)] ?? source }
         }
-        var untrusted = false
+        var untrusted = metadata["held_answers"] != nil
         let projected = ContactThread.project(selected, person: "the person, from the contact's thread", names: names)
         let trust = PeerTrust.read(projected.flatMap(\.speakers), dataRoot: dataRoot, peers: peers)
         let messages: [JSONValue] = projected.map { line in

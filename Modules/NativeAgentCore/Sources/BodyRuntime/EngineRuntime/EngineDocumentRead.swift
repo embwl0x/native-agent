@@ -34,7 +34,7 @@ extension NativeAgentEngine {
     @concurrent public nonisolated func readDocument(subject: DocumentSubject, expectedCall: PartFace.Call? = nil,
                                                       surface: String? = nil, readUsing: PartFaces.DemandRead? = nil) async throws -> String {
         let request = DocumentRequest(id: UUID(), subject: subject, expectedCall: expectedCall, textOnly: true)
-        let reply = try await EngineFaceProjection.document(request, engine: self, surface: surface, publish: false, readUsing: readUsing)
+        let reply = try await EngineFaceProjection.document(request, engine: self, surface: surface, readUsing: readUsing)
         guard case .result(.string(let text)) = reply else {
             throw PartCallError(code: "document_unconfirmed", message: "The document owner did not return its text.")
         }
@@ -65,7 +65,7 @@ extension NativeAgentEngine {
             if cursor == 0 {
                 face = try await owner.presentation(page: page, item: item, request: read, readUsing: { [tools] call in
                     try await tools.pageRead(call, envelope: envelope, turn: turn)
-                })
+                }, stampRevision: true)
             } else { face = try await owner.heldPresentation(page: page, request: read) }
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys]
